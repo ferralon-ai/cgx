@@ -23,6 +23,7 @@ This document specifies:
 - LS-5: Optional enrichment via SCIP ingestion
 - LS-6: Confidence degradation across tiers
 - LS-7: Per-language concurrency semantics (spawn/suspend/lock constructs + detached-error behavior)
+- LS-8: Per-language primitive harvest table (implicit call kinds, resource-pair syntax, metadata carriers, build-config mechanism, non-call dataflow)
 
 ---
 
@@ -303,3 +304,108 @@ All `io.*` effects (`io.file`, `io.net`, `io.db`, `io.proc`) are assigned by the
 producing rule when a call site resolves to a known system-call or standard-library
 I/O function. The full built-in list is managed in the language model files and is
 user-extensible via `cgx.toml`.
+
+---
+
+## LS-8: Per-Language Primitive Harvest Table
+
+**Status:** `schema-room` — the primitive kinds in this table must be reserved
+in the schema (GM-15, GM-16, GM-19, DF-20) before the schema stabilises; the
+mechanical harvest from language syntax into these primitives is the prerequisite
+for framework-pack evaluation (see docs/12-language-primitives-and-frameworks.md
+FW-1). Per-language packs for resource-pair syntax (column 3) harvest into GM-13
+without requiring user configuration.
+
+This table maps the concrete surface syntax of each Tier 1 language (plus C#,
+which is covered in LS-2 and LS-3) to the `cgx` primitive types defined in
+docs/03-code-graph-model.md and docs/04-dataflow-and-provenance.md. The
+`implicit:<kind>` enum is defined in GM-16; it is reproduced here for reference
+only — the authoritative definition is GM-16.
+
+`implicit:<kind>` enum values: `drop`, `destructor`, `deref`, `coercion`,
+`operator`, `iterator`, `context-enter`, `context-exit`, `property`, `defer`,
+`static-init`, `conversion`.
+
+For the framework-pack layer that sits on top of the metadata-carrier column, see
+docs/12-language-primitives-and-frameworks.md.
+
+### LS-8.1 — Rust
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — drop** | Scope-exit of a value implementing `Drop` | `calls` with `implicit:drop`; also GM-13 resource-pair release | The release half of the resource pair declared by `Drop`; harvested automatically without user `[[resource_pairs]]` entry |
+| **Implicit calls — deref** | `*x` where `x: impl Deref`, auto-deref in method call | `calls` with `implicit:deref`; confidence `certain` for monomorphized, `probable` for `dyn` | Deref coercion chains are followed transitively |
+| **Implicit calls — coercion** | `T as U` where `From<T>` / `Into<U>` / `?` operator | `calls` with `implicit:coercion`; `coerce(T,U)` transformation kind on the pedigree edge (DF-10) | The `?` operator invokes `From::from` on the error type; this is an implicit call |
+| **Implicit calls — operator** | `a + b`, `a == b`, `a < b`, `*a`, `a[i]` | `calls` with `implicit:operator` to the `Add::add` / `PartialEq::eq` / `Index::index` etc. implementation | Monomorphized: `certain`; `dyn Trait`: `probable` |
+| **Implicit calls — iterator** | `for x in iter` | `calls` with `implicit:iterator` to `IntoIterator::into_iter` and `Iterator::next` | Harvested at the `for` loop desugaring; `next` call has `edge_condition = loop` |
+| **Native resource-pair syntax** | `MutexGuard` drop, `File` drop, `impl Drop` release | GM-13 resource pair (acquire = constructor / `lock()`, release = `implicit:drop` scope-exit) | Built-in pairs cover `Mutex::lock` / `MutexGuard::drop`, `File::open` / `File::drop` |
+| **Metadata carrier** | `#[attr]`, `#[derive(Trait)]`, `#[cfg(...)]` | GM-15 metadata fact on the annotated symbol | `#[cfg(...)]` → GM-19 `cfg-condition` attribute; `#[derive(...)]` → GM-16 `generated-member` class |
+| **Build-config mechanism** | `#[cfg(feature = "x")]`, `#[cfg(target_os = "linux")]` | GM-19 `cfg-condition` attribute; feature flags sourced from `Cargo.toml` | |
+| **Channel / non-call dataflow** | `tx.send(value)` / `rx.recv()` (tokio, std::sync) | DF-20 non-call dataflow edge; `derives-from` between send and receive sites | Channel value pedigree preserved across the send/receive boundary |
+
+### LS-8.2 — Go
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — defer** | `defer f()` | `calls` with `implicit:defer`; `edge_condition = always`; also GM-13 resource-pair release when paired with a resource open | `defer` runs on both normal and panic exit; the `always` condition captures this |
+| **Implicit calls — static-init** | `func init()` | `calls` with `implicit:static-init`; `entrypoint` adjacent | Each package's `init()` functions are invoked at package load time in declaration order |
+| **Implicit calls — iterator** | `for k, v := range collection` | `calls` with `implicit:iterator` to the range iteration protocol | Range over maps, slices, channels; channel range blocks until close |
+| **Native resource-pair syntax** | `defer f.Close()`, `defer mu.Unlock()` | GM-13 resource pair; acquire = `os.Open` / `mu.Lock()`, release = `implicit:defer` scope-exit edge | Built-in pairs cover `os.Open` / `(*os.File).Close`, `sync.Mutex.Lock` / `Unlock` |
+| **Metadata carrier** | Go struct tags: `` `json:"field"` ``, `` `yaml:"field"` ``, `` `db:"field"` `` | GM-15 metadata fact on the struct field; `keep-alive` class for serialization tags | Struct tags are the primary metadata mechanism; no annotation syntax |
+| **Build-config mechanism** | `//go:build linux && amd64`, `// +build linux` (legacy) | GM-19 `cfg-condition` attribute; sourced from file-level build constraint comments | |
+| **Channel / non-call dataflow** | `ch <- value` (send), `<-ch` (receive), `select` | DF-20 non-call dataflow edge; also GM-10 suspension point on channel send/receive in goroutines | Channel direction (send-only, receive-only) preserved in the edge attributes |
+
+### LS-8.3 — Python
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — context-enter/exit** | `with resource as r:` | `calls` with `implicit:context-enter` to `__enter__`; `calls` with `implicit:context-exit` to `__exit__`; also GM-13 resource pair | `__exit__` has `edge_condition = always` (called on both normal and exception exit) |
+| **Implicit calls — iterator** | `for x in iterable:`, list comprehension | `calls` with `implicit:iterator` to `__iter__` and `__next__` | Generator protocol (`__iter__` returns `self`; `__next__` advances) |
+| **Implicit calls — property** | `obj.attr` where `attr` is a `@property` | `calls` with `implicit:property` to the getter/setter/deleter | Descriptor protocol generalises this; `@property` is the common case |
+| **Implicit calls — operator** | `a + b`, `a == b`, `a[i]`, `a[i] = v` | `calls` with `implicit:operator` to `__add__`, `__eq__`, `__getitem__`, `__setitem__` | Duck-typed; confidence `probable` with name-match, `possible` without type annotation |
+| **Implicit calls — static-init** | Module-level code executed on import | `calls` with `implicit:static-init`; `entrypoint` adjacent; `edge_condition = always` on module load | Python module execution on import is a first-class effect; relevant for DF-20 import-time side effects |
+| **Native resource-pair syntax** | `with open("f") as fh:`, `with lock:` | GM-13 resource pair; acquire = `__enter__`, release = `implicit:context-exit` | Built-in pairs cover `open()` / `__exit__`, `threading.Lock` / `__exit__` |
+| **Metadata carrier** | `@decorator`, `@app.route(...)`, `@dataclass` | GM-15 metadata fact on the decorated symbol | Decorators are the primary metadata mechanism; framework packs extend (see docs/12 FW-3.2) |
+| **Build-config mechanism** | `if sys.version_info >= (3, 10):`, `if TYPE_CHECKING:` | GM-19 `cfg-condition` attribute (heuristic; confidence `probable`) | |
+| **Channel / non-call dataflow** | `asyncio.Queue.put` / `asyncio.Queue.get`, `queue.Queue` | DF-20 non-call dataflow edge | Async queue send/receive treated as non-call dataflow; pedigree preserved |
+
+### LS-8.4 — TypeScript / JavaScript
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — iterator** | `for (const x of iterable)`, spread `[...iter]` | `calls` with `implicit:iterator` to `Symbol.iterator` / `next()` | Generator protocol; async iterators add `Symbol.asyncIterator` |
+| **Implicit calls — property** | Proxy traps (`get`, `set`); getter/setter definitions | `calls` with `implicit:property` to the getter/setter | Proxy interception is modelled as `possible`; static getter/setter is `probable` with SCIP |
+| **Implicit calls — operator** | Tagged template literals `` tag`...` `` | `calls` with `implicit:operator` to the tag function | Tag function receives the template parts and interpolated values |
+| **Implicit calls — coercion** | Implicit `toString()` in string concatenation, `valueOf()` in arithmetic | `calls` with `implicit:coercion`; `coerce(any,string)` or `coerce(any,number)` transformation kind (DF-10) | High-value for type-juggling auth-bypass queries (DF-10) |
+| **Implicit calls — static-init** | Top-level module code, `import` side effects | `calls` with `implicit:static-init`; DF-20 import-time edge | `import "side-effect-module"` executes module code; entrypoint-adjacent |
+| **Native resource-pair syntax** | No language-level syntax; library patterns (`using` in TS 5.2+, `Symbol.dispose`) | GM-13 resource pair when `Symbol.dispose` is implemented; `using` keyword → `implicit:context-exit` | TS 5.2 `using` keyword is an explicit resource-pair declaration |
+| **Metadata carrier** | TypeScript decorators (`@Controller()`, `@Injectable()`) | GM-15 metadata fact on the decorated symbol | Requires `experimentalDecorators` or TS 5.0+ native decorators; framework packs extend (docs/12 FW-3.4) |
+| **Build-config mechanism** | `process.env.NODE_ENV === "production"`, `typeof window !== "undefined"` | GM-19 `cfg-condition` attribute (heuristic; confidence `probable`) | Bundler-level dead-code elimination (Rollup/esbuild `tree-shaking`) is not modelled |
+| **Channel / non-call dataflow** | `postMessage` / `message` event (Workers), `EventEmitter.emit` / `on` | DF-20 non-call dataflow edge; Worker channel treated as DF-20 with `possible` confidence | EventEmitter string-named events: literal names resolve at `probable`; computed names at `possible` |
+
+### LS-8.5 — Java
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — static-init** | `static { ... }` block | `calls` with `implicit:static-init` to the static initializer block | Executed once on class loading; entrypoint-adjacent |
+| **Implicit calls — coercion** | Implicit `toString()` in string concatenation (`"x" + obj`) | `calls` with `implicit:coercion` to `Object.toString()`; `coerce(Object,String)` transformation kind (DF-10) | |
+| **Implicit calls — iterator** | Enhanced `for (T x : collection)` | `calls` with `implicit:iterator` to `Iterable.iterator()` and `Iterator.next()` | |
+| **Implicit calls — operator** | No operator overloading in Java; string `+` is `concat` kind (DF-10) | `concat` transformation kind on `derives-from` edge | |
+| **Native resource-pair syntax** | `try (Resource r = new Resource()) { }` (try-with-resources) | GM-13 resource pair; acquire = constructor / `open()`, release = `implicit:context-exit` mapped to `AutoCloseable.close()` | try-with-resources is the native Java resource-pair syntax; harvested without user configuration |
+| **Metadata carrier** | `@Annotation`, `@interface` declarations | GM-15 metadata fact on the annotated symbol | Spring, JPA, Jakarta annotations extend via framework packs (docs/12 FW-3.1, FW-3.3) |
+| **Build-config mechanism** | Maven profiles, Gradle build variants, `@ConditionalOnProperty` | GM-19 `cfg-condition` attribute; `probable` confidence for annotation-driven conditions | |
+| **Channel / non-call dataflow** | `BlockingQueue.put` / `take`, `CompletableFuture` completion | DF-20 non-call dataflow edge; CompletableFuture completion chain tracked as async edges (LS-4) | |
+
+### LS-8.6 — C#
+
+| Construct category | Concrete syntax | `cgx` primitive | Notes |
+|---|---|---|---|
+| **Implicit calls — property** | `obj.Property` (C# properties are methods) | `calls` with `implicit:property` to `get_Property()` / `set_Property()` | Properties are syntactic sugar over getter/setter methods; the implicit call is always present |
+| **Implicit calls — iterator** | `foreach (var x in collection)`, `yield return` | `calls` with `implicit:iterator` to `IEnumerable.GetEnumerator()` and `IEnumerator.MoveNext()` | `yield return` desugars to a state-machine class; the state-machine type is a `generated-member` |
+| **Implicit calls — coercion** | Implicit conversion operators (`operator T(U u)`) | `calls` with `implicit:coercion`; `coerce(U,T)` transformation kind (DF-10) | Explicit `operator` keyword defines the conversion; invoked implicitly at assignment |
+| **Implicit calls — operator** | `a + b`, `a == b`, `a[i]` | `calls` with `implicit:operator` to the defined `operator +`, `operator ==`, indexer | |
+| **Implicit calls — destructor** | Class finalizer `~MyClass()` | `calls` with `implicit:destructor`; confidence `possible` (GC-scheduled, not deterministic) | GC-scheduled; not a reliable resource-release mechanism; modelled for completeness |
+| **Native resource-pair syntax** | `using (var r = new Resource()) { }`, `using var r = ...;` | GM-13 resource pair; acquire = constructor, release = `implicit:context-exit` mapped to `IDisposable.Dispose()` | Both `using` statement and `using` declaration (C# 8+) are harvested |
+| **Metadata carrier** | `[Attribute]`, custom `Attribute` subclasses | GM-15 metadata fact on the decorated symbol | ASP.NET attributes extend via framework packs (docs/12 FW-3.3) |
+| **Build-config mechanism** | `#if DEBUG`, `#if NETCOREAPP3_1`, `[Conditional("DEBUG")]` | GM-19 `cfg-condition` attribute; `[Conditional]` attribute harvested as a cfg-conditioned call site | `[Conditional("DEBUG")]` methods are only called when the named symbol is defined; this is a call-site cfg condition |
+| **Channel / non-call dataflow** | `Channel<T>` (`WriteAsync` / `ReadAsync`), `BlockingCollection` | DF-20 non-call dataflow edge; async channel send/receive treated as non-call dataflow | |

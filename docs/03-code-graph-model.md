@@ -3,7 +3,7 @@
 **Status:** Feature specification (pre-implementation)
 **Audience:** Engineers integrating with or extending `cgx`; contributors; advanced users building queries
 **Working name:** `cgx` (placeholder — see docs/README.md)
-**Cross-references:** docs/04-dataflow-and-provenance.md · docs/05-queries.md · docs/08-language-support.md · docs/10-landscape.md
+**Cross-references:** docs/04-dataflow-and-provenance.md · docs/05-queries.md · docs/08-language-support.md · docs/10-landscape.md · docs/12-language-primitives-and-frameworks.md
 
 ---
 
@@ -30,7 +30,13 @@ This document specifies:
 - GM-11: Synchronization context and lock sets
 - GM-12: Function effect system
 - GM-13: Resource lifecycle pairs (acquire/release)
-- GM-14: Code-trust boundaries (unsafe, FFI, dependency edges, reflection, macro provenance)
+- GM-14: Code-trust boundaries (unsafe, FFI, dependency edges, reflection, macro provenance, type-confidence boundaries)
+- GM-15: Metadata and annotation facts (semantic classes; lowering to graph facts)
+- GM-16: Implicit call sites (`implicit:<kind>` marker; resource-pair harvest)
+- GM-17: Mediated call edges (DI, events, registries; `established-by` provenance + confidence)
+- GM-18: Reflection and string-mediated dispatch (literal-pedigree resolution; tainted-string dispatch)
+- GM-19: Build-configuration variance (`cfg-condition` attribute; per-configuration graph)
+- GM-20: Error-model conversion points (recover/catch_unwind exit the exceptional class; checked-exception precision)
 
 ---
 
@@ -818,6 +824,455 @@ code whose control flow may not match developer intent.
 Confidence is not automatically degraded for macro-expanded edges (the
 expansion is static and fully visible to `cgx`), but `macro_origin` is queryable
 so that query authors can apply their own confidence policy.
+
+### GM-14.6 — Type-confidence boundaries
+
+A **type-confidence boundary** is a program point where the static type of a
+value stops being evidence for call-target resolution or taint classification.
+Beyond this point, the static type carries no constraint on which methods are
+dispatched or which data flows through.
+
+Type-confidence boundaries arise from language escape hatches for the static
+type system:
+
+| Language | Construct | Effect |
+|---|---|---|
+| TypeScript | `any` | Type checker stops constraining; all method calls are `possible` resolution |
+| Go | `interface{}` / `any` | Concrete type erased; interface method calls require type-switch or runtime assertion |
+| C# | `dynamic` | Dispatch deferred to the DLR at runtime; `cgx` cannot resolve the callee statically |
+| Any | Reflection result | Return type is `Object` or equivalent; concrete type erased (see GM-14.4, GM-18) |
+| Any | Type-assertion / cast from broad interface | Confidence partially restored if the assertion target is a concrete type visible to `cgx` |
+
+The confidence-degradation rule at type-confidence boundaries matches the
+`reflective`/`dynamic` cut-marker rule in GM-14.4: any node reachable only via
+at least one type-confidence-boundary transition carries at most `possible`
+confidence.
+
+Type-confidence boundaries are in the same uncertainty family as unsafe regions
+(GM-14.1), FFI boundaries (GM-14.2), and reflection sites (GM-14.4). The
+`any`-frontier query — "where does a dynamically typed value enter my
+statically typed code?" — is specified in DF-19 (lineage type reconstruction)
+and Q-30 (coercion and type-confidence queries).
+
+---
+
+## GM-15 — Metadata and Annotation Facts
+
+**Status:** `core-extension` — without metadata facts, entrypoint sets, guard
+checks, and dead-member analysis are incorrect on framework-heavy code, which
+describes the majority of real codebases.
+
+Annotations (Java), attributes (C#, Rust), decorators (Python, TypeScript),
+and struct tags (Go) are **metadata facts on symbols**. `cgx` models them as
+graph facts, not as a new node type: metadata is an attribute of the symbol node
+it annotates. The semantic interpretation of metadata — what it means for
+reachability, call routing, or analysis — is supplied by **framework packs**
+(see docs/12-language-primitives-and-frameworks.md for the pack configuration
+format and per-framework catalogs).
+
+### GM-15.1 — Metadata semantic classes
+
+Every piece of metadata that `cgx` processes is lowered to at least one of the
+following **semantic classes**. A single annotation may lower to more than one
+class.
+
+| Class | Meaning | Machinery it feeds |
+|---|---|---|
+| `entrypoint` | The annotated symbol is a reachability root | Populates the entrypoint set (GM-7); reachability is wrong without this on framework code |
+| `guard` | The annotated symbol carries an authz/authn check that is the annotation itself — there is no call in the source path | Must-pass-through predicate (Q-20); false authz-bypass findings result if this class is absent |
+| `negative-guard` | The annotated symbol disables a protection that would otherwise apply | "Which endpoints disable X?" security query family |
+| `interception` | The call to the annotated symbol is rewritten at runtime to pass through a proxy, advice, or wrapper | Call-graph rewriter; adds a mediated `calls` edge (see GM-17); `@Async` additionally converts the call to a `spawns` edge (GM-9) |
+| `generated-member` | The annotated symbol, or symbols derived from it, exist with no source the developer wrote | Produced symbols receive `macro_origin` provenance (GM-14.5); call targets resolve against generated symbols |
+| `keep-alive` | The annotated field or method is used reflectively or by serialization, even if no static call site exists | Suppresses DF-8 dead-member false positives on annotated members |
+| `contract` | The annotation carries a nullability, precondition, or type contract | Feeds DF-14 (nullability and optionality flow) |
+
+### GM-15.2 — Lowering to graph facts
+
+The lowering is performed at index time by the active framework packs. Each
+class maps to a concrete graph-fact change:
+
+- `entrypoint`: the symbol node's `kind` is promoted to (or additionally tagged
+  as) `entrypoint`; the symbol is added to the entrypoint set used by GM-7.
+- `guard`: a `must-pass-through` fact is recorded on the symbol node,
+  queryable as a Q-20 predicate.
+- `negative-guard`: a `protection-disabled` attribute is set; queryable as a
+  filter in authz-bypass queries.
+- `interception`: a `calls` edge is inserted from the annotated symbol's call
+  site to the intercepting proxy or advice symbol, with `established-by:annotation`
+  (see GM-17). When the annotation is `@Async` (or equivalent), the inserted
+  edge is `spawns` (GM-9) rather than `calls`.
+- `generated-member`: generated symbols are indexed with `macro_origin` set to
+  the generator name and `implicit_source: true`; call edges to them are valid
+  targets.
+- `keep-alive`: the symbol node receives `keep_alive: true`; DF-8 dead-member
+  analysis treats it as referenced.
+- `contract`: the nullability or contract fact is stored as a DF-14 annotation
+  on the symbol node.
+
+### GM-15.3 — Motivating example: Spring @PreAuthorize
+
+```java
+@GetMapping("/admin/delete")
+@PreAuthorize("hasRole('ADMIN')")
+public void deleteUser(String id) { ... }
+```
+
+Without metadata facts:
+
+- `deleteUser` is not in the entrypoint set — reachability analysis is blind to
+  it.
+- The authz check `hasRole('ADMIN')` has no call in the source path — a
+  must-pass-through query (Q-20) asking "is there an authz check before
+  `deleteUser`?" finds none and reports a false authz-bypass.
+
+With the Spring pack active:
+
+- `@GetMapping` lowers to `entrypoint` — `deleteUser` enters the reachability
+  set.
+- `@PreAuthorize` lowers to `guard` — the must-pass-through fact is recorded;
+  Q-20 queries resolve correctly.
+- A query for "endpoints whose only authz mechanism is a `negative-guard`"
+  (`@PermitAll`, `@AllowAnonymous`) finds real bypass candidates, not noise.
+
+### GM-15.4 — Framework pack scope
+
+The pack configuration format, the built-in pack catalog (Spring, Guice,
+NestJS, FastAPI, Django, Axum, and others), and the user-extension mechanism
+are specified in docs/12-language-primitives-and-frameworks.md. This section
+defines only the graph-fact semantics that packs produce.
+
+---
+
+## GM-16 — Implicit Call Sites
+
+**Status:** `core-extension` — implicit calls are real control-flow edges;
+omitting them produces incorrect effect sets (GM-12), broken resource-pair
+tracking (GM-13), and missed reachability.
+
+An **implicit call site** is a location in source code where a function is
+invoked without explicit call syntax. `cgx` models these as `calls` edges with
+an `implicit:<kind>` attribute that identifies the language mechanism.
+
+### GM-16.1 — Implicit kind enum
+
+The `implicit` attribute on a `calls` edge takes exactly one of the following
+values:
+
+| Kind | Description | Language examples |
+|---|---|---|
+| `drop` | Destructor / finalizer called at scope exit | Rust `Drop::drop`, C++ destructor |
+| `destructor` | Named destructor syntax (distinct from drop in C++) | C++ `~MyClass()` explicit call in derived class |
+| `deref` | Implicit dereference coercion triggers a method call | Rust `Deref` / `DerefMut` coercion |
+| `coercion` | Implicit type conversion invokes a conversion function | Rust `From`/`Into` via `?`; C++ conversion operators |
+| `operator` | Arithmetic, comparison, or index operator desugars to a method call | Rust `Add::add`, Python `__add__`, C++ `operator+` |
+| `iterator` | A `for`/`foreach` loop desugars to iterator protocol calls | Rust `Iterator::next`, Python `__iter__`/`__next__`, C++ range `begin`/`end` |
+| `context-enter` | A context-management construct calls the entry function | Python `with` (`__enter__`); C# `using` enter; Java `try-with-resources` open |
+| `context-exit` | A context-management construct calls the exit / cleanup function | Python `with` (`__exit__`); C# `using` dispose; Java `try-with-resources` close |
+| `property` | A field-access expression desugars to a getter/setter call | Python `@property`, C# `get`/`set` accessors, Kotlin `get`/`set` |
+| `defer` | A deferred call is registered at one site and executes at scope exit | Go `defer`; runs on panic path too — see GM-3 and GM-13 |
+| `static-init` | A static or class-level initializer runs before first use | Java `static {}` block; Go `init()`; Python module-level code |
+| `conversion` | An explicit conversion syntax desugars to a conversion function | Python `int(x)`, `str(x)`; Swift `Int(x)` |
+
+Per-language mapping of each construct to an `implicit:<kind>` edge is
+specified in docs/08-language-support.md (LS-8).
+
+### GM-16.2 — Relationship to resource lifecycle pairs
+
+The constructs `context-enter` / `context-exit`, `defer`, and `drop` are the
+**language-native declarations of GM-13 resource pairs**. Framework packs and
+per-language rules harvest these syntax forms automatically:
+
+- Python `with` blocks desugar to `(__enter__, __exit__)` pairs — `cgx` records
+  them as resource pair instances without user configuration.
+- Java `try-with-resources` emits `(open, close)` pairs via the `context-enter`
+  / `context-exit` implicit edges.
+- Rust `Drop` creates a `(acquire, drop)` pair at the scope boundary; the
+  release edge is the implicit `drop` call.
+- Go `defer` registers the release; `cgx` pairs it with the corresponding
+  acquire call site and records the `defer` kind on the release edge.
+
+The must-reach-on-all-paths query (GM-13.3, Q-22) applies to these implicit
+pairs identically to user-declared pairs.
+
+### GM-16.3 — Effect set impact
+
+Implicit call edges participate fully in transitive effect computation (GM-12).
+A `defer` call to a function with `io.file` effect contributes `io.file` to the
+enclosing function's transitive effect set; an implicit `Drop` that closes a
+socket contributes `io.net`.
+
+---
+
+## GM-17 — Mediated Call Edges
+
+**Status:** `core-extension` — dependency injection, event dispatch, and
+registry patterns are the dominant architectural patterns in enterprise
+codebases; modelling them closes the largest gap in call-graph completeness for
+those codebases.
+
+A **mediated call edge** connects a caller and a callee that are not syntactically
+linked — the binding is established by a container, event bus, or registry at
+runtime. `cgx` models these as `calls` or `constructs` edges carrying an
+`established-by` attribute that records the binding evidence.
+
+### GM-17.1 — Edge attributes for mediated calls
+
+```
+established-by: annotation | config-file | registration-site | convention
+confidence:     certain | probable | possible
+```
+
+The `established-by` value records the evidence class:
+
+| Value | Meaning | Example |
+|---|---|---|
+| `annotation` | The binding is declared by a metadata annotation on one or both symbols | Spring `@Autowired`, Guice `@Inject`, NestJS `@Injectable` |
+| `config-file` | The binding is declared in an external configuration file | Spring XML, Guice Module class, CDI beans.xml |
+| `registration-site` | The binding is established by an explicit register/subscribe call in source | `eventBus.subscribe(MyHandler.class)`, `router.register("/path", handler)` |
+| `convention` | The binding is inferred from a naming or structural convention | Spring `@Component` name-based injection, Go `init()` side effects |
+
+### GM-17.2 — Confidence rules
+
+| Evidence class | Confidence | Rationale |
+|---|---|---|
+| Compile-time DI (Dagger, Wire) | `certain` | Binding is resolved and type-checked at compile time; the generated code is present in the graph |
+| Runtime container with annotation evidence (Spring, Guice, NestJS) | `probable` | Container resolves the binding at startup; the wiring annotation is direct evidence even though resolution is deferred |
+| Convention-based or config-file binding | `probable` | Convention evidence is strong but requires the convention to hold exactly |
+| Event bus or signal/slot without type constraint | `possible` | The subscriber set cannot be fully determined without runtime type information |
+
+### GM-17.3 — Relationship to cut markers
+
+Mediated call edges that cannot be resolved to a unique callee retain the
+`via-DI` cut marker (GM-5.3) alongside the `established-by` attribute. The cut
+marker signals that the edge required external evidence; the `established-by`
+attribute records what evidence was used. Both are independently queryable.
+
+### GM-17.4 — Examples
+
+```
+// Spring @Autowired — annotation-mediated construction
+// established-by: annotation, confidence: probable
+UserService → UserRepository  (constructs, established-by:annotation)
+
+// Dagger 2 — compile-time DI
+// established-by: annotation, confidence: certain (generated code visible)
+AppComponent → DatabaseModule  (constructs, established-by:annotation)
+
+// Event bus — registration-site evidence
+// established-by: registration-site, confidence: possible
+OrderService → ShippingEventHandler  (calls, established-by:registration-site)
+```
+
+---
+
+## GM-18 — Reflection and String-Mediated Dispatch
+
+**Status:** `core-extension` — reflection is present in most large codebases;
+string-literal resolution recovers a meaningful fraction of otherwise invisible
+edges, and tainted-string dispatch is a high-severity security pattern.
+
+Reflection and string-mediated dispatch include `Method.invoke`, `getattr`,
+`Class.forName`, `dynamic import()`, Go `reflect`, Ruby `send`, and analogous
+constructs that resolve a call target from a string value at runtime.
+
+### GM-18.1 — Resolution by string pedigree
+
+When the string value reaching a reflective dispatch site has a **literal
+pedigree** — that is, the `derives-from` chain (DF-1) traces back to a string
+constant with no taint and no join with a non-literal source — `cgx` resolves
+the edge to the named symbol:
+
+| String pedigree | Confidence assigned | Example |
+|---|---|---|
+| Direct string literal | `probable` | `getattr(obj, "process_payment")` |
+| Constant derived from a literal only | `probable` | `method = "process_" + "payment"; getattr(obj, method)` |
+| Joined with a non-literal source | `possible` | Value from a join node (DF-9) where one arm is non-literal |
+| No literal ancestry; fully dynamic | Unresolved; cut-marker `reflective` emitted | Method name from user input, config, or database |
+
+The resolved edge carries the standard `reflective` cut marker alongside its
+confidence label; the cut marker is never removed even for literal-pedigree
+resolutions, because the dispatch is still dynamic at runtime.
+
+### GM-18.2 — Tainted string reaching reflective dispatch
+
+When the string reaching a reflective dispatch site is tainted (derived from
+an untrusted source per DF-5), the dispatch is a **security-critical reflection
+site**: an attacker who controls the method name controls which code executes.
+
+`cgx` emits a taint-flow finding when a tainted string flows to any reflective
+dispatch. This is a top-tier security query (Q-31) in the framework-aware query
+family: "find paths where a tainted value reaches a reflective dispatch site."
+
+The candidate-callee set in this case is explicitly marked `possible` with the
+full set of methods matching the name pattern (if determinable from the taint
+source's value set); otherwise the candidate set is recorded as empty with
+`unresolved` status.
+
+### GM-18.3 — Unresolvable dynamic dispatch
+
+When the string is fully dynamic and the source of the method name cannot be
+determined by pedigree analysis, `cgx` is honest:
+
+- The edge is emitted with cut-marker `reflective` and confidence `possible`.
+- The `candidate_set` attribute is populated if a bounded set of method names
+  is inferrable (e.g. from an enum or a set of string constants that feeds the
+  dispatch); otherwise it is empty.
+- Queries that ask for "all paths through reflective dispatch" find these edges
+  via the `reflective` cut marker regardless of whether the callee is resolved.
+
+The soundiness statement applies: `cgx` does not claim to enumerate all dynamic
+dispatch targets. Known unresolved dispatch sites are surfaced, not silently
+dropped.
+
+---
+
+## GM-19 — Build-Configuration Variance
+
+**Status:** `schema-room` — per-configuration graph indexing is roadmap; the
+`cfg-condition` attribute is reserved now so that the schema does not need a
+breaking change when that feature ships.
+
+Build-configuration variance covers Rust `#[cfg(feature = "...")]`,
+C/C++ `#ifdef`, Go build tags (`//go:build`), Python version guards
+(`sys.version_info`), and analogous mechanisms that gate code inclusion on
+compile-time or build-time conditions.
+
+The call graph is **per build configuration**: a symbol or edge that exists
+only when `feature = "legacy-auth"` is enabled is not present in graphs built
+without that feature. A second dimension of branch-awareness beyond runtime
+edge conditions (GM-3).
+
+### GM-19.1 — The `cfg-condition` attribute
+
+`cgx` records build-configuration conditions as an attribute on affected nodes
+and edges:
+
+```
+cfg-condition: string | null
+```
+
+A non-null `cfg-condition` is the textual representation of the condition that
+must hold for this node or edge to be present in the graph. Examples:
+
+```
+cfg-condition: "feature = \"legacy-auth\""
+cfg-condition: "target_os = \"linux\""
+cfg-condition: "go:build linux && amd64"
+cfg-condition: "#ifdef ENABLE_TLS"
+```
+
+A null `cfg-condition` means the node or edge is unconditionally present.
+
+### GM-19.2 — Query behavior under `cfg-condition`
+
+Queries that traverse a node or edge with a non-null `cfg-condition` surface
+the condition alongside the result:
+
+```
+Path: entrypoint → auth::validate → legacy::token_check
+  Note: edge (auth::validate → legacy::token_check) exists only with
+        cfg-condition: "feature = \"legacy-auth\""
+```
+
+Queries can filter to include or exclude cfg-conditioned nodes/edges:
+`--exclude-cfg` omits any path segment that requires a non-default build
+condition; `--cfg feature=legacy-auth` includes it.
+
+### GM-19.3 — Per-configuration indexing (roadmap)
+
+**Status (this subsection only):** `roadmap` — full per-configuration indexing
+is not committed to the initial schema.
+
+Full per-configuration analysis would index the graph once per distinct feature
+combination, producing separate sub-graphs. Queries would then ask "does this
+path exist in ANY configuration?" or "in ALL configurations?" or "only in
+configuration X?"
+
+The `cfg-condition` attribute is the schema-room for this: it is the
+per-edge/per-node annotation that a per-configuration query engine would consume.
+No restructuring of the node/edge model is required when this feature is
+implemented.
+
+---
+
+## GM-20 — Error-Model Conversion Points
+
+**Status:** `core-extension` — Go `recover` and Rust `catch_unwind` are common
+idioms that convert panic-path flow back to value-path flow; stating the
+conversion semantics explicitly prevents false positive exception-class tagging
+downstream of these sites. Java checked exceptions give free precision on
+exception-edge targets.
+
+### GM-20.1 — Panic-to-value conversion
+
+Go's `recover()` and Rust's `std::panic::catch_unwind` convert a panic (which
+`cgx` models as a `panic`-conditioned path) back into an ordinary return value.
+The conversion is a **point** in the graph, not a new edge-condition label.
+
+The five-value edge-condition model (GM-3) is unchanged. The conversion is
+expressed within the existing model as follows:
+
+1. **Before the conversion point**: edges on the panic path carry
+   `edge_condition = panic` as defined in GM-3.
+2. **At the conversion point**: the `recover()` call or `catch_unwind` call
+   site is the boundary node. The call site itself receives `edge_condition =
+   panic` (it is only reached on the panic path).
+3. **After the conversion point**: downstream edges from the conversion call's
+   return value carry `edge_condition = always` or `edge_condition = conditional`
+   (depending on whether the caller checks whether recovery succeeded) — the
+   exceptional class does not propagate past this point.
+
+This means `recover` and `catch_unwind` act analogously to a `catch` block in
+Java or Python: they terminate the exceptional path and resume value-path
+semantics. The distinction from `catch` is that they absorb `panic`-class edges,
+not `exception`-class edges.
+
+```
+// Go example
+go_panic_site          (edge_condition: panic)
+    → defer_func       (edge_condition: panic)
+        → recover()    (edge_condition: panic)   ← conversion point
+recover_return_value   (edge_condition: conditional)  ← downstream: conditional on whether recover() returned non-nil
+    → handle_error     (edge_condition: conditional)
+```
+
+### GM-20.2 — Interaction with GM-9 (detached error domains)
+
+A `recover` inside a `defer` inside a goroutine (the canonical Go pattern)
+operates within the goroutine's own detached error domain (GM-9.2). The panic
+does not propagate to the spawner regardless of whether `recover` is present.
+`recover` determines whether the goroutine itself exits normally or panics;
+the spawner is unaffected either way.
+
+`catch_unwind` in a Rust `tokio::spawn` closure similarly constrains the panic
+within the task. Downstream edges from `catch_unwind`'s return value resume
+always/conditional semantics inside the task; the `spawns` edge to the outer
+context does not carry the panic class.
+
+### GM-20.3 — Java checked exceptions
+
+Java checked exceptions give `certain` confidence on exception-edge targets,
+because the throws clause in a method signature is a static declaration that
+`cgx` can read directly from the SCIP index or AST.
+
+For a method declared `throws IOException`:
+
+- The `throws` edge from the method to `IOException` carries `confidence:
+  certain`.
+- Call edges to that method on paths where `IOException` is not caught carry
+  `edge_condition = exception` with `confidence: certain`.
+- Callers that handle the exception in a `catch (IOException e)` block have
+  calls inside the handler body labeled `exception` (they are only reached if
+  the exception is thrown).
+
+This contrasts with unchecked exceptions (`RuntimeException` and subclasses),
+which are not declared in signatures and produce `exception`-conditioned edges
+at `probable` or `possible` confidence only when the throw site is statically
+visible.
+
+The precision benefit is queryable: a query for "all certain exception-class
+paths from `readConfig` to its callers" returns the declared-checked-exception
+propagation chain, not an over-approximated set.
 
 ---
 

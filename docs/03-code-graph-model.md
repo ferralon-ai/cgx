@@ -25,6 +25,12 @@ This document specifies:
 - GM-6: Provenance attached to every fact
 - GM-7: Entrypoint modelling
 - GM-8: Per-language semantics mapping
+- GM-9: Spawn edges (`spawns` edge kind; detached error domain)
+- GM-10: Suspension points (await/yield)
+- GM-11: Synchronization context and lock sets
+- GM-12: Function effect system
+- GM-13: Resource lifecycle pairs (acquire/release)
+- GM-14: Code-trust boundaries (unsafe, FFI, dependency edges, reflection, macro provenance)
 
 ---
 
@@ -416,6 +422,402 @@ convention. `cgx` applies heuristic rules:
 | `setjmp` / `longjmp` | Modelled as `exception`-conditioned edges to the `longjmp` target |
 | C++ `throw` / `catch` | Same as Java: `throws`/`catches` edges, `exception` condition |
 | Virtual method call (C++ vtable) | `calls:virtual`; CHA/RTA candidate set |
+
+---
+
+## GM-9 — Spawn Edges
+
+**Status:** `schema-room` — the edge kind and its domain interaction with
+path-relative transience must be reserved in the schema now; the full
+concurrency-query surface (Q-24) is a later implementation milestone.
+
+`spawns` is an **edge kind**, orthogonal to the five-value edge-condition label
+set. A `spawns` edge from symbol A to symbol B means: A initiates asynchronous,
+detached execution of B without waiting for its completion. The spawner does not
+hold a reference to the spawned task's return value at the call site; errors
+that occur inside the spawned task do not propagate back to A's call stack.
+
+### GM-9.1 — Spawn edge kind vs edge condition
+
+The `spawns` kind and the edge-condition label are independent attributes on the
+same edge record:
+
+| Field | Values | Orthogonality |
+|---|---|---|
+| `edge_type` | `spawns` (or `calls`, `calls:async`, etc.) | Classifies the structural relationship |
+| `edge_condition` | `always` / `conditional` / `loop` / `exception` / `panic` | Classifies the guard at the call site |
+
+A spawn inside a `catch` block is a `spawns` edge with `edge_condition =
+exception`. A spawn in a loop is `spawns` with `edge_condition = loop`. The
+condition describes when the spawn is initiated, not what happens inside the
+spawned task.
+
+### GM-9.2 — Detached error domain
+
+**Exceptional propagation terminates across `spawns` edges.**
+
+A path that crosses a `spawns` edge enters a **detached error domain**: the
+spawned task's error-handling machinery is independent of the spawner's. This
+has two consequences for path-relative transience (GM-4):
+
+1. **The `seen_exceptional` flag does not cross `spawns` edges.** A walk that
+   enters a spawned task via a `spawns` edge reinitialises `seen_exceptional =
+   false` for paths inside that task. Exception-class edges inside the spawner
+   do not make callees inside the spawned task exception-transient.
+
+2. **Exception edges inside the spawned task do not propagate back to the
+   spawner.** There is no call-stack unwind from task to spawner; the spawned
+   task's panics, unhandled rejections, or task-completion errors surface only
+   through the task's own completion handle (if one exists — see LS-7 for
+   per-language behavior).
+
+Queries that ask "which paths from entrypoint E carry an exception-class edge
+before reaching sink S" correctly exclude paths whose only exception-class edge
+is inside a spawned task.
+
+### GM-9.3 — Per-language lowering
+
+Per-language spawn constructs are specified in docs/08-language-support.md
+(LS-7). The table there maps each language's spawn surface to `spawns` edges
+with appropriate edge conditions.
+
+### GM-9.4 — Relationship to `calls:async`
+
+`calls:async` (GM-2.1) models an `await` point: the caller suspends but retains
+ownership of the result — control returns when the callee completes. `spawns`
+models detached launch: the caller does not wait. The distinction is queryable
+and is the basis for "await while holding a lock" vs "spawn under a lock"
+queries (see Q-24).
+
+---
+
+## GM-10 — Suspension Points
+
+**Status:** `schema-room` — the `suspends` property must be reserved now so
+that TOCTOU-class queries (Q-24) can be expressed without a schema migration; full
+query support follows.
+
+A **suspension point** is a call site or expression where the current execution
+context yields control to a scheduler or event loop before resuming. Between the
+suspension and resumption, any shared mutable state may have changed.
+
+### GM-10.1 — The `suspends` node property
+
+`cgx` attaches a boolean `suspends = true` attribute to any call-site node
+that is a known suspension point. This property is node-level: it annotates the
+call site in the caller, not the callee.
+
+`suspends` is the **TOCTOU primitive** in the graph model. A query of the form
+"is there an `await` between the validation of X and the use of X?" is
+expressed as a path predicate: "does any node on the path from validation to use
+have `suspends = true`?" The `async-toctou` query pattern in Q-24 is built on
+this property.
+
+### GM-10.2 — Per-language lowering
+
+| Language | Suspension construct | `suspends` emitted on |
+|---|---|---|
+| Rust | `.await` expression | The `calls:async` edge's source call-site node |
+| JavaScript / TypeScript | `await` expression | The `calls:async` edge's source call-site node |
+| Python | `await` expression | The `calls:async` edge's source call-site node |
+| Go | Channel send/receive (`<-`), `select` | The channel-operation node |
+| Java | `CompletableFuture.get()`, `Future.get()` blocking join; not `thenApply` (which is non-blocking continuation) | The blocking-join call-site node |
+| Kotlin | `suspend fun` call site; `await()` on `Deferred` | The suspend-call-site node |
+
+Full per-language detail is in docs/08-language-support.md (LS-7).
+
+### GM-10.3 — Interaction with lock sets
+
+A suspension point while holding a lock is the canonical "await-under-lock"
+bug. The combination of `suspends = true` and a non-empty lock set at the call
+site (GM-11) is queryable as a first-class predicate. See Q-24 for the query
+surface.
+
+---
+
+## GM-11 — Synchronization Context and Lock Sets
+
+**Status:** `schema-room` — the lock-set attribute must be reserved in the
+schema alongside GM-9 and GM-10; lock-set queries (Q-24) depend on it.
+
+The **synchronization context** at a call site is the set of
+synchronization objects that are **held** (acquired but not yet released) when
+that call site executes. `cgx` models this as a **lock set** attribute on
+call-site nodes.
+
+### GM-11.1 — Lock set attribute
+
+Each call-site node in the graph carries:
+
+```
+lock_set: Set<symbol>   # symbols of synchronization objects held at this site
+```
+
+A symbol is in `lock_set` if a path from an acquire call for that symbol to
+this call site exists with no intervening release call for the same symbol on
+any path reaching this site. Lock-set computation is a path-sensitive property;
+`cgx` computes a **conservative over-approximation** (the set of locks that
+_may_ be held, not a proof that all are held) using the acquire/release pair
+model from GM-13.
+
+### GM-11.2 — Uses of the lock set
+
+Lock-set attributes enable three classes of queries (see Q-24):
+
+| Query | Predicate |
+|---|---|
+| Await-under-lock | Call site has `suspends = true` AND `lock_set` is non-empty |
+| Inconsistent lock set | Field `F` is accessed from ≥ 2 call sites whose `lock_set` attributes do not share a common lock |
+| Blocking-call-in-async | Call site has a `blocking` effect (GM-12) AND is reachable from an async entrypoint |
+| Double-acquire | Acquire path for lock L reaches another acquire site for L with no intervening release |
+
+### GM-11.3 — Lock set and `spawns` edges
+
+Lock sets do not cross `spawns` edges. The spawned task starts with an empty
+lock set regardless of what the spawner holds. This reflects the runtime
+reality: the spawner's mutex guards do not transfer to a detached task.
+
+---
+
+## GM-12 — Function Effect System
+
+**Status:** `core-extension` — effect sets are high-leverage metadata
+derivable from the existing call graph structure and edge taxonomy; they are
+core to the security and correctness query families planned from the outset.
+
+Every function node in the graph carries an **effect set**: the union of
+effects that function may exhibit, computed transitively over the call graph.
+
+### GM-12.1 — Effect lattice
+
+The effect lattice has exactly the following values:
+
+| Effect | Meaning |
+|---|---|
+| `pure` | No side effects; return value depends only on arguments |
+| `reads-global` | Reads module-level or process-global mutable state |
+| `writes-global` | Writes module-level or process-global mutable state |
+| `io.file` | File system read or write |
+| `io.net` | Network socket read or write |
+| `io.db` | Database read or write |
+| `io.proc` | Subprocess execution or inter-process communication |
+| `spawns` | Initiates a detached concurrent task |
+| `dynamic-code` | Executes dynamically specified code (`eval`, `exec`, `dlopen`, `Class.forName`) |
+| `nondeterministic` | Depends on time, randomness, or environment variables |
+| `blocking` | May block the calling thread (sync I/O, `thread::sleep`, `std::mutex::lock`) |
+
+`pure` is the bottom element: a function declared `pure` may not have any other
+effect. The remaining values are not totally ordered; a function may carry any
+subset of the non-`pure` values simultaneously.
+
+### GM-12.2 — Transitive computation rule
+
+A function's effect set is computed as follows:
+
+1. **Own effects**: assigned from the function's body by the producing rule
+   (e.g. a call to `File::open` contributes `io.file`; a call to `tokio::spawn`
+   contributes `spawns`).
+2. **Called-function union**: the function's effect set includes the union of
+   the effect sets of all functions it reaches via `calls` (and `calls:*`)
+   edges, recursively.
+3. **Spawned-function attribution**: effects of functions reachable via `spawns`
+   edges are **not** unioned into the spawner's own effect set by default. They
+   are attributed to the spawner via the `spawns` edge and are queryable
+   separately (e.g. "which effects does this spawner's task graph reach?").
+   This keeps the spawner's direct effect set accurate: a function that only
+   spawns work and does nothing else is `spawns`-effect only, not
+   transitively `io.file` through its spawned tasks.
+
+The spawns-attribution rule is the explicit design choice: tools that naively
+union spawned effects into spawners produce false positives ("this async
+handler has `io.file` effect") that obscure the real question ("is this async
+handler's spawned task doing file I/O independently?").
+
+### GM-12.3 — Effect set storage
+
+Effect sets are stored as a bit vector on the function node. The full
+union-over-reachable-callees is pre-computed at index time and stored as a
+`transitive_effects` attribute, separate from the `own_effects` attribute
+(direct effects only). Both are queryable.
+
+### GM-12.4 — Cross-language effect lowering
+
+Per-language lowering of construct → effect value is specified in
+docs/08-language-support.md (LS-7).
+
+---
+
+## GM-13 — Resource Lifecycle Pairs (Acquire/Release)
+
+**Status:** `schema-room` — the pair representation and release-on-all-paths
+query must be reserved now; full query semantics live in Q-22 (forward citation).
+
+A **resource lifecycle pair** is a declared `(acquire, release)` symbol pair
+asserting that every execution path from an acquire call must reach a
+corresponding release call — including paths in the exceptional class.
+
+### GM-13.1 — Pair declaration
+
+Pairs are declared in `cgx.toml` or built into the per-language defaults:
+
+```toml
+# cgx.toml — user-defined resource pair
+[[resource_pairs]]
+acquire = "myapp::db::Connection::begin"
+release = ["myapp::db::Connection::commit", "myapp::db::Connection::rollback"]
+```
+
+The `release` field accepts a list: any one of the listed symbols satisfies the
+release obligation. This models transactions (either `commit` or `rollback`
+closes the resource) and multiple close paths.
+
+### GM-13.2 — Built-in per-language defaults
+
+`cgx` ships with built-in defaults for common resource pairs. These are active
+without configuration:
+
+| Language | Acquire | Release |
+|---|---|---|
+| Java | `InputStream.open`, `Connection.getConnection`, `Lock.lock` | `close()`, `Connection.close()`, `Lock.unlock()` |
+| Python | `open()` | `close()`, `__exit__` |
+| Python | `threading.Lock.acquire` | `threading.Lock.release`, `__exit__` |
+| Rust | `Mutex::lock` | `MutexGuard` drop (implicit at scope end; modelled as release on the scope-exit edge) |
+| Go | `sync.Mutex.Lock` | `sync.Mutex.Unlock` |
+| Go | `os.Open` | `(*os.File).Close` |
+| JavaScript | `fs.open` | `fs.close` |
+| Java | `synchronized` block enter | `synchronized` block exit (implicit; modelled on scope-exit edge) |
+
+Users can add pairs for any framework pattern (database sessions, HTTP client
+builders, file streams, custom transaction abstractions) via `cgx.toml`.
+
+### GM-13.3 — The release-on-all-paths question
+
+The motivating query for resource pairs is:
+
+> Is release reached on ALL paths from acquire, including exception-class paths?
+
+This is not a reachability query (∃-path). It is a **must-reach** query
+(∀-path): every execution path from the acquire call site must pass through a
+release call. Paths in the exceptional class (`exception` or `panic` edge
+condition) are explicitly included; a resource leaked only on the exception path
+is still a leak.
+
+This query pattern is specified in Q-22 (forward citation). Its foundation is
+path-relative transience (GM-4): the exceptional-class path machinery that GM-4
+defines for queries like "which callees are only reached through error handling"
+generalises directly to "does every exception-class path from acquire reach
+release."
+
+### GM-13.4 — Typestate (roadmap)
+
+**Status (this subsection only):** `roadmap` — full typestate is design-room
+only; no schema commitment is made here.
+
+Typestate generalises resource pairs to arbitrary protocol sequences: "methods
+valid only after `init()`", "no `write()` after `close()`", "every `begin()`
+reaches exactly one of `commit()` or `rollback()`." The acquire/release pair
+model in GM-13.1–13.3 captures roughly 80% of the real bugs in this family at
+a fraction of the cost. Full typestate — tracking arbitrary state machines over
+method call sequences — is reserved for a later design milestone.
+
+The graph model does not preclude typestate: the pair-declaration schema in
+GM-13.1 is a degenerate two-state automaton, and the schema can be extended to
+n-state automata without restructuring the node/edge model.
+
+---
+
+## GM-14 — Code-Trust Boundaries
+
+**Status:** `schema-room` — the attributes described here extend the existing
+cut-marker and confidence machinery (GM-5) with queryable metadata; they must
+be reserved now so that CVE-reachability and dependency-graph queries (Q-25)
+resolve correctly.
+
+Code-trust boundaries are regions or transitions in the call graph where the
+confidence of static analysis degrades and where external trust assumptions
+enter. `cgx` makes each such boundary explicit and queryable.
+
+### GM-14.1 — Unsafe regions (Rust)
+
+Rust `unsafe` blocks and `unsafe fn` declarations are annotated on the
+enclosing function node:
+
+```
+unsafe_region: true | false
+```
+
+Any function node with `unsafe_region = true` — or that transitively calls a
+function with `unsafe_region = true` — is queryable as a trust boundary.
+Confidence does not automatically degrade at unsafe boundaries (the static
+call graph is still resolved), but unsafe regions are surfaced as a filter so
+that security queries can include or exclude them explicitly.
+
+### GM-14.2 — FFI boundaries
+
+Calls crossing a foreign-function boundary carry the existing `via-FFI`
+cut-marker (GM-5.3). At GM-14 level, the additional attribute is:
+
+```
+ffi_language: string    # e.g. "C", "C++", "JNI", "Python C extension"
+```
+
+Confidence is `possible` for the resolved target (the foreign symbol name is
+known but behaviour inside it is not modelled). The cut-marker edge is still
+emitted; query authors filter it in or out according to their question.
+
+### GM-14.3 — Dependency edges (package and version)
+
+Every `calls` or `spawns` edge that crosses a module boundary into a
+third-party dependency carries additional attributes:
+
+```
+dependency {
+  package:   string    # package name (e.g. "serde", "log4j-core", "requests")
+  version:   string    # version string as resolved by the package manager
+  ecosystem: string    # "crates.io", "maven", "pypi", "npm", "go"
+}
+```
+
+These attributes enable CVE-reachability queries (Q-25): given a CVE that
+identifies a vulnerable symbol in `package@version`, determine whether any
+path from a declared entrypoint reaches that symbol, with what confidence, and
+on what edge condition.
+
+Confidence degrades for dependency edges when the resolved target is inside a
+dependency that has no SCIP index: edges fall to `probable` (unique name) or
+`possible` (ambiguous name) per the standard confidence ladder (GM-5.2).
+
+### GM-14.4 — Reflection and dynamic dispatch uncertainty
+
+Reflection sites and dynamic dispatch with unresolved candidate sets are
+already marked with cut-marker values `reflective` and `dynamic` (GM-5.3). At
+GM-14 level, these are additionally surfaced as explicit trust-boundary
+transitions: any path that traverses a `reflective` or `dynamic` cut-marker
+edge has reduced analytical confidence for all downstream nodes.
+
+Confidence degradation rule: any node reachable only via at least one
+`reflective` or `dynamic` cut-marker edge carries at most `possible` confidence,
+regardless of the resolution tier that produced the edge.
+
+### GM-14.5 — Macro and codegen provenance
+
+Edges produced from macro-expanded or code-generated source carry a provenance
+`rule` tag identifying the expansion source (e.g. `macro_rules!`,
+`proc-macro`, `annotation-processor`, `codegen-template`). This is already
+supported in GM-6; GM-14 adds the queryable attribute:
+
+```
+macro_origin: string | null    # name of the macro or generator, if applicable
+```
+
+Edges with a non-null `macro_origin` have reduced human auditability: the
+developer did not write the call site directly. Security queries can filter for
+"all paths that include at least one macro-generated call edge" to identify
+code whose control flow may not match developer intent.
+
+Confidence is not automatically degraded for macro-expanded edges (the
+expansion is static and fully visible to `cgx`), but `macro_origin` is queryable
+so that query authors can apply their own confidence policy.
 
 ---
 

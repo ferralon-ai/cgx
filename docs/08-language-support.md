@@ -22,6 +22,7 @@ This document specifies:
 - LS-4: Async model per language
 - LS-5: Optional enrichment via SCIP ingestion
 - LS-6: Confidence degradation across tiers
+- LS-7: Per-language concurrency semantics (spawn/suspend/lock constructs + detached-error behavior)
 
 ---
 
@@ -102,6 +103,17 @@ supported language's error/exception surface to `cgx` edge conditions.
 | **Ruby** | `raise` / `rescue`; `ensure` | `exception` on rescue block edges | Duck typing applies; see LS-3 |
 
 **Rust `?` / Go `if err != nil` and the `exception` label.** Rust's `?` operator and Go's `if err != nil` pattern are ordinary data-conditioned branches in their respective languages — there is no stack unwinding and no exception object. `cgx` nonetheless assigns them the `exception` label because they represent the semantically equivalent "failure branch" concept. This ensures that cross-language queries for "non-exception paths" (`--exclude-edge-condition exception`) correctly exclude both languages' failure-path call edges. The producing rule is recorded in provenance so users can distinguish Go/Rust error-branch edges from Java/Python catch-block edges. `panic` (Rust `panic!`/`unwrap`, Go `panic()`) remains a separate label because it represents non-recoverable abort-path semantics.
+
+**Detached-task error behavior.** Errors that occur inside a spawned task do not propagate back to the spawner via the call stack (see GM-9 in docs/03-code-graph-model.md). Each language surfaces the spawned task's error through its own completion handle; the table below covers the four primary Tier 1 cases:
+
+| Language | Spawn construct | Detached error surface |
+|---|---|---|
+| **Go** | `go func()` / `go goroutine` | Goroutine panics terminate the program by default (no recovery at spawner); recovery is only possible inside the goroutine itself via `defer recover()`. Panics are not delivered to the spawner. |
+| **Rust** | `tokio::spawn` / `async_std::task::spawn` | Returns a `JoinHandle<T>`; calling `.await` on it yields `Err(JoinError)` if the task panicked. The error is surfaced on the `JoinHandle` path, not propagated to the spawner automatically. Dropping the `JoinHandle` detaches the task; panics in detached tasks do not affect the spawner. |
+| **JavaScript / TypeScript** | `Promise` without `.catch`; `async` IIFE without `await` | An unhandled rejection fires the global `unhandledRejection` event (Node.js) or is surfaced as a console warning (browser). It is not delivered to the spawner's call frame. |
+| **Python** | `asyncio.create_task` | An exception in a task that is never awaited fires `Task exception was never retrieved` via the event loop's exception handler. Awaiting the task raises the exception at the `await` site; if the task is discarded, the exception is lost. |
+
+In `cgx`, the exceptional-class edges inside a spawned task have `seen_exceptional` scoped to the task's own path walk; they do not make call sites in the spawner exception-transient. See GM-9.2 in docs/03-code-graph-model.md for the full semantics.
 
 **Path-relative transience:** an edge that is only reachable because an upstream
 edge is in the exceptional class (`exception` or `panic`) is exception-transient
@@ -205,3 +217,89 @@ explicit confidence label. The system does not silently drop uncertain edges;
 it labels them as `possible` and lets the caller decide whether to include
 them. This is consistent with the soundiness principle stated in
 docs/01-vision-and-principles.md.
+
+---
+
+## LS-7: Per-Language Concurrency Semantics
+
+**Status:** `schema-room` — spawn, suspension, and lock constructs must be
+catalogued per-language now so that GM-9, GM-10, GM-11, and GM-12 schema
+reservations are grounded in concrete language surface; the full concurrency
+query surface (Q-24) follows.
+
+This section specifies the per-language mapping of concurrency constructs to
+the graph attributes defined in docs/03-code-graph-model.md: `spawns` edge kind
+(GM-9), `suspends` node property (GM-10), lock-set entries (GM-11), and effect
+values (GM-12). Languages covered match the Tier 1 set from LS-1 plus C/C++ for
+completeness.
+
+### LS-7.1 — Spawn constructs
+
+| Language | Spawn construct | `cgx` representation | Notes |
+|---|---|---|---|
+| **Rust** | `tokio::spawn(async { … })`, `async_std::task::spawn`, `std::thread::spawn` | `spawns` edge from call site to the spawned closure or async block; `edge_condition` reflects the guard at the call site | `JoinHandle` drop (detach) is annotated; `tokio::task::spawn_blocking` adds `blocking` effect to the spawned fn |
+| **Go** | `go f()`, `go func() { … }()` | `spawns` edge from `go` statement to the goroutine body | Channel operations on the spawned goroutine are tracked as synchronization points for lock-set analysis |
+| **Python** | `asyncio.create_task(coro)`, `asyncio.ensure_future`, `loop.run_in_executor` | `spawns` edge to the coroutine or executor function | `concurrent.futures.Future` submit tracked as `spawns` with `blocking` effect in executor |
+| **JavaScript / TypeScript** | `new Promise(fn)`, unhandled `async` IIFE (`(async () => { … })()`), `setTimeout`/`setImmediate` callbacks | `spawns` edge to the callback or async body; `.then` / `.catch` continuations are tracked as `calls:async` edges, not spawn | Promise constructor callback is a spawned async context if not explicitly awaited |
+| **Java** | `ExecutorService.submit`, `CompletableFuture.runAsync`, `new Thread(r).start`, virtual thread `Thread.ofVirtual().start` | `spawns` edge to the `Runnable`/`Callable` body | `CompletableFuture.thenApplyAsync` is a continuation chain and uses `calls:async`; only `.runAsync` with no handle is a detached spawn |
+| **C / C++** | `pthread_create`, `std::thread` constructor, `std::async(std::launch::async, …)` | `spawns` edge to the thread function | `std::async` with `std::launch::deferred` is modelled as `calls:async`, not spawn |
+
+### LS-7.2 — Suspension constructs
+
+| Language | Suspension construct | `suspends = true` emitted on | Notes |
+|---|---|---|---|
+| **Rust** | `.await` expression | The `calls:async` edge source node | Every `.await` is a suspension; the scheduler may schedule other tasks before resumption |
+| **JavaScript / TypeScript** | `await` expression | The `calls:async` edge source node | Includes `await` inside loops and `await` in `Promise.all` arguments |
+| **Python** | `await` expression | The `calls:async` edge source node | `asyncio.sleep(0)` is a well-known yield point; `cgx` marks it `suspends = true` |
+| **Go** | Channel send (`ch <-`) / receive (`<- ch`), `select` statement, `runtime.Gosched` | The channel-operation node | Go does not have `await`; cooperative yield happens at channel operations and GC preemption points |
+| **Java** | `Future.get()` (blocking join), `CompletableFuture.join()`, `Object.wait()` | The blocking-join call-site node | Non-blocking continuations (`thenApply`) do not set `suspends` |
+| **Kotlin** | `suspend fun` call site; `Deferred.await()` | The suspend-call-site node | `delay()` and other suspend library functions are pre-tagged in `cgx`'s built-in Kotlin model |
+| **C / C++** | No language-level suspension primitive | Not emitted | Platform-level blocking (POSIX `select`, `epoll_wait`) tagged with `blocking` effect only |
+
+### LS-7.3 — Lock constructs
+
+| Language | Acquire construct | Release construct | `cgx` modelling |
+|---|---|---|---|
+| **Rust** | `Mutex::lock()`, `RwLock::read()`, `RwLock::write()` | `MutexGuard` / `RwLockGuard` drop (scope-exit edge) | RAII; lock held from acquire call site to end-of-scope; scope-exit edge models release; `lock_set` populated accordingly |
+| **Go** | `sync.Mutex.Lock()`, `sync.RWMutex.Lock()`, `sync.RWMutex.RLock()` | `Unlock()`, `RUnlock()` | Explicit acquire/release; `defer mu.Unlock()` is modelled as release on the `always`-condition scope-exit edge |
+| **Python** | `threading.Lock.acquire()`, `with lock:` (context manager) | `release()`, `__exit__` | `with` block modelled as acquire at entry, release on scope-exit (including exception paths via `__exit__` which is `always`-conditioned) |
+| **JavaScript / TypeScript** | No language-level mutex; `Atomics.wait` (SharedArrayBuffer); library mutexes (e.g. `async-mutex`) | Library-specific release | `Atomics.wait` annotated with `blocking` effect; library mutexes tracked if declared in `cgx.toml` |
+| **Java** | `synchronized` block / method enter; `Lock.lock()`, `ReadWriteLock` | `synchronized` block exit (implicit); `Lock.unlock()` | `synchronized` block exit is modelled as an `always`-conditioned scope-exit edge; `Lock.unlock()` in `finally` is `always`-conditioned inside the finally block |
+| **C / C++** | `pthread_mutex_lock`, `std::mutex::lock`, `std::unique_lock` constructor | `pthread_mutex_unlock`, `std::mutex::unlock`, `std::unique_lock` destructor | RAII (`unique_lock`) modelled same as Rust; C explicit acquire/release tracked as pair; `cgx` applies heuristic matching for `pthread_*` pairs |
+
+### LS-7.4 — Effect values per language
+
+The following table maps each language's concrete constructs to the GM-12
+effect lattice values. Entries marked `(built-in)` are pre-populated in
+`cgx`'s per-language model; all others follow from the transitive computation
+rule (GM-12.2).
+
+| Language | Construct | Effect value |
+|---|---|---|
+| **Rust** | `tokio::spawn`, `std::thread::spawn`, `task::spawn_blocking` | `spawns` |
+| **Rust** | `async fn` / `.await` | (transitively computes `io.*` from async body) |
+| **Rust** | `tokio::time::sleep`, `thread::sleep`, `std::sync::Mutex::lock` | `blocking` |
+| **Rust** | `rand::random`, `std::time::SystemTime::now` | `nondeterministic` |
+| **Go** | `go` statement | `spawns` |
+| **Go** | `time.Sleep`, blocking channel receive, `sync.Mutex.Lock` | `blocking` |
+| **Go** | `time.Now`, `rand.Int`, `os.Getenv` | `nondeterministic` |
+| **Python** | `asyncio.create_task`, `threading.Thread.start`, `concurrent.futures.submit` | `spawns` |
+| **Python** | `time.sleep`, `threading.Lock.acquire` (blocking) | `blocking` |
+| **Python** | `eval`, `exec`, `importlib.import_module` | `dynamic-code` |
+| **Python** | `time.time`, `random.random`, `os.environ` | `nondeterministic` |
+| **JavaScript / TypeScript** | Unhandled async IIFE, `new Worker(…)` | `spawns` |
+| **JavaScript / TypeScript** | `eval`, `new Function(…)` | `dynamic-code` |
+| **JavaScript / TypeScript** | `Date.now`, `Math.random` | `nondeterministic` |
+| **Java** | `ExecutorService.submit`, `new Thread(…).start`, `CompletableFuture.runAsync` | `spawns` |
+| **Java** | `Thread.sleep`, `Object.wait`, `Future.get` (blocking) | `blocking` |
+| **Java** | `Class.forName`, `Method.invoke` | `dynamic-code` |
+| **Java** | `System.currentTimeMillis`, `new Random()` | `nondeterministic` |
+| **C / C++** | `pthread_create`, `std::thread` constructor | `spawns` |
+| **C / C++** | `sleep`, `usleep`, `pthread_mutex_lock` (blocking) | `blocking` |
+| **C / C++** | `dlopen`, `dlsym` | `dynamic-code` |
+| **C / C++** | `time(NULL)`, `rand()` | `nondeterministic` |
+
+All `io.*` effects (`io.file`, `io.net`, `io.db`, `io.proc`) are assigned by the
+producing rule when a call site resolves to a known system-call or standard-library
+I/O function. The full built-in list is managed in the language model files and is
+user-extensible via `cgx.toml`.

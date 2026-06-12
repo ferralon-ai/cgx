@@ -2,7 +2,7 @@
 
 ## Audience
 
-This document maps the four `cgx` user personas to the 85 questions they need
+This document maps the four `cgx` user personas to the 108 questions they need
 answered. It drives the feature list: every capability in
 [03-code-graph-model.md](03-code-graph-model.md) (feature prefix `GM-`) and
 [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix `DF-`) traces
@@ -54,15 +54,15 @@ DF- = dataflow/provenance) and whether existing tools serve it:
 
 ---
 
-## Theme 1: Reachability and Attack Surface — Q1–Q13
+## Theme 1: Reachability and Attack Surface — Q1–Q13, Q87–Q88, Q92–Q93, Q100
 
-*13 questions. 8 NOVEL.*
+*18 questions. 13 NOVEL.*
 
 | Q | Persona | Natural-Language Question | Capabilities | Coverage |
 |---|---------|--------------------------|--------------|---------|
 | Q1 | PSE | Which HTTP handler entrypoints can reach `exec()`, `system()`, or shell subprocess calls? | `path-query` + `entrypoint-enum` + `sink-enum` (GM-) | Partial (CodeQL, Semgrep — slow, no MCP) |
 | Q2 | PSE | Can any internet-facing endpoint reach our database query builders without going through the input validation layer? | `path-query` + negative `edge-condition-filter` (GM-) | NOVEL |
-| Q3 | PSE | Is the CVE'd function `libfoo::deserialize()` actually reachable from any of our entrypoints in production code? | `reachability` (GM-) | Partial (Endor Labs, Coana, Govulncheck — dep-level only; internal chain is NOVEL) |
+| Q3 | PSE | Is the CVE'd function `libfoo::deserialize()` actually reachable from any of our entrypoints in production code? | `reachability` (GM-); Q-25 for path and data-flow context | Partial (Endor Labs, Coana, Govulncheck — ∃-path only; path/taint/trust-boundary context is NOVEL) |
 | Q4 | PSE | Which paths to the crypto key derivation function come ONLY through exception handlers? | `path-query` + `edge-condition-filter` (exception-only) (GM-) | NOVEL |
 | Q5 | PSE | What is the minimal set of entrypoints from which a user-supplied value could reach the template rendering engine? | `taint-propagation` + `entrypoint-enum` (DF-) | Partial (SAST — not MCP-queryable) |
 | Q6 | PSE | Do any paths from public API endpoints reach internal admin functions that should only be called from the scheduler? | `path-query` + `entrypoint-enum` (GM-) | NOVEL |
@@ -73,6 +73,11 @@ DF- = dataflow/provenance) and whether existing tools serve it:
 | Q11 | SSE | If I add a new public route handler, what existing call paths does it share with authenticated handlers? | `subgraph-extract` + `path-query` (GM-) | NOVEL |
 | Q12 | PSE | Which sinks (file write, network send, process spawn) are reachable only during exception handling paths? | `sink-enum` + `edge-condition-filter` (exception-only) (GM-) | NOVEL |
 | Q13 | PSE | Show me all paths from user-controlled input functions to any function that generates or validates JWT tokens. | `taint-propagation` + `sink-enum` (DF-) | Partial (SAST — not MCP-queryable) |
+| Q87 | PSE | Does every path from a public handler to a protected resource traverse the authorization check — or can any path bypass it? | Q-20 must-pass-through (∀-path dominance); GM-14 trust boundaries | NOVEL (∀-path at call-graph level; existing tools express ∃-path reachability only) |
+| Q88 | PSE | Is the authorization check on the same execution path as the resource access it guards, or only on a sibling branch? | Q-20 must-pass-through; path-relative transience (GM-4) | NOVEL (dominance-based check/use separation; no existing tool answers inter-procedurally) |
+| Q92 | PSE | Does tainted data from any network source reach a URL-fetch, file-open, or redirect sink without a canonicalization sanitizer on every path? | Q-23 typed taint; DF-12 sink classes (`path`, `redirect-url`, `net-request`); Q-20 must-pass-through | NOVEL (class-matched sanitizer enforcement; existing SAST does ∃-path-negation, not ∀-path guarantee) |
+| Q93 | PSE | What types are constructed from untrusted deserialized bytes, and what do their constructors and `Drop` implementations reach? | Q-23 typed taint; DF-12 source class `deserialization`; GM-14 code-trust boundaries | NOVEL (gadget-chain reachability from deserialized type constructors is not served by any current tool) |
+| Q100 | PSE | Do deserialized object fields flow to model or database writes without an allow-list check on every path? | Q-23 typed taint; DF-12 source class `deserialization`, sink class `sql`; Q-20 must-pass-through | NOVEL (mass-assignment class-matched taint with ∀-path allow-list check; no existing tool covers this combination) |
 
 ---
 
@@ -97,9 +102,9 @@ DF- = dataflow/provenance) and whether existing tools serve it:
 
 ---
 
-## Theme 3: Provenance and Taint — Q26–Q36
+## Theme 3: Provenance and Taint — Q26–Q36, Q86, Q91, Q94–Q96, Q102
 
-*11 questions. 8 NOVEL.*
+*17 questions. 14 NOVEL.*
 
 The **pedigree** of a value is its inbound provenance fan-out — the set of values that
 populated it, traced transitively through transformations (e.g.,
@@ -119,12 +124,18 @@ in [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md).
 | Q34 | SSE | Which functions mutate shared state that is later read by the authentication check? | `taint-propagation` + `edge-condition-filter` (DF-) | NOVEL |
 | Q35 | PSE | Are there paths where a decrypted value is passed to a logging function? | `taint-propagation` + `sink-enum` (DF-) | NOVEL |
 | Q36 | ASA | Show me all data flows from `request.body` to any SQL query builder, annotated with whether sanitization functions are on the path. | `taint-propagation` + `path-query` + `edge-condition-filter` (DF-) | NOVEL |
+| Q86 | PSE | Do any paths from a network source reach a SQL sink without a class-matched sanitizer (one declared for class `sql`) on every path? | Q-23 typed taint; DF-11 taint labels and class-matched sanitization; DF-12 source class `network`, sink class `sql` | NOVEL (class-matched sanitizer with shared schema; existing tools use per-query flow states or experimental labels with no cross-query registry) |
+| Q91 | PSE | Trace all values derived from key material or credentials: which reach log, error-message construction, or serialization sinks? | Q-23 typed taint; DF-13 secret pedigree; DF-12 sink classes `log`, `format-string` | NOVEL (secret-specific pedigree with class-matched sinks; Q28 and Q35 are partial ancestors limited to individual call sites, not full pedigree chains) |
+| Q94 | PSE | What is the pedigree of the nonce or IV passed to this cipher call — does it originate from a CSPRNG, or from a constant, timestamp, or attacker-influenced value? | Q-5 pedigree; DF-10 transformation kinds; DF-13 secret pedigree | NOVEL (pedigree-based crypto misuse detection; no existing tool traces nonce/IV origin through transformation kinds) |
+| Q95 | PSE | Are any loop bounds, allocation sizes, or arguments to `Regex::new()` derived from tainted data? | Q-23 typed taint; DF-15 numeric narrowing and widening; DF-12 source classes `network`, `cli` | NOVEL (DoS surface via taint-to-allocation-size and ReDoS via taint-to-regex-compile; no existing tool combines numeric transformation kinds with taint propagation to these sinks) |
+| Q96 | PSE | Are there numeric narrowing conversions (e.g., `u64` → `u32`) on a tainted data path that feeds into an allocation-size argument? | Q-23 typed taint; DF-15 numeric narrowing and widening; DF-10 transformation kinds | NOVEL (overflow-to-alloc pattern requires narrowing transformation kinds on the taint path; no existing tool tracks both the narrowing operation and the downstream allocation site together) |
+| Q102 | SSE | Where is a value unwrapped or dereferenced without a null/None/Err check dominating every path to that use site? | DF-14 nullability and optionality flow; Q-20 must-pass-through (dominance check) | NOVEL (inter-procedural dominating-check query for optionality; rustc reports individual `unwrap` calls but not whether a dominating check is absent on all paths) |
 
 ---
 
-## Theme 4: Failure-Path Behavior — Q37–Q45, Q76–Q78
+## Theme 4: Failure-Path Behavior — Q37–Q45, Q76–Q78, Q98, Q101, Q103, Q106
 
-*12 questions. 12 NOVEL (all).*
+*16 questions. 15 NOVEL.*
 
 This theme maps directly to OWASP Top 10 2025 A10: Mishandling of Exceptional
 Conditions. Exception-path edge labeling — `edge-condition: exception` — is the
@@ -144,6 +155,10 @@ enabling capability. No existing tool labels or queries exception-conditioned ed
 | Q76 | PSE | Which exception handlers implement fail-open logic (catch block allows execution to continue without re-checking auth)? | `path-query` + `edge-condition-filter` (GM-) | NOVEL |
 | Q77 | PSE | Are there catch-all exception handlers (`catch Exception`, `recover()`) that silently swallow errors on security-critical paths? | `path-query` + `edge-condition-filter` (GM-) | NOVEL |
 | Q78 | SSE | Which multi-step transaction functions do NOT have compensating calls (rollback/undo) on their exception paths? | `path-query` + `edge-condition-filter` (GM-) | NOVEL |
+| Q98 | PSE | Which catch sites on authentication code paths discard the error and allow execution to continue on the happy path? | `path-query` + `edge-condition-filter`; GM-12 function effect system | Partial (Q76 covers fail-open authorization handlers; Q98 is distinct: it targets authn code specifically and requires tracing the discard-and-continue pattern via GM-12 effect attributes) |
+| Q101 | SSE | Which call sites ignore this function's error or `Result` return value — the return is dropped without any match or `?`? | `edge-condition-filter` (GM-); `sink-enum` scoped to error returns | NOVEL (ignored-error detection at the call-site level via edge condition analysis; no existing tool serves this as a graph query) |
+| Q103 | SSE | Are there execution paths on which `commit()` is called more than once, or on which neither `commit()` nor `rollback()` is called? | Q-22 ordering and pairing predicates (A-then-B on all paths); GM-13 resource lifecycle pairs | NOVEL (acquire/release pairing predicate for transaction lifecycle; no existing tool expresses "exactly one of commit/rollback on every path" as a composable query primitive) |
+| Q106 | SSE | Which functions mutate shared state and then reach a `panic!` or `unwrap` call, leaving invariants in a partially-mutated state? | Q-22 ordering and pairing predicates; GM-9 spawn edges (`panic` edge condition); `edge-condition-filter` | NOVEL (panic-safety / poisoned-invariant detection requires pairing state-mutation edges with downstream panic-condition edges; no existing tool models this) |
 
 ---
 
@@ -168,13 +183,15 @@ code causing a production failure.
 
 ---
 
-## Theme 6: Temporal and VCS Graph Diffs — Q54–Q61
+## Theme 6: Temporal and VCS Graph Diffs — Q54–Q61, Q99, Q107
 
-*8 questions. 8 NOVEL (all).*
+*10 questions. 10 NOVEL (all).*
 
 The index uses blob-OID content addressing so diffs operate on the stored graph
 without re-parsing unchanged files. No existing tool offers graph diffs as a queryable
 API. See [06-indexing-and-vcs.md](06-indexing-and-vcs.md) for the storage model.
+Edge-age and author attribution (IX-9) enables the security gate and branch-coverage
+questions below.
 
 | Q | Persona | Natural-Language Question | Capabilities | Coverage |
 |---|---------|--------------------------|--------------|---------|
@@ -186,6 +203,8 @@ API. See [06-indexing-and-vcs.md](06-indexing-and-vcs.md) for the storage model.
 | Q59 | PSE | Between last release and HEAD, which previously-unreachable dangerous functions became reachable? | `graph-diff` + `reachability` (GM-) | NOVEL |
 | Q60 | ACA | After my edit session, show me a diff of the call graph: what new edges exist, what edges were removed, any new reachability to flagged sinks? | `graph-diff` + `sink-enum` (GM-) | NOVEL |
 | Q61 | SSE | Which functions had their call-graph neighborhood change significantly in the last sprint? | `graph-diff` (GM-) | NOVEL |
+| Q99 | PSE | Does this branch introduce any new source→sink taint path, new `unsafe` region, or new call edge into a sensitive sink that was not present on `main`? | Q-7 `diff` subcommand; Q-25 dependency and CVE reachability; IX-9 edge age and author attribution; DF-12 sink classes | NOVEL (security gate combining graph diff with taint-class awareness and edge authorship; no existing tool answers this as a unified query) |
+| Q107 | SSE | Which `match`/`switch` sites in the changed files are missing a case for an enum variant that was added on this branch? | IX-9 edge age and author attribution; `graph-diff` (GM-) | NOVEL (branch-local exhaustiveness gap detection via call-graph diff combined with edge attribution; no existing tool surfaces this as a graph query) |
 
 ---
 
@@ -247,6 +266,30 @@ internal call chain resolution.
 
 ---
 
+## Theme 10: Concurrency and Resource Safety — Q89–Q90, Q97, Q104–Q105, Q108
+
+*6 questions. 6 NOVEL (all).*
+
+This theme requires the concurrency model additions from
+[03-code-graph-model.md](03-code-graph-model.md) — specifically GM-9 (spawn edges),
+GM-10 (suspension points), GM-11 (synchronization context and lock sets), and GM-12
+(function effect system) — together with the pairing predicates in
+[05-queries.md](05-queries.md) (Q-22, Q-24). No existing static analysis tool answers
+the inconsistent-lock-set or inter-procedural await-holding-lock questions at the
+call-graph level; RacerD (Java/C) uses a boolean lock abstraction that cannot detect
+inconsistent lock sets, and Clippy `await_holding_lock` is intra-procedural only.
+
+| Q | Persona | Natural-Language Question | Capabilities | Coverage |
+|---|---------|--------------------------|--------------|---------|
+| Q89 | PSE | Is the same value validated before an `await` or file-system call and then used after it, with no re-validation on the resumed path? | Q-24 concurrency queries; GM-10 suspension points; `path-query` | NOVEL (TOCTOU detection requiring suspension-point awareness at the call-graph level; no existing tool models `await`/`yield` as a world-change boundary in static analysis) |
+| Q90 | PSE | Are there resource-acquire sites from which no release path exists that covers every exception-class edge, including task-cancellation paths? | Q-22 ordering and pairing predicates; GM-13 resource lifecycle pairs; `edge-condition-filter` | NOVEL (leak-on-exception-path as a composable pairing query on user-declared acquire/release pairs; Infer Pulse handles known API pairs but does not expose a declarable pairing primitive) |
+| Q97 | PSE | Which shared fields are written from two or more spawn-distinct execution contexts under inconsistent lock sets? | Q-24 concurrency queries; GM-11 synchronization context and lock sets; GM-9 spawn edges | NOVEL (inconsistent-lock-set detection requires tracking which specific lock is held per spawn context; Infer RacerD uses a boolean lock abstraction and cannot detect this pattern) |
+| Q104 | SSE | Which async functions hold a mutex guard live at an `await` point, and which blocking calls (sync I/O, `thread::sleep`) are reachable from async entrypoints? | Q-24 concurrency queries; GM-10 suspension points; GM-11 lock sets; GM-12 effect `blocking` | NOVEL (inter-procedural await-holding-lock and blocking-in-async detection; Clippy `await_holding_lock` is intra-procedural only and does not cross async call boundaries) |
+| Q105 | SSE | Which functions carry a `writes-global` effect and are callable from two or more spawn-distinct execution contexts without a lock on every path? | Q-24 concurrency queries; GM-12 function effect system; GM-11 lock sets; GM-9 spawn edges | NOVEL (effect-based global-write race detection requires the effect lattice from GM-12 combined with spawn-context analysis; no existing tool provides this as a composable query) |
+| Q108 | SSE | Which functions annotated or inferred as pure, or reachable only from test entrypoints, transitively reach `nondeterministic` effects (time, random, env reads)? | Q-24 concurrency queries; GM-12 function effect system (effect `nondeterministic`) | NOVEL (nondeterminism detection via transitive effect propagation; no existing tool exposes a `nondeterministic` effect attribute as a queryable graph property) |
+
+---
+
 ## Canonical Prompt Examples
 
 The following four queries from the original product specification are stable reference
@@ -283,16 +326,17 @@ Theme: Temporal / VCS (Q54–Q61 class). Capabilities: `graph-diff` +
 
 | Theme | Questions | NOVEL |
 |-------|-----------|-------|
-| 1. Reachability and Attack Surface | 13 (Q1–Q13) | 8 |
+| 1. Reachability and Attack Surface | 18 (Q1–Q13, Q87–Q88, Q92–Q93, Q100) | 13 |
 | 2. Impact and Blast Radius | 12 (Q14–Q25) | 8 |
-| 3. Provenance and Taint | 11 (Q26–Q36) | 8 |
-| 4. Failure-Path Behavior (incl. OWASP A10:2025) | 12 (Q37–Q45, Q76–Q78) | 12 |
+| 3. Provenance and Taint | 17 (Q26–Q36, Q86, Q91, Q94–Q96, Q102) | 14 |
+| 4. Failure-Path Behavior (incl. OWASP A10:2025) | 16 (Q37–Q45, Q76–Q78, Q98, Q101, Q103, Q106) | 15 |
 | 5. Dead and Unused Code | 8 (Q46–Q53) | 6 |
-| 6. Temporal and VCS Graph Diffs | 8 (Q54–Q61) | 8 |
+| 6. Temporal and VCS Graph Diffs | 10 (Q54–Q61, Q99, Q107) | 10 |
 | 7. API Surface and Contracts | 6 (Q62–Q67) | 5 |
 | 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 8 |
 | 9. Threat Modeling and DFD | 4 (Q82–Q85) | 4 |
-| **Total** | **85** | **67** |
+| 10. Concurrency and Resource Safety | 6 (Q89–Q90, Q97, Q104–Q105, Q108) | 6 |
+| **Total** | **108** | **89** |
 
 ---
 

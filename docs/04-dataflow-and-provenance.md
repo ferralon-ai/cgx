@@ -36,6 +36,10 @@ Features specified here:
 - DF-14: Nullability and optionality flow
 - DF-15: Numeric narrowing and widening
 - DF-16: Aliasing and escape
+- DF-17: Mutability model (binding/value/alias; writes-param/writes-receiver; mutation fan-out; sanitization invalidation)
+- DF-18: Function values and closures (pedigree-based indirect-call resolution; capture edges; deferred execution)
+- DF-19: Lineage type reconstruction (up/down/sideways constraint query; literals as anchors; contradiction detection)
+- DF-20: Non-call dataflow linkages (channels; import-time edges; deferred-execution marker)
 
 ---
 
@@ -662,9 +666,15 @@ The following kinds are built in. The vocabulary is user-extensible via config
 | `concat` | Two or more string/byte values are concatenated | Taint-preserving; the classic injection-enabling operation |
 | `parameterize(class)` | Source value is passed as a bind parameter for a given sink class (e.g. `parameterize(sql)`) | Taint-cleared for the named sink class; taint-preserving for all others |
 | `validate(class)` | Source value is asserted to conform to a constraint class (e.g. `validate(uuid)`, `validate(integer)`) | May clear taint depending on config — see DF-11.3 |
+| `coerce(from,to)` | Source value undergoes an implicit conversion that changes its type (e.g. `coerce(string,int)`, `coerce(any,User)`) | Taint-preserving; marks the edge where a value's type changes — see DF-17.5 for mutation interaction and DF-19.4 for type-reconstruction role |
 
 The `encode(class)` and `parameterize(class)` kinds carry a class argument that
-names the sink class they address. A parameterisation that uses SQL bind
+names the sink class they address. The `coerce(from,to)` kind carries two type
+arguments: the source type and the destination type of the implicit conversion.
+This enables queries that trace type juggling across trust boundaries — for example,
+a tainted string coerced to a boolean in a PHP authentication check
+(`"0e123" == "0"` evaluating as equal after numeric coercion) is visible as a
+`coerce(string,int)` edge in the pedigree. A parameterisation that uses SQL bind
 parameters neutralises SQL injection but has no effect on a shell-sink: taint
 survives on any `shell`-class path.
 
@@ -744,7 +754,7 @@ edge's transformation kind (DF-10):
 
 | Kind | Taint survival rule |
 |---|---|
-| `copy`, `projection`, `aggregation`, `parse`, `serialize`, `decode(class)`, `truncate`, `narrow`, `widen`, `arith`, `concat` | Taint is **preserved** — the label propagates to the derived value unchanged |
+| `copy`, `projection`, `aggregation`, `parse`, `serialize`, `decode(class)`, `truncate`, `narrow`, `widen`, `arith`, `concat`, `coerce(from,to)` | Taint is **preserved** — the label propagates to the derived value unchanged |
 | `encode(class)` | Taint is **cleared** for sink classes matching `class`; preserved for all others |
 | `parameterize(class)` | Taint is **cleared** for sink classes matching `class`; preserved for all others |
 | `validate(class)` | Taint survival is **config-dependent** — the project declares whether `validate(class)` clears taint for matching sink classes; default is to preserve (conservative) |
@@ -1082,7 +1092,403 @@ internally; results reported by DF-7 will carry the escape kind from DF-16.1.
 
 ---
 
+## DF-17 — Mutability Model
+
+**Status: core-extension** (binding and value mutability) / **schema-room** (alias mutability) — the
+`mutation-out` inventory category (DF-2.1) and `derives-from` edges already represent mutation in
+the current graph; this section formalises the three-level model, adds the `writes-param(i)` and
+`writes-receiver` effect-lattice extensions, defines mutation fan-out as the outbound dual of
+pedigree, and states the sanitization-invalidation rule that refines DF-11. The alias level inherits
+DF-16's `schema-room` status because full alias analysis cost applies.
+
+### DF-17.1 — Three levels of mutability
+
+Languages conflate three distinct concepts under "mutability." `cgx` models them separately:
+
+| Level | What it governs | Immutable examples | Mutable examples |
+|---|---|---|---|
+| `binding` | Whether the **name** can be reassigned to a different value | `const` (JS/TS), `final` (Java), `let` (Rust, non-`mut`) | `var` (JS/Go), `let mut` (Rust), unqualified locals |
+| `value` | Whether the **object's internal state** can change | `Object.freeze()`, frozen dataclasses (Python), `record` (Java 16+), Rust `&T` (shared ref), `const` member functions (C++) | Regular classes, `&mut T` (Rust), mutable structs |
+| `alias` | Whether **another reference** can mutate the value through a separate binding | Rust ownership system statically prevents this at `certain` confidence | Shared references in most other languages; closures capturing by ref; values passed to concurrent tasks |
+
+A binding that is `binding`-immutable may still be `value`-mutable: a `final List<String>` in Java
+cannot be reassigned but can have elements appended. The three levels compose independently.
+
+Alias mutability composes with DF-16 escape and docs/03 GM-10 suspension: a value-mutable value that
+escapes its allocating scope (DF-16.1) and crosses a suspension point (GM-10) can be mutated by
+another task between the suspension and the next use. This is the precise three-ingredient signature
+for TOCTOU vulnerabilities.
+
+### DF-17.2 — Effect-lattice extensions: writes-param and writes-receiver
+
+docs/03-code-graph-model.md GM-12 specifies the function effect system, which already includes
+`writes-global`. DF-17 extends the effect lattice with two finer-grained kinds:
+
+| Effect | Meaning |
+|---|---|
+| `writes-param(i)` | The function mutates the value bound to its i-th parameter through a mutable reference or pointer |
+| `writes-receiver` | The function mutates the receiver object (`self`, `this`) |
+
+These effects are recorded on the function node as effect-lattice attributes (GM-12) and are
+propagated interprocedurally through function summaries (DF-3.3). A call site where `writes-param(0)`
+is present for the callee generates a `mutation-out` edge (DF-2.1) attributed to argument 0 at the
+call site.
+
+This makes the question "does `f(myList)` mutate `myList`?" answerable interprocedurally — the same
+question that the container-model worked example in DF-1.2 raises but does not address for the
+mutation direction.
+
+### DF-17.3 — Mutation fan-out
+
+**Pedigree** (DF-1) is the inbound provenance fan-out: "what populated this value?" **Mutation
+fan-out** is its outbound dual: "who can change this value after this point?"
+
+A mutation fan-out query from value `V` at program point `P` returns the set of all aliases,
+parameters, and captures through which `V` (or a value that `V` derives into) may be mutated after
+`P`, together with the confidence and the `writes-param(i)` / `writes-receiver` / `mutation-out`
+evidence for each entry.
+
+The fan-out is computed by forward traversal of escape edges (DF-16.1), capture edges (DF-18.2), and
+`writes-param(i)` / `writes-receiver` summaries reachable from `V`'s allocation site. The motivating
+query is the **exposed-internal-state** class (analogous to SpotBugs `EI_EXPOSE_REP`): "which getter
+methods return a mutable reference to an internal field, and what code mutates the field through that
+reference?"
+
+### DF-17.4 — Sanitization-invalidation rule
+
+This rule refines DF-11 (typed taint) and is grounded in the DF-16 aliasing model.
+
+> **Sanitization-invalidation:** A taint label that was cleared by a sanitizer at program point `P`
+> is **re-applied** if the sanitized value is subsequently mutated — through any alias — before it
+> reaches a sink.
+
+The failure mode this addresses: a value is sanitized, stored in a field or captured by a closure,
+then mutated through an alias before the sanitized reference is used. The sanitization clearing event
+at `P` is no longer valid at the use site. A taint model without this rule reports false safety on
+the mutated value.
+
+`cgx` enforces this rule by annotating the cleared taint label with the program-point of
+sanitization and the set of live aliases at that point. If any alias in the set carries a
+`mutation-out` edge (DF-2.1) after `P`, the cleared label is re-applied with `confidence: probable`
+(the mutation path may not be feasible on all execution paths).
+
+### DF-17.5 — Interaction with coerce(from,to)
+
+A `coerce(from,to)` transformation kind (DF-10) on a pedigree edge changes the value's type.
+Mutability is type-level: the mutability level of the derived value after a coercion is determined
+by the destination type, not the source. Queries that trace mutation fan-out must therefore
+follow `coerce` edges and re-evaluate mutability at the destination type.
+
+---
+
+## DF-18 — Function Values and Closures
+
+**Status: schema-room** — the `lambda` node kind (docs/03-code-graph-model.md GM-1.1) and
+`calls:closure` / `calls:callback` edge types (GM-2.1) are already in the schema; this section
+adds the function-value node flavor, specifies capture edges with their mutability attribution, and
+defines indirect-call resolution as pedigree computed over function values. Full precision on
+indirect resolution depends on the resolution ladder (GM-5) and is `possible` without deeper
+inference.
+
+### DF-18.1 — Function values as a node flavor
+
+A **function value** is a function or method used as a data value: stored in a variable, passed as
+an argument, returned from a function, or placed in a collection. The `lambda` kind in GM-1.1 covers
+anonymous callables; DF-18 generalises this to named functions used as values (Rust `let f =
+my_fn;`, Python `handler = process_order`, Go `var fn func(int) = compute`).
+
+Function values are represented as symbol nodes with `kind: function-value` in the dataflow graph.
+A `derives-from` edge with kind `copy` connects the original function symbol to the function-value
+node, establishing pedigree linkage.
+
+### DF-18.2 — Indirect-call resolution as pedigree
+
+The key insight: **indirect-call resolution is pedigree computed over function values**.
+
+At an indirect call site `f(args)` where `f` is a function value, the candidate callee set is the
+set of function values that flow to `f` at that site. This is exactly the pedigree query for `f`
+(DF-1), restricted to function-value nodes. Each candidate carries the confidence label from how it
+was tracked through the pedigree:
+
+| Pedigree chain for `f` | Resolution confidence |
+|---|---|
+| `f` directly assigned from a named function | `certain` (if no conditional branches) or `probable` (if branch) |
+| `f` returned from a function whose return is resolved | inherits the return's confidence |
+| `f` stored in a container and retrieved | `probable` (smashed collection model; DF-4.2) |
+| `f` passed through an opaque call or FFI boundary | `possible`; cut marker `reflective` emitted |
+
+This resolution reuses the existing pedigree machinery (DF-1), container models (DF-4), and
+function summaries (DF-3.3) with no new analysis. The `calls:indirect` edge in GM-2.1 carries the
+resolved `candidate_set` populated by this pedigree query.
+
+### DF-18.3 — Capture edges and the loop-variable capture bug family
+
+When a closure or lambda captures a variable from its enclosing scope, `cgx` records a **capture
+edge** — a `derives-from` edge from the captured variable to the function-value node, attributed
+with the capture mode:
+
+| Attribute | Value | Meaning |
+|---|---|---|
+| `capture` | `by-value` | The closure holds a copy of the variable's value at the time of creation |
+| `capture` | `by-ref` | The closure holds a reference to the variable; mutations to the variable after closure creation are visible inside the closure |
+
+The capture mode is composed with the captured variable's mutability level (DF-17.1). The
+combination `capture: by-ref` + `value: mutable` on a loop-variable produces the canonical
+**loop-variable capture bug family**:
+
+```python
+# Python late-binding example
+handlers = []
+for i in range(5):
+    handlers.append(lambda: print(i))   # captures i by ref (late binding)
+# All handlers print 4 — they all reference the same binding, which ends at i=4
+```
+
+```go
+// Go pre-1.22 example
+for _, v := range items {
+    go func() { process(v) }()   // captures v by ref; v is reassigned each iteration
+}
+```
+
+```javascript
+// JS var-in-loop example
+var fns = [];
+for (var i = 0; i < 5; i++) {
+    fns.push(function() { return i; });   // var-scoped i, captured by ref
+}
+// All fns return 5
+```
+
+In each case, the capture edge carries `capture: by-ref` and the captured variable has
+`binding: mutable` (reassigned by the loop). The query "find closures capturing a mutable
+loop-variable by reference" is directly expressible over these attributes (docs/05-queries.md Q-28).
+
+### DF-18.4 — Captured resources and deferred execution
+
+A closure that captures a resource (a lock guard, a file handle, a database connection) extends the
+resource lifecycle pair (docs/03-code-graph-model.md GM-13): the release event is now contingent
+on when — and whether — the closure executes. The capture edge appears in the GM-13 acquire/release
+pairing analysis.
+
+When a closure is stored for deferred execution (event handler registration, callback argument,
+`Promise` constructor), the call from storage to execution is temporally decoupled from
+registration. This ties to:
+
+- `spawns` edges (GM-9): the closure may execute on a separate task, inheriting the spawn/exception-
+  termination semantics.
+- Mediated call edges (docs/03 GM-17): a stored callback is an indirect call where the mediator
+  (event loop, scheduler, DI container) establishes the connection; the `established-by` provenance
+  attribute records the registration site.
+- Suspension points (GM-10): if the closure `await`s or yields, it is subject to the same
+  interleaving hazards as any suspended task.
+
+---
+
+## DF-19 — Lineage Type Reconstruction
+
+**Status: core-extension** at the query-specification level — the constraint-gathering traversal is
+expressed as a pedigree query (DF-1), a forward-use scan (DF-6.2), and unification over existing
+graph elements (DF-9 joins, DF-16 aliases, channel send↔recv from DF-20). Precision at runtime
+depends on the resolution tier (GM-5) and degrades to `possible` at type-confidence boundaries
+(docs/03 GM-14). Full inference-quality reconstruction (certain for all values) is roadmap and
+depends on SCIP enrichment.
+
+### DF-19.1 — Motivation
+
+Dynamic languages, gradual type systems, and reflection-heavy code produce values whose types are
+erased or widened to `any` / `interface{}` / `Object`. Without type information at these points,
+virtual dispatch resolution is imprecise and taint queries that depend on the receiver type fail.
+
+Lineage type reconstruction recovers type evidence from the graph itself rather than from type
+annotations. For a value `V` of unknown or widened type, the reconstruction query crawls three
+directions from `V`'s node and intersects the resulting constraints.
+
+### DF-19.2 — The three constraint directions
+
+**Up — pedigree constraints (inbound)**
+
+Follow `derives-from` edges backward from `V` to its sources. Each source contributes type evidence:
+
+| Source kind | Evidence strength | Type contribution |
+|---|---|---|
+| Literal (`42`, `"foo"`, `true`, `[]`) | `certain` | The literal's language-defined type (int, string, bool, collection) |
+| Constructor call (`new User(...)`, `User { }`, `User::new()`) | `certain` | The constructed type |
+| Function call return | inherits the call's confidence | The declared or inferred return type of the callee |
+| Parameter | inherits annotation confidence | The declared or inferred parameter type |
+
+Literals and constructors are the **ground-truth leaves** where the reconstruction bottoms out: they
+carry `certain` confidence and propagate their types forward through transformation kinds (DF-10).
+Primitive operations propagate type automatically: `arith` edges produce numeric types, `concat`
+edges produce string types, `coerce(from,to)` edges produce the destination type.
+
+**Down — use constraints (forward)**
+
+Follow forward data-flow (DF-6.2) from `V` to its uses. Each use constrains from below:
+
+| Use kind | Type constraint |
+|---|---|
+| Method call `V.send()` | `V` satisfies the type of any symbol with a `send` method (structural / duck footprint) |
+| Typed-parameter sink `fn process(x: Socket)` with `V` as argument | `V` satisfies `Socket` |
+| Sink class declaration (DF-12.2) that requires a specific type | `V` is compatible with the sink's expected type |
+
+Down constraints are weaker than up constraints because they express structural compatibility, not
+identity. They are most valuable for values of bare interface types (`interface{}`, `any`, untyped
+`Object`) where up constraints are absent.
+
+**Sideways — unification constraints**
+
+Values that must share a type propagate constraints laterally:
+
+| Unification source | Lateral constraint |
+|---|---|
+| Two branches feeding a DF-9 join node | Both must satisfy the join's expected type |
+| Aliases tracked in DF-16 | All aliases of `V` share `V`'s type |
+| Channel send↔recv pair (DF-20.1) | Sent value and received value must be the same type |
+| Branch merge into one variable (`if cond { a } else { b }`, both assigned to the same binding) | `a` and `b` must be subtypes of the binding's type |
+
+Sideways unification often collapses the candidate set. Two values entering a join where one is
+`certain: string` and the other is `certain: int` produce an **empty intersection** — a
+contradiction.
+
+### DF-19.3 — Result: candidate type set with confidence
+
+The reconstruction query returns:
+
+| Result | Meaning |
+|---|---|
+| Single type, `certain` | Fully resolved — the value has exactly this type at this point |
+| Narrowed set, `probable` | Two or three candidate types consistent with all constraints |
+| Wider set, `possible` | Constraints are insufficient to narrow below the type-confidence boundary |
+| Empty set: **CONTRADICTION** | No type satisfies all constraints simultaneously — this is a bug signal |
+
+A contradiction indicates that the same value is used in two incompatible ways: for example, passed
+to a function expecting a `Socket` (down constraint) but constructed as a `File` (up constraint).
+This class of bug — "find values whose reconstructed type contradicts their declared type" — is
+expressible as a query (docs/05-queries.md Q-26) and has no direct equivalent in mainstream static
+tools.
+
+### DF-19.4 — Worked example: reconstructing a Go `interface{}` value
+
+```go
+func process(v interface{}) {
+    // v has no up-constraint from the call site — bare interface{}
+    v.(*Config).Timeout = 30   // type assertion: down-constrains v to *Config
+    store(v)                   // store expects type Store; sideways-constrains v
+}
+
+func caller() {
+    cfg := &Config{Host: "db"}   // constructor: up-constraint, certain *Config
+    process(cfg)
+}
+```
+
+Reconstruction for `v` inside `process`:
+
+1. **Up**: `cfg` in `caller` is constructed as `*Config` (`certain`). The `derives-from` edge
+   through the parameter boundary propagates `probable: *Config` (confidence degrades one step
+   through the parameter boundary at `process(cfg)` because the declared parameter type is
+   `interface{}`).
+
+2. **Down**: the type assertion `v.(*Config)` asserts `*Config` — structural constraint
+   `probable: *Config`. The call `store(v)` adds whatever `store`'s parameter type is; if `store`
+   expects `*Config`, this reinforces.
+
+3. **Sideways**: no join nodes or aliases involving `v` in this fragment.
+
+**Result**: candidate set `{ *Config }` at `probable` confidence, supported by three independent
+constraints (constructor pedigree, type assertion, typed-parameter use). A query asking "what type
+flows into `process`?" returns `*Config / probable` with an evidence trail naming the constructor
+at `caller` line N and the assertion at `process` line M.
+
+If a second call site passes an `*AuditLog` where a `*Config` is expected, the sideways unification
+at the join of both call paths produces a contradiction — `cgx` reports the inconsistency.
+
+### DF-19.5 — Precision limits
+
+Type reconstruction precision degrades at type-confidence boundaries (docs/03 GM-14):
+
+- TypeScript `any`, Go `interface{}` passed across multiple boundaries without assertion
+- Reflection results (`reflect.ValueOf(x).Interface()`, `Method.invoke()`)
+- Values arriving through a `possible`-confidence indirect call (DF-18.2)
+
+At these points the reconstruction result is `possible` and the evidence trail names the boundary.
+Users can ask "where does `any` enter my typed codebase?" as a type-confidence-boundary query
+(Q-30) independently of the full reconstruction.
+
+---
+
+## DF-20 — Non-Call Dataflow Linkages
+
+**Status: core-extension** — channel and queue send↔recv edges and import-time edges are
+representable as `derives-from` edges with existing attributes; the `deferred-execution` marker
+extends edge provenance with no schema change. The key addition is making these linkages explicit
+and queryable rather than implicit gaps (which would otherwise appear as pedigree cut points).
+
+### DF-20.1 — Channel and queue send↔recv edges
+
+In languages with channel or message-queue concurrency (Go channels, Rust `mpsc`, actor mailboxes,
+async queues), a value sent by producer `A` and received by consumer `B` has a dataflow dependency
+that has no connecting call expression.
+
+`cgx` represents this as a `derives-from` edge from the sent value to the received variable, with:
+
+| Attribute | Value |
+|---|---|
+| `kind` | `copy` (identity — channel does not transform the value) |
+| `established-by` | `channel-send-recv` |
+| `confidence` | `probable` for bounded channels (bounded buffer; send and recv are structurally paired); `possible` for unbounded or dynamic queues |
+| `provenance` | file:line of both the send expression and the receive expression |
+
+Without this edge, a pedigree query on the received value stops at the receive call and fails to
+trace back to the producer. Channel edges feed directly into lineage type reconstruction (DF-19.2
+sideways unification): the sent type and received type must be the same, collapsing the candidate
+set.
+
+### DF-20.2 — Import-time and module-load edges
+
+In Python, JavaScript, and Go, importing a module executes code at load time. Python and JS module
+bodies run on first import; Go `init()` functions run before `main`. Java `static` initialiser
+blocks behave identically.
+
+These execution paths are invisible to a call-graph analysis that starts from `main` because they
+are not reachable via call edges. `cgx` models them as entrypoint-adjacent edges (docs/03 GM-7):
+each module-load execution site is treated as an entrypoint, and the code it runs is reachable from
+that entrypoint.
+
+Practically, this means:
+- A taint source that populates a module-level global during `init()` is reachable in the graph.
+- A registered callback added to a global registry during module load is tracked as a mediated call
+  edge (GM-17) sourced from the import-time entrypoint.
+- "Which side-effects occur before `main` runs?" is answerable as a reachability query from
+  import-time entrypoints.
+
+### DF-20.3 — Deferred execution: code-as-data marker
+
+Frameworks that accept code as data — LINQ expression trees, ORM query builders (SQLAlchemy,
+Hibernate Criteria), Spring Data derived queries (`findByEmailAndStatus`), Spark transformations —
+do not execute the submitted code as bytecode. The lambda or expression is reified and translated
+by the framework (typically into SQL, a query plan, or a request).
+
+`cgx` marks the `derives-from` edge carrying a code-as-data value with the provenance attribute
+`deferred-execution: true`. The semantics:
+
+- Taint analysis: a tainted value flowing into a deferred-execution expression may parameterise the
+  resulting query; the taint label propagates with `confidence: possible` because the translation
+  semantics are framework-dependent and may neutralise injection (e.g. LINQ's parameterised SQL) or
+  may not (string-interpolated query builders).
+- Type reconstruction (DF-19): the return type of the deferred computation is the framework's output
+  type, not the closure's declared return type. The DF-19 down-constraint for the closure body uses
+  the framework's known translation rules if a framework pack (docs/03 GM-15) declares them.
+- Pedigree: the deferred-execution edge is a `derives-from` edge with tag `composed` at the
+  expression site and `deferred-execution: true` in provenance, so pedigree traversal includes it
+  but callers can filter on the attribute.
+
+---
+
 *Next:* docs/05-queries.md — query language syntax, worked examples for every
 question class, and the canonical reachability and pedigree query forms.
 Query primitives for the security patterns covered in DF-9 through DF-16
-are specified in Q-20 through Q-25.
+are specified in Q-20 through Q-25. Query primitives for DF-17 through DF-20
+(mutation fan-out, closure capture, lineage type reconstruction, coercion,
+non-call dataflow) are specified in Q-26 through Q-31.

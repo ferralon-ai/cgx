@@ -28,6 +28,14 @@ Features specified here:
 - DF-6: Backward and forward slicing
 - DF-7: Instance-level analysis (never-referenced members)
 - DF-8: Soundiness — what `cgx` labels `possible` vs claims as fact
+- DF-9: Join (union) pedigree nodes
+- DF-10: Transformation kinds on derives-from edges
+- DF-11: Typed taint labels and class-matched sanitization
+- DF-12: Trust boundaries: source classes and sink classes
+- DF-13: Secret pedigree
+- DF-14: Nullability and optionality flow
+- DF-15: Numeric narrowing and widening
+- DF-16: Aliasing and escape
 
 ---
 
@@ -520,5 +528,561 @@ accepted limit, not a defect.
 
 ---
 
+## DF-9 — Join (Union) Pedigree Nodes
+
+**Status: core-extension** — the existing `derives-from` graph already
+represents fan-out pedigree (DF-1.3); join nodes make multi-source assembly
+points explicit and queryable rather than implicit in the fan-out DAG.
+
+### DF-9.1 — Motivation
+
+DF-1.3 shows that a single value may derive from multiple independent sources.
+In the current model those multiple inbound `derives-from` edges meet at the
+derived-value node, but the assembly point itself carries no identity. This is
+adequate for reachability queries ("does any tainted source reach this value?")
+but inadequate for questions that reason about the *combination*: "which
+specific sources were joined here, and can they be queried as a set?"
+
+The canonical motivating example: an object assembled from argument `id` and
+the result of `lookup(id)` has both values in its pedigree. When `id` is
+network-tainted and `lookup(id)` returns a database row, the assembled object
+carries taint from two distinct source classes (`network` and `db`). A query
+asking "does this object derive from a network source AND a db source jointly?"
+requires the join to be a named, addressable node.
+
+### DF-9.2 — Join node representation
+
+A **join node** is a synthetic node in the pedigree graph inserted at any point
+where two or more distinct `derives-from` edges converge on a single derived
+value as a result of structural assembly (not conditional branching, which uses
+tag `branched`).
+
+Join nodes carry the following attributes:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | `join` | Fixed node kind distinguishing join nodes from value/symbol nodes |
+| `arity` | integer | Number of distinct inbound pedigree branches |
+| `site` | file:line | The assembly expression (struct literal, function call, concatenation, etc.) |
+| `provenance` | provenance record | Producing rule and confidence (GM-6.1) |
+
+The join node replaces the implicit convergence: instead of multiple
+`derives-from` edges arriving at the derived-value node, each inbound source
+connects to the join node, and a single `derives-from` edge connects the join
+node to the derived value.
+
+```
+argument `id`          --derives-from(copy)-->  [join node @ line 42]
+result of lookup(id)   --derives-from(copy)-->  [join node @ line 42]
+                                                       |
+                                              derives-from(composed)
+                                                       |
+                                               assembled object
+```
+
+### DF-9.3 — Relationship to existing edges
+
+Join nodes extend DF-1 and DF-3; they do not replace or redefine them. Every
+`derives-from` edge incoming to a join node follows the same transformation-tag
+rules as any other `derives-from` edge (DF-3.2, and the expanded kind vocabulary
+in DF-10). The edge from join node to assembled value carries tag `composed`
+(existing DF-3.2 vocabulary).
+
+For conditional selection (`if cond { a } else { b }`), the tag remains
+`branched` (DF-3.2) and no join node is inserted. Join nodes are used only for
+structural assembly where both branches contribute simultaneously.
+
+### DF-9.4 — Queryability
+
+Join nodes are queryable via the standard pedigree API (docs/05-queries.md Q-5)
+with an optional `--join-nodes` flag that expands them in the returned DAG.
+Query predicates can address join nodes directly:
+
+- "Does this value have a join node whose inbound sources include both a
+  `network` source class and a `db` source class?" (typed taint — see DF-11)
+- "How many distinct pedigree branches converge at this join node?"
+- "What is the assembly site of this join?"
+
+These predicates are central to the typed taint queries in docs/05-queries.md
+Q-23.
+
+---
+
+## DF-10 — Transformation Kinds on Derives-From Edges
+
+**Status: core-extension** — this section replaces the `transformation tags`
+vocabulary introduced in DF-3.2 with a precise, security-motivated taxonomy.
+The old tag names remain valid aliases during any migration period; new work
+should use the kind names defined here.
+
+### DF-10.1 — Why transformation kind matters
+
+DF-3.2 established that every `derives-from` edge carries a tag describing how
+the derived value relates to the source. The tag vocabulary in DF-3.2 is
+structurally oriented (mapped, aggregated, filtered, etc.). Security analysis
+needs a finer and differently-oriented vocabulary: the question is not "what
+container operation occurred?" but "does this transformation preserve, introduce,
+or neutralise a security property?"
+
+The clearest example is SQL injection. Consider two ways to build a query string:
+
+```python
+# concat: taint-preserving — user_input lands verbatim in the SQL string
+query = "SELECT * FROM users WHERE name = '" + user_input + "'"
+db.execute(query)
+
+# parameterize: taint-neutralising for sql sinks — user_input becomes a bind parameter
+db.execute("SELECT * FROM users WHERE name = ?", [user_input])
+```
+
+Both operations derive `query` (or the second argument) from `user_input`. In
+the DF-3.2 model, both would carry tag `composed`. With transformation kinds,
+the first carries `concat` (a taint-preserving, injection-enabling kind) and
+the second carries `parameterize(sql)` (a taint-neutralising kind for `sql`
+sinks). The distinction is load-bearing for the SQL-injection query.
+
+### DF-10.2 — Canonical transformation kind vocabulary
+
+The following kinds are built in. The vocabulary is user-extensible via config
+(see DF-10.3).
+
+| Kind | Description | Security relevance |
+|---|---|---|
+| `copy` | Value is passed through without structural change; includes aliases, moves, identity functions | Fully taint-preserving |
+| `projection` | A field or subset of the source is extracted | Taint-preserving for the projected field; other fields are not carried |
+| `aggregation` | Multiple source values are combined into a scalar (fold, reduce, sum, count) | Taint-preserving: if any input is tainted, the aggregate is tainted |
+| `parse` | Source is parsed or deserialised into a typed value | Taint-preserving: attacker-controlled bytes become attacker-controlled structure |
+| `serialize` | Source is serialised to a byte/string representation | Taint-preserving: attacker-controlled structure becomes attacker-controlled bytes |
+| `encode(class)` | Source is encoded for a specific target context (e.g. `encode(html)`, `encode(url)`) | Taint-cleared for the named sink class; taint-preserving for all others |
+| `decode(class)` | Source is decoded from a specific encoding (e.g. `decode(base64)`) | Taint-preserving; may expand attack surface |
+| `truncate` | Source value is shortened or capped in length | Taint-preserving; may affect exploit feasibility |
+| `narrow` | Numeric value is converted to a smaller type or range (e.g. `u64 → u32`) | Taint-preserving; may introduce overflow (see DF-15) |
+| `widen` | Numeric value is converted to a larger type or range (e.g. `i32 → i64`) | Taint-preserving |
+| `arith` | Arithmetic operation is applied (add, subtract, multiply, divide, shift) | Taint-preserving; attacker-influenced arithmetic feeds downstream uses |
+| `concat` | Two or more string/byte values are concatenated | Taint-preserving; the classic injection-enabling operation |
+| `parameterize(class)` | Source value is passed as a bind parameter for a given sink class (e.g. `parameterize(sql)`) | Taint-cleared for the named sink class; taint-preserving for all others |
+| `validate(class)` | Source value is asserted to conform to a constraint class (e.g. `validate(uuid)`, `validate(integer)`) | May clear taint depending on config — see DF-11.3 |
+
+The `encode(class)` and `parameterize(class)` kinds carry a class argument that
+names the sink class they address. A parameterisation that uses SQL bind
+parameters neutralises SQL injection but has no effect on a shell-sink: taint
+survives on any `shell`-class path.
+
+### DF-10.3 — User-extensible kinds
+
+Projects can declare additional transformation kinds in `cgx.toml`:
+
+```toml
+[[transforms]]
+kind             = "html-template-escape"
+taint-preserving = false
+sink-classes     = ["html"]   # clears taint only for html sinks
+```
+
+Custom kinds are recorded in provenance alongside built-in kinds and are
+available in all query predicates.
+
+### DF-10.4 — Relationship to DF-3.2 tags
+
+The DF-3.2 tags (`identity`, `mapped`, `aggregated`, `filtered`, `parsed`,
+`formatted`, `branched`, `composed`) remain supported as structural tags. They
+answer "what container/structural operation occurred?" The DF-10 kinds answer
+"what is the security effect of this operation?" Both attributes coexist on
+a `derives-from` edge when applicable. New analysis rules should prefer the
+DF-10 kind vocabulary for security predicates.
+
+---
+
+## DF-11 — Typed Taint Labels and Class-Matched Sanitization
+
+**Status: core-extension** — this section refines the taint model in DF-5.
+It does not replace DF-5; it adds the class-matching requirement to
+sanitization, the taint-survival rules through transformation kinds, and the
+extensible lattice.
+
+### DF-11.1 — Taint labels are typed
+
+In DF-5 the `category` field on a source or sanitizer declaration is a
+free-form string used for filtering. DF-11 formalises the category as a
+**source class** (see DF-12 for the canonical list) and makes the class a
+first-class attribute of the taint label propagated on the dataflow graph.
+
+Every taint label propagating through the graph carries:
+
+| Attribute | Description |
+|---|---|
+| `source-class` | The class of the originating source (e.g. `network`, `env`) |
+| `sink-class` | The class of the target sink that this label is relevant to (e.g. `sql`, `html`) |
+| `confidence` | `certain` / `probable` / `possible` (GM-5.1) |
+| `path-condition` | Edge conditions along the path (GM-3) |
+
+### DF-11.2 — Class-matched sanitization
+
+A sanitizer clears a taint label **only if** its declared sink class matches
+the sink class of the taint label. Mismatched sanitizers are transparent.
+
+**Motivating example:**
+
+```python
+safe_for_html = html_escape(user_input)   # sanitizer class: html
+db.execute("SELECT * FROM t WHERE id = " + safe_for_html)  # sink class: sql
+```
+
+`html_escape` is declared with sanitizer class `html`. The taint label
+propagating toward the `sql`-class sink carries `sink-class: sql`. Because
+`html ≠ sql`, the sanitizer does not clear the taint. `cgx` reports the SQL
+injection finding even though the value passed through a sanitizer.
+
+This is the fundamental error that class-unaware taint models make: they
+treat any sanitizer as a clearing event regardless of context, producing
+false negatives on cross-context reuse.
+
+### DF-11.3 — Taint survival through transformation kinds
+
+The survival of a taint label through a `derives-from` edge depends on the
+edge's transformation kind (DF-10):
+
+| Kind | Taint survival rule |
+|---|---|
+| `copy`, `projection`, `aggregation`, `parse`, `serialize`, `decode(class)`, `truncate`, `narrow`, `widen`, `arith`, `concat` | Taint is **preserved** — the label propagates to the derived value unchanged |
+| `encode(class)` | Taint is **cleared** for sink classes matching `class`; preserved for all others |
+| `parameterize(class)` | Taint is **cleared** for sink classes matching `class`; preserved for all others |
+| `validate(class)` | Taint survival is **config-dependent** — the project declares whether `validate(class)` clears taint for matching sink classes; default is to preserve (conservative) |
+
+The `branched` structural tag (DF-3.2): taint propagates from any tainted
+inbound branch. The label is annotated with `path-condition: conditional`.
+
+### DF-11.4 — Extensible taint lattice
+
+The set of source classes, sink classes, and sanitizer classes is
+user-extensible. Projects define additional entries in `cgx.toml`:
+
+```toml
+[[taint.source-classes]]
+name        = "payment-api"
+description = "Values returned from the payment processor API"
+
+[[taint.sink-classes]]
+name        = "audit-log"
+description = "Values written to the immutable audit log"
+
+[[taint.sanitizers]]
+symbol      = "myapp::redact::scrub_pii"
+sink-class  = "audit-log"
+```
+
+Built-in source and sink classes are listed in DF-12. The full class lattice
+(built-ins plus project additions) is emitted in the index manifest so queries
+can enumerate it.
+
+### DF-11.5 — Reconciliation with DF-5
+
+DF-5.2 uses a free-form `category` field on source, sink, and sanitizer
+declarations. That field is now interpreted as a source class or sink class per
+the DF-12 vocabulary. Existing configurations that use category names matching
+DF-12 built-ins require no migration. Configurations using non-standard names
+should add a corresponding `[[taint.source-classes]]` or
+`[[taint.sink-classes]]` entry to make the class explicit.
+
+---
+
+## DF-12 — Trust Boundaries: Source Classes and Sink Classes
+
+**Status: core-extension** — sources and sinks are already present in DF-5;
+this section assigns the canonical class vocabulary, defines trust boundaries,
+and documents the user-extension mechanism.
+
+### DF-12.1 — Source classes (built-in)
+
+A **source class** identifies the trust boundary that a value crossed to enter
+the program. Values from lower-trust sources require more scrutiny before
+reaching sensitive sinks.
+
+| Source class | Description | Typical symbols |
+|---|---|---|
+| `network` | Values received from a network socket, HTTP request, RPC call, or any remote endpoint | HTTP request body/params/headers, gRPC payloads, raw socket reads |
+| `file` | Values read from the filesystem | `File::open`, `fs::read_to_string`, `open()`, `readFile()` |
+| `env` | Values from environment variables or the process environment | `std::env::var`, `os.environ`, `process.env` |
+| `cli` | Values from command-line arguments | `args().collect()`, `sys.argv`, `os.Args` |
+| `db` | Values returned from a database query or ORM | `Row::get`, ORM `.find()`, raw SQL result rows |
+| `deserialization` | Values produced by deserialising an externally-supplied byte sequence | `serde_json::from_str`, `pickle.loads`, `JSON.parse` |
+| `ipc` | Values received via inter-process communication (pipes, shared memory, Unix domain sockets, message queues) | `recv()`, named-pipe reads, mmap-backed buffers |
+
+All built-in source classes are user-extensible (DF-11.4).
+
+### DF-12.2 — Sink classes (built-in)
+
+A **sink class** identifies the kind of operation that a value reaches. Sink
+classes determine which sanitizers are relevant (DF-11.2) and which
+vulnerability class a finding maps to.
+
+| Sink class | Vulnerability class | Description |
+|---|---|---|
+| `sql` | SQL injection | Values interpolated into SQL query strings |
+| `shell` | Command injection | Values passed to shell execution (`exec`, `system`, subprocess) |
+| `path` | Path traversal | Values used to construct filesystem paths (`File::open`, `readFile`) |
+| `html` | Cross-site scripting (XSS) | Values written to HTML output without encoding |
+| `header` | Header injection | Values written to HTTP response headers |
+| `redirect-url` | Open redirect | Values used as HTTP redirect targets |
+| `format-string` | Format-string injection | Values used as format strings (`printf`, `format!`) |
+| `regex` | ReDoS | Values used to compile regular expressions at runtime |
+| `deserialize` | Deserialization gadget chains | Values passed to deserialization entry points |
+| `eval` | Code injection | Values passed to `eval`, `exec`, `dlopen`, or equivalent |
+| `log` | Secret / PII exposure | Values written to log output (see also DF-13) |
+| `net-request` | SSRF | Values used to construct outbound network request URLs or targets |
+
+All built-in sink classes are user-extensible (DF-11.4). Sanitizer classes
+mirror sink classes: a sanitizer named for class `sql` clears `sql`-destined
+taint labels (DF-11.2).
+
+### DF-12.3 — Trust boundaries
+
+A **trust boundary** is a point in the data flow where a value transitions from
+a lower-trust context (a source class) into program-controlled processing. Every
+source class defines an implicit trust boundary at the point where the value is
+first introduced into the graph.
+
+Trust boundaries are surfaced as queryable attributes. Queries can ask:
+- "Which values crossing the `network` trust boundary reach any `sql`-class sink?"
+- "Does any path from a `deserialization` source reach an `eval` sink?"
+
+Trust-boundary crossing is also the point at which taint labels are seeded
+(DF-11.1). The boundary node is recorded in provenance so the exact entry point
+is traceable to a file:line in the index.
+
+Cross-references: docs/03-code-graph-model.md GM-14 (code-trust boundaries —
+unsafe, FFI, dependency edges, reflection) addresses compile-time and
+link-time trust concerns that are orthogonal to the runtime data-flow trust
+boundaries defined here.
+
+---
+
+## DF-13 — Secret Pedigree
+
+**Status: core-extension** — a specialisation of DF-12 (source class `secret`
+is a narrowing of `env` and external secret-store reads) plus typed taint
+(DF-11) targeting the `log`, `net-request`, `serialize`, and
+`format-string` sink classes.
+
+### DF-13.1 — What counts as key material
+
+Secret pedigree tracks values that originate from:
+
+- Environment variables conventionally used for secrets (`*_KEY`, `*_SECRET`,
+  `*_TOKEN`, `*_PASSWORD`, `*_CREDENTIAL`) — detected heuristically and
+  overridable in config
+- Explicit secret-store reads (e.g. `aws_secretsmanager::get_secret_value`,
+  `vault::read`, `k8s::secret::get`) — declared via `[[taint.sources]]` with
+  source class `secret`
+- Private key and certificate material (PEM reads, key-derivation function
+  outputs) — declared similarly
+
+Projects declare secret sources in `cgx.toml`:
+
+```toml
+[[taint.sources]]
+symbol       = "myapp::config::get_api_key"
+source-class = "secret"
+```
+
+### DF-13.2 — Sensitive sinks for secrets
+
+Secret-labelled taint is tracked toward sinks that could expose the material:
+
+| Sink class | Exposure risk | Example |
+|---|---|---|
+| `log` | Secret written to log output | `log::info!("key={}", api_key)` |
+| `format-string` | Secret interpolated into a format string that may reach log/output | `format!("Authorization: Bearer {}", token)` |
+| `net-request` | Secret sent as part of an outbound request beyond its intended endpoint | URL-embedded credentials, SSRF carrying auth headers |
+| `serialize` | Secret included in a serialised payload that may be stored or transmitted | JSON response body carrying raw key material |
+
+Error-message and exception-message construction is treated as equivalent to
+`log` for this purpose: a value that flows into an error string, an exception
+constructor, or a `Debug`/`Display` implementation that reaches a log sink is
+reported as a secret-exposure finding.
+
+### DF-13.3 — Findings
+
+Secret-exposure findings carry:
+- `source-class: secret`
+- The originating symbol (file:line) and its declaration in `cgx.toml`
+- The sink (file:line) and the sink class
+- The full pedigree path including any transformation kinds (DF-10) — a secret
+  that is `concat`-ed into a string before logging is still reported
+
+---
+
+## DF-14 — Nullability and Optionality Flow
+
+**Status: core-extension** — nullability is representable in the current graph
+via edge conditions and value attributes; this section specifies the standard
+pedigree queries and the dominating-check requirement.
+
+### DF-14.1 — Where nullable values arise
+
+A value is nullable (may be `null` / `None` / zero-value / `Err`-default at
+runtime) if it originates from any of:
+
+- A function whose return type is `Option<T>`, `Result<T, E>`, a nullable
+  reference type (`T?`, `*T`), or an interface type whose runtime value may be
+  nil
+- A field declared with a nullable type
+- A map/dictionary lookup that may not find the key (e.g. `map[key]` in Go,
+  `.get(key)` returning `Option` in Rust)
+- A type assertion or cast that may fail at runtime (dynamic cast)
+- An external source (source class `db`, `deserialization`, `network`) where
+  fields may be absent or null in the incoming data
+
+`cgx` tracks nullable values by recording the producing expression on the
+`derives-from` path and annotating it with `nullable: true` in provenance.
+
+### DF-14.2 — Dominating-check requirement
+
+A null dereference is possible when a nullable value is used without a
+null-check **dominating** every use. **Dominates** here has the standard
+control-flow meaning: node A dominates node B if every path from the entry
+point to B passes through A (see docs/05-queries.md Q-20, which exposes
+dominance as a query predicate).
+
+A **dominating check** is a call or branch that:
+- Returns a non-nullable type or branches on the value being non-null
+  (e.g. `if x != nil`, `if let Some(v) = x`, `x.ok_or(...)`)
+- Appears on every path from the nullable origin to the use site
+
+`cgx` reports a `nullable-use` finding when a nullable value is used (via a
+`derives-from` or direct-use edge) without a dominating check on every
+inbound path. The finding carries the nullable origin (file:line) and the
+use site (file:line).
+
+### DF-14.3 — Propagation through transformation kinds
+
+Nullability propagates through all taint-preserving transformation kinds
+(DF-11.3). A `projection` from a nullable source produces a nullable value.
+A `concat` that includes a nullable string component produces a nullable string.
+An `aggregation` over a collection that may contain null elements may produce
+a null result depending on the aggregation function (language-specific;
+see docs/08-language-support.md LS-7 for per-language rules).
+
+---
+
+## DF-15 — Numeric Narrowing and Widening
+
+**Status: core-extension** — the `narrow` and `widen` transformation kinds
+(DF-10) are the representation; this section specifies the overflow-to-alloc
+detection pattern and the pedigree annotations.
+
+### DF-15.1 — Narrowing and widening on pedigree paths
+
+A pedigree path that includes one or more `narrow` edges carries a potential
+integer overflow or truncation. `cgx` records the narrowing chain on the
+`derives-from` path, annotating each `narrow` edge with:
+
+| Attribute | Description |
+|---|---|
+| `from-type` | Source numeric type (e.g. `u64`, `usize`) |
+| `to-type` | Derived numeric type (e.g. `u32`, `u16`) |
+| `site` | file:line of the conversion expression |
+
+### DF-15.2 — Overflow-to-alloc: the canonical pattern
+
+The canonical security-relevant instance of numeric narrowing is the
+overflow-to-alloc pattern:
+
+```rust
+let count: u64 = user_input.parse()?;   // source: network/cli
+let size: u32  = count as u32;           // narrow: u64 → u32 (may overflow)
+let buf        = vec![0u8; size as usize]; // allocation size derived from narrowed value
+```
+
+If `count` is attacker-controlled and exceeds `u32::MAX`, the narrowing wraps
+to a small value. The allocation succeeds with a much smaller buffer than
+intended, and subsequent writes into `buf` using the original `count` value
+overflow the buffer.
+
+`cgx` detects this pattern as a pedigree path where:
+1. A `narrow` edge appears between a tainted source and a value used as an
+   allocation size or buffer length.
+2. The taint label carries a source class that crosses a trust boundary
+   (DF-12.1).
+
+The finding includes the full narrowing chain and the allocation site.
+
+### DF-15.3 — Widening
+
+Widening (`narrow` → `widen`) does not introduce overflow but may affect
+sign semantics. A `widen` from a signed to an unsigned type on a tainted
+path is flagged when the widened value feeds an allocation size or index
+(sign-extension to a large unsigned value).
+
+---
+
+## DF-16 — Aliasing and Escape
+
+**Status: schema-room** — the escape and aliasing questions are representable
+in principle using existing graph elements (`derived-from`, field stores, closure
+captures, the DF-7 instance analysis), but full alias analysis is the most
+analysis-expensive feature in this family. The schema reserves representation;
+complete inference is deferred. Be explicit about precision limits when
+interpreting findings.
+
+### DF-16.1 — Escape categories
+
+A value **escapes** its allocating or declaring scope when any of the following
+occurs:
+
+| Escape kind | Description | Example |
+|---|---|---|
+| `closure-capture` | A variable from an enclosing scope is captured by a closure (by reference or by move) | Rust `move |x| { uses outer_val }`, Python `def inner(): nonlocal y` |
+| `stored-in-field` | A reference or value is written into a struct field or global that outlives the current stack frame | `self.cache = &local_buf`, `GLOBAL.store(ptr)` |
+| `returned` | A reference to a local value is returned to the caller | Rust borrow-checker catches this; other languages may not |
+| `passed-to-opaque` | A value is passed to a call site where the callee is opaque (FFI, reflection, dynamic dispatch) | `c_function(&local)`, `reflect.ValueOf(x).Set(...)` |
+
+Escape is already partially tracked in DF-7.4 (instance escape for
+never-referenced member analysis). DF-16 generalises the escape concept to
+arbitrary values and references, not just object instances.
+
+### DF-16.2 — Mutation through alias
+
+When a value escapes into an alias, mutations through the alias affect the
+original. `cgx` represents alias relationships as `derives-from` edges with
+kind `copy` (for moves/identity) or as structural edges depending on the
+language model. Mutation-through-alias findings arise when:
+
+1. A mutable reference or pointer to a value is stored or captured (`closure-capture` or `stored-in-field` escape).
+2. A `mutation-out` edge (DF-2.1) is recorded on the alias.
+3. The mutation is not visible at the use site of the original value.
+
+This is the cause of use-after-invalidation bugs (e.g. iterator invalidation,
+Rust `Vec` reallocation through an aliased `&mut`).
+
+### DF-16.3 — Precision and analysis cost
+
+Full alias analysis (Andersen-style or Steensgaard-style points-to analysis)
+is quadratic to cubic in the number of abstract locations and is the most
+expensive analysis in this family. `cgx` currently uses the access-path
+abstraction (DF-2.3, DF-8.3) with depth limit k, which handles the common
+cases (direct field aliases, single-level captures) but misses aliases through
+deeply nested structures.
+
+Findings involving aliasing carry confidence `possible` unless the alias chain
+is fully resolved within the access-path depth limit, in which case `probable`
+or `certain` applies (GM-5.1).
+
+Users should treat aliasing findings as requiring manual confirmation more
+often than other finding classes. The cut-marker mechanism (DF-8.3,
+`truncated-access-path`) surfaces the points where alias tracking was
+truncated.
+
+### DF-16.4 — Relationship to DF-7
+
+DF-7.4 already classifies instance escape into three confidence tiers. DF-16
+generalises this: the same escape categories apply to any value, and the same
+confidence rules apply. The DF-7 analysis uses the DF-16 escape categorisation
+internally; results reported by DF-7 will carry the escape kind from DF-16.1.
+
+---
+
 *Next:* docs/05-queries.md — query language syntax, worked examples for every
 question class, and the canonical reachability and pedigree query forms.
+Query primitives for the security patterns covered in DF-9 through DF-16
+are specified in Q-20 through Q-25.

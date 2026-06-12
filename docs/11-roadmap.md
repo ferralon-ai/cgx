@@ -418,6 +418,30 @@ The following risks are identified across all research findings. Each phase that
 
 ---
 
+### Risk 8: Framework-pack maintenance burden
+
+**Source.** Brainstorm A (metadata-driven semantics), docs/12 (FW-1 framework pack design).
+
+**Description.** Built-in framework packs must track annotation semantics across library versions. Spring `@PreAuthorize` semantics do not change often, but AOP proxies, conditional beans, and custom composable annotations (`@MyAuth` that is itself annotated with `@PreAuthorize`) can silently invalidate pack-declared guard facts. A stale pack that no longer matches the in-use annotation pattern produces silent false negatives in framework-guard-aware queries (Q119, Q121). The user-extensible pack mechanism shifts maintenance burden to users for in-house annotations, which is the intended design, but the built-in packs must be actively maintained.
+
+**Mitigation.** Pack files carry a `framework_version` range field. `cgx index` emits a warning when the declared framework version in the dependency manifest (detected from `pom.xml`, `build.gradle`, `requirements.txt`) falls outside the pack's declared range. Users can pin to an older pack version or override with a local pack. Built-in packs are versioned and distributed as part of the `cgx` binary; updating the binary updates the packs. The user-extensible config path means a user can always override a stale built-in pack.
+
+**Phase exposure.** Phase 3 (framework-pack evaluation), ongoing maintenance.
+
+---
+
+### Risk 9: Type-reconstruction precision and false-confidence
+
+**Source.** R1 findings (TypeScript `getTypeAtLocation`; Pytype; researcher vocabulary note on "abductive"), Brainstorm B (lineage type reconstruction).
+
+**Description.** DF-19 lineage type reconstruction assigns a confidence label (`certain`, `probable`, `possible`) to each candidate type in the result set. The confidence derives from the strength of the constraints gathered: a constructor call is a `certain` anchor; a method-call footprint match is `probable`. For values with few constraints — a bare `interface{}` passed through a long call chain without type-asserting uses — the reconstruction returns a wide candidate set labeled `possible`, which users may treat as more informative than it is. This creates a false-confidence risk: the type reconstruction result looks authoritative, but the `possible` confidence tier means the value could be any type satisfying the footprint.
+
+**Mitigation.** The `--explain` output for Q-26 includes the evidence trail for each candidate — which constraint anchors drove the inference. Users can inspect whether the candidates are `certain` (constructor anchors) or `possible` (footprint matches only). The contradiction signal (empty unification) is always reliable: an empty result means conflicting constraints, not a lack of information. Documentation for DF-19 and Q-26 explicitly states that `possible` candidates are structural matches, not resolved types, and that the absence of a `certain` candidate in the set does not mean the value is unresolvable.
+
+**Phase exposure.** Phase 3 (DF-19 / Q-26 implementation and documentation).
+
+---
+
 ## New Feature Placement and Status Rollup
 
 The table below covers all feature IDs added in this revision. Placement is by the phase
@@ -454,6 +478,24 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | Q-25 | Dependency and CVE reachability queries | schema-room | Phase 4 | Phase 4 | Requires dependency edges with package+version attribution from GM-14/Phase 2; taint context added in Phase 4 when Phase 3 is complete |
 | IX-9 | Edge age and author attribution | core-extension | Phase 4 | Phase 4 | Requires VCS integration from Phase 4; edge authorship via `git log` integration |
 | LS-7 | Per-language concurrency semantics | schema-room | Phase 1 (spec) | Phase 1 (basic), Phase 2 (refined) | Language-semantic table for spawn/suspend/lock constructs per language; basic entries in Phase 1 alongside GM-9/10/11 schema work |
+| GM-15 | Metadata and annotation facts | core-extension | Phase 1 (schema) | Phase 3 (framework-pack evaluation) | Metadata-fact representation must be reserved in Phase 1 before the schema stabilises; framework-pack evaluation (lowering annotation patterns to semantic classes) arrives in Phase 3 when the query layer is ready |
+| GM-16 | Implicit call sites | core-extension | Phase 1 | Phase 1 | `implicit:<kind>` marker on call edges; syntactic detection of Rust Drop / Go defer / Python dunders / C++ RAII; per-language lowering in LS-8 |
+| GM-17 | Mediated call edges | core-extension | Phase 1 (schema) | Phase 3 (DI wiring resolution) | `established-by` provenance attribute reserved in Phase 1; DI wiring resolution and event-dispatch edge synthesis in Phase 3 when framework packs are evaluated |
+| GM-18 | Reflection and string-mediated dispatch | core-extension | Phase 1 (schema) | Phase 2 (literal-pedigree resolution), Phase 3 (tainted-string query) | `string-pedigree` attribute reserved on reflection call sites in Phase 1; literal-pedigree resolution to `probable` edges in Phase 2 via pedigree traversal; tainted-string reflection as a security query in Phase 3 |
+| GM-19 | Build-configuration variance | schema-room | Phase 1 | Roadmap | `cfg-condition` attribute reserved in Phase 1; per-configuration graph indexing is roadmap |
+| GM-20 | Error-model conversion points | core-extension | Phase 1 | Phase 1 | Syntactic detection of Go `recover` / Rust `catch_unwind`; conversion points emit edges reverting from exceptional class to `always`/`conditional` |
+| DF-17 | Mutability model | core-extension (binding/value) / schema-room (alias) | Phase 1 (schema) | Phase 3 (mutation fan-out, writes-param summaries) | Three-level mutability model; `writes-param(i)` / `writes-receiver` effect-lattice extensions in Phase 3; alias level inherits DF-16 `schema-room` status |
+| DF-18 | Function values and closures | schema-room | Phase 1 (schema) | Phase 3 (capture edges, indirect-call resolution) | Function-value node flavor and capture-edge attribute schema reserved in Phase 1; capture analysis and pedigree-based indirect-call resolution in Phase 3 |
+| DF-19 | Lineage type reconstruction | core-extension | Phase 3 | Phase 3 | Up/down/sideways constraint-gathering traversal implemented as a pedigree query; requires Phase 3 dataflow infrastructure |
+| DF-20 | Non-call dataflow linkages | core-extension | Phase 3 | Phase 3 | Channel send↔recv edges and import-time edges as explicit `derives-from` linkages; `deferred-execution` marker; requires Phase 3 dataflow representation |
+| Q-26 | Lineage type reconstruction queries | core-extension | Phase 3 | Phase 3 | Candidate type set + confidence + evidence trail from DF-19 traversal; type-contradiction detection as a bug signal |
+| Q-27 | Mutation fan-out and exposed-state queries | schema-room | Phase 3 | Phase 3 | Requires DF-17 `writes-param(i)` / `writes-receiver` effect summaries; mutation fan-out query and sanitization-invalidation detection |
+| Q-28 | Closure-capture queries | schema-room | Phase 3 | Phase 3 | Requires DF-18 capture edges; loop-variable capture detection; captured-resource lifetime extension |
+| Q-29 | Higher-order / function-value call-resolution queries | schema-room | Phase 3 | Phase 3 | Requires DF-18 function-value pedigree; indirect-call candidate set with per-callee confidence |
+| Q-30 | Coercion and type-confidence queries | schema-room | Phase 3 | Phase 3 | Requires DF-10 `coerce(from,to)` transformation kind (Phase 3) and GM-14 type-confidence boundary (Phase 1 schema); type-juggling-in-auth and `any`-frontier detection |
+| Q-31 | Framework-aware queries | core-extension | Phase 3 | Phase 3 | Requires GM-15 metadata facts + GM-17 mediated edges + GM-18 reflection; metadata-guard-aware must-pass-through; framework-entrypoint reachability; tainted-reflection dispatch |
+| LS-8 | Per-language primitive harvest table | schema-room | Phase 1 (spec) | Phase 1 (basic), Phase 2 (refined) | Per-language mapping of implicit call kinds and resource-pair syntax; companion to LS-7; serves as the lowering reference for GM-16 and GM-19 |
+| docs/12 FW-1..6 | Framework pack design, semantic classes, per-framework mappings, mediated edges, build variance, reflection packs | schema-room | Phase 1 (schema) | Phase 3 (pack evaluation) | All sections `schema-room` per docs/12; pack config schema and metadata-fact representation reserved in Phase 1; built-in pack evaluation and user-extensible pack loading in Phase 3 |
 
 **Rationale for schema-room items appearing early.** GM-9, GM-10, GM-11, GM-13,
 GM-14, and LS-7 are marked `schema-room` because their graph representation (the
@@ -466,6 +508,20 @@ the `escape` attribute on `derives-from` edges is reserved in Phase 1 and comput
 Phase 3. Full interprocedural alias analysis is a roadmap item explicitly because
 the cost and false-positive risk (Risk 6, Risk 7) warrant a dedicated design pass before
 committing to an algorithm.
+
+The same pattern applies to the features added in this revision. GM-15 through GM-20,
+DF-17 through DF-20, LS-8, and docs/12 FW-1..6 all require schema reservations in
+Phase 1 (metadata-fact representation, `implicit:<kind>` marker, `established-by`
+attribute, `string-pedigree` attribute, `cfg-condition` attribute, capture-edge attribute,
+function-value node flavor, per-language primitive harvest table). Their analyses land in
+Phase 3 alongside the dataflow infrastructure they compose with. Q-26 through Q-31 inherit
+their phase placement from the GM and DF features they query over — all Phase 3. The
+exception is GM-20, which is syntactically detectable in Phase 1 without dataflow; and
+GM-18 literal-pedigree resolution, which is tractable in Phase 2 once pedigree traversal
+is available. Status tags for Q-26 through Q-31 in the rollup above are copied verbatim
+from the owning Status lines in docs/05-queries.md: Q-26 and Q-31 are `core-extension`
+(they consume facts that are themselves core-extension); Q-27 through Q-30 are
+`schema-room`.
 
 ---
 
@@ -485,3 +541,5 @@ The table below maps each persona question theme from `docs/02-personas-and-ques
 | AI-Agent-Specific (Q68–Q81) | Basic MCP | — | Taint MCP | Diff MCP | Full polish | — |
 | Threat Modeling / DFD (Q82–Q85) | — | — | Taint matrix | — | Structured | + policy |
 | Concurrency & Resource Safety (Q89–Q90, Q97, Q104–Q105, Q108) | Schema reserved (GM-9/10/11/12/13); LS-7 spec | Spawn edge refinement (GM-14) | Full: lock-set (Q97), await-holding-lock (Q104), effect queries (Q105, Q108), resource pairing (Q89, Q90) | — | — | — |
+| Types, Mutability & Closures (Q109–Q118) | Schema reserved (DF-17/18 attributes; GM-14 type-confidence boundary; GM-16 implicit call markers; LS-8 spec) | — | Full: type reconstruction (Q109, Q110) via DF-19/Q-26; mutation fan-out (Q111–Q113) via DF-17/Q-27; capture queries (Q114, Q115) via DF-18/Q-28; higher-order resolution (Q116) via Q-29; coercion/any-frontier (Q117, Q118) via Q-30 | — | — | — |
+| Framework Semantics & Metadata (Q119–Q126) | Schema reserved (GM-15 metadata facts; GM-16 implicit calls; GM-17 established-by; GM-18 string-pedigree; GM-19 cfg-condition; docs/12 FW-1..6 pack schema; LS-8 spec) | Literal-pedigree reflection resolution (Q123, GM-18) | Full: framework-guard must-pass-through (Q119) via Q-31; negative-guard enumeration (Q120); framework-entrypoint reachability (Q121); tainted-string reflection (Q122); DI established-by provenance (Q124) via GM-17; channel dataflow pedigree (Q125) via DF-20; cfg-variant paths (Q126) via GM-19 | — | — | + policy (cfg-variant security assertions) |

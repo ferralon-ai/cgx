@@ -339,6 +339,84 @@ Graph-powered impact analysis tool with a 12-phase pipeline. Incremental indexin
 
 ---
 
+## Tier 5: Specialized Language-Primitive Analyzers
+
+These tools target specific sub-problems: framework metadata modeling, closure capture detection, type inference, reflection resolution, or dependency injection. None provides a general-purpose call-graph query interface for security and impact analysis.
+
+### CodeQL Models as Data (MaD)
+
+**What it does.** Declares sources, sinks, summaries, barrier models, and neutral models as YAML/CSV data-extension rows per library. A `summaryModel` row specifies a method and flow-through spec so the dataflow engine synthesizes edges without needing library source. `barrierGuardModel` rows block taint flow at conditional checks. User-extensible for new libraries.
+
+**Entrypoints.** `SpringEntryPoints.qll` and related modules recognize annotation-driven request-mapping methods as live roots for dead-code and taint analysis. These are hardcoded QL class hierarchies, not extensible MaD rows. The MaD public API supports `sourceModel`, `sinkModel`, `summaryModel`, `barrierModel`, `barrierGuardModel`, and `neutralModel` — not an `entrypointModel` row type.
+
+**Gap vs cgx.** MaD does not model annotation-driven guards (`@PreAuthorize`) as composable graph facts. A `barrierGuardModel` row requires a QL expression match for each guard pattern — there is no declarative "annotation X → guard semantic class" row. Entrypoints derived from annotations are hardcoded, not user-extensible via pack config. `cgx` framework packs (GM-15, docs/12 FW-1) lower annotation patterns to `entrypoint`, `guard`, `negative-guard`, and `interception` semantic classes via a declarative config that works across all query types simultaneously.
+
+---
+
+### Go VTA (golang.org/x/tools/go/callgraph/vta)
+
+**What it does.** Builds a global type-propagation graph where each function literal receives a node. Propagates function literals through assignments, parameters, struct fields, and channels. For each indirect call site, the set of function-literal nodes that flow to the call position becomes the callee set. Used by govulncheck as its primary call-graph algorithm.
+
+**Gap vs cgx.** VTA is a conservative overapproximation: it may include spurious callee edges and is unsound for reflection. Crucially, it carries no per-capture-edge attributes: the `by-ref` vs `by-value` nature of a closure capture, the mutability of the captured variable, and the resulting escape through DF-16 are not represented. VTA answers "which functions can flow here" (a set); `cgx` answers "what is the pedigree of this function value and what attributes does each capture edge carry" (DF-18, Q-29). The `by-ref` × mutability attribute is the one that catches the loop-variable capture bug family (Q114).
+
+---
+
+### Loop-Capture Lint Tools (ESLint `no-loop-func`, Go `vet loopclosure`, Python flake8-bugbear B023)
+
+**What they do.** These three tools detect functions defined inside loops that reference loop-iteration variables syntactically.
+- `ESLint no-loop-func`: disallows functions in loops referencing mutable `var`-scoped variables; satisfied by `let`/`const` block-scoped references.
+- `Go vet loopclosure`: detects goroutines capturing range-loop variables by reference; opts for false negatives (only reports when certain); superseded for modules declaring `go 1.22+` by per-iteration loop variable scoping.
+- `Python flake8-bugbear B023`: flags functions defined inside loops that reference a loop variable by name (late-binding capture in Python).
+
+**Gap vs cgx.** All three detect the symptom — a closure inside a loop referencing a mutable variable — as a syntactic lint. None models the capture as a graph edge with `by-ref` vs `by-value` and mutability attributes. None composes the capture with dataflow (DF-18 capture edges feeding DF-16 escape), with interprocedural mutation fan-out (DF-17 writes-param), or with taint propagation. `cgx` models each captured variable as a `capture` edge attributed `by-ref | by-value` × the variable's mutability level (binding / value / alias), making the loop-capture family a derived query rather than a hardcoded lint rule.
+
+---
+
+### SpotBugs EI\_EXPOSE\_REP
+
+**What it does.** Detects methods that return a direct reference to a mutable internal field (`EI_EXPOSE_REP`) or store a mutable parameter directly into a field (`EI_EXPOSE_REP2`). Pattern match on bytecode: a method returns a field whose type is a mutable array, `Date`, or `Collection`.
+
+**Gap vs cgx.** SpotBugs detects the getter/setter exposure pattern locally. It does not compute interprocedural write-effect summaries ("does calling f(myList) mutate myList?") and does not answer mutation fan-out queries ("who can change this value after this point?"). `cgx` DF-17 provides `writes-param(i)` and `writes-receiver` effect summaries as queryable graph facts, enabling Q111 (mutation fan-out) and Q112 (exposed-internal-state) as interprocedural, composable queries.
+
+---
+
+### Go Compiler and JVM Escape Analysis
+
+**What it does.** The Go compiler's escape analysis records per-parameter "escapes to heap" tags across packages. JVM HotSpot uses escape analysis for scalar replacement and stack allocation. Both are allocation-optimization analyses, not mutation-semantics analyses.
+
+**Gap vs cgx.** Escape analysis answers "does this value leave its current stack frame?" not "does a callee write through this parameter?" Neither Go escape analysis nor JVM escape analysis answers Q111 ("which aliases can mutate this value after this point?") or Q112 ("which getters expose mutable internal state?"). The Rust borrow checker statically prevents aliased mutation at compile time but is a prevention mechanism, not a post-hoc query API that discovers mutation effects on existing code.
+
+---
+
+### TypeScript Compiler API (`getTypeAtLocation`) and Pytype
+
+**What they do.**
+- TypeScript `TypeChecker.getTypeAtLocation(node)`: given any AST node in a fully type-checked program, returns the inferred/narrowed type at that point. This is a type LOOKUP over an already-type-checked program.
+- Pytype: infers types for Python code even without annotations and generates `.pyi` stubs. Internal inference engine is not exposed as a public programmatic query API.
+
+**Gap vs cgx.** `getTypeAtLocation` returns `any` for `any`-typed nodes — it does not reconstruct a candidate type from the node's usage context. Pytype infers types whole-program but does not expose a per-expression query API for "what candidate types does pytype infer for this expression, with what confidence?" Neither tool performs use-constrained bidirectional type reconstruction (DF-19 Q-26): crawling pedigree (up), uses (down), and unification (sideways) to produce a candidate type set with confidence labels. Neither detects type contradictions (empty-unification bug signal). These are genuine novelties of `cgx`.
+
+---
+
+### Reflection Resolution Tools (TamiFlex, DroidRA, CodeQL Reflection.qll)
+
+**What they do.**
+- **TamiFlex**: runtime instrumentation that records reflective calls into a log; post-run, rewrites bytecode to replace reflective calls with direct calls. Coverage bounded by test suite execution — static calls not exercised at runtime remain unresolved.
+- **DroidRA**: COAL composite constant-propagation solver for Android apps. Infers string values flowing to `Class.forName`, `Method.invoke`, etc. Evaluates on Android benchmarks (ISSTA'16). Resolves literal/near-literal string arguments; dynamic strings (from user input or runtime configuration) remain unresolved.
+- **CodeQL Reflection.qll**: infers `Class<T>` type parameters via `inferClassParameterType`; flags fields accessed reflectively via `reflectivelyRead` / `reflectivelyWritten`; matches literal `Class.forName` string arguments. Does not report a coverage metric; non-literal strings are unresolved and left as opaque.
+
+**Gap vs cgx.** All three share the same coverage ceiling: literal/near-literal strings resolve to probable call edges; dynamic strings do not. None surfaces the *pedigree of the string argument* as a first-class graph attribute that downstream queries consume. `cgx` GM-18 models each reflection call site with a string-pedigree attribute: if the pedigree is `literal`, the edge carries confidence `probable`; if the pedigree is `tainted`, the reflection call is itself a security query target (Q122, Q123). The pedigree attribute is queryable — callers of Q-31 framework-aware queries can filter on it.
+
+---
+
+### Dagger (Compile-Time Dependency Injection)
+
+**What it does.** Dagger's annotation processor reads `@Inject`, `@Provides`, `@Module`, and `@Component` at compile time and generates plain Java source implementing the dependency graph. At runtime, the JVM sees direct constructor calls — zero reflection.
+
+**Gap vs cgx.** Because Dagger generates source, any analyzer ingesting that generated source sees ordinary call edges with `certain` confidence — the wiring is structurally transparent. The gap applies to analyzers that read only user-authored source: they miss the generated edges entirely. For runtime DI containers (Spring, Guice), the wiring is established at runtime via reflection and component scanning; no production tool provides call/construct edges with `established-by` provenance and confidence tiers. `cgx` GM-17 models mediated call edges with `established-by: <annotation | config-file | registration-site>` and confidence (`certain` for compile-time DI like Dagger-generated code, `probable` for runtime containers). Jasmine (ASE'22) is the closest academic prior art for Spring injection edges; it is a research prototype, Spring-only, with no confidence tiers or provenance on added edges.
+
+---
+
 ## Gaps We Fill
 
 The gaps below are confirmed across all surveyed tools. Each represents a question class that no existing tool answers for a Rust codebase via a fast CLI and STDIO MCP interface.
@@ -423,6 +501,54 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 ---
 
+### Gap 11: Type reconstruction as a query
+
+**Evidence.** No production tool exposes type reconstruction from usage as an on-demand query for an arbitrary unannotated value. TypeScript `getTypeAtLocation` performs type LOOKUP — it returns `any` for `any`-typed nodes, not a candidate type reconstructed from usage. Pytype generates whole-program stubs but does not expose a per-expression query API. Research tools (DLInfer, Type4Py) apply machine learning to infer types from code patterns; they are not graph-query APIs. The brainstorm's bidirectional constraint traversal — pedigree (up), uses (down), unification across joins/aliases/channels (sideways) — has no equivalent in any production analyzer.
+
+**What cgx provides.** DF-19 (Lineage type reconstruction) implements up/down/sideways constraint gathering as a pedigree query. Q-26 surfaces the result as a candidate type set with confidence labels and an evidence trail. Single `certain` type means the value is resolved; empty unification is a contradiction and a bug signal. This answers Q109 (type reconstruction for `interface{}`-typed values) and Q110 (type-contradiction detection) for which no existing tool provides a general query.
+
+---
+
+### Gap 12: Framework-guard and framework-entrypoint modeling as composable graph facts
+
+**Evidence.** No tool models annotation-driven guards (`@PreAuthorize`, `[Authorize]`, `@login_required`) as composable graph facts — as a semantic condition on the call path rather than syntactic annotation presence. CodeQL MaD supports `barrierGuardModel` rows that block taint flow at conditional checks matching a QL expression, but this requires custom QL per guard and does not model the annotation itself as a semantic class. Semgrep can pattern-match the absence of `@PreAuthorize` on `@RequestMapping` methods syntactically, but this is not a call-path condition. CodeQL Spring `EntryPoints.qll` hardcodes Spring request-mapping annotations as QL class hierarchies — not extensible via MaD rows or a declarative pack config.
+
+**What cgx provides.** GM-15 (Metadata and annotation facts) and docs/12 framework packs lower annotation patterns to seven semantic classes (`entrypoint`, `guard`, `negative-guard`, `interception`, `generated-member`, `keep-alive`, `contract`) via a declarative config. Q-31 (Framework-aware queries) provides `--metadata-guard` for must-pass-through checks against annotation guards (Q119) and `--negative-guard` for negative-guard enumeration (Q120). Built-in packs cover major frameworks; the same extension mechanism as taint source/sink/sanitizer config applies.
+
+---
+
+### Gap 13: Capture-edge attributes for closures
+
+**Evidence.** Existing loop-capture lint tools (ESLint `no-loop-func`, Go `vet loopclosure`, Python B023) detect the symptom syntactically. None models the capture as a by-ref vs by-value edge attribute on the closure node in a queryable graph. None composes capture with interprocedural mutation fan-out (DF-17) or with taint propagation. The syntactic tools are per-language, hardcoded rules; they do not generalize to arbitrary mutable-capture patterns across call boundaries.
+
+**What cgx provides.** DF-18 (Function values and closures) adds a `capture` edge from each captured variable into the closure node, attributed `by-ref | by-value` × the variable's mutability level. This makes the loop-variable capture family a derived graph query: "closures where a by-ref capture has binding-mutable or value-mutable captured variable" (Q114). Q-28 (Closure-capture queries) composes capture edges with resource lifecycle pairs (Q115) and with escape analysis (DF-16).
+
+---
+
+### Gap 14: Parameter-mutation effect summaries as queryable graph facts
+
+**Evidence.** No production tool computes "does function f mutate parameter i?" as a queryable, composable interprocedural graph fact. Go escape analysis records "parameter escapes to heap" for allocation optimization but not write-effect semantics. SpotBugs EI_EXPOSE_REP detects the getter exposure pattern locally. Infer Pulse tracks memory states for known resource types but frames findings as bug reports, not callable-effect summaries. Rust borrow checker prevents aliased mutation at compile time; it does not model write effects on existing code as a query.
+
+**What cgx provides.** DF-17 (Mutability model) extends the GM-12 effect lattice with `writes-param(i)` and `writes-receiver` effect summaries. These are stored as queryable graph attributes on function nodes — callers can ask "does any callee of this function carry a `writes-param` effect on the value I just validated?" (Q111). Mutation fan-out queries (Q-27) compose these summaries with pedigree to answer "who can change this value after this point?", which sanitization-invalidation detection (Q113) requires.
+
+---
+
+### Gap 15: `established-by` provenance on container-established call edges
+
+**Evidence.** No production tool provides call/construct edges with `established-by` provenance and confidence tiers for container-established wiring. CodeQL Spring models `@Autowired`-injected fields and Spring controllers as entry points but does not emit `calls(X, Y)` edges representing bean wiring. Jasmine (ASE'22) adds Spring injection edges as a research prototype, Spring-only, with no confidence tiers or provenance on added edges. Dagger-generated code appears as plain method calls to analyzers that ingest generated sources — `certain` confidence — but analyzers that skip generated source miss the edges entirely.
+
+**What cgx provides.** GM-17 (Mediated call edges) models DI wiring, event dispatch, and registry callbacks as `calls`/`constructs` edges carrying `established-by: <annotation | config-file | registration-site>` and confidence (`certain` for compile-time Dagger-generated edges, `probable` for runtime Spring/Guice containers). Q-31 can filter on `established-by` provenance, answering Q124 (which DI-wired edges were established by a specific annotation). Jasmine is the closest academic prior art; `cgx` extends the pattern to be language-agnostic and user-extensible.
+
+---
+
+### Gap 16: String-pedigree attribute on reflection edges
+
+**Evidence.** TamiFlex, DroidRA, and CodeQL Reflection.qll all resolve reflective calls where the class/method name string has a literal or near-literal pedigree. None surfaces the pedigree of the string argument as a first-class graph attribute that downstream queries consume. TamiFlex is purely dynamic (bounded by test coverage). DroidRA is Android-specific. CodeQL Reflection.qll does not report a coverage fraction; non-literal strings are opaque.
+
+**What cgx provides.** GM-18 (Reflection and string-mediated dispatch) adds a `string-pedigree` attribute on each reflection call edge: `literal` (constant string — probable target resolution via pedigree), `tainted` (user-influenced string — security query target), or `dynamic` (unresolvable). The attribute is queryable: Q122 (tainted-string reflection) and Q123 (literal-pedigree resolution) both filter on `string-pedigree`. A reflection call site where the string is tainted is surfaced as a distinct security signal independent of whether the target can be resolved.
+
+---
+
 ## Summary: Capability Matrix by Gap
 
 | Gap | Best existing tool | cgx approach |
@@ -438,3 +564,9 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 | User-declarable resource pairs as query primitives | Infer Pulse (built-in pairs only; no query language) | GM-13 declared pairs + Q-22 pairing predicates |
 | Global sanitizer-class schema | None (per-query CodeQL flow states; experimental Semgrep labels) | DF-11 typed taint labels with built-in + user-extensible class lists |
 | CVE reachability with taint and trust-boundary context | govulncheck (∃-path, function-level, Go only) | Q-25 + DF-12 source/sink classes + confidence tiers |
+| Type reconstruction as a query | TypeScript `getTypeAtLocation` (type lookup only; returns `any` for `any`) | DF-19 up/down/sideways constraint reconstruction; Q-26 candidate-set query |
+| Framework-guard / entrypoint modeling as graph facts | CodeQL MaD (hardcoded QL hierarchies; no declarative guard row) | GM-15 + framework packs: declarative annotation → semantic class |
+| Closure capture-edge attributes (by-ref × mutability) | Loop lint tools (ESLint / go-vet / B023 — syntactic only) | DF-18 capture edges with `by-ref \| by-value` × mutability; Q-28 |
+| Parameter-mutation effect summaries | None (SpotBugs local pattern; Go escape = heap escape, not write effect) | DF-17 `writes-param(i)` / `writes-receiver`; mutation fan-out; Q-27 |
+| `established-by` provenance on DI-wired edges | Jasmine ASE'22 (research prototype; Spring-only; no confidence tiers) | GM-17 mediated edges with provenance + confidence; Q-31 |
+| String-pedigree attribute on reflection edges | DroidRA / CodeQL Reflection.qll (resolve literals; no pedigree attribute) | GM-18 `string-pedigree` attribute; tainted-reflection as security signal |

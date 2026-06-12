@@ -2,11 +2,11 @@
 
 ## Audience
 
-This document maps the four `cgx` user personas to the 108 questions they need
-answered. It drives the feature list: every capability in
-[03-code-graph-model.md](03-code-graph-model.md) (feature prefix `GM-`) and
-[04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix `DF-`) traces
-back to at least one question here.
+This document maps the four `cgx` user personas to the 126 questions they need
+answered, spanning 12 themes and 104 NOVEL questions. It drives the feature list:
+every capability in [03-code-graph-model.md](03-code-graph-model.md) (feature prefix
+`GM-`) and [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix
+`DF-`) traces back to at least one question here.
 
 ---
 
@@ -290,6 +290,63 @@ inconsistent lock sets, and Clippy `await_holding_lock` is intra-procedural only
 
 ---
 
+## Theme 11: Types, Mutability, and Closures — Q109–Q118
+
+*10 questions. 8 NOVEL.*
+
+This theme covers DF-17 (mutability model), DF-18 (function values and closures), DF-19
+(lineage type reconstruction), and the `coerce` transformation kind added to DF-10. The
+enabling primitives are in [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md)
+(DF-17..DF-19). Queries Q-26 through Q-30 in [05-queries.md](05-queries.md) provide the
+query-layer surface.
+
+No existing production tool exposes type reconstruction from usage as an on-demand query
+for an arbitrary unannotated value, computes interprocedural parameter-mutation effects as
+queryable graph facts, or models closure capture edges with by-ref/by-value × mutability
+attributes.
+
+| Q | Persona | Natural-Language Question | Capabilities | Coverage |
+|---|---------|--------------------------|--------------|---------|
+| Q109 | PSE | What is the candidate type set for the value passed to `dispatch()` — it is typed as `interface{}` at the call site but has a concrete usage footprint downstream? | DF-19 lineage type reconstruction; Q-26; `provenance-trace` (up/down/sideways constraint traversal) | NOVEL (no production tool performs use-constrained type reconstruction as an on-demand query for an arbitrary untyped value; TypeScript `getTypeAtLocation` is type LOOKUP, not reconstruction — it returns `any` for `any`-typed nodes) |
+| Q110 | PSE | Which values are used in two incompatible ways — for example, passed as an integer to one function and as a string to another — indicating a type contradiction? | DF-19 lineage type reconstruction (contradiction detection: empty unification = bug signal); Q-26 | NOVEL (contradiction detection via intersecting up/down/sideways type constraints has no equivalent in any production static analysis tool; type checkers narrow existing declared types, they do not detect contradictions in untyped values) |
+| Q111 | PSE | After this value is validated and returned from `parse_user_input()`, which aliases or callees can mutate it before it reaches the authorization check? | DF-17 mutability model; Q-27 mutation fan-out; `writes-param(i)` / `writes-receiver` effect summaries | NOVEL (no production tool computes interprocedural parameter-mutation effects as queryable graph facts; SpotBugs EI_EXPOSE_REP detects the getter pattern locally; Go escape analysis tracks heap escape, not parameter write effects) |
+| Q112 | SSE | Which getters on `UserRecord` return a direct reference to a mutable internal field — callers can mutate the object's state through the returned reference? | DF-17 mutability model; Q-27 mutation fan-out; `writes-receiver` effect | NOVEL (SpotBugs EI_EXPOSE_REP detects this local AST pattern but does not compute interprocedural mutation fan-out; no tool answers "who else holds a mutable reference to this object's internals" as a graph query) |
+| Q113 | PSE | Is there a path where `sanitize(input)` clears a taint label and then a callee mutates the value through an alias, re-introducing the taint before the value reaches the SQL sink? | DF-17 mutability model (sanitization invalidation); DF-11 taint labels; Q-27 | NOVEL (sanitize-then-mutate-via-alias is a real bug class; no existing taint analysis re-applies a cleared taint label when the sanitized value is mutated through an alias after sanitization) |
+| Q114 | PSE | Which closures capture a loop variable by reference — the variable's value at call time will be the final loop value, not the value at capture time? | DF-18 function values and closures; Q-28 closure-capture queries; capture edge `by-ref` × binding mutability | Partial (ESLint `no-loop-func`, Go `vet loopclosure`, and Python flake8-bugbear B023 detect this syntactically as a lint warning; no tool models the capture as a by-ref edge attribute on the closure node in a queryable graph, or composes capture with dataflow mutability to flag the general case) |
+| Q115 | SSE | Which closures capture a file handle, database connection, or lock guard, and on which execution paths does the closure run — potentially extending the resource's lifetime beyond the scope where it was acquired? | DF-18 function values and closures; Q-28 closure-capture queries; GM-13 resource lifecycle pairs; `edge-condition-filter` | NOVEL (no tool models captured-resource lifetime through the closure's execution context; Rust borrow checker prevents some dangling-closure cases at compile time but does not model the semantic resource-extension pattern as a queryable graph fact) |
+| Q116 | SSE | What are the candidate callee functions for the indirect call at this site — `handler` is a function value whose origin I need to trace? | DF-18 function values and closures; Q-29 higher-order/function-value call-resolution queries; `provenance-trace` over function values | Partial (Go VTA in `golang.org/x/tools/go/callgraph/vta` propagates function literals through the type graph for Go; Andersen-style points-to analysis resolves function pointers in C/C++; neither is a query API for arbitrary codebases, and neither provides per-callee confidence labels from pedigree tracking) |
+| Q117 | PSE | Does a tainted value reach a loose-equality comparison or implicit type coercion in an authorization decision path — for example, PHP `==` treating `"0e123"` and `"0"` as equal? | DF-17 mutability model; DF-10 `coerce(from,to)` transformation kind; Q-30 coercion and type-confidence queries; `taint-propagation` | NOVEL (type-juggling-in-auth requires tracking implicit coercions as labeled graph edges and composing them with taint propagation to an auth-decision sink; no production tool combines coercion transformation kinds with taint propagation to authorization decision points) |
+| Q118 | PSE | Where does the `any`-typed, `interface{}`-typed, or unannotated-parameter frontier begin — which call sites are the first point where a value crosses from fully typed into untyped territory? | GM-14 code-trust boundaries (type-confidence boundary); Q-30 coercion and type-confidence queries; `edge-label-query` | NOVEL (type-confidence boundaries as queryable graph facts with a trust-boundary analogue have no equivalent in any production tool; TypeScript does not expose `any`-frontier points as a call-graph-level query) |
+
+---
+
+## Theme 12: Framework Semantics and Metadata — Q119–Q126
+
+*8 questions. 7 NOVEL.*
+
+This theme covers GM-15 (metadata and annotation facts), GM-16 (implicit call sites),
+GM-17 (mediated call edges), GM-18 (reflection and string-mediated dispatch), GM-19
+(build-configuration variance), and DF-20 (non-call dataflow linkages). The query surface
+is Q-31 in [05-queries.md](05-queries.md). Framework packs are specified in
+[12-language-primitives-and-frameworks.md](12-language-primitives-and-frameworks.md).
+
+No production tool models annotation-driven guards as composable graph facts, exposes
+`established-by` provenance on DI-wired call edges, or models channel send↔recv as
+first-class pedigree edges.
+
+| Q | Persona | Natural-Language Question | Capabilities | Coverage |
+|---|---------|--------------------------|--------------|---------|
+| Q119 | PSE | Does every path from an HTTP handler to a protected resource traverse the `@PreAuthorize` annotation guard — or can any path reach the resource without the guard being on the call path? | GM-15 metadata and annotation facts; Q-31 framework-aware queries; Q-20 must-pass-through; framework-pack `guard` semantic class | NOVEL (no production tool models annotation-driven guards as composable graph facts; CodeQL can pattern-match the annotation's presence or absence syntactically but does not represent `@PreAuthorize` as a semantic guard on call paths; Semgrep absence-pattern rules are purely syntactic with no call-path condition) |
+| Q120 | PSE | Which endpoints carry a negative-guard annotation — `@csrf_exempt`, `[AllowAnonymous]`, or `@PermitAll` — disabling a protection that is on by default? | GM-15 metadata and annotation facts; Q-31 framework-aware queries; framework-pack `negative-guard` semantic class | NOVEL (no tool exposes negative-guard annotations as a dedicated queryable metadata class; existing tools can grep for the annotation text but do not model the semantic implication — that a protection is disabled — as a graph fact) |
+| Q121 | PSE | Which annotation-declared entrypoints (`@GetMapping`, `@app.route`, `#[tokio::main]`, `@KafkaListener`) are reachable without passing through the authentication middleware? | GM-15 metadata and annotation facts; GM-16 implicit call sites; Q-31 framework-aware queries; Q-20 must-pass-through; framework-pack `entrypoint` semantic class | NOVEL (entrypoints populated by annotation are invisible without framework packs; CodeQL Spring models hardcode Spring request-mapping entrypoints in QL class hierarchies — not extensible via MaD rows — and do not model the authentication path condition) |
+| Q122 | PSE | Which reflective dispatch calls — `Method.invoke`, `getattr`, `Class.forName` — receive a string whose pedigree includes user-controlled input? | GM-18 reflection and string-mediated dispatch; Q-31 framework-aware queries; `taint-propagation`; DF-12 source class `network` | NOVEL (tainted-string-to-reflection as a first-class graph query — where the string pedigree reaching the reflective call is surfaced as a queryable edge attribute — has no equivalent in production tools; TamiFlex/DroidRA resolve literal strings only; CodeQL Reflection.qll has no pedigree attribute on reflection edges) |
+| Q123 | SSE | Which reflective calls have a string with a literal pedigree — the class or method name comes from a string constant — and what are the probable call targets? | GM-18 reflection and string-mediated dispatch; Q-31 framework-aware queries; `provenance-trace` over string pedigree | Partial (DroidRA resolves literal/near-literal strings via COAL constant propagation for Android; CodeQL Java Reflection.qll infers `Class<T>` type parameters and tracks `Class.forName` with literal arguments; neither surfaces string pedigree as a first-class graph attribute that downstream queries consume, and neither is a general-purpose query API) |
+| Q124 | SSE | Which call edges in this Spring or NestJS application are established by dependency injection rather than a direct call expression — and what annotation or config entry established each edge? | GM-17 mediated call edges; Q-31 framework-aware queries; `established-by` provenance + confidence tier | NOVEL (no production tool provides call edges with `established-by` provenance and confidence tiers for container-established wiring; CodeQL Spring models `@Autowired` fields as entry points but does not emit explicit wiring call edges; Jasmine [ASE'22] adds Spring injection edges as a research prototype only) |
+| Q125 | PSE | Does tainted data sent on a Go channel or Rust `mpsc` channel reach a sensitive sink on the receiving side — tracing the dataflow through the send↔recv pair? | DF-20 non-call dataflow linkages; Q-31 framework-aware queries; `taint-propagation` through channel edges; `derives-from` with no connecting call | NOVEL (channel send↔recv breaks pedigree in all existing tools — the receiver side has no edge back to the sender unless the tool models the channel as a derives-from linkage; no production tool models Go channels or Rust `mpsc` as first-class pedigree edges) |
+| Q126 | SSE | Which call paths to the legacy authentication function exist only when build flag `LEGACY_AUTH` is enabled — and are they absent in the default production build? | GM-19 build-configuration variance; Q-31 framework-aware queries; `cfg-condition` attribute; `edge-condition-filter` | NOVEL (no production tool represents build-flag-gated paths as a queryable edge attribute that can be filtered to show only paths present under a given configuration; tools do per-configuration scanning but do not model the cfg condition as a first-class graph property) |
+
+---
+
 ## Canonical Prompt Examples
 
 The following four queries from the original product specification are stable reference
@@ -336,7 +393,9 @@ Theme: Temporal / VCS (Q54–Q61 class). Capabilities: `graph-diff` +
 | 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 8 |
 | 9. Threat Modeling and DFD | 4 (Q82–Q85) | 4 |
 | 10. Concurrency and Resource Safety | 6 (Q89–Q90, Q97, Q104–Q105, Q108) | 6 |
-| **Total** | **108** | **89** |
+| 11. Types, Mutability, and Closures | 10 (Q109–Q118) | 8 |
+| 12. Framework Semantics and Metadata | 8 (Q119–Q126) | 7 |
+| **Total** | **126** | **104** |
 
 ---
 

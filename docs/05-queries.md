@@ -47,6 +47,12 @@ Both layers produce identical result objects: every result node and edge carries
 | Q-23 | Typed taint queries (class-matched source → sink with sanitizer-class clearing) | 1 + 2 |
 | Q-24 | Concurrency queries (lock sets, await-holding-lock, blocking-in-async, cross-spawn races) | 1 + 2 |
 | Q-25 | Dependency and CVE reachability queries | 1 + 2 |
+| Q-26 | Lineage type reconstruction queries (type discovery; type-contradiction bug query) | 1 + 2 |
+| Q-27 | Mutation fan-out and exposed-state queries | 1 + 2 |
+| Q-28 | Closure-capture queries (loop-variable capture; captured-resource lifetime) | 1 + 2 |
+| Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 |
+| Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 |
+| Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 |
 
 ---
 
@@ -265,6 +271,23 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 **Predicates:**
 - `NONE(n IN nodes(path) WHERE <condition>)` — negative path constraint
 - `ANY(r IN relationships(path) WHERE <condition>)` — path-relative transience check
+- `<type> COMPATIBLE_WITH <type>` — structural type-compatibility test; returns `false` when the two types share no common subtype (used by the type-reconstruction queries in Q-26)
+- `<expr> IS EMPTY` — true when a reconstructed candidate set is empty, i.e. the constraint intersection has no solution (a type contradiction; see Q-26)
+
+### Procedure calls
+
+Most traversals express directly as `MATCH` patterns. A small number of analyses compute a result by *intersecting* constraints gathered from several directions at once — they do not reduce to a single path pattern — and are exposed as named procedures invoked with the standard openCypher `CALL … YIELD` form:
+
+```
+CALL cgx.<procedure>(<args>) YIELD <columns>
+```
+
+The yielded columns bind like node properties and may be filtered in a following `WHERE` and returned in `RETURN`. Available procedures:
+
+- `cgx.type_reconstruct(value, direction: "up"|"down"|"sideways"|"all")` — reconstructs a value's type from its lineage (see Q-26); yields `candidate_type`, `confidence`, `evidence`. The constraint intersection across the three directions is why this is a procedure rather than a pattern.
+- `cgx.mutation_fanout(value)` — the outbound dual of pedigree (see Q-27); yields `mutator`, `effect`, `confidence`.
+
+Procedures compose with the rest of Layer 2: their yielded values can drive a subsequent `MATCH`, and `COMPATIBLE_WITH` / `IS EMPTY` operate on the reconstructed types they return.
 
 ### Shell quoting convention
 
@@ -1398,6 +1421,666 @@ cgx query --at $(git merge-base main HEAD) '
 ```
 
 The `introducing_commit` and `introducing_author` fields on edges (IX-9) let CI annotate new sink-reachable edges with the exact commit and author that introduced them, enabling targeted security review assignments.
+
+---
+
+## Q-26: Lineage Type Reconstruction Queries
+
+**Status: core-extension** — the query-layer surface mirrors the graph-level reconstruction defined in `docs/04-dataflow-and-provenance.md` DF-19, which is itself `core-extension`. The constraint-gathering traversal (up/down/sideways over existing pedigree, forward-flow, and unification edges) requires no new schema primitives beyond those already present in DF-1, DF-6, DF-9, DF-16, and DF-20.
+
+### Motivation and prior art position
+
+For values of erased or widened type (`any`, `interface{}`, untyped parameters, reflection results), standard type lookup returns the widened type — not the actual type the value carries. TypeScript's Compiler API `getTypeAtLocation` resolves the inferred or declared type at any AST node after whole-program type-checking, but returns `any` for values of type `any` — this is type **lookup**, not reconstruction from usage. Pytype infers types for unannotated Python by whole-program analysis and generates stub files, but does not expose a per-expression query API that can be driven from the call graph. No production tool answers "what are the candidate types of this value, derived from how it is used?" as an on-demand graph query. DF-19 is a genuine novelty claim.
+
+cgx answers this question by crawling three directions from the value's node and intersecting the resulting constraints (see DF-19.2 for the full specification):
+
+- **Up (pedigree):** constructors and literals are `certain` type anchors; return types and parameters contribute their declared/inferred types with inherited confidence.
+- **Down (uses):** method calls and typed-parameter sinks constrain the value structurally (its duck footprint).
+- **Sideways (unification):** values that must share a type — two arms of a DF-9 join, DF-16 aliases, DF-20 channel send↔recv pairs — propagate constraints laterally.
+
+Primitive operations propagate type via DF-10 transformation kinds: `arith` edges yield numeric types, `concat` edges yield string types, `coerce(from,to)` edges yield the destination type.
+
+### Result shape
+
+| Result | Meaning |
+|--------|---------|
+| Single type, `certain` | Fully resolved — the value has exactly this type at this point |
+| Narrowed set, `probable` | Two or three candidate types consistent with all constraints |
+| Wider set, `possible` | Insufficient constraints; call is near a type-confidence boundary (GM-14.6) |
+| Empty set — **CONTRADICTION** | No type satisfies all constraints simultaneously; this is a bug signal |
+
+A contradiction indicates the value is used in two incompatible ways — for example, constructed as `File` (up, `certain`) but passed to a function requiring `Socket` (down). This query class has no direct equivalent in any mainstream static analysis tool.
+
+### Layer 1 — Subcommand
+
+```
+cgx type-of <symbol-or-var> <path>
+             [--at-function <fn>]
+             [--direction up|down|sideways|all]  # default: all
+             [--confidence certain|probable|possible]
+             [--format <fmt>]
+```
+
+The `--direction` flag restricts which constraint directions are gathered. `all` runs all three and intersects the results.
+
+**Examples:**
+
+```bash
+# Discover the candidate type of 'v' at entry to process()
+cgx type-of v ./ --at-function process
+
+# Type discovery using only pedigree (up-direction only — fastest)
+cgx type-of v ./ --at-function process --direction up --confidence probable
+
+# All values in the codebase whose declared type is any/interface{} but
+# whose reconstructed type is certain — they have a known type despite erasure
+cgx type-of '*' ./ --declared-type any --reconstructed-confidence certain
+```
+
+### Layer 2 — Query language
+
+**Discover the type of a named value:**
+
+```bash
+cgx query '
+  MATCH (v {name:"v", scope:"process"})
+  CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
+  RETURN candidate_type, confidence, evidence
+  ORDER BY confidence DESC
+' ./
+```
+
+**Type-contradiction bug query — values whose reconstructed type contradicts their declared type:**
+
+```bash
+cgx query '
+  MATCH (v)
+  WHERE v.declared_type IS NOT NULL
+  CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
+  WHERE candidate_type IS EMPTY
+     OR (confidence IN ["certain","probable"]
+         AND NOT candidate_type COMPATIBLE_WITH v.declared_type)
+  RETURN v.name, v.file, v.line,
+         v.declared_type,
+         candidate_type,
+         evidence
+  ORDER BY v.file, v.line
+' ./
+```
+
+`candidate_type IS EMPTY` returns values where the constraint intersection is empty — a contradiction. The `COMPATIBLE_WITH` predicate tests structural compatibility; it returns `false` when the reconstructed type and the declared type share no common subtype.
+
+---
+
+## Q-27: Mutation Fan-Out and Exposed-State Queries
+
+**Status: schema-room** — depends on the `writes-param(i)` / `writes-receiver` effect-lattice extensions (DF-17.2, GM-12) and alias edges (DF-16), both `schema-room`. The query patterns described here are expressed once that schema is populated.
+
+### Motivation and prior art position
+
+**Pedigree** (DF-1) answers "what populated this value" — the inbound direction. **Mutation fan-out** (DF-17.3) is its outbound dual: "who can change this value after this point?" Both directions are needed to reason about a value's safety.
+
+SpotBugs `EI_EXPOSE_REP` detects getter methods that return a reference to a mutable internal field — AST/bytecode pattern-matching, intraprocedural, Java only. It does not compute interprocedural write effects. Go escape analysis records whether a parameter escapes to the heap (for allocation optimization), not whether its contents are written. Rust's borrow checker prevents aliased mutation at compile time — this is a prevention mechanism, not a post-hoc query over existing code. No production tool computes `writes-param(i)` as a callable-effect summary that is queryable across a call graph. DF-17's effect-lattice extensions are novel as composable graph facts. (Closest prior art terminology: "parameter-effect summaries" or "write-effect summaries" in the research literature.)
+
+### Query families
+
+#### Who can mutate this value after this point?
+
+```bash
+# Mutation fan-out from 'user_record' after AuthHandler::validate returns
+cgx query '
+  MATCH (v {name:"user_record", scope:"AuthHandler::validate"})
+  CALL cgx.mutation_fanout(v) YIELD mutator, effect, confidence
+  RETURN mutator.name, mutator.file, mutator.line,
+         effect,        -- writes-param(0), writes-receiver, mutation-out
+         confidence
+  ORDER BY confidence DESC, mutator.file
+' ./
+```
+
+#### Does f(x) mutate x?
+
+```bash
+cgx query '
+  MATCH (fn {name:"sort_records"})
+  WHERE "writes-param(0)" IN fn.own_effects
+     OR "writes-param(0)" IN fn.transitive_effects
+  RETURN fn.name, fn.file, fn.line,
+         fn.transitive_effects
+' ./
+```
+
+#### Getters returning references to mutable internal state (EI_EXPOSE_REP-style)
+
+```bash
+cgx query '
+  MATCH (getter:method)-[:MEMBER_OF]->(t)
+  WHERE getter.name STARTS WITH "get"
+    AND getter.return_mutability = "mutable"
+    AND getter.return_is_internal_field = true
+  RETURN getter.name, getter.file, getter.line,
+         t.name AS containing_type
+  ORDER BY t.name, getter.name
+' ./
+```
+
+The `return_is_internal_field` attribute is set when the return value's pedigree traces to a field of `self`/`this` without a defensive copy. This is the composable graph-query equivalent of SpotBugs `EI_EXPOSE_REP`; unlike SpotBugs, it composes with pedigree and taint queries to answer "which code mutates the exposed field through the returned reference?"
+
+#### Sanitization invalidation: cleared taint re-applied via mutation (DF-17.4)
+
+```bash
+cgx query '
+  MATCH path = (sanitizer)-[:DATA_FLOW*]->(use {sink_class:"sql"})
+  WHERE sanitizer.sanitizer_class = "sql"
+    AND ANY(edge IN relationships(path)
+            WHERE edge.taint_label.re_applied = true
+              AND edge.taint_label.reason = "mutation-after-sanitization")
+  RETURN sanitizer.name, sanitizer.file, sanitizer.line,
+         use.name, use.file, use.line
+' ./
+```
+
+### Layer 1 — Subcommand
+
+```bash
+# Mutation fan-out from a named value at a given function
+cgx mutation-fanout <symbol-or-var> <path> [--at-function <fn>] [--depth N] [--format <fmt>]
+
+# Functions that mutate their first argument
+cgx query --effect writes-param(0) <path>
+```
+
+---
+
+## Q-28: Closure-Capture Queries
+
+**Status: schema-room** — depends on capture edges (DF-18.3) with `by-value`/`by-ref` attribution and the captured variable's mutability level (DF-17.1). Both are `schema-room`. The query patterns are expressed once these edge attributes are populated.
+
+### Motivation and prior art position
+
+ESLint `no-loop-func` (JavaScript), Go `vet loopclosure`, and Python `flake8-bugbear B023` all detect the **symptom** of the loop-variable capture bug — a function defined inside a loop that references a mutable loop variable — as syntactic lint rules. They operate on scope analysis, not graph facts. Go 1.22 changed per-iteration variable scoping to eliminate the most common Go form of this bug, but does not model the capture. VTA (`golang.org/x/tools/go/callgraph/vta`) propagates function literals through type assignments but does not model individual capture edges with `by-value`/`by-ref` × mutability attributes.
+
+cgx models captures as typed graph edges (DF-18.3), making the loop-capture family directly queryable and composable with escape (DF-16), mutation fan-out (DF-17.3), and resource-lifecycle (GM-13) analysis.
+
+### Query families
+
+#### Loop-variable capture bug family (by-ref capture of a mutable loop variable)
+
+```bash
+cgx query '
+  MATCH (loop_var)-[cap:CAPTURE {capture:"by-ref"}]->(closure)
+  WHERE loop_var.binding_mutability = "mutable"
+    AND loop_var.is_loop_variable = true
+  RETURN loop_var.name, loop_var.file, loop_var.line,
+         closure.name,  closure.file, closure.line,
+         cap.capture AS capture_mode
+  ORDER BY loop_var.file, loop_var.line
+' ./
+```
+
+This query is language-agnostic: it finds Go pre-1.22 goroutine closures capturing loop variables, JavaScript `var`-in-loop closures, and Python late-binding lambdas from a single pattern.
+
+#### Captured-resource lifetime: closure captures a lock guard
+
+```bash
+cgx query '
+  MATCH (resource)-[cap:CAPTURE]->(closure)
+  WHERE resource.resource_class = "lock"
+  RETURN resource.name, resource.file, resource.line,
+         closure.name, closure.file, closure.line,
+         cap.capture AS capture_mode
+  ORDER BY resource.file, resource.line
+' ./
+```
+
+A closure capturing a lock guard extends the resource lifecycle pair (GM-13): the lock is held until the closure executes, not until the enclosing scope exits. This is analogous to the `await-holding-lock` concurrency query (Q-24) but for captured (rather than actively held) locks.
+
+#### Closures that outlive their frame (dangling capture risk)
+
+```bash
+cgx query '
+  MATCH (v)-[cap:CAPTURE {capture:"by-ref"}]->(closure)
+  MATCH escape_path = (closure)-[:DATA_FLOW*]->(sink)
+  WHERE sink.scope_depth < v.scope_depth   -- closure escapes to outer scope
+    AND v.binding_mutability = "mutable"
+  RETURN v.name, v.file, v.line,
+         closure.name, sink.name,
+         sink.file, sink.line
+' ./
+```
+
+### Layer 1 — Subcommand
+
+```bash
+# Find all closures with by-ref captures of mutable loop variables
+cgx query --capture-bug loop-variable <path> [--format <fmt>]
+
+# Find all closures capturing resources (lock guards, file handles, connections)
+cgx query --capture-bug resource-lifetime <path> [--format <fmt>]
+```
+
+---
+
+## Q-29: Higher-Order / Function-Value Call-Resolution Queries
+
+**Status: schema-room** — depends on function-value nodes (DF-18.1) and pedigree-based indirect-call resolution (DF-18.2). Both are `schema-room`, as is the `calls:indirect` candidate-set population from the pedigree query.
+
+### Overview
+
+An indirect call site `f(args)` where `f` is a function value resolves by asking "what is the pedigree of `f`?" — the set of function values flowing to `f` at that call site is the candidate callee set. This is the pedigree query (DF-1) applied to function-value nodes. No new analysis is required: the existing pedigree machinery (DF-1), container models (DF-4), and function summaries (DF-3.3) answer the question directly.
+
+Each candidate in the set carries the confidence label from how it was tracked through pedigree:
+
+| Pedigree chain for the function value | Resolution confidence |
+|--------------------------------------|-----------------------|
+| Direct assignment from a named function | `certain` (no branch) or `probable` (branch merge) |
+| Returned from a function whose return is resolved | Inherits the return edge's confidence |
+| Stored in a container and retrieved | `probable` (smashed collection model, DF-4.2) |
+| Passed through an opaque call or FFI boundary | `possible`; cut-marker `reflective` emitted |
+
+### Layer 1 — Subcommand
+
+```bash
+# What functions can the callback argument to process() actually call?
+cgx pedigree callback ./ --at-function process --kind function-value
+
+# Resolve indirect call sites in the auth module up to probable confidence
+cgx callees '**' ./ --indirect --confidence probable --path-filter 'auth/**'
+```
+
+### Layer 2 — Query language
+
+**What functions can this callback actually invoke?**
+
+```bash
+cgx query '
+  MATCH (callsite)-[:CALLS:indirect]->(target)
+  WHERE callsite.scope = "process"
+    AND callsite.arg_position = 0
+  RETURN target.name, target.file, target.line,
+         callsite.confidence AS resolution_confidence
+  ORDER BY callsite.confidence DESC, target.name
+' ./
+```
+
+**Unresolved indirect call sites (no candidate beyond possible):**
+
+```bash
+cgx query '
+  MATCH (callsite)-[r:CALLS:indirect]->(target)
+  WHERE r.confidence = "possible"
+    AND size(callsite.candidate_set) = 0
+  RETURN callsite.name, callsite.file, callsite.line,
+         r.cut_marker
+  ORDER BY callsite.file, callsite.line
+' ./
+```
+
+**Function values that flow to multiple call sites (shared callbacks):**
+
+```bash
+cgx query '
+  MATCH (fn_val:function-value)-[:DATA_FLOW*]->(site1)-[:CALLS:indirect]->()
+  MATCH (fn_val)-[:DATA_FLOW*]->(site2)-[:CALLS:indirect]->()
+  WHERE site1 <> site2
+  RETURN fn_val.name, fn_val.file, fn_val.line,
+         collect(distinct site1.name + "@" + site1.file + ":" + site1.line)
+           AS call_sites
+  ORDER BY fn_val.file, fn_val.line
+' ./
+```
+
+---
+
+## Q-30: Coercion and Type-Confidence Queries
+
+**Status: schema-room** — depends on `coerce(from,to)` transformation kind on DF-10 edges (`schema-room` as part of DF-10 vocabulary) and type-confidence boundaries (GM-14.6, `schema-room`). The query patterns are expressed once these attributes are populated.
+
+### Query families
+
+#### Type-juggling-in-auth (tainted value reaching a loose-equality comparison in an auth decision)
+
+This query targets the class of bugs where PHP-style type coercion (`"0e123" == "0"` evaluates to `true` in loose comparison) or JavaScript loose equality (`"0" == 0`) allows an attacker-controlled value to satisfy an auth check through coercion rather than genuine equality. The `coerce(from,to)` edge on DF-10 marks the conversion point; Q-30 traces tainted values through those edges to auth-class sinks.
+
+**Layer 2 — Full query:**
+
+```bash
+cgx query '
+  MATCH path = (src)-[:DATA_FLOW*]->(coerce_site)-[:DATA_FLOW {transformation_kind:"coerce"}]
+                ->(sink {sink_class:"auth-check"})
+  WHERE src.source_class IN ["network","user-input"]
+    AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "auth-check")
+  RETURN src.name, src.file, src.line,
+         coerce_site.name, coerce_site.file, coerce_site.line,
+         [e IN relationships(path) | e.transformation_kind] AS transformations,
+         sink.name, sink.file, sink.line
+  ORDER BY src.file, src.line
+' ./
+```
+
+The `transformation_kind:"coerce"` filter selects only the edges where a type change occurs; the `sink_class:"auth-check"` targets comparisons or decisions that determine authentication or authorization outcomes.
+
+**Layer 1 — Subcommand:**
+
+```bash
+cgx paths --from-class user-input --to-class auth-check \
+          --require-transformation coerce \
+          --confidence probable \
+          <path>
+```
+
+#### The `any`-frontier: where does a dynamically typed value enter typed code?
+
+Values of type `any` (TypeScript), `interface{}` / `any` (Go), `dynamic` (C#), or reflection results mark points where the static type system stops being evidence (GM-14.6). The `any`-frontier query finds these entry points — the trust-boundary analog for the type system.
+
+```bash
+cgx query '
+  MATCH (boundary)-[r:DATA_FLOW]->(typed_receiver)
+  WHERE boundary.type_confidence_boundary = true
+    AND typed_receiver.declared_type IS NOT NULL
+    AND typed_receiver.declared_type <> "any"
+    AND typed_receiver.declared_type <> "interface{}"
+  RETURN boundary.name, boundary.file, boundary.line,
+         typed_receiver.name, typed_receiver.declared_type,
+         r.transformation_kind
+  ORDER BY boundary.file, boundary.line
+' ./
+```
+
+When `type_confidence_boundary = true`, the node carries a GM-14.6 attribute indicating that downstream resolution confidence is at most `possible` without further assertion or reconstruction (DF-19).
+
+#### Coercion chains — values that change type multiple times
+
+```bash
+cgx query '
+  MATCH path = (src)-[:DATA_FLOW* {transformation_kind:"coerce"}]->(sink)
+  WHERE length(path) >= 2
+  RETURN src.name, src.file, src.line,
+         [e IN relationships(path) | e.coerce_from + " → " + e.coerce_to] AS coercion_chain,
+         sink.name, sink.file, sink.line
+  ORDER BY length(path) DESC
+  LIMIT 20
+' ./
+```
+
+---
+
+## Q-31: Framework-Aware Queries
+
+**Status: core-extension** — the query patterns here consume GM-15 `guard` and `entrypoint` facts and GM-18 `reflective` cut-marker edges, all of which are `core-extension`. The must-pass-through predicate (Q-20) and the pedigree query (DF-1) are already specified as core capabilities; Q-31 extends them by consuming the framework-pack-supplied metadata facts at query time.
+
+### Metadata-guard-aware authorization bypass (headline framework query)
+
+The Q-20 must-pass-through query finds handlers that reach a protected operation without passing through a named check function. On framework-heavy codebases this produces false positives: `@PreAuthorize("hasRole('ADMIN')")` is an authorization check with **no call in the source path** — the authz check is the annotation itself. Without GM-15 `guard` facts, must-pass-through queries report every annotated endpoint as a bypass.
+
+GM-15 lowers `@PreAuthorize` (and equivalent annotations in other frameworks — Django `@login_required`, C# `[Authorize]`, Go middleware registration) to a `must-pass-through` fact on the symbol node. Q-31's metadata-guard-aware query consumes these facts:
+
+**Layer 2 — Full query:**
+
+```bash
+cgx query '
+  MATCH path = (h {kind:"entrypoint"})-[:CALLS*]->(sink {name:"db::write"})
+  WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+    AND NONE(n IN nodes(path)
+             WHERE n.name = "require_admin"
+                OR n.guard_class IS NOT NULL)   -- GM-15 guard fact on any node
+  RETURN h.name, h.file, h.line,
+         sink.name, sink.file, sink.line,
+         length(path) AS hops
+  ORDER BY h.file, h.line
+' ./
+```
+
+The `n.guard_class IS NOT NULL` predicate matches any node that carries a GM-15 `guard` semantic class, regardless of whether the guard is a function call or a metadata annotation. Without this clause, annotated endpoints produce false bypass findings.
+
+**Layer 1 — Subcommand:**
+
+```bash
+# Authorization bypass: any handler reaches db::write without a guard
+# (metadata guards satisfied by GM-15 guard facts — no false positives on
+# annotated endpoints)
+cgx paths --from 'kind:entrypoint' --to db::write ./ \
+    --avoiding 'name:require_admin OR guard_class:*' \
+    --confidence probable \
+    --format sarif > authz-bypass.sarif
+
+# Assert no bypass exists (CI gate)
+cgx paths --from 'kind:entrypoint' --to db::write ./ \
+    --avoiding 'name:require_admin OR guard_class:*' \
+    --assert-empty
+```
+
+### Framework entrypoint reachability
+
+When framework packs are active, entrypoints declared via metadata (`@GetMapping`, `#[tokio::main]`, `@Scheduled`, etc.) enter the entrypoint set automatically (GM-15.2). Reachability queries are correct for framework code without manual entrypoint declaration:
+
+```bash
+cgx query '
+  MATCH (ep {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink)
+  WHERE sink.sink_class IN ["sql","shell","file_write"]
+  RETURN ep.name, ep.file, ep.line,
+         sink.name, sink.sink_class,
+         ep.framework_pack AS established_by
+  ORDER BY ep.framework_pack, ep.name
+' ./
+```
+
+The `framework_pack` attribute records which pack promoted the symbol to `entrypoint`, enabling queries that audit coverage ("which frameworks have entrypoints in scope?").
+
+### Negative-guard inventory: which endpoints disable a protection?
+
+```bash
+cgx query '
+  MATCH (ep {kind:"entrypoint"})
+  WHERE ep.negative_guard_class IS NOT NULL
+  RETURN ep.name, ep.file, ep.line,
+         ep.negative_guard_class AS disabled_protection,
+         ep.framework_pack
+  ORDER BY ep.negative_guard_class, ep.name
+' ./
+```
+
+Negative guards (GM-15.1) are annotations that disable a protection — `@csrf_exempt` (Django), `[AllowAnonymous]` (ASP.NET), `#[allow(...)]` (Rust). This query enumerates all endpoints that carry such a fact, making the "which endpoints opt out of protection P?" question a single graph lookup.
+
+### Tainted-string reflective dispatch
+
+A tainted string reaching a reflective dispatch site means an attacker who controls that string controls which code executes. GM-18.2 emits a taint-flow finding when a tainted string flows to any reflective dispatch; Q-31 exposes this as a query.
+
+The string pedigree attribute on reflective call edges (GM-18.1) is a novel framing in cgx: all mainstream tools share the same ceiling — literal-pedigree strings resolve to `probable` edges; dynamic strings are unresolved (TamiFlex via runtime instrumentation; DroidRA via COAL solver for Android; CodeQL Java Reflection for `Class.forName` literals). No production tool surfaces the string pedigree itself as a first-class graph attribute that downstream security queries can consume. cgx does.
+
+```bash
+cgx query '
+  MATCH path = (src)-[:DATA_FLOW*]->(dispatch {cut_marker:"reflective"})
+  WHERE src.source_class IN ["network","user-input"]
+    AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "method-name")
+  RETURN src.name, src.file, src.line,
+         dispatch.name, dispatch.file, dispatch.line,
+         [e IN relationships(path) | e.transformation_kind] AS transforms,
+         dispatch.string_pedigree
+  ORDER BY src.file, src.line
+' ./
+```
+
+The `string_pedigree` attribute on the dispatch node records whether the method-name string has a `literal`, `constant`, `joined`, or `tainted` provenance (GM-18.1). Queries can filter for `tainted` specifically to surface the highest-severity cases.
+
+---
+
+## Language-Primitives Worked Examples
+
+The following three worked examples show both query layers for the headline query types introduced in Q-26, Q-30, and Q-31.
+
+---
+
+### Worked Example 7: Lineage Type Reconstruction and the Type-Contradiction Bug Query
+
+**Question:** What type does the value `payload` actually carry in `RpcHandler::dispatch`, and does any value in the codebase have a reconstructed type that contradicts its declared type?
+
+This demonstrates Q-26 (lineage type reconstruction, DF-19).
+
+**Part A — Type discovery for a single value:**
+
+```bash
+cgx type-of payload ./ --at-function RpcHandler::dispatch
+```
+
+Example output (JSON):
+
+```json
+{
+  "symbol": "payload",
+  "scope": "RpcHandler::dispatch",
+  "declared_type": "interface{}",
+  "reconstructed": [
+    {
+      "candidate_type": "*Config",
+      "confidence": "probable",
+      "evidence": [
+        { "direction": "up",
+          "kind": "constructor",
+          "source": "caller.go:42: cfg := &Config{Host: \"db\"}",
+          "confidence": "certain" },
+        { "direction": "down",
+          "kind": "typed-param-sink",
+          "source": "rpc.go:17: store(payload) where store expects *Config",
+          "confidence": "probable" }
+      ]
+    }
+  ]
+}
+```
+
+The `declared_type` is `interface{}` (a type-confidence boundary per GM-14.6); the reconstructed type is `*Config / probable` based on constructor pedigree (up, `certain`) and a typed-parameter use (down, `probable`).
+
+**Part B — Codebase-wide type-contradiction query:**
+
+```bash
+cgx query '
+  MATCH (v)
+  WHERE v.declared_type IS NOT NULL
+    AND v.declared_type <> "any"
+    AND v.declared_type <> "interface{}"
+  CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
+  WHERE candidate_type IS EMPTY
+  RETURN v.name, v.file, v.line,
+         v.declared_type AS declared,
+         evidence AS contradiction_evidence
+  ORDER BY v.file, v.line
+' ./
+```
+
+An empty candidate set means no type satisfies all three directions of constraints simultaneously — the value is used in two incompatible ways. This is a class of bug that no production static analysis tool exposes as an on-demand graph query.
+
+**Variation — contradiction at a specific call site:**
+
+```bash
+cgx query '
+  MATCH (v {name:"result", scope:"Processor::run"})
+  CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
+  RETURN v.name, v.file, v.line, candidate_type, confidence
+' ./
+```
+
+---
+
+### Worked Example 8: Type-Juggling-in-Auth
+
+**Question:** Does any user-controlled value reach an authorization decision through a type coercion — a path where the value's type changes between input and auth check?
+
+This demonstrates Q-30 (coercion and type-confidence queries, DF-10 `coerce(from,to)`).
+
+**Subcommand:**
+
+```bash
+cgx paths --from-class user-input --to-class auth-check \
+          --require-transformation coerce \
+          --confidence probable \
+          --format sarif > type-juggling-auth.sarif
+```
+
+**Full query:**
+
+```bash
+cgx query '
+  MATCH path = (src)-[:DATA_FLOW*]->(coerce_edge_target)-[:DATA_FLOW*]->(sink {sink_class:"auth-check"})
+  WHERE src.source_class IN ["network","user-input"]
+    AND ANY(edge IN relationships(path)
+            WHERE edge.transformation_kind STARTS WITH "coerce")
+    AND NONE(n IN nodes(path)
+             WHERE n.sanitizer_class = "auth-check"
+               AND NOT ANY(e IN relationships(path)
+                           WHERE e.transformation_kind STARTS WITH "coerce"
+                             AND position_in(coerce_edge_target, path)
+                                 < position_in(n, path)))
+  RETURN src.name, src.file, src.line,
+         [e IN relationships(path) | e.transformation_kind] AS transforms,
+         sink.name, sink.file, sink.line,
+         length(path) AS hops
+  ORDER BY src.file, src.line
+' ./
+```
+
+The `ANY ... WHERE transformation_kind STARTS WITH "coerce"` selects paths that include at least one DF-10 `coerce(from,to)` edge. The `NONE` clause excludes paths where a sanitizer appears after the coercion. Non-empty results indicate that a user-controlled value reaches an auth decision through a type change — the value may satisfy the check through coercion rather than legitimate data.
+
+---
+
+### Worked Example 9: Metadata-Guard-Aware Authorization Bypass
+
+**Question:** Which HTTP handler entrypoints reach `db::write` on a non-exception path without any authorization guard — either a function call or a metadata annotation?
+
+This demonstrates Q-31 consuming GM-15 `guard` facts so that `@PreAuthorize`-style annotations do not generate false bypass findings.
+
+**Subcommand:**
+
+```bash
+# Step 1: find bypass paths (metadata guards satisfy the check — no false positives)
+cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
+          --to db::write \
+          --avoiding 'name:require_admin OR guard_class:*' \
+          --confidence probable \
+          --exclude-edge-condition exception \
+          --format sarif > authz-bypass.sarif
+
+# Step 2: CI gate — assert no bypass exists
+cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
+          --to db::write \
+          --avoiding 'name:require_admin OR guard_class:*' \
+          --exclude-edge-condition exception \
+          --assert-empty
+```
+
+**Full query:**
+
+```bash
+cgx query '
+  MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
+  WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+    AND NONE(n IN nodes(path)
+             WHERE n.name = "require_admin"
+                OR n.guard_class IS NOT NULL)
+  RETURN h.name, h.file, h.line,
+         sink.name, sink.file, sink.line,
+         h.framework_pack AS handler_established_by,
+         length(path) AS hops
+  ORDER BY hops, h.file, h.line
+' ./
+```
+
+**Without** the `n.guard_class IS NOT NULL` clause, every handler annotated with `@PreAuthorize` (or equivalent) would appear as a bypass because the annotation's authz check has no call in the source path. With GM-15 `guard` facts present, `guard_class` is non-null on those methods and the `NONE` predicate correctly excludes them. This is the direct answer to the false-positive problem on Spring, Django, and ASP.NET codebases.
+
+**Auditing guard coverage — which entrypoints have NO guard?**
+
+```bash
+cgx query '
+  MATCH (ep {kind:"entrypoint", entrypoint_class:"http"})
+  WHERE ep.guard_class IS NULL
+    AND ep.name NOT IN ["health_check", "favicon"]
+  RETURN ep.name, ep.file, ep.line,
+         ep.framework_pack
+  ORDER BY ep.framework_pack, ep.name
+' ./
+```
+
+Zero results means every HTTP endpoint has at least one authz annotation or call-based guard — the ∀ coverage assertion for the authz layer.
 
 ---
 

@@ -185,6 +185,39 @@ semantics and the stewardship caveat.
 SCIP ingestion is isolated to this layer and does not affect the parse or graph
 compute layers.
 
+### Type inference depth as a resolution-ladder driver
+
+The resolution ladder (docs/03-code-graph-model.md GM-5.2) is directly driven by
+the depth of type inference available at each call site. The connection is
+precise:
+
+- **Calls on receivers whose type is declared or resolved by SCIP** reach tier 2
+  (`probable` to `certain` confidence), because the receiver's type is available
+  and the callee set is narrowed by the type hierarchy.
+- **Calls on receivers with an inferred type** (Rust `let`, TypeScript variable
+  inference, Kotlin `val`, C++ `auto`) reach tier 2 when SCIP enrichment is
+  present — the SCIP index carries the inferred type. Without SCIP, the
+  resolution falls to tier 1 (scope-graph name match), emitting `probable` for a
+  unique name match and `possible` for an ambiguous one.
+- **Calls on receivers at a type-confidence boundary** (`any`, `interface{}`,
+  `dynamic`, reflection results — docs/03 GM-14.6) cannot resolve beyond `possible`
+  regardless of tier, because the receiver's type carries no constraint on callee
+  identity.
+
+The practical implication: a codebase that relies heavily on type inference but
+does not supply a SCIP index will resolve a significant fraction of calls at
+`probable` (unique name match) rather than `certain`. Supplying a SCIP index
+upgrades these to the tier 2 confidence band where the compiler's own type
+inference results are used directly.
+
+Type inference also drives lineage type reconstruction (docs/04 DF-19): when the
+reconstruction query reaches a value whose type was inferred by the compiler and
+recorded in the SCIP index, the up-direction constraint arrives as `probable`
+with the inferred type as evidence. Without SCIP, the up-direction must rely on
+constructor pedigree alone, which may be absent for values that cross
+type-confidence boundaries. See docs/05-queries.md Q-26 for the query-layer
+surface and docs/04 DF-19 for the full reconstruction specification.
+
 ---
 
 ## AR-5: Graph Compute Layer

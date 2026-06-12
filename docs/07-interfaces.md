@@ -41,6 +41,11 @@ A TUI (terminal user interface) is explicitly out of scope for v1.
 | IF-17 | MCP structured output: `structuredContent` + `outputSchema` per 2025-06-18 spec |
 | IF-18 | MCP pagination: `cursor` + `has_more` |
 | IF-19 | MCP token-efficiency: `max_results`, compact symbol IDs, `resource_link` for bulk evidence |
+| IF-20 | `paths` subcommand: must-analysis flags (`--must-pass-through`, `--avoiding`, `--quantifier`, `--including-exception-paths`, `--assert-all-reach-sink`) | 1 |
+| IF-21 | `paths` subcommand: typed-taint flags (`--from-class`, `--to-class`, `--require-sanitizer-class`, `--negate-sanitizer`, `--to-package`) | 1 |
+| IF-22 | `diff` subcommand: security-gate flags (`--new-paths-only`, `--calls-to-sink-class`) | 1 |
+| IF-23 | MCP tool: `taint_paths` | 2 |
+| IF-24 | MCP tool: `diff_security` | 2 |
 
 ---
 
@@ -476,6 +481,192 @@ Token budgets are a real constraint for AI agent contexts. `cgx mcp` implements 
 ```
 
 **Lazy schema loading.** Tool schemas are registered but the `callgraph://schema/{root}` resource is not pushed unless requested. This avoids consuming the agent's context window with schema text on every session start.
+
+---
+
+## IF-20: `paths` Must-Analysis Flags
+
+**Status: core-extension** — surface for Q-20 (must-pass-through / ∀-path) and Q-22 (acquire/release pairing). These flags extend the existing `paths` subcommand; no new subcommand is introduced.
+
+```
+cgx paths --from <symbol> --to <symbol> <path>
+          [--must-pass-through <symbol>]
+          [--avoiding <symbol>]
+          [--quantifier exists|all]
+          [--including-exception-paths]
+          [--assert-all-reach-sink]
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--must-pass-through <symbol>` | Return only paths that include the named node; with `--assert-empty` this asserts no path avoids it |
+| `--avoiding <symbol>` | Return only paths that do NOT include the named node (complement set) |
+| `--quantifier exists` | Default; returns any path satisfying the predicates (∃-path) |
+| `--quantifier all` | Applies predicates over the full path set; use with `--to` to assert all paths reach the target |
+| `--including-exception-paths` | Include exception- and panic-conditioned paths in the path set (Q-11 complement of `--exclude-edge-condition exception`) |
+| `--assert-all-reach-sink` | Exit code 1 if any path from `--from` does NOT reach any symbol in `--to`; used for acquire/release completeness assertion |
+
+`--must-pass-through` and `--avoiding` can each be repeated to apply multiple node constraints. All constraints combine as AND predicates.
+
+See `docs/05-queries.md` Q-20 and Q-22 for worked examples.
+
+---
+
+## IF-21: `paths` Typed-Taint Flags
+
+**Status: core-extension** — surface for Q-23 (typed taint queries). Adds class-based source, sink, and sanitizer selection to the `paths` subcommand.
+
+```
+cgx paths [--from-class <source-class>] [--to-class <sink-class>]
+          [--require-sanitizer-class <sanitizer-class>]
+          [--negate-sanitizer]
+          [--to-package <pkg[@version-range]>]
+          <path>
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--from-class <class>` | Restrict sources to nodes with the named source class (DF-12.1). Values: `network`, `file`, `env`, `cli`, `db`, `deserialization`, `ipc`, `secret` |
+| `--to-class <class>` | Restrict sinks to nodes with the named sink class (DF-12.2). Values: `sql`, `shell`, `path`, `html`, `header`, `redirect-url`, `format-string`, `regex`, `deserialize`, `eval`, `log`, `net-request` |
+| `--require-sanitizer-class <class>` | Restrict to paths that include (or, with `--negate-sanitizer`, exclude) a sanitizer of the named class |
+| `--negate-sanitizer` | Invert the sanitizer filter: return paths where NO matching-class sanitizer is present (the injection-finding mode) |
+| `--to-package <spec>` | Restrict sinks to symbols in the named package; `spec` may include a version constraint (`libfoo@>=1.0.0,<2.0.0`) |
+
+`--from-class` and `--to-class` traverse `DATA_FLOW` edges instead of `CALLS` edges. They require DF-11 and DF-12 to be active in the index.
+
+See `docs/05-queries.md` Q-23 and Q-25 for worked examples.
+
+---
+
+## IF-22: `diff` Security-Gate Flags
+
+**Status: core-extension** — surface for Q-25 Worked Example 6 (branch-diff security gate) and IX-9 (edge age attribution). Extends the existing `diff` subcommand.
+
+```
+cgx diff --base <ref> [--head <ref>] <path>
+         [--new-paths-only]
+         [--calls-to-sink-class <class>]
+         [--order introducing_commit]
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--new-paths-only` | Restrict diff output to edges that introduce a new source → sink path not present at the base ref |
+| `--calls-to-sink-class <class>` | Restrict diff output to new edges whose target has the named sink class; repeatable for multiple classes |
+| `--order introducing_commit` | Sort results by `introducing_commit` timestamp (newest first); requires IX-9 edge-age attributes |
+
+`--calls-to-sink-class` may be repeated. Multiple values combine as OR: `--calls-to-sink-class sql --calls-to-sink-class shell` returns new edges into either class.
+
+See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9 for full examples.
+
+---
+
+## IF-23: MCP Tool `taint_paths`
+
+**Status: core-extension** — MCP surface for Q-23 typed taint queries. Security and AI coding agents use this tool to find source → sink paths with class-matched sanitizer checking.
+
+```json
+{
+  "name": "taint_paths",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "from_class":            { "type": "string", "description": "Source class (network, file, env, cli, db, deserialization, ipc, secret)" },
+      "to_class":              { "type": "string", "description": "Sink class (sql, shell, path, html, log, eval, net-request, ...)" },
+      "root":                  { "type": "string", "description": "Repository root path" },
+      "require_sanitizer":     { "type": "boolean", "default": false, "description": "When true, return only paths WITH a matching sanitizer (coverage audit). When false (default), return paths WITHOUT a matching sanitizer (finding mode)." },
+      "sanitizer_class":       { "type": "string", "description": "Override sanitizer class; defaults to to_class" },
+      "confidence":            { "type": "string", "enum": ["certain","probable","possible"], "default": "probable" },
+      "max_results":           { "type": "integer", "default": 20 },
+      "cursor":                { "type": "string" },
+      "at":                    { "type": "string" }
+    },
+    "required": ["from_class", "to_class", "root"]
+  }
+}
+```
+
+**Example call:**
+
+```json
+{ "from_class": "network", "to_class": "sql", "root": "/workspace/myproject", "confidence": "probable" }
+```
+
+**Response** (same `structuredContent` schema as other path tools):
+
+```json
+{
+  "structuredContent": {
+    "results": [
+      {
+        "source": { "name": "http::request::body", "file": "src/handlers.rs", "line": 12 },
+        "sink":   { "name": "db::query", "file": "src/db.rs", "line": 88 },
+        "hops": 3,
+        "has_sanitizer": false,
+        "edge_conditions": ["always","always","conditional"]
+      }
+    ],
+    "has_more": false,
+    "cursor": null,
+    "graph_version": "abc1234"
+  }
+}
+```
+
+---
+
+## IF-24: MCP Tool `diff_security`
+
+**Status: core-extension** — MCP surface for the branch-diff security gate (Q-25 Worked Example 6, IX-9). Lets AI security agents query which edges and paths are new on a branch relative to a base ref, with sink-class filtering and author attribution.
+
+```json
+{
+  "name": "diff_security",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "root":               { "type": "string" },
+      "base":               { "type": "string", "description": "Base ref (branch name, commit SHA, or 'main')" },
+      "head":               { "type": "string", "default": "HEAD" },
+      "sink_classes":       { "type": "array", "items": { "type": "string" }, "description": "Sink classes to filter new edges by (e.g. [\"sql\",\"shell\"])" },
+      "new_paths_only":     { "type": "boolean", "default": true },
+      "max_results":        { "type": "integer", "default": 20 },
+      "cursor":             { "type": "string" }
+    },
+    "required": ["root", "base"]
+  }
+}
+```
+
+**Example call:**
+
+```json
+{ "root": "/workspace/myproject", "base": "main", "sink_classes": ["sql","shell","eval"] }
+```
+
+**Response:**
+
+```json
+{
+  "structuredContent": {
+    "new_edges": [
+      {
+        "caller": { "name": "api::handler", "file": "src/api.rs", "line": 55 },
+        "sink":   { "name": "db::execute", "file": "src/db.rs", "line": 22, "sink_class": "sql" },
+        "introducing_commit": "a3f92b1",
+        "introducing_author": "dev@example.com",
+        "edge_condition": "always",
+        "confidence": "certain"
+      }
+    ],
+    "has_more": false,
+    "cursor": null,
+    "graph_version": "abc1234"
+  }
+}
+```
+
+The `introducing_commit` and `introducing_author` fields come from IX-9 edge-age attribution. An AI agent can use this to identify which developer introduced a security-relevant edge and request a focused review.
 
 ---
 

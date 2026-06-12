@@ -25,6 +25,7 @@ This document specifies:
 - IX-6: Worktree model
 - IX-7: Concurrent CLI access
 - IX-8: Index location
+- IX-9: Edge age and author attribution
 
 ---
 
@@ -378,3 +379,118 @@ If the repository is cloned to a new path, a new repo-ID is computed and
 `cgx` re-indexes from scratch on first use. Transferring the cache to a new
 machine requires relocating the `~/.cache/cgx/<old-repo-id>/` directory to
 `~/.cache/cgx/<new-repo-id>/` on the destination (not automated in v1).
+
+---
+
+## IX-9: Edge Age and Author Attribution
+
+**Status: core-extension** — the blob-OID and merge-base machinery already in place (IX-1, IX-4) provides the inputs needed to attribute each call edge to the commit that introduced it. This is derivable at index time without additional git object reads on the query path.
+
+### Motivation
+
+Two motivating queries make this the single highest-value security feature in the VCS integration layer:
+
+1. **Newest edges into sensitive sinks.** Security review prioritization: "which call edges pointing to `sql`-, `shell`-, or `eval`-class sinks were introduced most recently, and by whom?" Reviewers can focus on the newest-introduced edges rather than reviewing the full reachable graph.
+
+2. **Branch-diff security gate (CI).** "Did this pull request introduce any new edge from a network-tainted source to a sensitive sink?" If `introducing_commit` on a new call edge is one of the commits in this PR, the gate fires. This is the "diff gate" question in `docs/05-queries.md` Q-25 Worked Example 6.
+
+### Derivation
+
+Edge age is derived from the content-addressed index structure (IX-1) via the per-branch merge-base machinery (IX-4):
+
+1. **Blob OID → commit OID.** Each edge in Layer 1 is keyed by the blob OID of the file that introduced it (IX-1). The git object store allows reverse-lookup of the set of commits whose trees include a given blob OID: `git log --all --find-object=<blob-oid>` returns the relevant commits. The earliest such commit (by topological order, not timestamp) is the **introducing commit** for that blob.
+
+2. **Edge-level attribution.** Within a file, the line range of the call site is known from the edge's provenance record (GM-6.1). `git blame --porcelain -L <line>,<line> <file>` returns the commit and author that last changed that line. At index time, `cgx` runs blame on the call-site lines for new blobs and stores the result in the Layer 1 entry.
+
+3. **Incremental cost.** Blame is run only for blobs that are new to the index — i.e., blobs whose OID does not appear in any prior Layer 1 entry. For unchanged blobs (cache hits), the stored attribution is reused. This keeps incremental indexing cost proportional to the number of changed files, not the total index size.
+
+4. **Merge-base scoping.** For branch-diff queries, "introduced by this branch" means: the introducing commit is reachable from the branch tip but not from the merge-base with `main` (IX-4 step 2). This is computed via `git log <merge-base>..<branch-tip> --format='%H'` and stored as the branch-introduced commit set.
+
+### Edge attributes
+
+Each call edge in the Layer 2 index gains two additional attributes when IX-9 is active:
+
+```
+introducing_commit:  string   # commit SHA where this call edge first appeared
+introducing_author:  string   # git author identity for that commit (name + email)
+```
+
+These attributes are optional: edges in blobs that were present before IX-9 was first run carry no attribution until the blob is re-indexed (i.e., until the file changes and the new blob is indexed with blame).
+
+### Query surface
+
+Both attributes are available in the full query language and as diff-subcommand filters.
+
+**Layer 1 — diff subcommand:**
+
+```bash
+# New edges into sensitive sinks introduced by this branch
+cgx diff --base main --head HEAD ./ \
+    --calls-to-sink-class sql \
+    --calls-to-sink-class shell \
+    --calls-to-sink-class eval \
+    --format sarif > new-sink-edges.sarif
+
+# Newest edges into sql sinks across all branches (review prioritization)
+cgx diff --base HEAD~30 --head HEAD ./ \
+    --calls-to-sink-class sql \
+    --order introducing_commit \
+    --format json | jq '.[] | {edge, introducing_author, introducing_commit}'
+```
+
+**Layer 2 — query language:**
+
+```cypher
+-- Newest edges into sensitive sinks, with author attribution
+MATCH (caller)-[r:CALLS]->(sink)
+WHERE sink.sink_class IN ["sql","shell","eval","log","net-request"]
+  AND r.introducing_commit IS NOT NULL
+RETURN caller.name, caller.file, caller.line,
+       sink.name, sink.sink_class,
+       r.introducing_commit, r.introducing_author
+ORDER BY r.introducing_commit DESC
+LIMIT 50
+
+-- Branch-diff gate: edges introduced by this PR's commits
+MATCH (caller)-[r:CALLS]->(sink {sink_class:"sql"})
+WHERE r.introducing_commit IN $pr_commits
+RETURN caller.name, caller.file, caller.line,
+       sink.name,
+       r.introducing_commit, r.introducing_author
+```
+
+### Interaction with IX-4 (branch-diff)
+
+The edge-age attribute and the branch edge-set diff (IX-4) answer related but distinct questions:
+
+| Question | Mechanism |
+|----------|-----------|
+| Which edges are structurally new on this branch (not present at merge-base)? | IX-4 edge-set difference: present at branch tip, absent at merge-base |
+| Which edge was introduced by a specific commit? | IX-9 `introducing_commit` attribute on the edge |
+| Which author introduced a specific edge? | IX-9 `introducing_author` attribute |
+
+An edge that is structurally new (IX-4) typically also has `introducing_commit` pointing to a commit on this branch. However, an edge may be new on this branch but have an `introducing_author` from a prior branch (e.g. a cherry-pick). Both attributes are stored and queryable independently.
+
+### CI integration
+
+The branch-diff security gate (docs/05-queries.md, Worked Example 6) combines IX-4 (which edges are new) with IX-9 (which commit introduced each new edge) to produce annotated SARIF findings:
+
+```yaml
+- name: Security diff gate
+  run: |
+    PR_COMMITS=$(git log origin/main..HEAD --format='%H')
+    cgx diff --base origin/main --head HEAD ./ \
+        --calls-to-sink-class sql \
+        --calls-to-sink-class shell \
+        --calls-to-sink-class eval \
+        --assert-empty \
+        --format sarif > security-diff.sarif
+  continue-on-error: false
+
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: security-diff.sarif
+```
+
+Each SARIF finding carries `introducing_author` in the `properties` bag, enabling GitHub's code-scanning UI to assign the finding to the commit author for review.

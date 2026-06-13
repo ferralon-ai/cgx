@@ -236,3 +236,209 @@ fn unused_reports_orphan() {
         "orphan is unused: {out}"
     );
 }
+
+// --- cgx doctor integration tests ---
+
+#[test]
+fn doctor_reports_on_indexed_repo() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["doctor"]);
+    assert_eq!(code, 0, "doctor should exit 0: {out}");
+    // The human report must contain some basic quality fields.
+    assert!(
+        out.contains("nodes:") || out.contains("Nodes:") || out.contains("node"),
+        "doctor output mentions nodes: {out}"
+    );
+    assert!(
+        out.contains("trust") || out.contains("Trust"),
+        "doctor output mentions trust: {out}"
+    );
+}
+
+#[test]
+fn doctor_json_format_is_valid_json() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor --format json should exit 0: {out}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out).expect("doctor --format json must emit valid JSON");
+    // The JSON report should carry node_count and trust fields.
+    assert!(
+        parsed.get("node_count").is_some(),
+        "JSON report has node_count: {out}"
+    );
+    assert!(
+        parsed.get("trust").is_some(),
+        "JSON report has trust: {out}"
+    );
+}
+
+#[test]
+fn doctor_without_index_is_graph_error_exit_3() {
+    let (_tmp, repo) = fixture_repo();
+    // No `cgx index` run.
+    let (_out, code) = run_cgx(&repo, &["doctor"]);
+    assert_eq!(code, 3, "doctor on un-indexed repo → exit 3");
+}
+
+// --- cgx diff integration tests ---
+
+/// Create a two-commit fixture repo where the second commit adds a new function
+/// that calls `beta`, so the diff has at least one added edge.
+fn two_commit_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = fixture_repo(); // first commit: main→alpha→beta + orphan
+
+    // Second commit: add a new caller `gamma` that also calls `beta`.
+    let main_v2 = "\
+mod helper;
+
+fn main() {
+    alpha();
+    gamma();
+}
+
+fn alpha() {
+    helper::beta();
+}
+
+fn orphan() {
+    helper::beta();
+}
+
+fn gamma() {
+    helper::beta();
+}
+";
+    std::fs::write(repo.join("src/main.rs"), main_v2).unwrap();
+    git(&repo, &["add", "src/main.rs"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "add gamma",
+            "--date=2020-01-02T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+#[test]
+fn diff_two_commits_shows_added_edges() {
+    let (_tmp, repo) = two_commit_fixture();
+    let (out, code) = run_cgx(&repo, &["diff", "HEAD~1", "HEAD"]);
+    assert_eq!(code, 0, "diff should exit 0: {out}");
+    // The diff must report at least one added edge or node for `gamma`.
+    assert!(
+        out.contains("+ edge") || out.contains("+ node"),
+        "diff HEAD~1 HEAD should show additions: {out}"
+    );
+}
+
+#[test]
+fn diff_same_commit_shows_no_diff() {
+    let (_tmp, repo) = fixture_repo();
+    let (out, code) = run_cgx(&repo, &["diff", "HEAD", "HEAD"]);
+    assert_eq!(code, 0, "diff HEAD HEAD should exit 0: {out}");
+    assert!(
+        out.contains("(no diff)"),
+        "diff of same commit should be empty: {out}"
+    );
+}
+
+#[test]
+fn diff_newer_than_shows_only_added_edges() {
+    let (_tmp, repo) = two_commit_fixture();
+    let (out, code) = run_cgx(&repo, &["diff", "HEAD~1", "HEAD", "--newer-than"]);
+    assert_eq!(code, 0, "--newer-than should exit 0: {out}");
+    // Must not report removed or changed edges.
+    assert!(
+        !out.contains("- edge"),
+        "newer-than must not show removed edges: {out}"
+    );
+    assert!(
+        !out.contains("~ edge"),
+        "newer-than must not show changed edges: {out}"
+    );
+}
+
+#[test]
+fn diff_json_format_is_valid_json() {
+    let (_tmp, repo) = two_commit_fixture();
+    let (out, code) = run_cgx(&repo, &["diff", "HEAD~1", "HEAD", "--format", "json"]);
+    assert_eq!(code, 0, "diff --format json should exit 0: {out}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out).expect("diff --format json must emit valid JSON");
+    assert!(
+        parsed.get("added_edges").is_some(),
+        "JSON diff has added_edges: {out}"
+    );
+}
+
+// --- cgx mcp integration tests ---
+
+#[test]
+fn mcp_initialize_responds_and_exits_on_eof() {
+    // Pipe a single initialize request and expect a valid JSON-RPC response.
+    let initialize_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    let out = Command::new(cargo_bin("cgx"))
+        .args(["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.take() {
+                let mut s = stdin;
+                let _ = writeln!(s, "{initialize_msg}");
+                // Drop stdin to signal EOF.
+                drop(s);
+            }
+            child.wait_with_output()
+        })
+        .expect("run cgx mcp");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    // The server must respond with a valid JSON-RPC result.
+    assert!(
+        stdout.contains(r#""id":1"#) || stdout.contains(r#""id": 1"#),
+        "mcp initialize response has id=1: {stdout}"
+    );
+    assert!(
+        stdout.contains("protocolVersion"),
+        "mcp initialize response has protocolVersion: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_tools_list_returns_tools() {
+    let list_msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+    let out = Command::new(cargo_bin("cgx"))
+        .args(["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.take() {
+                let mut s = stdin;
+                let _ = writeln!(s, "{list_msg}");
+                drop(s);
+            }
+            child.wait_with_output()
+        })
+        .expect("run cgx mcp tools/list");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("callers") || stdout.contains("tools"),
+        "mcp tools/list response mentions tools: {stdout}"
+    );
+}

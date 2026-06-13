@@ -15,17 +15,19 @@ use std::process::ExitCode as ProcExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use cgx_core::{NodeId, SymbolKind, SymbolPattern};
+use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path};
+use cgx_mcp::ServerConfig;
 use cgx_query::{
     callees, callers, paths as query_paths, reaches, unused, EdgeFilter, GraphView, PathWalker,
 };
-use cgx_store::{FactStore, SqliteStore};
+use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::output::{render, Format, ResultSet};
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{db_path, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -77,6 +79,37 @@ enum Command {
         kind: Option<KindArg>,
         #[command(flatten)]
         query: QueryArgs,
+    },
+    /// Report on the quality of the current on-disk index.
+    Doctor {
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Diff the call graph between two git refs.
+    Diff {
+        /// The base ref (e.g. `main`, `HEAD~1`, a tag, or a commit SHA).
+        base: String,
+        /// The head ref (e.g. `HEAD`).
+        head: String,
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+        /// Show only edges added at head but absent at base (edges newer than base).
+        #[arg(long)]
+        newer_than: bool,
+    },
+    /// Start the MCP STDIO server (docs/07 IF-9).
+    Mcp {
+        /// Default repository root injected into tool calls that omit it.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
@@ -171,6 +204,17 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Reaches { from, to, query } => run_reaches(&from, to.as_deref(), query),
         Command::Paths { from, to, query } => run_paths(&from, &to, query),
         Command::Unused { kind, query } => run_unused(kind, query),
+        Command::Doctor { repo, format } => run_doctor(repo, format),
+        Command::Diff {
+            base,
+            head,
+            repo,
+            format,
+            newer_than,
+        } => run_diff(&base, &head, repo, format, newer_than),
+        Command::Mcp { root } => {
+            cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
+        }
     }
 }
 
@@ -392,6 +436,229 @@ fn assertion_message(code: ExitCode) -> String {
         ExitCode::Vacuous => "assertion passed vacuously (exit 4)".into(),
         _ => "assertion outcome".into(),
     }
+}
+
+fn run_doctor(repo: Option<PathBuf>, format: Format) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+    let ptr = read_pointer(&repo_root)?;
+    let store = open_store(&repo_root)?;
+    let rep = cgx_doctor::report(&store, GraphId(ptr.graph_id))
+        .map_err(|e| CliError::graph(format!("reading graph: {e}")))?;
+    match format {
+        Format::Json => println!(
+            "{}",
+            cgx_doctor::render_json(&rep)
+                .map_err(|e| CliError::graph(format!("rendering doctor json: {e}")))?
+        ),
+        _ => println!("{}", cgx_doctor::render_text(&rep)),
+    }
+    Ok(())
+}
+
+/// Index a single git ref into the store, returning its graph id.
+///
+/// Uses `git worktree add --detach` to materialize the commit tree, calls
+/// `index_path` against it (blob-OID cache hits are free), then removes the
+/// worktree. The shared `store` accumulates both graphs so `diff_trees` can
+/// read them.
+fn index_ref(
+    repo_root: &Path,
+    commit_hex: &str,
+    store: &mut SqliteStore,
+) -> Result<GraphId, CliError> {
+    let tmp = tempfile::Builder::new()
+        .prefix("cgx-diff-")
+        .tempdir()
+        .map_err(|e| CliError::graph(format!("creating temp dir: {e}")))?;
+    let worktree_path = tmp.path().to_path_buf();
+
+    // Materialize the commit's tree into a linked worktree.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            worktree_path.to_str().unwrap_or("."),
+            commit_hex,
+        ])
+        .status()
+        .map_err(|e| CliError::graph(format!("running git worktree add: {e}")))?;
+    if !status.success() {
+        return Err(CliError::graph(format!(
+            "git worktree add failed for {commit_hex}"
+        )));
+    }
+
+    let registry = default_registry();
+    let outcome = index_path(&worktree_path, &registry, store)
+        .map_err(|e| CliError::graph(format!("indexing ref {commit_hex}: {e}")))?;
+
+    // Remove the worktree before returning (cleanup regardless of index result).
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or("."),
+        ])
+        .status();
+
+    Ok(outcome.graph_id)
+}
+
+fn run_diff(
+    base: &str,
+    head: &str,
+    repo: Option<PathBuf>,
+    format: Format,
+    newer_than: bool,
+) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+
+    // Open (or create) the shared on-disk store for this diff session.
+    // We create a fresh in-memory store so the two indexed snapshots don't
+    // pollute the user's on-disk index.
+    let db_file = db_path(&repo_root);
+    std::fs::create_dir_all(cgx_dir(&repo_root))
+        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    let mut store =
+        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+
+    let blame = BlameRepo::discover(&repo_root)
+        .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
+    let base_commit = blame
+        .resolve_commit(base)
+        .map_err(|e| CliError::usage(format!("resolving base ref {base:?}: {e}")))?;
+    let head_commit = blame
+        .resolve_commit(head)
+        .map_err(|e| CliError::usage(format!("resolving head ref {head:?}: {e}")))?;
+
+    let base_id = index_ref(&repo_root, &base_commit, &mut store)?;
+    let head_id = index_ref(&repo_root, &head_commit, &mut store)?;
+
+    let diff = cgx_diff::diff_trees(&store, base_id, head_id)
+        .map_err(|e| CliError::graph(format!("diffing trees: {e}")))?;
+
+    if newer_than {
+        // Show only added edges.
+        print_diff_newer_than(&diff, format);
+    } else {
+        print_diff_full(&diff, format);
+    }
+
+    Ok(())
+}
+
+fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
+    match format {
+        Format::Json => {
+            let doc = serde_json::json!({
+                "added_edges": diff.added_edges.iter().map(diff_edge_json).collect::<Vec<_>>(),
+                "removed_edges": diff.removed_edges.iter().map(diff_edge_json).collect::<Vec<_>>(),
+                "changed_edges": diff.changed_edges.iter().map(changed_edge_json).collect::<Vec<_>>(),
+                "added_nodes": diff.added_nodes.iter().map(diff_node_json).collect::<Vec<_>>(),
+                "removed_nodes": diff.removed_nodes.iter().map(diff_node_json).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).expect("diff json serializes")
+            );
+        }
+        _ => {
+            for e in &diff.added_edges {
+                println!(
+                    "+ edge  {}  ->  {}  ({})",
+                    e.identity.src_fqn, e.identity.dst_fqn, e.identity.file
+                );
+            }
+            for e in &diff.removed_edges {
+                println!(
+                    "- edge  {}  ->  {}  ({})",
+                    e.identity.src_fqn, e.identity.dst_fqn, e.identity.file
+                );
+            }
+            for e in &diff.changed_edges {
+                println!(
+                    "~ edge  {}  ->  {}  ({})",
+                    e.identity.src_fqn, e.identity.dst_fqn, e.identity.file
+                );
+            }
+            for n in &diff.added_nodes {
+                println!("+ node  {}", n.record.fqn);
+            }
+            for n in &diff.removed_nodes {
+                println!("- node  {}", n.record.fqn);
+            }
+            if diff.added_edges.is_empty()
+                && diff.removed_edges.is_empty()
+                && diff.changed_edges.is_empty()
+                && diff.added_nodes.is_empty()
+                && diff.removed_nodes.is_empty()
+            {
+                println!("(no diff)");
+            }
+        }
+    }
+}
+
+fn print_diff_newer_than(diff: &cgx_diff::GraphDiff, format: Format) {
+    match format {
+        Format::Json => {
+            let doc = serde_json::json!({
+                "added_edges": diff.added_edges.iter().map(diff_edge_json).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).expect("diff json serializes")
+            );
+        }
+        _ => {
+            for e in &diff.added_edges {
+                println!(
+                    "+ edge  {}  ->  {}  ({})",
+                    e.identity.src_fqn, e.identity.dst_fqn, e.identity.file
+                );
+            }
+            if diff.added_edges.is_empty() {
+                println!("(no new edges)");
+            }
+        }
+    }
+}
+
+fn diff_edge_json(e: &cgx_diff::DiffEdge) -> serde_json::Value {
+    serde_json::json!({
+        "src": e.identity.src_fqn,
+        "dst": e.identity.dst_fqn,
+        "file": e.identity.file,
+        "kind": format!("{:?}", e.identity.edge_kind),
+    })
+}
+
+fn changed_edge_json(e: &cgx_diff::ChangedEdge) -> serde_json::Value {
+    serde_json::json!({
+        "src": e.identity.src_fqn,
+        "dst": e.identity.dst_fqn,
+        "file": e.identity.file,
+        "kind": format!("{:?}", e.identity.edge_kind),
+        "changes": {
+            "condition": e.changes.condition,
+            "confidence": e.changes.confidence,
+            "tier": e.changes.tier,
+        }
+    })
+}
+
+fn diff_node_json(n: &cgx_diff::DiffNode) -> serde_json::Value {
+    serde_json::json!({
+        "fqn": n.record.fqn,
+        "file": n.record.file,
+    })
 }
 
 // --- shared plumbing ---------------------------------------------------------

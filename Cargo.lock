@@ -158,6 +158,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-lang-rust"
+version = "0.1.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "smallvec",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
+name = "cgx-lang-ts"
+version = "0.1.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "serde",
+ "serde_yaml",
+ "smallvec",
+ "tree-sitter",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "cgx-resolve"
+version = "0.1.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "proptest",
+ "smallvec",
+]
+
+[[package]]
 name = "cgx-store"
 version = "0.1.0"
 dependencies = [

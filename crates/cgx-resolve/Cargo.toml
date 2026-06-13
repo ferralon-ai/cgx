@@ -1,0 +1,16 @@
+[package]
+name = "cgx-resolve"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx shared cross-file resolution: builds a symbol table from per-file FileFacts, links references to definitions, and emits a confidence-tiered linked graph with candidate sets and cut markers."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-frontend = { path = "../cgx-frontend" }
+smallvec.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

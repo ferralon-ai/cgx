@@ -81,32 +81,9 @@ cgx query '
 
 ### Q48 — Which feature-flag branches are permanently dead given that flag `LEGACY_AUTH` is always false?
 
-**Personas:** SSE · **Status:** needs-schema-room-feature (GM-19 build-configuration variance)
+**Personas:** SSE · **Status:** not answerable as specced — requires branch-predicate modeling (no feature; see docs/05 'graph reachability, not path feasibility')
 
-When a feature flag is statically known to be always false, all code guarded exclusively by that flag is unreachable. This question finds those dead branches before they accumulate over time.
-
-**The query**
-
-```cgx
--- illustrative: requires GM-19 (schema-room)
-cgx query '
-  MATCH (fn)
-  WHERE fn.cfg_condition = "LEGACY_AUTH"
-    AND fn.cfg_value = false
-  RETURN fn.name, fn.file, fn.line,
-         fn.cfg_condition AS dead_flag
-  ORDER BY fn.file, fn.line
-' ./
-```
-
-**Breaking it down**
-
-| Fragment | What it means |
-|---|---|
-| `fn.cfg_condition = "LEGACY_AUTH"` | The node is guarded by the named compile-time flag (GM-19 `cfg-condition` attribute). |
-| `fn.cfg_value = false` | The flag evaluates to false in the default configuration, making this branch permanently dead. |
-
-**Reading the result** — Returned nodes are only compiled in when `LEGACY_AUTH` is true. Because the flag is always false in the production build, these are effectively dead. GM-19 must be populated before this query runs.
+Determining which branches are permanently dead because a runtime flag is always false requires reasoning about runtime values flowing into branch conditions. `cgx` reports graph reachability, not path feasibility; branch predicates are not modelled at the call-graph level (docs/01 non-goals, docs/05 feasibility boundary). The adjacent answerable question — which nodes exist only under a *build-time* configuration flag — is Q126 / GM-19, which stays answerable.
 
 ---
 
@@ -219,31 +196,9 @@ cgx query '
 
 ### Q52 — Which branches of `switch`/`match` statements on enum type `OrderStatus` are unreachable given actual call sites?
 
-**Personas:** SSE · **Status:** needs-schema-room-feature (GM-19 build-configuration variance)
+**Personas:** SSE · **Status:** not answerable as specced — requires branch-predicate modeling (no feature; see docs/05 'graph reachability, not path feasibility')
 
-A `match` arm that no actual call site ever exercises is dead code at the branch level. This is finer-grained than function-level dead code: the function is reachable, but specific variant arms within it never fire.
-
-**The query**
-
-```cgx
--- illustrative: requires GM-19 (schema-room)
-cgx query '
-  MATCH (branch {kind:"match-arm", enum_type:"OrderStatus"})
-  WHERE NOT ()-[:CALLS*]->(branch)
-  RETURN branch.name, branch.variant, branch.file, branch.line
-  ORDER BY branch.file, branch.line
-' ./
-```
-
-**Breaking it down**
-
-| Fragment | What it means |
-|---|---|
-| `kind:"match-arm"` | Targets individual arms of a `match`/`switch` statement, not the whole function. |
-| `enum_type:"OrderStatus"` | Scope to arms that match on the `OrderStatus` enum specifically. |
-| `NOT ()-[:CALLS*]->(branch)` | No execution path reaches this arm. |
-
-**Reading the result** — Each returned row is a `match` arm that is structurally present but never triggered. This may indicate a removed feature (the variant was deleted from call sites but the arm was forgotten) or an impossible variant in the current data model. GM-19 schema population is needed for branch-level reachability attribution.
+Determining which `match` arms are unreachable given the actual values supplied at call sites requires reasoning about argument values flowing into the scrutinee — that is, path feasibility under argument-value constraints. `cgx` reports graph reachability, not path feasibility; branch predicates and runtime values are not modelled at the call-graph level (docs/01 non-goals, docs/05 feasibility boundary).
 
 ---
 

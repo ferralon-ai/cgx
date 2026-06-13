@@ -84,8 +84,9 @@ On every `cgx` invocation (query or explicit index command):
 
 3. **Incremental re-index**: re-analyze only the changed blob OIDs in parallel
    (rayon thread pool — see AR-6). Each blob is independent; Layer 1 writes are
-   batch-committed in a single storage transaction. Then recompute the Layer 2
-   cross-file graph.
+   batch-committed in a single storage transaction. Then recompute the Layer-2
+   cross-file graph **by relinking cached Layer-1 facts** (no reparse of unchanged
+   blobs); target includes this relink (<500ms for 1–20 changed files at 100k LOC).
 
 4. **Answer query**: the index now reflects HEAD; execute the query.
 
@@ -133,6 +134,32 @@ is more predictable for CI use and avoids stale in-memory facts from prior
 
 There is no option to refuse queries when the working tree is dirty; that would
 be the worst UX for interactive use.
+
+### MCP overlay lifetime
+
+When `cgx` runs as an MCP STDIO server (`cgx mcp`), the `--include-dirty`
+semantics are extended to a per-tool-call overlay lifetime:
+
+- **On each tool call with `include_dirty: true`** (the MCP default — see
+  docs/07-interfaces.md IF-9): enumerate dirty files via `gix status`, compute a
+  synthetic blob OID for each using the same SHA computation as git, build or reuse
+  Layer-1 facts for those OIDs, and compute a Layer-2 overlay delta for the query.
+  Nothing is written to the persistent index (the IX-3 never-persisted invariant
+  is preserved).
+- **In-process memoization**: the MCP process may cache overlay Layer-1 facts keyed
+  by synthetic blob OID. Because the key is content-addressed, reuse across tool
+  calls is automatically correct — a further edit changes the OID and misses the
+  cache. This makes call N+1 on an unchanged dirty tree cheap without any
+  session/staleness protocol.
+- **Result honesty**: `structuredContent` gains `"dirty": bool` and
+  `"dirty_files_analyzed": int`; `graph_version` becomes
+  `"<tree-oid>+dirty.<overlay-digest>"` when the overlay is active, where
+  `overlay-digest` is a deterministic hash of the sorted synthetic OIDs — so agents
+  (and caches keyed by `(query, graph_version)`) can distinguish bases.
+- **MCP tools default to `include_dirty: true`; the CLI default remains
+  committed-state-only.** This divergence is principled: agents editing and then
+  immediately verifying via MCP tool calls receive post-edit truth by default; CI
+  pipelines invoking the CLI get the predictable committed-state default.
 
 ---
 

@@ -2,10 +2,13 @@
 
 ## Vision
 
-`cgx` makes the call graph of a Rust codebase a first-class queryable artifact.
+`cgx` makes the call graph of a codebase a first-class queryable artifact —
+general-purpose across programming languages via a tiered adapter model (LS-1),
+implemented in Rust. Launch Tier-1 adapters: Rust and TypeScript/JavaScript; the
+tier system adds languages incrementally.
 Software engineers, security engineers, and AI coding/security agents ask structural
-and dataflow questions about source code; `cgx` answers them with file:line evidence
-in milliseconds, from the command line or over MCP.
+and dataflow questions about source code; `cgx` answers them with file:line evidence,
+sub-second for indexed structural queries, from the command line or over MCP.
 
 The tool fills a gap that existing tools leave open:
 
@@ -15,12 +18,12 @@ The tool fills a gap that existing tools leave open:
 - Dependency-level reachability tools (Endor Labs, Govulncheck) stop at the package
   boundary; they do not resolve internal call chains.
 - AI coding context tools (Aider repo-map, CIE MCP) provide call-graph summaries but
-  carry no edge condition labels (happy vs. exception), no graph diff, and no Rust
-  support.
+  carry no edge condition labels (happy vs. exception), no graph diff, and no
+  Rust-or-TypeScript-deep support.
 
 `cgx` answers questions that no existing tool serves: exception-path-only reachability,
 graph diff between commits or branches, negative path constraints, and MCP-queryable
-internal call chains for Rust.
+internal call chains.
 
 ---
 
@@ -48,9 +51,9 @@ query, `cgx` produces the same output, always.
 
 ### Fast startup and response
 
-`cgx` targets sub-second response for indexed queries on codebases up to several
-hundred thousand lines. The index is pre-built; query execution reads from the stored
-graph, not from re-parsing source.
+`cgx` delivers sub-second responses for indexed structural queries; heavier query
+classes carry separate measured budgets (docs/09 AR-11). The index is pre-built;
+query execution reads from the stored graph, not from re-parsing source.
 
 ### Index fully auto-managed; explicit override commands available
 

@@ -27,6 +27,14 @@ This document specifies:
 - FW-5: Build-configuration variance
 - FW-6: Reflection packs
 
+**Launch scope (ADR-09).** Built-in framework packs ship for the Tier-1 launch
+languages: tokio/axum/serde (Rust) and Express/Node + one TypeScript web framework
+(NestJS). Spring (Java), Flask/Django (Python), Rails (Ruby), and packs for other
+non-launch languages are `Status: roadmap` — their pack entries are specified below
+as worked mappings (for design completeness and future implementation), but are not
+built-in at launch. Worked-mapping tables for roadmap-language frameworks remain in
+this document as specifications; each roadmap section carries a status note.
+
 The graph primitives that these features lower to are defined in
 docs/03-code-graph-model.md (GM-15 through GM-19). This document maps framework
 constructs onto those primitives; it does not redefine them.
@@ -275,6 +283,18 @@ symbol nodes for the generated members, following the generation rules declared
 in the pack (e.g. Lombok `@Getter` on field `String name` → method `getName()`).
 These synthetic nodes carry `macro_origin` = the generator name (GM-14.5).
 
+**Rust proc-macro split (ADR-07).** For Rust `#[derive(...)]` and attribute macros:
+
+- **Annotation-derived facts (works unexpanded, Phase 1):** `#[derive(Serialize)]`
+  on a type → `generated-member`/keep-alive facts on the annotated type; the
+  derived method signatures are predicted from the pack rule (not expanded). These
+  facts are available at Phase 1 without expansion.
+- **Generated-body call edges (unexpanded-macro blind spot until `--rust-expand`):**
+  call edges *into* or *within* the generated method bodies (e.g., the `serialize`
+  impl body) are absent until `cgx index --rust-expand` is used. Each affected call
+  site emits an `unexpanded-macro` cut-marker (GM-5.3, Status: core-extension,
+  Phase 1) so the gap is auditable.
+
 Concrete examples:
 
 | Ecosystem | Annotation / attribute | Generated members |
@@ -335,6 +355,8 @@ belongs to, the confidence, and the resulting graph fact or edge modification.
 
 ### FW-3.1 — Spring (Java)
 
+**Status: roadmap** — Java is a planned Tier-1 language (not a launch language per ADR-09). This is the most complete worked mapping and serves as the design specification for when the Java adapter ships.
+
 Spring is the canonical annotation-heavy framework: security, transactions, async,
 caching, scheduling, and messaging are all annotation-driven. This is the most
 complete worked mapping.
@@ -394,6 +416,8 @@ complete worked mapping.
 
 ### FW-3.2 — Flask and Django (Python)
 
+**Status: roadmap** — Python is a planned Tier-1 language (not a launch language per ADR-09). This worked mapping is the design specification for when the Python adapter ships.
+
 Python web frameworks use decorators and URL-config for entrypoints; security is
 decorator-driven.
 
@@ -419,6 +443,8 @@ decorator-driven.
 | URL-to-view mapping in `urls.py` | `entrypoint` | `probable` | Config-file pack entry; `probable` because URL routing is dynamic at load time |
 
 ### FW-3.3 — ASP.NET Core (C#)
+
+**Status: roadmap** — C# is a planned Tier-1 language (not a launch language per ADR-09). This worked mapping is the design specification for when the C# adapter ships.
 
 ASP.NET attributes decorate controller actions. The security model uses attribute-based
 authorization filters evaluated before the action body executes.
@@ -475,6 +501,8 @@ constructor parameters at module startup — the canonical mediated-edge scenari
 
 ### FW-3.5 — tokio and actix-web (Rust)
 
+**Status: core-extension (launch pack)** — Rust is a Tier-1 launch language (ADR-09). This section is a Phase-1 implementation commitment; tokio/axum/serde/actix-web packs ship built-in at launch.
+
 Rust async frameworks use procedural macro attributes. Most Rust metadata is
 compile-time and fully statically verifiable — pack entries for Rust carry
 `confidence = "certain"` in almost all cases.
@@ -501,7 +529,7 @@ compile-time and fully statically verifiable — pack entries for Rust carry
 | `#[serde(rename = "x")]`, `#[serde(skip)]`, `#[serde(default)]` | `keep-alive` | `certain` | serde accesses this field; suppress dead-member finding |
 | `#[serde(skip_serializing_if = "Option::is_none")]` | `keep-alive` | `certain` | Field accessed by generated serializer |
 
-**Confidence note for Rust.** Rust procedural macros are evaluated at compile time by the compiler. Their effects are fully visible to `cgx` via the expanded AST (or via SCIP, which reflects the post-expansion graph). For this reason, pack entries for Rust attributes carry `certain` confidence except where the semantics depend on runtime registration (e.g. actix's `App::service` registration).
+**Confidence note for Rust.** Rust procedural macros are evaluated at compile time by the compiler. Their annotation-derived facts (entrypoints, generated-member class, keep-alive) are harvested unexpanded and carry `certain` confidence. Generated-body call edges within derived implementations (e.g., the body of `serialize()`) are a proc-macro blind spot until `cgx index --rust-expand` is used; affected call sites emit an `unexpanded-macro` cut-marker (GM-5.3). SCIP enrichment (Phase 2) provides the post-expansion graph and resolves these edges at `certain` confidence when available.
 
 ---
 

@@ -129,8 +129,9 @@ main::process_request
 | 1 | CI assertion failed: `--assert-empty` fired (results found when none expected), or `--assert-count` / `--assert-max` threshold exceeded |
 | 2 | Query parse error or invalid flag combination |
 | 3 | Graph error: index missing, corrupt, or build failed |
+| 4 | Assertion vacuously satisfied: the gate passed but matched zero symbols or filters excluded all candidate results; see IF-5. Suppress with `--allow-vacuous`. |
 
-Exit code 1 is the CI-gate signal. Exit codes 2 and 3 indicate tool or configuration problems, not result conditions.
+Exit code 1 is the CI-gate signal. Exit codes 2 and 3 indicate tool or configuration problems, not result conditions. Exit code 4 indicates a vacuous pass — the assertion matched nothing, which is itself a warning condition (see IF-5).
 
 ### IF-5: CI assertion mode
 
@@ -153,6 +154,19 @@ cgx unused ./ --kind method --confidence certain \
 ```
 
 These flags compose with any subcommand. When `--assert-empty` fires, output is still written (to stdout or `--output <file>`); the exit code signals the assertion result.
+
+#### Vacuity guard
+
+**Definition (vacuous pass):** an `--assert-empty` assertion passed AND at least one of:
+
+- **(a) Zero-symbol match:** the `--from`/`--to`/symbol pattern resolved to zero matching symbols.
+- **(b) Filter exclusion:** confidence/edge-condition filters excluded every result the same query returns unfiltered (unfiltered count > 0, filtered count = 0). The unfiltered count is computed by re-running the (cheap, linear) reachability/cut test without the filters — never by path enumeration.
+
+**Default behavior:** a vacuous pass exits with **code 4** ("assertion vacuously satisfied") unless `--allow-vacuous` is given. With `--allow-vacuous`, the tool exits 0 and emits a stderr warning; JSON/`structuredContent` output includes `"vacuous": true`; SARIF output carries a `note`-level result.
+
+**`--assert-count N` / `--assert-max N`:** receive clause (a) only (zero-symbol match is always suspicious); clause (b) does not apply to count assertions.
+
+**Warning (confidence narrowing):** confidence filters such as `--confidence certain` narrow the assertion gate toward false safety. Before SCIP enrichment (Phase 2), almost no edge is labeled `certain`, so an `--assert-empty --confidence certain` gate passes vacuously on any pre-SCIP corpus — exit code 4 catches this. See docs/07-interfaces.md IF-9 and docs/05-queries.md Q-18.
 
 **GitHub Actions integration example:**
 
@@ -226,6 +240,8 @@ cgx mcp [--root <path>] [--log-level debug|info|warn]
 
 **Recommended v1 transport:** STDIO. SSE/HTTP transport is a v2 feature. STDIO works in Claude Code, Cursor, Continue.dev, and any MCP-compatible agent harness without network configuration.
 
+All graph-querying MCP tools accept `include_dirty: true` (the MCP default) to analyze uncommitted working-tree changes via a per-call content-addressed overlay that is never persisted to the index. The CLI `--include-dirty` flag defaults to false. See docs/06-indexing-and-vcs.md IX-3 for the overlay lifetime and memoization semantics.
+
 Configuration in Claude Code (`.mcp.json` or project settings):
 
 ```json
@@ -254,10 +270,11 @@ Execute a full query-language expression and return structured results.
     "properties": {
       "query":       { "type": "string", "description": "Cypher-subset query expression" },
       "root":        { "type": "string", "description": "Repository root path" },
-      "at":          { "type": "string", "description": "Commit ref (default: HEAD)" },
-      "max_results": { "type": "integer", "default": 20 },
-      "cursor":      { "type": "string", "description": "Pagination cursor from prior call" },
-      "format":      { "type": "string", "enum": ["json", "jsonl"], "default": "json" }
+      "at":            { "type": "string", "description": "Commit ref (default: HEAD)" },
+      "include_dirty": { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" },
+      "max_results":   { "type": "integer", "default": 20 },
+      "cursor":        { "type": "string", "description": "Pagination cursor from prior call" },
+      "format":        { "type": "string", "enum": ["json", "jsonl"], "default": "json" }
     },
     "required": ["query", "root"]
   }
@@ -282,10 +299,14 @@ Execute a full query-language expression and return structured results.
     "has_more": false,
     "cursor": null,
     "graph_version": "abc1234",
+    "dirty": false,
+    "dirty_files_analyzed": 0,
     "total_matched": 1
   }
 }
 ```
+
+When `include_dirty: true` and uncommitted changes are present, `graph_version` takes the form `"<tree-oid>+dirty.<overlay-digest>"` where `overlay-digest` is a deterministic hash of the sorted synthetic OIDs for the dirty files analyzed. `dirty` is `true` and `dirty_files_analyzed` reports the count of analyzed dirty files.
 
 The `structuredContent` field is the canonical structured result. For backward compatibility with clients that only consume `TextContent`, the server also serializes the same data as the `content` array entry.
 
@@ -304,7 +325,8 @@ The `structuredContent` field is the canonical structured result. For backward c
       "cursor":          { "type": "string" },
       "edge_condition":  { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
       "confidence":      { "type": "string", "enum": ["certain","probable","possible"] },
-      "at":              { "type": "string" }
+      "at":              { "type": "string" },
+      "include_dirty":   { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["symbol", "root"]
   }
@@ -337,7 +359,8 @@ Same schema as `callers` with identical parameters. Returns symbols the named sy
       "exclude_edge_condition":  { "type": "string" },
       "only_edge_condition":     { "type": "string" },
       "cursor":                  { "type": "string" },
-      "at":                      { "type": "string" }
+      "at":                      { "type": "string" },
+      "include_dirty":           { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["from", "to", "root"]
   }
@@ -370,7 +393,8 @@ Same schema as `callers` with identical parameters. Returns symbols the named sy
       "entrypoint":     { "type": "string" },
       "confidence":     { "type": "string", "enum": ["certain","probable"] },
       "max_results":    { "type": "integer", "default": 20 },
-      "cursor":         { "type": "string" }
+      "cursor":         { "type": "string" },
+      "include_dirty":  { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["root"]
   }
@@ -387,9 +411,10 @@ Returns the full provenance record for a single symbol: definition location, cal
   "inputSchema": {
     "type": "object",
     "properties": {
-      "symbol": { "type": "string" },
-      "root":   { "type": "string" },
-      "at":     { "type": "string" }
+      "symbol":        { "type": "string" },
+      "root":          { "type": "string" },
+      "at":            { "type": "string" },
+      "include_dirty": { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["symbol", "root"]
   }
@@ -508,7 +533,7 @@ cgx paths --from <symbol> --to <symbol> <path>
 
 `--must-pass-through` and `--avoiding` can each be repeated to apply multiple node constraints. All constraints combine as AND predicates.
 
-See `docs/05-queries.md` Q-20 and Q-22 for worked examples.
+The `--must-pass-through` and `--avoiding` / `--quantifier all` flags compile to the normative guarded-cut reachability semantics defined in docs/05-queries.md Q-20 (ADR-02). Results include a `guard_analysis` field in the output: `"cut+dominance"` when all callers on the path had dominance facts available (finding confidence = min edge confidence on path); `"cut-only"` when ≥1 caller lacked dominance facts (finding confidence capped at `probable`). See docs/05-queries.md Q-20 and Q-22 for worked examples.
 
 ---
 
@@ -579,7 +604,8 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
       "confidence":            { "type": "string", "enum": ["certain","probable","possible"], "default": "probable" },
       "max_results":           { "type": "integer", "default": 20 },
       "cursor":                { "type": "string" },
-      "at":                    { "type": "string" }
+      "at":                    { "type": "string" },
+      "include_dirty":         { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["from_class", "to_class", "root"]
   }
@@ -608,10 +634,15 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
     ],
     "has_more": false,
     "cursor": null,
-    "graph_version": "abc1234"
+    "graph_version": "abc1234",
+    "vacuous": false,
+    "dirty": false,
+    "dirty_files_analyzed": 0
   }
 }
 ```
+
+`vacuous: true` is set when the assertion passed vacuously (zero source or sink symbols matched, or all candidates were filtered out). See IF-5 vacuity guard for semantics.
 
 ---
 
@@ -631,7 +662,8 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
       "sink_classes":       { "type": "array", "items": { "type": "string" }, "description": "Sink classes to filter new edges by (e.g. [\"sql\",\"shell\"])" },
       "new_paths_only":     { "type": "boolean", "default": true },
       "max_results":        { "type": "integer", "default": 20 },
-      "cursor":             { "type": "string" }
+      "cursor":             { "type": "string" },
+      "include_dirty":      { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["root", "base"]
   }
@@ -661,10 +693,15 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
     ],
     "has_more": false,
     "cursor": null,
-    "graph_version": "abc1234"
+    "graph_version": "abc1234",
+    "vacuous": false,
+    "dirty": false,
+    "dirty_files_analyzed": 0
   }
 }
 ```
+
+`vacuous: true` is set when the diff returned zero results because no source/sink symbols matched or all candidates were filtered. See IF-5 vacuity guard.
 
 The `introducing_commit` and `introducing_author` fields come from IX-9 edge-age attribution. An AI agent can use this to identify which developer introduced a security-relevant edge and request a focused review.
 

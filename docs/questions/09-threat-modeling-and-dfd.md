@@ -149,7 +149,7 @@ RETURN src.name, src.file, src.line, sink.name, length(path) AS hops
 
 ---
 
-### Q85 — Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and branch conditions.
+### Q85 — Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and edge-condition labels.
 
 **Personas:** PSE · **Status:** answerable-today — uses Q-3 (`paths` subcommand), Q-14 (negative path constraint), and Q-11 (edge-condition filter)
 

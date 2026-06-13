@@ -35,7 +35,12 @@ Full parse plus language-specific semantic enrichment. Scope graph construction
 via `tree-sitter-graph` with language-specific rules. Where available, an
 optional language-specific deep parser augments the tree-sitter AST.
 
-Languages in Tier 1 at launch: **Rust, JavaScript, TypeScript, Python, Java, Go**
+**Tier 1 at launch: Rust, TypeScript, JavaScript** (TypeScript and JavaScript
+share one adapter family).
+
+**Tier 1 planned (in order):** Python, Go, Java, C#. Rows for planned languages
+in LS-7 and LS-8 are specification-ahead-of-implementation (`Status: roadmap` for
+those rows); only Rust and TypeScript/JavaScript rows are Phase-1 commitments.
 
 Characteristic capabilities at Tier 1:
 - Callee resolution at `certain` or `probable` confidence for most call sites.
@@ -228,6 +233,11 @@ catalogued per-language now so that GM-9, GM-10, GM-11, and GM-12 schema
 reservations are grounded in concrete language surface; the full concurrency
 query surface (Q-24) follows.
 
+**Scope note:** rows for Rust and TypeScript/JavaScript are Phase-1 implementation
+commitments. Rows for Python, Go, Java, C/C++, Kotlin, Swift, C# are
+specification-ahead-of-implementation (`Status: roadmap`) — they ground the schema
+reservation but are not implemented until their language's Tier-1 adapter ships.
+
 This section specifies the per-language mapping of concurrency constructs to
 the graph attributes defined in docs/03-code-graph-model.md: `spawns` edge kind
 (GM-9), `suspends` node property (GM-10), lock-set entries (GM-11), and effect
@@ -241,7 +251,7 @@ completeness.
 | **Rust** | `tokio::spawn(async { … })`, `async_std::task::spawn`, `std::thread::spawn` | `spawns` edge from call site to the spawned closure or async block; `edge_condition` reflects the guard at the call site | `JoinHandle` drop (detach) is annotated; `tokio::task::spawn_blocking` adds `blocking` effect to the spawned fn |
 | **Go** | `go f()`, `go func() { … }()` | `spawns` edge from `go` statement to the goroutine body | Channel operations on the spawned goroutine are tracked as synchronization points for lock-set analysis |
 | **Python** | `asyncio.create_task(coro)`, `asyncio.ensure_future`, `loop.run_in_executor` | `spawns` edge to the coroutine or executor function | `concurrent.futures.Future` submit tracked as `spawns` with `blocking` effect in executor |
-| **JavaScript / TypeScript** | `new Promise(fn)`, unhandled `async` IIFE (`(async () => { … })()`), `setTimeout`/`setImmediate` callbacks | `spawns` edge to the callback or async body; `.then` / `.catch` continuations are tracked as `calls:async` edges, not spawn | Promise constructor callback is a spawned async context if not explicitly awaited |
+| **JavaScript / TypeScript** | `new Promise(fn)`, unhandled `async` IIFE (`(async () => { … })()`), `setTimeout`/`setImmediate` callbacks | `spawns` edge to the callback or async body; `.then` / `.catch` / `.finally` continuations are tracked as `calls:async` edges (`edge_condition: conditional`/`exception`), not spawn — see LS-7 scope note and LS-4 async model | Promise constructor callback is a spawned async context if not explicitly awaited |
 | **Java** | `ExecutorService.submit`, `CompletableFuture.runAsync`, `new Thread(r).start`, virtual thread `Thread.ofVirtual().start` | `spawns` edge to the `Runnable`/`Callable` body | `CompletableFuture.thenApplyAsync` is a continuation chain and uses `calls:async`; only `.runAsync` with no handle is a detached spawn |
 | **C / C++** | `pthread_create`, `std::thread` constructor, `std::async(std::launch::async, …)` | `spawns` edge to the thread function | `std::async` with `std::launch::deferred` is modelled as `calls:async`, not spawn |
 
@@ -315,6 +325,12 @@ mechanical harvest from language syntax into these primitives is the prerequisit
 for framework-pack evaluation (see docs/12-language-primitives-and-frameworks.md
 FW-1). Per-language packs for resource-pair syntax (column 3) harvest into GM-13
 without requiring user configuration.
+
+**Scope note:** rows for Rust (LS-8.1) and TypeScript/JavaScript (LS-8.4) are
+Phase-1 implementation commitments. Rows for Go, Python, Java, C# are
+specification-ahead-of-implementation (`Status: roadmap`) — they ground the
+schema reservation but are not implemented until the language's Tier-1 adapter
+ships.
 
 This table maps the concrete surface syntax of each Tier 1 language (plus C#,
 which is covered in LS-2 and LS-3) to the `cgx` primitive types defined in

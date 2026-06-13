@@ -1,0 +1,353 @@
+//! [`PathWalker`] — the per-walk state machine that the traversal engines share.
+//!
+//! The walker owns the two pieces of state a CTE cannot express, which is exactly
+//! why Layer 1 is direct Rust graph algorithms rather than recursive SQL
+//! (architecture §4):
+//!
+//! 1. **Path-relative transience (GM-4.2).** A per-walk `seen_exceptional` flag,
+//!    set irrevocably when an exceptional-class edge (`exception`/`panic`) is
+//!    crossed, and *reset at every fork* to the value it held at the fork point.
+//!    A DFS naturally provides fork-point reset: the flag is part of the recursion
+//!    state, so backtracking restores it.
+//! 2. **Spawn-domain reset (GM-9.2).** Crossing a `Spawns` edge enters a detached
+//!    error domain: `seen_exceptional` is reinitialised to `false` downstream of
+//!    the spawn, so exception edges in the spawner do not make callees inside the
+//!    spawned task exception-transient.
+//!
+//! The walker is configured with an [`EdgeFilter`] (static per-edge admission)
+//! and a depth limit; it exposes the two traversal shapes the subcommands need:
+//! a bounded breadth-first frontier walk (`callers`/`callees`) and a bounded
+//! depth-first path enumeration (`paths`/`reaches`).
+
+use std::collections::VecDeque;
+
+use cgx_core::{EdgeRecord, NodeId};
+
+use crate::filter::{Direction, EdgeFilter};
+use crate::view::GraphView;
+
+/// Default cap on enumerated paths, applied when the caller sets none. Keeps a
+/// dense graph's path explosion bounded without the caller having to remember to.
+pub const DEFAULT_MAX_PATHS: usize = 1024;
+
+/// Configuration shared by every traversal a walk performs.
+#[derive(Debug, Clone)]
+pub struct PathWalker {
+    /// Static per-edge admission predicate.
+    pub filter: EdgeFilter,
+    /// Maximum hop count from the anchor. `None` = unbounded (whole reachable set).
+    pub max_depth: Option<u32>,
+    /// Maximum number of paths to enumerate (`paths` only). `None` =
+    /// [`DEFAULT_MAX_PATHS`].
+    pub max_paths: Option<usize>,
+}
+
+impl Default for PathWalker {
+    fn default() -> Self {
+        PathWalker {
+            filter: EdgeFilter::calls(),
+            max_depth: None,
+            max_paths: None,
+        }
+    }
+}
+
+/// Whether crossing `edge` should set the per-walk exceptional flag, and whether
+/// it resets the exceptional domain (GM-9.2). Returns the `seen_exceptional`
+/// value that holds *after* crossing `edge`, given its value `before`.
+fn advance_exceptional(before: bool, edge: &EdgeRecord) -> bool {
+    if edge.kind == cgx_core::EdgeKind::Spawns {
+        // Detached error domain: downstream of a spawn the flag reinitialises to
+        // false regardless of the spawn edge's own condition (GM-9.2.1).
+        return false;
+    }
+    before || edge.condition.is_exceptional()
+}
+
+/// A node discovered by [`PathWalker::bfs`], with its discovery metadata.
+#[derive(Debug, Clone)]
+pub struct Discovered {
+    pub node: NodeId,
+    /// Hops from the anchor (≥ 1).
+    pub depth: u32,
+    /// Edge through which the node was first reached at `depth`.
+    pub via: EdgeRecord,
+    /// `seen_exceptional` value on the (shortest) discovery path *at* this node.
+    pub exception_transient: bool,
+}
+
+impl PathWalker {
+    /// The effective path cap.
+    fn path_cap(&self) -> usize {
+        self.max_paths.unwrap_or(DEFAULT_MAX_PATHS)
+    }
+
+    /// Whether `depth` is within the configured limit.
+    fn within_depth(&self, depth: u32) -> bool {
+        self.max_depth.is_none_or(|d| depth <= d)
+    }
+
+    /// Breadth-first frontier walk from `start` in `dir`, returning each reachable
+    /// node once (at its shortest depth) with its discovery edge and the
+    /// path-relative transience flag on that shortest path.
+    ///
+    /// `start` itself is not included. Results are returned in a deterministic
+    /// order: ascending `(depth, node_id)`. Because the frontier is processed in
+    /// ascending node-id order and edges come back in canonical order, the first
+    /// time a node is seen is stable across runs.
+    pub fn bfs(&self, view: &GraphView, start: NodeId, dir: Direction) -> Vec<Discovered> {
+        let n = view.node_count();
+        let mut seen = vec![false; n];
+        let mut out: Vec<Discovered> = Vec::new();
+        // (node, depth, seen_exceptional-on-shortest-path)
+        let mut frontier: VecDeque<(NodeId, u32, bool)> = VecDeque::new();
+
+        if let Some(si) = checked_index(start, n) {
+            seen[si] = true;
+        }
+        frontier.push_back((start, 0, false));
+
+        while let Some((node, depth, exc)) = frontier.pop_front() {
+            if !self.within_depth(depth + 1) {
+                continue;
+            }
+            // Snapshot + sort this node's admitted neighbors by peer id so the
+            // discovery order is deterministic regardless of edge layout.
+            let mut nbrs: Vec<(NodeId, EdgeRecord, bool)> = view
+                .neighbors(node, dir, &self.filter)
+                .map(|er| {
+                    let next_exc = advance_exceptional(exc, er.edge);
+                    (er.peer, er.edge.clone(), next_exc)
+                })
+                .collect();
+            nbrs.sort_by_key(|(peer, edge, _)| (peer.0, edge.id.0));
+
+            for (peer, edge, next_exc) in nbrs {
+                let pi = match checked_index(peer, n) {
+                    Some(pi) => pi,
+                    None => continue,
+                };
+                if seen[pi] {
+                    continue;
+                }
+                seen[pi] = true;
+                out.push(Discovered {
+                    node: peer,
+                    depth: depth + 1,
+                    via: edge,
+                    exception_transient: next_exc,
+                });
+                frontier.push_back((peer, depth + 1, next_exc));
+            }
+        }
+
+        out.sort_by_key(|d| (d.depth, d.node.0));
+        out
+    }
+
+    /// Whether `goal` is reachable from `start` in `dir` within the depth limit.
+    /// A pure BFS over admitted edges; cheaper than enumerating a witness.
+    pub fn reachable(&self, view: &GraphView, start: NodeId, goal: NodeId, dir: Direction) -> bool {
+        if start == goal {
+            return true;
+        }
+        self.bfs(view, start, dir).iter().any(|d| d.node == goal)
+    }
+
+    /// A shortest witnessing path from `start` to `goal` in `dir`, as the node
+    /// sequence plus the edge taken into each non-source node. `None` if
+    /// unreachable within the depth limit. Deterministic: BFS predecessor recorded
+    /// only on first (shortest, lowest-id) discovery.
+    pub fn shortest_path(
+        &self,
+        view: &GraphView,
+        start: NodeId,
+        goal: NodeId,
+        dir: Direction,
+    ) -> Option<Vec<(NodeId, Option<EdgeRecord>)>> {
+        if start == goal {
+            return Some(vec![(start, None)]);
+        }
+        let n = view.node_count();
+        let mut pred: Vec<Option<(NodeId, EdgeRecord)>> = vec![None; n];
+        let mut seen = vec![false; n];
+        let mut frontier: VecDeque<(NodeId, u32)> = VecDeque::new();
+        if let Some(si) = checked_index(start, n) {
+            seen[si] = true;
+        }
+        frontier.push_back((start, 0));
+
+        while let Some((node, depth)) = frontier.pop_front() {
+            if !self.within_depth(depth + 1) {
+                continue;
+            }
+            let mut nbrs: Vec<(NodeId, EdgeRecord)> = view
+                .neighbors(node, dir, &self.filter)
+                .map(|er| (er.peer, er.edge.clone()))
+                .collect();
+            nbrs.sort_by_key(|(peer, edge)| (peer.0, edge.id.0));
+            for (peer, edge) in nbrs {
+                let pi = match checked_index(peer, n) {
+                    Some(pi) => pi,
+                    None => continue,
+                };
+                if seen[pi] {
+                    continue;
+                }
+                seen[pi] = true;
+                pred[pi] = Some((node, edge));
+                if peer == goal {
+                    return Some(reconstruct(start, goal, &pred));
+                }
+                frontier.push_back((peer, depth + 1));
+            }
+        }
+        None
+    }
+
+    /// Enumerate simple (acyclic) paths from `start` to `goal` in `dir`, within
+    /// the depth limit and capped at the path limit. Each path is the node
+    /// sequence plus the entering edge per node (source's entering edge is `None`)
+    /// plus the per-step `seen_exceptional` flag *before* entering that node.
+    ///
+    /// DFS gives fork-point reset for free: `seen_exceptional` lives on the
+    /// recursion stack, so backtracking to a fork restores the flag (GM-4.2).
+    /// Paths are returned in a deterministic discovery order (neighbors visited in
+    /// ascending peer/edge id), then the caller applies the result ordering.
+    #[allow(clippy::type_complexity)]
+    pub fn enumerate_paths(
+        &self,
+        view: &GraphView,
+        start: NodeId,
+        goal: NodeId,
+        dir: Direction,
+    ) -> Vec<Vec<WalkStep>> {
+        let cap = self.path_cap();
+        let mut paths: Vec<Vec<WalkStep>> = Vec::new();
+        let mut stack: Vec<WalkStep> = vec![WalkStep {
+            node: start,
+            via: None,
+            exception_transient: false,
+        }];
+        let mut on_path = vec![false; view.node_count()];
+        if let Some(si) = checked_index(start, view.node_count()) {
+            on_path[si] = true;
+        }
+        self.dfs(
+            view,
+            start,
+            goal,
+            dir,
+            &mut stack,
+            &mut on_path,
+            &mut paths,
+            cap,
+        );
+        paths
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        &self,
+        view: &GraphView,
+        node: NodeId,
+        goal: NodeId,
+        dir: Direction,
+        stack: &mut Vec<WalkStep>,
+        on_path: &mut [bool],
+        paths: &mut Vec<Vec<WalkStep>>,
+        cap: usize,
+    ) {
+        if paths.len() >= cap {
+            return;
+        }
+        if node == goal && stack.len() > 1 {
+            paths.push(stack.clone());
+            return;
+        }
+        let depth = (stack.len() - 1) as u32;
+        if !self.within_depth(depth + 1) {
+            return;
+        }
+        let exc_here = stack.last().map(|s| s.exception_transient).unwrap();
+
+        let mut nbrs: Vec<(NodeId, EdgeRecord, bool)> = view
+            .neighbors(node, dir, &self.filter)
+            .map(|er| {
+                let next_exc = advance_exceptional(exc_here, er.edge);
+                (er.peer, er.edge.clone(), next_exc)
+            })
+            .collect();
+        nbrs.sort_by_key(|(peer, edge, _)| (peer.0, edge.id.0));
+
+        let n = view.node_count();
+        for (peer, edge, next_exc) in nbrs {
+            let pi = match checked_index(peer, n) {
+                Some(pi) => pi,
+                None => continue,
+            };
+            if on_path[pi] {
+                continue; // simple paths only — no cycles
+            }
+            on_path[pi] = true;
+            stack.push(WalkStep {
+                node: peer,
+                via: Some(edge),
+                exception_transient: next_exc,
+            });
+            self.dfs(view, peer, goal, dir, stack, on_path, paths, cap);
+            stack.pop();
+            on_path[pi] = false;
+            if paths.len() >= cap {
+                return;
+            }
+        }
+    }
+}
+
+/// One node on an enumerated walk, with the edge taken to enter it and the
+/// path-relative transience flag *as the node is entered* (GM-4).
+#[derive(Debug, Clone)]
+pub struct WalkStep {
+    pub node: NodeId,
+    pub via: Option<EdgeRecord>,
+    /// `seen_exceptional` value at the moment this node is entered — i.e. whether
+    /// an exceptional-class edge was crossed on the way here.
+    pub exception_transient: bool,
+}
+
+/// Index a node id into a `0..n` array, returning `None` if out of range.
+fn checked_index(node: NodeId, n: usize) -> Option<usize> {
+    let i = node.index();
+    if i < n {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Walk the predecessor array back from `goal` to `start`, producing the path in
+/// source→sink order with each node's entering edge.
+fn reconstruct(
+    start: NodeId,
+    goal: NodeId,
+    pred: &[Option<(NodeId, EdgeRecord)>],
+) -> Vec<(NodeId, Option<EdgeRecord>)> {
+    let mut rev: Vec<(NodeId, Option<EdgeRecord>)> = Vec::new();
+    let mut cur = goal;
+    loop {
+        match &pred[cur.index()] {
+            Some((p, edge)) => {
+                rev.push((cur, Some(edge.clone())));
+                cur = *p;
+            }
+            None => {
+                rev.push((cur, None));
+                break;
+            }
+        }
+    }
+    debug_assert_eq!(rev.last().map(|(n, _)| *n), Some(start));
+    rev.reverse();
+    rev
+}

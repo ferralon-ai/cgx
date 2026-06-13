@@ -75,11 +75,12 @@ The ordering prioritizes:
 ### Exit criteria
 
 Phase 1 is complete when:
-- The four canonical prompt examples produce correct output on a test Rust codebase:
+- The three canonical prompt examples produce correct output on a test Rust codebase:
   1. Non-exception paths from `main::foo` to `vulnerable::bar`
   2. Pedigree of a variable in a function (basic data flow)
-  3. Members never referenced downstream from a given instance (basic unused)
-  4. Exception-path edges to `vulnerable::bar` (syntactic approximation)
+  3. Exception-path edges to `vulnerable::bar` (syntactic approximation)
+
+  > **Note:** Canonical example 3 (instance-level dead members — "properties/methods never referenced downstream from THIS instance") is removed from Phase-1 exit criteria. Instance-level dead-member analysis (DF-7) requires allocation-site abstraction and escape analysis that are `schema-room` until Phase 3. Phase 1 ships basic type-level unused-code detection (`cgx unused --kind method`); instance-scoped analysis is a Phase-3 deliverable (per roadmap §7).
 - `cgx callers`/`cgx callees` answer in under 500ms on a 100k-LOC Rust codebase after index warm-up
 - MCP server passes tool call round-trips in Claude Code
 - Auto-index completes in under 30 seconds for 100k LOC
@@ -533,6 +534,8 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | GM-24 | Accessor / property override | schema-room | Phase 1 | Phase 3 | Extends `overrides` to range over accessor symbols; `shadows-field` derived edge from subclass accessor to shadowed parent field or accessor |
 | GM-25 | Abstract-method fulfillment map | core-extension | Phase 1 | Phase 3 | `fulfills` derived edge from concrete method to abstract declaration; `unfulfilled_abstract` derived predicate per concrete type; derived from `is_abstract` + `overrides` + MRO |
 | Q-32 | Override-contract drift queries | core-extension | Phase 3 | Phase 3 | Exception-contract widening, dropped-base-guard, field-footprint drift; composed from `overrides` + exception edges + corrected Q-20 ∀-path must-pass-through; gated on corrected Q-20 |
+| GM-26 | Transitive `may-panic` effect | schema-room | Phase 1 (schema) | Phase 2/3 | Extends GM-12 effect lattice with one value (`may-panic`); `own_effects`/`transitive_effects` attributes reserved; populated after edge-confidence upgrade in Phase 2 and transitive-closure recompute |
+| Q-33 | Recursion / SCC / architecture-cycle queries | core-extension | Phase 1 (schema) | Phase 2 | `scc_id`/`scc_size` derived node attributes from petgraph `kosaraju_scc` (already in stack); exposes SCC membership, mutual-recursion detection, and architecture-cycle queries |
 
 **Rationale for schema-room items appearing early.** GM-9, GM-10, GM-11, GM-13,
 GM-14, and LS-7 are marked `schema-room` because their graph representation (the

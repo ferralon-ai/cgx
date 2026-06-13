@@ -54,6 +54,7 @@ Both layers produce identical result objects: every result node and edge carries
 | Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 |
 | Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 |
 | Q-32 | Override-contract drift queries (exception-widening, dropped-base-guard, field-footprint drift) | 2 |
+| Q-33 | Recursion / SCC / architecture-cycle queries | 1 + 2 |
 
 ---
 
@@ -255,6 +256,12 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 - `MEMBER_OF` — member-of-type relationship
 - `OVERRIDES`, `INHERITS`, `IMPLEMENTS` — structural object-model edges (lowercase canonical `edge_type` in GM-2.2; uppercase in MATCH patterns per the `member-of`/`MEMBER_OF` precedent)
 - `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` — Theme-13 object-model edges (GM-21..GM-25); uppercase in MATCH patterns only
+
+**`CALLS*` transitive-closure semantics under cycles (finding 2.3):**
+
+`CALLS*` (and `CALLS*min..max`) uses simple-path semantics: each node is visited at most once per traversal. When the call graph contains a recursive cycle — directly recursive functions, or mutually recursive groups — the traversal terminates after visiting each node in the cycle exactly once and does not loop. This guarantees finite termination regardless of cycle structure. The default upper bound when no `max` is specified is the `--depth` flag value (default: unlimited but bounded by the simple-path constraint — the longest simple path in the graph). Users may supply an explicit bound `[:CALLS*1..10]` to cap traversal depth independently of the simple-path guarantee.
+
+Implications for Q-15 reachability-matrix queries: `count(*) over CALLS*` counts distinct reachable nodes (each counted once under simple-path semantics), not path lengths or traversal steps. A pair of mutually recursive functions `f ↔ g` appears as two reachable nodes, not an infinite count.
 
 **Edge properties:**
 - `condition` — `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"`
@@ -2146,6 +2153,93 @@ RETURN sub.name, sub.file, sub.line
 **Breaking it down.** The first `MATCH ALL ... MUST PASS THROUGH` confirms that the base method routes every path to the sink through a guard with `guard_class:"authz"`. The second `MATCH ALL ... AVOIDING` finds the same sink reachable from the override on a path that avoids that guard — the dropped-guard pattern. Because Q-32 is a query-class feature that depends on the corrected Q-20 ∀-path semantics, the query is gated with the illustrative comment.
 
 **Reading the result.** Non-empty results identify overrides that silently removed an authorization check the base method enforced. Each row names the override method and its source location. The guard set is derived from the base's sub-graph, not declared by the query author — this is the key difference from a plain Q-20 authorization-bypass query.
+
+---
+
+## Q-33: Recursion / SCC / Architecture-Cycle Queries
+
+**Status: core-extension** — the petgraph SCC (Strongly Connected Component) algorithm is part of the selected dependency stack (docs/09), shared with the `unused` query's reachability analysis. Exposing SCC membership as a queryable property requires no new schema primitives beyond function-node attributes derived at index time.
+
+### Motivation
+
+A **strongly connected component** (SCC) of the call graph is a maximal set of functions that are mutually reachable — every function in the set can transitively call every other. A non-trivial SCC (size > 1) is a recursive cycle: the functions are directly or mutually recursive. Architecture-level cycles (module A depends on module B which depends on module A) are the cross-module analog.
+
+SCC membership answers questions that simple reachability cannot: "Is function `f` part of a recursive group?", "What is the maximum depth of any non-recursive path?", "Which module pairs form an architectural cycle?"
+
+### Schema representation
+
+Each function node carries two derived attributes populated at index time:
+
+- `scc_id` — an opaque identifier shared by all members of the same SCC. Functions not in any cycle have a unique `scc_id` (singleton SCC).
+- `scc_size` — the number of members in the SCC. `scc_size = 1` means the function is non-recursive; `scc_size > 1` means it is part of a recursive cycle.
+
+These attributes are derived from the call graph at index time using Tarjan's or Kosaraju's algorithm (petgraph `kosaraju_scc`). They are not stored as edges; they are node properties.
+
+### Layer 1 — Subcommand
+
+```bash
+# List all functions in recursive cycles (scc_size > 1)
+cgx unused ./ --kind fn --filter scc_size_gt 1
+
+# Show which SCC a given function belongs to
+cgx explain crypto::hash ./ --show-scc
+
+# List all members of the SCC containing a named function
+cgx query --scc-of crypto::hash ./
+```
+
+### Layer 2 — Query language
+
+**Which functions are part of a recursive cycle?**
+
+```cypher
+MATCH (f)
+WHERE f.scc_size > 1
+RETURN f.name, f.file, f.line, f.scc_id, f.scc_size
+ORDER BY f.scc_size DESC, f.scc_id, f.name
+```
+
+Non-empty results identify functions in mutual or direct recursion. A single large SCC may indicate an architecture smell: a cluster of tightly coupled functions with no clear call hierarchy.
+
+**All members of the SCC containing a named function:**
+
+```cypher
+MATCH (root {name: "order_service::process"})
+MATCH (member)
+WHERE member.scc_id = root.scc_id
+  AND member.scc_size > 1
+RETURN member.name, member.file, member.line
+ORDER BY member.name
+```
+
+**Architecture cycles: module pairs that mutually depend on each other:**
+
+```cypher
+-- Illustrative: file-path prefix used as module proxy
+MATCH (a)-[:CALLS*]->(b)-[:CALLS*]->(a)
+WHERE a.file STARTS WITH "src/auth/"
+  AND b.file STARTS WITH "src/payment/"
+  AND a <> b
+RETURN DISTINCT a.name AS auth_fn, b.name AS payment_fn
+ORDER BY auth_fn, payment_fn
+LIMIT 20
+```
+
+**Maximum non-recursive path depth from an entrypoint (acyclic subgraph):**
+
+```cypher
+-- Find the longest path from any entrypoint, excluding recursive nodes
+MATCH path = (ep {kind: "entrypoint"})-[:CALLS*]->(leaf)
+WHERE NONE(n IN nodes(path) WHERE n.scc_size > 1)
+  AND NOT (leaf)-[:CALLS]->()
+RETURN ep.name, leaf.name, length(path) AS depth
+ORDER BY depth DESC
+LIMIT 10
+```
+
+### Reading the result
+
+`scc_id` is an opaque integer assigned at index time; its value has no semantic meaning beyond grouping members of the same SCC. `scc_size` is the authoritative measure. A path query constrained to `scc_size = 1` nodes is guaranteed to terminate without the cycle concern (simple-path semantics still apply, but no cycle can exist among nodes all with `scc_size = 1`). Functions with `scc_size > 1` are those for which `CALLS*` traversal applies the simple-path cycle-cut.
 
 ---
 

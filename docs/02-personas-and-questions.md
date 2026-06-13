@@ -227,7 +227,7 @@ questions below.
 
 ## Theme 8: AI-Agent-Specific Queries — Q68–Q75, Q79–Q81
 
-*11 questions. 7 NOVEL.*
+*11 questions. 5 NOVEL. Q69 and Q80 are not answerable as specced (require agent-session state).*
 
 These questions arise from AI coding and security agent constraints: limited context
 windows, structured output requirements, low tool-call budgets, and post-edit
@@ -238,7 +238,7 @@ diffs, or negative path constraints.
 | Q | Persona | Natural-Language Question | Capabilities | Coverage |
 |---|---------|--------------------------|--------------|---------|
 | Q68 | ACA | Give me a token-efficient representation of the call graph subgraph I need to safely edit `processPayment()` — 2 hops callers, 3 hops callees, with edge labels. | `subgraph-extract` + `edge-label-query` (GM-) | NOVEL |
-| Q69 | ACA | Which functions does `OrderController.create()` call that I have NOT yet seen in this session's context window? | `subgraph-extract` + context-diff (GM-) | NOVEL |
+| Q69 | ACA | Which functions does `OrderController.create()` call that I have NOT yet seen in this session's context window? | `subgraph-extract` + context-diff (GM-) | not answerable as specced — requires agent-session context-window tracking (no feature; `cgx` has no access to an agent's loaded-symbol state) |
 | Q70 | ACA | Is there any function I'm about to call that is only safe to call from the happy path and would fail if called from an error handler? | `edge-condition-filter` + `path-query` (GM-) | NOVEL |
 | Q71 | ASA | Scan the entire codebase: for every function that takes a `String` from an HTTP request parameter, determine if it reaches a shell command function without a sanitizer on the path. | `taint-propagation` + `entrypoint-enum` + `sink-enum` (DF-, GM-) | Partial (SAST — no MCP interface) |
 | Q72 | ACA | I'm implementing a new feature that calls `sendEmail()`. What other functions currently call `sendEmail()` and what context do they set up first? | `blast-radius` + `subgraph-extract` (GM-) | NOVEL |
@@ -246,7 +246,7 @@ diffs, or negative path constraints.
 | Q74 | ACA | Given that I want to add a parameter to `Config.load()`, which other functions will need changes based on the call graph? | `blast-radius` + `subgraph-extract` (GM-) | Partial (LSP) |
 | Q75 | ASA | After running `cargo audit`, for each reported advisory, determine: (a) is the vulnerable function reachable? (b) from which entrypoints? (c) is there a sanitizer on any path? | `reachability` + `path-query` + `edge-condition-filter` (GM-, DF-) | NOVEL |
 | Q79 | ACA | In 3 MCP tool calls instead of 34, give me the complete call chain from entrypoint to the function I'm about to edit, with all intermediate signatures. | `path-query` + structured MCP output (GM-); (requires GM-1.3 `signature`) | Partial (CIE — not Rust, no exception labels) |
-| Q80 | ACA | Which symbols in the files I've already loaded are referenced by functions I haven't loaded yet? (outbound dangling references) | `subgraph-extract` + `api-surface-query` (GM-) | NOVEL |
+| Q80 | ACA | Which symbols in the files I've already loaded are referenced by functions I haven't loaded yet? (outbound dangling references) | `subgraph-extract` + `api-surface-query` (GM-) | not answerable as specced — requires agent-session loaded-file tracking (no feature; `cgx` has no access to an agent's session state) |
 | Q81 | ACA | For the function I'm implementing, show me every other function in the codebase that calls the same dependencies, so I can match the established pattern. | `subgraph-extract` + pattern matching (GM-) | NOVEL |
 
 ---
@@ -413,13 +413,13 @@ Theme: Temporal / VCS (Q54–Q61 class). Capabilities: `graph-diff` +
 | 5. Dead and Unused Code | 8 (Q46–Q53) | 4 |
 | 6. Temporal and VCS Graph Diffs | 10 (Q54–Q61, Q99, Q107) | 10 |
 | 7. API Surface and Contracts | 6 (Q62–Q67) | 5 |
-| 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 7 |
+| 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 5 (Q69, Q80 not answerable as specced) |
 | 9. Threat Modeling and DFD | 4 (Q82–Q85) | 4 |
 | 10. Concurrency and Resource Safety | 6 (Q89–Q90, Q97, Q104–Q105, Q108) | 6 |
 | 11. Types, Mutability, and Closures | 10 (Q109–Q118) | 8 |
 | 12. Framework Semantics and Metadata | 8 (Q119–Q126) | 7 |
 | 13. Object Model and Inheritance | 12 (Q127–Q138) | 12 |
-| **Total** | **138** | **112** |
+| **Total** | **138** | **110** (Q69, Q80 re-gated to not answerable as specced per ADR-11 / roadmap §7) |
 
 ---
 

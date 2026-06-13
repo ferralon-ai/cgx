@@ -1413,5 +1413,49 @@ A `fulfills` derived edge from a concrete method to the abstract method (`is_abs
 
 ---
 
+## GM-26 — Transitive `may-panic` Effect
+
+**Status:** `schema-room` — `panic` already exists as an edge condition label (GM-3); this feature reserves one new effect-lattice value (`may-panic`) on the GM-12 effect system and a corresponding derived node attribute. Full transitive computation is deferred to the same phase as the GM-12 transitive-closure upgrade (Phase 2/3).
+
+### Motivation
+
+The `panic` edge condition (GM-3) labels individual call edges taken only on an unwinding or aborting path. It answers "does this specific call site execute on a panic path?" — a per-edge property. It does not answer "can this function, transitively, cause a panic?" — a per-function property. For Rust code (the primary launch language), the latter is the operationally important question: library authors annotate functions as `#[must_not_panic]`; callers want to know whether a transitive dependency exposes a panic path.
+
+The `may-panic` effect fills this gap: it is one effect-lattice value away from the existing `panic` edge condition, propagated transitively over `calls` edges rather than stored on individual edges.
+
+### Schema representation
+
+The GM-12 effect lattice (GM-12.1) is extended with one value:
+
+| Effect | Meaning |
+|---|---|
+| `may-panic` | The function, or a function it reaches transitively, may execute a `panic!`, `unwrap`, `expect`, `index out of bounds`, or equivalent abort path |
+
+`may-panic` follows the same transitive computation rule as all other effect values (GM-12.2): a function's `may-panic` effect is set if any reachable function via `calls` or `calls:*` edges carries a `panic` edge condition on at least one outgoing edge.
+
+`may-panic` is **not** set for functions reachable only via `spawns` edges (consistent with GM-12.2's spawns-attribution rule: spawned work's effects are attributed separately, not unioned into the spawner).
+
+### Attributes
+
+- `own_effects`: extended to include `may-panic` when the function's own body contains at least one `panic`-conditioned call site.
+- `transitive_effects`: extended to include `may-panic` when any reachable callee carries `may-panic` in its own or transitive effects.
+
+Both attributes are schema-reserved in Phase 1 (null/absent); populated in Phase 2 once edge confidence improves and transitive effect computation runs.
+
+### Illustrative query
+
+```cypher
+-- illustrative: requires GM-26 (schema-room)
+-- Which public API functions transitively may panic?
+MATCH (f {visibility: "public"})
+WHERE "may-panic" IN f.transitive_effects
+RETURN f.name, f.file, f.line
+ORDER BY f.file, f.line
+```
+
+See also: Q-33 (docs/05), which exposes the recursion/SCC and architecture-cycle query class; `may-panic` on recursive functions is a natural companion query.
+
+---
+
 *Next:* docs/04-dataflow-and-provenance.md — value pedigree, scope entry/exit
 inventory, taint analysis, and instance-level dead-member analysis.

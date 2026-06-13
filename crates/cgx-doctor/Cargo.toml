@@ -1,0 +1,18 @@
+[package]
+name = "cgx-doctor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx index-quality / health report: per-confidence-tier edge counts, cut-marker inventory, unresolved-call rate, and soundiness trust score. Library API for `cgx doctor`."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-store = { path = "../cgx-store" }
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+cgx-index = { path = "../cgx-index" }
+tempfile = "3"

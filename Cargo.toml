@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/mightye/callgraph"
+rust-version = "1.96"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+smallvec = { version = "1", features = ["serde"] }
+
+# Dev-dependencies shared across crates
+proptest = "1"

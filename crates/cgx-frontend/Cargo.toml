@@ -1,0 +1,22 @@
+[package]
+name = "cgx-frontend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx language-frontend seam: LanguageFrontend trait, FileFacts, registry, and the Tier-0 generic tree-sitter fallback."
+
+[dependencies]
+cgx-core.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+
+[dev-dependencies]
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-json.workspace = true

@@ -9,9 +9,19 @@ repository = "https://github.com/mightye/callgraph"
 rust-version = "1.96"
 
 [workspace.dependencies]
+cgx-core = { path = "crates/cgx-core" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 smallvec = { version = "1", features = ["serde"] }
+thiserror = "2"
+tree-sitter = "0.26"
+
+# Grammar crates (parse layer). Pinned at WP-03; lang adapters reuse these.
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-json = "0.24"
 
 # Dev-dependencies shared across crates
 proptest = "1"

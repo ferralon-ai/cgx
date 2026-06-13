@@ -1,0 +1,23 @@
+[package]
+name = "cgx-index"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx indexing pipeline: enumerates source blobs from a git tree or working directory, extracts per-blob FileFacts via the frontend registry (blob-OID-keyed incremental cache), links them with cgx-resolve, and stores the linked graph keyed by tree OID."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-frontend.workspace = true
+cgx-lang-rust = { path = "../cgx-lang-rust" }
+cgx-lang-ts = { path = "../cgx-lang-ts" }
+cgx-resolve = { path = "../cgx-resolve" }
+cgx-store = { path = "../cgx-store" }
+gix = { version = "0.80", default-features = false, features = ["blob-diff"] }
+rayon = "1"
+thiserror.workspace = true
+tree-sitter-json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

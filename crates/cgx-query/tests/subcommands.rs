@@ -5,7 +5,8 @@ mod common;
 
 use cgx_core::{Confidence, EdgeCondition, EntrypointKind, SymbolKind, SymbolPattern};
 use cgx_query::{
-    callees, callers, paths, reaches, unused, Direction, EdgeFilter, GraphView, PathWalker,
+    callees, callers, paths, reaches, reaches_all, unused, Direction, EdgeFilter, GraphView,
+    PathWalker,
 };
 
 use common::{id_of, GraphBuilder};
@@ -471,6 +472,131 @@ fn resolve_symbol_by_glob_and_short_name() {
 
     let short = v.resolve_symbol(&SymbolPattern::short_name("hash"));
     assert_eq!(short.len(), 2); // crypto::hash and net::hash
+}
+
+// --- CALLS* cycle-termination semantics (docs/05-queries.md, finding 2.3c) ----
+//
+// These mirror the `fixtures/rust-sample/src/recursion.rs` fixture as an inline
+// graph (the cgx-query suite's convention) and prove the engine honors
+// SIMPLE-PATH semantics under cycles: each node is visited at most once per
+// traversal, so `CALLS*` TERMINATES regardless of cycle structure and counts
+// each reachable node exactly once. If simple-path semantics ever regressed
+// (e.g. the BFS `seen` / DFS `on_path` cycle-cut were removed), these tests
+// would hang or OOM rather than fail — that is the guarantee being protected.
+
+/// Direct self-recursion `factorial -> factorial` (a 1-node SCC / self-edge).
+/// `CALLS*` must terminate and report no *distinct* reachable node other than
+/// the start (which `callees` excludes), not loop forever on the self-edge.
+#[test]
+fn calls_star_terminates_on_direct_self_recursion() {
+    let g = GraphBuilder::new()
+        .func("factorial")
+        .calls("factorial", "factorial");
+    let v = view(g);
+    let f = id_of(v.nodes(), "factorial");
+
+    // Terminates; the only reachable node is the start itself, excluded from the
+    // forward-reachability set — so zero distinct *other* nodes, not infinite.
+    let reached = reaches_all(&v, f, &PathWalker::default());
+    assert!(reached.is_empty());
+
+    // `paths` over the self-edge must not enumerate an infinite path set.
+    let ps = paths(&v, f, f, &PathWalker::default());
+    assert!(ps.is_empty(), "self-edge yields no nontrivial simple path");
+}
+
+/// Mutual recursion `is_even <-> is_odd` (a 2-node SCC). `CALLS*` from one must
+/// reach exactly the OTHER (1 distinct node), terminating — not infinite.
+#[test]
+fn calls_star_terminates_on_mutual_recursion() {
+    let g = GraphBuilder::new()
+        .func("is_even")
+        .func("is_odd")
+        .calls("is_even", "is_odd")
+        .calls("is_odd", "is_even");
+    let v = view(g);
+    let even = id_of(v.nodes(), "is_even");
+
+    let reached = reaches_all(&v, even, &PathWalker::default());
+    let fqns: Vec<&str> = reached.iter().map(|r| r.node.fqn.as_str()).collect();
+    // Exactly is_odd reachable (is_even is the start, excluded). 1 distinct node,
+    // each counted once — NOT a path-length count that would diverge on the cycle.
+    assert_eq!(fqns, vec!["is_odd"]);
+}
+
+/// 3-node SCC `a -> b -> c -> a` with a non-recursive tail `c -> leaf`.
+/// Reachability from the SCC entry over `CALLS*` is the DISTINCT set
+/// {b, c, leaf} (a is the start, excluded) = 3 nodes — finite despite the cycle,
+/// and the leaf past the cycle is still reached.
+#[test]
+fn calls_star_terminates_and_counts_distinct_over_3_node_scc() {
+    let g = GraphBuilder::new()
+        .func("a")
+        .func("b")
+        .func("c")
+        .func("leaf")
+        .calls("a", "b")
+        .calls("b", "c")
+        .calls("c", "a")
+        .calls("c", "leaf");
+    let v = view(g);
+    let a = id_of(v.nodes(), "a");
+
+    // Distinct-node reachability: terminates, each node once.
+    let reached = reaches_all(&v, a, &PathWalker::default());
+    let mut fqns: Vec<&str> = reached.iter().map(|r| r.node.fqn.as_str()).collect();
+    fqns.sort_unstable();
+    assert_eq!(fqns, vec!["b", "c", "leaf"]);
+    // The full distinct reachable set including the start is {a, b, c, leaf} = 4.
+    assert_eq!(reached.len() + 1, 4);
+
+    // `reaches` past the cycle to the leaf terminates with a witness path.
+    let leaf = id_of(v.nodes(), "leaf");
+    let r = reaches(&v, a, leaf, &PathWalker::default());
+    assert!(r.reachable);
+
+    // `paths` from a to leaf does not loop on the cycle: simple paths only, so
+    // exactly one acyclic path a -> b -> c -> leaf is enumerated (the cycle
+    // back-edge c -> a is cut by `on_path`).
+    let ps = paths(&v, a, leaf, &PathWalker::default());
+    assert_eq!(ps.len(), 1);
+    let seq: Vec<&str> = ps[0].steps.iter().map(|s| s.node.fqn.as_str()).collect();
+    assert_eq!(seq, vec!["a", "b", "c", "leaf"]);
+}
+
+/// Bounded `CALLS*1..N` respects the depth bound even inside a cycle: from the
+/// SCC entry `a`, depth 1 reaches only `b`, depth 2 reaches {b, c}, and the walk
+/// still terminates (the cycle does not let a low bound over-collect).
+#[test]
+fn bounded_calls_star_respects_depth_bound_inside_cycle() {
+    let g = GraphBuilder::new()
+        .func("a")
+        .func("b")
+        .func("c")
+        .func("leaf")
+        .calls("a", "b")
+        .calls("b", "c")
+        .calls("c", "a")
+        .calls("c", "leaf");
+    let v = view(g);
+    let a = id_of(v.nodes(), "a");
+
+    let depth1 = PathWalker {
+        max_depth: Some(1),
+        ..Default::default()
+    };
+    let reached1 = reaches_all(&v, a, &depth1);
+    let r1: Vec<&str> = reached1.iter().map(|r| r.node.fqn.as_str()).collect();
+    assert_eq!(r1, vec!["b"]);
+
+    let depth2 = PathWalker {
+        max_depth: Some(2),
+        ..Default::default()
+    };
+    let reached2 = reaches_all(&v, a, &depth2);
+    let mut r2: Vec<&str> = reached2.iter().map(|r| r.node.fqn.as_str()).collect();
+    r2.sort_unstable();
+    assert_eq!(r2, vec!["b", "c"]);
 }
 
 #[test]

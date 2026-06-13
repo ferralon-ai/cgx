@@ -1,0 +1,74 @@
+file: "src/recursion.rs"
+defs:
+  - fqn: "rust_sample::recursion::a"
+    kind: function
+    line: 41
+    visibility: public
+  - fqn: "rust_sample::recursion::b"
+    kind: function
+    line: 45
+    visibility: private
+  - fqn: "rust_sample::recursion::c"
+    kind: function
+    line: 49
+    visibility: private
+  - fqn: "rust_sample::recursion::factorial"
+    kind: function
+    line: 11
+    visibility: public
+  - fqn: "rust_sample::recursion::is_even"
+    kind: function
+    line: 21
+    visibility: public
+  - fqn: "rust_sample::recursion::is_odd"
+    kind: function
+    line: 30
+    visibility: public
+  - fqn: "rust_sample::recursion::leaf"
+    kind: function
+    line: 55
+    visibility: private
+refs:
+  - caller: "rust_sample::recursion::factorial"
+    callee: "rust_sample::recursion::factorial"
+    kind: calls
+    edge_condition: conditional
+    confidence: certain
+    line: 15
+  - caller: "rust_sample::recursion::is_even"
+    callee: "rust_sample::recursion::is_odd"
+    kind: calls
+    edge_condition: conditional
+    confidence: certain
+    line: 25
+  - caller: "rust_sample::recursion::is_odd"
+    callee: "rust_sample::recursion::is_even"
+    kind: calls
+    edge_condition: conditional
+    confidence: certain
+    line: 34
+  - caller: "rust_sample::recursion::a"
+    callee: "rust_sample::recursion::b"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 42
+  - caller: "rust_sample::recursion::b"
+    callee: "rust_sample::recursion::c"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 46
+  - caller: "rust_sample::recursion::c"
+    callee: "rust_sample::recursion::a"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 50
+  - caller: "rust_sample::recursion::c"
+    callee: "rust_sample::recursion::leaf"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 51
+imports: []

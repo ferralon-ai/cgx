@@ -15,6 +15,7 @@ mod dead_code;
 mod cfg_feature;
 mod unsafe_ffi;
 mod proc_macro_fixture;
+mod recursion;
 mod spawn;
 
 use crate::direct::add;

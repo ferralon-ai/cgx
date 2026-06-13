@@ -2,8 +2,8 @@
 
 ## Audience
 
-This document maps the four `cgx` user personas to the 126 questions they need
-answered, spanning 12 themes and 104 NOVEL questions. It drives the feature list:
+This document maps the four `cgx` user personas to the 138 questions they need
+answered, spanning 13 themes and 112 NOVEL questions. It drives the feature list:
 every capability in [03-code-graph-model.md](03-code-graph-model.md) (feature prefix
 `GM-`) and [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix
 `DF-`) traces back to at least one question here.
@@ -52,6 +52,8 @@ DF- = dataflow/provenance) and whether existing tools serve it:
 - **Partial** — existing tools partially cover it; `cgx` adds speed, MCP interface,
   exception-path labels, or Rust support.
 
+NOVEL is judged against all surveyed tools regardless of speed or interface (docs/10). A broader set of questions — including several labeled Partial — is unserved by any *fast, daemon-free, MCP-native* tool; positioning may make that scoped claim, but the NOVEL label itself is strict.
+
 ---
 
 ## Theme 1: Reachability and Attack Surface — Q1–Q13, Q87–Q88, Q92–Q93, Q100
@@ -83,13 +85,13 @@ DF- = dataflow/provenance) and whether existing tools serve it:
 
 ## Theme 2: Impact and Blast Radius — Q14–Q25
 
-*12 questions. 8 NOVEL.*
+*12 questions. 7 NOVEL.*
 
 | Q | Persona | Natural-Language Question | Capabilities | Coverage |
 |---|---------|--------------------------|--------------|---------|
-| Q14 | SSE | If I change the signature of `UserRepository.findById()`, which callers will break and which tests cover those callers? | `blast-radius` + `path-query` (GM-) | Partial (LSP — no test coverage mapping) |
+| Q14 | SSE | If I change the signature of `UserRepository.findById()`, which callers will break and which tests cover those callers? | `blast-radius` + `path-query` (GM-); (requires GM-1.3 `signature`) | Partial (LSP — no test coverage mapping) |
 | Q15 | SSE | Which modules depend on `PaymentProcessor` and would be affected by extracting it to a microservice? | `blast-radius` (GM-) | Partial (dependency tools — module level only) |
-| Q16 | ACA | I'm about to edit function `F`. Give me the minimal subgraph (callers up to depth 2, callees up to depth 3) needed to understand the change impact. | `subgraph-extract` (GM-) | NOVEL |
+| Q16 | ACA | I'm about to edit function `F`. Give me the minimal subgraph (callers up to depth 2, callees up to depth 3) needed to understand the change impact. | `subgraph-extract` (GM-) | Partial (CIE / codegraph serve depth-bounded neighborhood retrieval; cgx adds edge-condition and confidence context) |
 | Q17 | SSE | Which functions have no test coverage when traced from test entrypoints through the call graph? | `reachability` + `dead-member-query` (GM-) | Partial (line-coverage tools — not call-graph based) |
 | Q18 | SSE | If `ConfigLoader.parse()` returns an error, which functions in the startup sequence won't be executed? | `path-query` + `edge-condition-filter` (GM-) | NOVEL |
 | Q19 | SSE | What is the set of all functions that could be executing when we crash at `panic_handler`? | `blast-radius` + `path-query` (GM-) | NOVEL |
@@ -164,7 +166,7 @@ enabling capability. No existing tool labels or queries exception-conditioned ed
 
 ## Theme 5: Dead and Unused Code — Q46–Q53
 
-*8 questions. 6 NOVEL.*
+*8 questions. 4 NOVEL.*
 
 Dead code is a security risk: dormant functions are unpatched and can be reactivated.
 The Knight Capital $440M incident (2012) is the canonical case of reactivated dormant
@@ -174,11 +176,11 @@ code causing a production failure.
 |---|---------|--------------------------|--------------|---------|
 | Q46 | SSE | Which public methods on `UserService` are never called from any entrypoint in our own codebase? | `dead-member-query` + `entrypoint-enum` (GM-) | Partial (rustc `dead_code` lint — private items only) |
 | Q47 | PSE | Which authentication-related functions exist in the codebase but are never reachable from any live entrypoint? | `dead-member-query` + `entrypoint-enum` (GM-) | NOVEL |
-| Q48 | SSE | Which feature-flag branches are permanently dead given that flag `LEGACY_AUTH` is always false? | `branch-condition-filter` + `dead-member-query` (GM-) | NOVEL |
+| Q48 | SSE | Which feature-flag branches are permanently dead given that flag `LEGACY_AUTH` is always false? | `dead-member-query` (GM-) | not answerable as specced — requires branch-predicate modeling (no feature; see docs/05 'graph reachability, not path feasibility') |
 | Q49 | SSE | Which database migration functions have already been applied and are now unreachable dead code? | `dead-member-query` (GM-) | NOVEL |
 | Q50 | PSE | List all functions that reference crypto primitives but are not reachable from any current entrypoint. | `dead-member-query` + `sink-enum` (GM-) | NOVEL |
 | Q51 | ACA | Before I delete function `F`, confirm it has zero callers from any entrypoint and is not referenced by any test entrypoint either. | `reachability` + `entrypoint-enum` (GM-) | Partial (LSP — not entrypoint-scoped) |
-| Q52 | SSE | Which branches of `switch`/`match` statements on enum type `OrderStatus` are unreachable given actual call sites? | `branch-condition-filter` + `dead-member-query` (GM-) | NOVEL |
+| Q52 | SSE | Which branches of `switch`/`match` statements on enum type `OrderStatus` are unreachable given actual call sites? | `dead-member-query` (GM-) | not answerable as specced — requires branch-predicate modeling (no feature; see docs/05 'graph reachability, not path feasibility') |
 | Q53 | PSE | Which API endpoints defined in the router are never called by any integration test? | `reachability` + `entrypoint-enum` (GM-) | NOVEL |
 
 ---
@@ -225,7 +227,7 @@ questions below.
 
 ## Theme 8: AI-Agent-Specific Queries — Q68–Q75, Q79–Q81
 
-*11 questions. 8 NOVEL.*
+*11 questions. 7 NOVEL.*
 
 These questions arise from AI coding and security agent constraints: limited context
 windows, structured output requirements, low tool-call budgets, and post-edit
@@ -240,10 +242,10 @@ diffs, or negative path constraints.
 | Q70 | ACA | Is there any function I'm about to call that is only safe to call from the happy path and would fail if called from an error handler? | `edge-condition-filter` + `path-query` (GM-) | NOVEL |
 | Q71 | ASA | Scan the entire codebase: for every function that takes a `String` from an HTTP request parameter, determine if it reaches a shell command function without a sanitizer on the path. | `taint-propagation` + `entrypoint-enum` + `sink-enum` (DF-, GM-) | Partial (SAST — no MCP interface) |
 | Q72 | ACA | I'm implementing a new feature that calls `sendEmail()`. What other functions currently call `sendEmail()` and what context do they set up first? | `blast-radius` + `subgraph-extract` (GM-) | NOVEL |
-| Q73 | ASA | Generate a SARIF report of all taint paths from HTTP input to SQL sinks, including the full call chain for each path. | `taint-propagation` + structured SARIF output (DF-, GM-) | NOVEL |
+| Q73 | ASA | Generate a SARIF report of all taint paths from HTTP input to SQL sinks, including the full call chain for each path. | `taint-propagation` + structured SARIF output (DF-, GM-) | Partial (CodeQL serves SARIF taint paths with call chains; novelty limited to fast/daemon-free/MCP packaging) |
 | Q74 | ACA | Given that I want to add a parameter to `Config.load()`, which other functions will need changes based on the call graph? | `blast-radius` + `subgraph-extract` (GM-) | Partial (LSP) |
 | Q75 | ASA | After running `cargo audit`, for each reported advisory, determine: (a) is the vulnerable function reachable? (b) from which entrypoints? (c) is there a sanitizer on any path? | `reachability` + `path-query` + `edge-condition-filter` (GM-, DF-) | NOVEL |
-| Q79 | ACA | In 3 MCP tool calls instead of 34, give me the complete call chain from entrypoint to the function I'm about to edit, with all intermediate signatures. | `path-query` + structured MCP output (GM-) | Partial (CIE — not Rust, no exception labels) |
+| Q79 | ACA | In 3 MCP tool calls instead of 34, give me the complete call chain from entrypoint to the function I'm about to edit, with all intermediate signatures. | `path-query` + structured MCP output (GM-); (requires GM-1.3 `signature`) | Partial (CIE — not Rust, no exception labels) |
 | Q80 | ACA | Which symbols in the files I've already loaded are referenced by functions I haven't loaded yet? (outbound dangling references) | `subgraph-extract` + `api-surface-query` (GM-) | NOVEL |
 | Q81 | ACA | For the function I'm implementing, show me every other function in the codebase that calls the same dependencies, so I can match the established pattern. | `subgraph-extract` + pattern matching (GM-) | NOVEL |
 
@@ -262,7 +264,7 @@ internal call chain resolution.
 | Q82 | PSE | For advisory GHSA-xxxx, which specific vulnerable function is called, from which of our functions, and is there a sanitizer between them? | `reachability` + `path-query` + `edge-condition-filter` (GM-, DF-) | NOVEL |
 | Q83 | ASA | Produce a reachability matrix: rows = entrypoint classes (HTTP, gRPC, CLI, cron), columns = sink classes (SQL, shell, file, network, crypto). Fill with path counts. | `reachability` + `entrypoint-enum` + `sink-enum` (GM-) | NOVEL |
 | Q84 | PSE | Which data flows cross trust boundaries (e.g., from external-user zone to internal-service zone) without passing through a validation function? | `path-query` + `edge-label-query` + trust-boundary annotation (GM-) | NOVEL |
-| Q85 | PSE | Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and branch conditions. | `path-query` + `branch-condition-filter` (GM-) | NOVEL |
+| Q85 | PSE | Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and edge-condition labels. | `path-query` + `edge-condition-filter` (GM-) | NOVEL |
 
 ---
 
@@ -347,6 +349,27 @@ first-class pedigree edges.
 
 ---
 
+## Theme 13: Object Model and Inheritance — Q127–Q138
+
+*12 questions. 12 NOVEL.*
+
+| Q | Persona | Natural-Language Question | Capabilities | Coverage |
+|---|---------|--------------------------|--------------|---------|
+| Q127 | SSE, ACA | What class actually implements the method this call resolves to? | GM-22 (method-resolution order / linearization) | NOVEL |
+| Q128 | SSE | Which subclasses override method (or property) X? | GM-2.2 `overrides` | NOVEL |
+| Q129 | PSE, SSE | Which overrides widen the exception contract their base method declared? | Q-32 (override-contract drift) | NOVEL |
+| Q130 | PSE | Which overrides drop a guard the base class enforced on all paths to a sink? | Q-32 (override-contract drift; depends on corrected Q-20 ∀-path) | NOVEL |
+| Q131 | SSE, ACA | Which calls bypass an override via `super` (delegate to an ancestor body)? | GM-21 (`calls:super` edge kind) | NOVEL |
+| Q132 | SSE, ACA | When a class doesn't override an interface/trait method, which default body does a call resolve to? | GM-23 (default-method body provenance) | NOVEL |
+| Q133 | SSE | Which concrete types leave an abstract method unfulfilled (would fail to compile / instantiate)? | GM-25 (`unfulfilled_abstract` derived predicate) | NOVEL |
+| Q134 | SSE, ACA | Which concrete method fulfills this abstract declaration, per concrete subtype? | GM-25 (`fulfills` edge) | NOVEL |
+| Q135 | SSE | Which subclass property/accessor shadows a parent field or accessor (changing read/write semantics)? | GM-24 (accessor override / `shadows-field`) | NOVEL |
+| Q136 | PSE, SSE | For this polymorphic call, what is the full set of bodies it could resolve to across instantiated subtypes? | GM-2.1 `calls:virtual` + `candidate_set` (GM-5.2 CHA/RTA at tier 3) | NOVEL |
+| Q137 | SSE, ACA | Which overrides change the receiver's field-write footprint relative to the base (write a field the base did not, or stop writing one it did)? | Q-32 (override-contract drift; `writes-field` from GM-2.2) | NOVEL |
+| Q138 | PSE | In a diamond / multiple-inheritance hierarchy, which mixin or trait actually wins for method M, and does that differ from the naive nearest-base guess? | GM-22 (linearization) | NOVEL |
+
+---
+
 ## Canonical Prompt Examples
 
 The following four queries from the original product specification are stable reference
@@ -384,18 +407,19 @@ Theme: Temporal / VCS (Q54–Q61 class). Capabilities: `graph-diff` +
 | Theme | Questions | NOVEL |
 |-------|-----------|-------|
 | 1. Reachability and Attack Surface | 18 (Q1–Q13, Q87–Q88, Q92–Q93, Q100) | 13 |
-| 2. Impact and Blast Radius | 12 (Q14–Q25) | 8 |
+| 2. Impact and Blast Radius | 12 (Q14–Q25) | 7 |
 | 3. Provenance and Taint | 17 (Q26–Q36, Q86, Q91, Q94–Q96, Q102) | 14 |
 | 4. Failure-Path Behavior (incl. OWASP A10:2025) | 16 (Q37–Q45, Q76–Q78, Q98, Q101, Q103, Q106) | 15 |
-| 5. Dead and Unused Code | 8 (Q46–Q53) | 6 |
+| 5. Dead and Unused Code | 8 (Q46–Q53) | 4 |
 | 6. Temporal and VCS Graph Diffs | 10 (Q54–Q61, Q99, Q107) | 10 |
 | 7. API Surface and Contracts | 6 (Q62–Q67) | 5 |
-| 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 8 |
+| 8. AI-Agent-Specific | 11 (Q68–Q75, Q79–Q81) | 7 |
 | 9. Threat Modeling and DFD | 4 (Q82–Q85) | 4 |
 | 10. Concurrency and Resource Safety | 6 (Q89–Q90, Q97, Q104–Q105, Q108) | 6 |
 | 11. Types, Mutability, and Closures | 10 (Q109–Q118) | 8 |
 | 12. Framework Semantics and Metadata | 8 (Q119–Q126) | 7 |
-| **Total** | **126** | **104** |
+| 13. Object Model and Inheritance | 12 (Q127–Q138) | 12 |
+| **Total** | **138** | **112** |
 
 ---
 

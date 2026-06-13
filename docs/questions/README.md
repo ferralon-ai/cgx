@@ -1,6 +1,6 @@
 # Question Cookbook — Index
 
-This directory contains 12 theme files totalling 126 answered questions drawn from the 126-question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme.
+This directory contains 13 theme files totalling 138 answered questions drawn from the 138-question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme.
 
 ---
 
@@ -20,8 +20,9 @@ This directory contains 12 theme files totalling 126 answered questions drawn fr
 | 10 | [10-concurrency-and-resource-safety.md](10-concurrency-and-resource-safety.md) | Concurrency and Resource Safety | Q89–Q90, Q97, Q104–Q105, Q108 | 6 |
 | 11 | [11-types-mutability-and-closures.md](11-types-mutability-and-closures.md) | Types, Mutability, and Closures | Q109–Q118 | 10 |
 | 12 | [12-framework-semantics-and-metadata.md](12-framework-semantics-and-metadata.md) | Framework Semantics and Metadata | Q119–Q126 | 8 |
+| 13 | [13-object-model-and-inheritance.md](13-object-model-and-inheritance.md) | Object Model and Inheritance | Q127–Q138 | 12 |
 
-**Total: 126 questions.** Question IDs are globally unique; each question appears in exactly one file.
+**Total: 138 questions.** Question IDs are globally unique; each question appears in exactly one file.
 
 ---
 
@@ -41,6 +42,6 @@ Each entry follows a consistent template defined in the cycle synthesis document
 
 ## Further reading
 
-- **Query language specification and worked examples:** [docs/05-queries.md](../05-queries.md) — the authoritative reference for all query syntax, subcommand signatures, and the full Q-1 through Q-31 feature list.
+- **Query language specification and worked examples:** [docs/05-queries.md](../05-queries.md) — the authoritative reference for all query syntax, subcommand signatures, and the full Q-1 through Q-32 feature list.
 - **Term definitions:** [docs/13-glossary.md](../13-glossary.md) — plain-language definitions of every term of art used across the cookbook, including edge conditions, confidence tiers, transience, pedigree, taint vocabulary, semantic classes, and indexing terms.
-- **Persona question inventory:** [docs/02-personas-and-questions.md](../02-personas-and-questions.md) — the authoritative list of all 126 questions, their themes, and the personas that ask them.
+- **Persona question inventory:** [docs/02-personas-and-questions.md](../02-personas-and-questions.md) — the authoritative list of all 138 questions, their themes, and the personas that ask them.

@@ -58,6 +58,7 @@ Every named program entity is a **symbol** in the graph. Symbols are the nodes.
 | `macro` | Hygienic macro or preprocessor definition | Rust `macro_rules!`, C `#define` |
 | `lambda` | Anonymous callable with a stable allocation site | closures, arrow functions, lambdas |
 | `entrypoint` | Declared root for reachability (see GM-7) | `main`, HTTP handler, test function |
+| `call-site` | A call expression site within a caller's body; subordinate node kind — never returned by symbol queries, joined via edge `site_id` | `handler::process` call to `db::write` at file.rs:42:8 |
 
 ### GM-1.2 — Symbol identity
 
@@ -77,6 +78,35 @@ Every symbol node carries:
 - `visibility`: `public` / `private` / `protected` / `internal` / `package` (language-mapped)
 - `is_abstract`: boolean (interfaces, abstract methods, trait declarations)
 - `confidence`: the weakest confidence of any fact contributing to this node (see GM-5)
+- `signature`: nullable structured record on `function`/`method`/`lambda` kinds (see below):
+  - `params`: ordered list of `{name, type_text, has_default: bool, variadic: bool}` — `type_text` is the declared type as written in source (Tier 1) or the SCIP-resolved type (Tier 2+), with the source recorded in provenance.
+  - `return_type_text`: string or null.
+  - `type_params`: list of strings (generics, as written).
+  - `receiver`: string or null (self/this type for methods).
+  - `canonical`: deterministic rendered string derived from the above (single normalization rule, language-tagged).
+  - Populated where the parser provides it; null where it cannot. No inference is performed to fill it at Tier 1. **Status: core-extension** (schema present and populated-where-parseable from Phase 1).
+
+### GM-1.4 — Call-site nodes
+
+**Identity.** A call-site node's identity is `(caller symbol id, file, line, col)` → stable `site_id`. The `site_id` is derived deterministically from the blob OID plus byte offset of the call expression — not from insertion order — so it is stable across re-indexes of an unchanged blob.
+
+**Subordinate node kind.** Call-site nodes are subordinate: they never appear in `nodes(path)` and are not matched by default symbol patterns. Call-graph paths remain sequences of symbol nodes. Site facts are reached through the edge: `r.site.lock_set`, `r.site.suspends`. `position_in(n, path)` is defined over the symbol-node sequence of a path; call-site nodes never appear in `nodes(path)`. Site-level ordering within one caller uses `site.ordinal` (lexical) or, when populated, CFG dominance — never path position.
+
+**Attributes** (with population phase):
+
+| Attribute | Type | Status | Phase |
+|---|---|---|---|
+| `caller` | symbol ref | core-extension | 1 |
+| `file` | string | core-extension | 1 |
+| `line` | int | core-extension | 1 |
+| `col` | int | core-extension | 1 |
+| `ordinal` | int (lexical index within caller) | core-extension | 1 |
+| `suspends` | bool (GM-10) | core-extension | 1 |
+| `cfg_block` | opaque id (intraprocedural CFG block) | **Status: schema-room** — consumed by Q-20 guarded-cut semantics | 3 |
+| `dominating_sites` | Set<site_id> (intraprocedural dominator facts) | **Status: schema-room** — consumed by Q-20 guarded-cut semantics | 3 |
+| `lock_set` | Set<symbol> (GM-11) | **Status: schema-room** | 3 |
+| `is_return_site` | bool | **Status: schema-room** | 3 |
+| arg position bindings (Q-29) | per-site | **Status: schema-room** | 3 |
 
 ---
 
@@ -95,9 +125,10 @@ Edges express typed relations between symbols. Every edge is directed
 | `calls:callback` | Invocation via a function-value argument | `sorted(key=fn)` |
 | `calls:async` | Logical call across an async suspension boundary | `.await` on an `async fn` |
 | `calls:indirect` | Call via function pointer without resolved target | `(*fp)(args)` |
+| `calls:super` | Statically-bound delegation to a named ancestor's body, bypassing virtual dispatch | `super().m()`, `Base::m()` |
 
 Virtual and indirect call edges carry a `candidate_set` attribute listing all
-symbols the edge may resolve to at runtime, ordered by estimated probability.
+symbols the edge may resolve to at runtime, ordered by estimated probability. A `calls:super` edge has a single resolved target and a `bypassed_override` attribute naming the override virtual dispatch would otherwise select.
 
 ### GM-2.2 — Data-flow and structural edges
 
@@ -126,6 +157,7 @@ Every edge carries:
 - `provenance`: file:line + producing rule (see GM-6)
 - `cut_markers`: zero or more of `reflective`, `dynamic`, `via-DI`, `via-FFI`,
   `unresolved` (see GM-5.3)
+- `site_id`: reference to the call-site node (GM-1.4) this edge originates from; present on all call-edge types.
 
 ---
 
@@ -171,6 +203,20 @@ branches in those languages, not exceptions in the traditional sense. `cgx`
 models them under the `exception` guard label because they represent the
 semantically equivalent "failure branch" concept; the producing rule is recorded
 in provenance so users can distinguish them.
+
+### GM-3.2 — Precedence rule
+
+When a call site is lexically enclosed by multiple constructs that each apply a different label (e.g., a call inside an `if` inside a `for` inside a `catch`), exactly one label wins: the **maximum by the following total precedence order**:
+
+```
+panic  >  exception  >  loop  >  conditional  >  always
+```
+
+**Determination rule.** Collect the set of applicable labels from the chain of enclosing constructs between the call expression and the caller's body root (per the GM-3.1 per-language mapping); emit the maximum by precedence.
+
+**finally/defer carve-out.** The existing rule that calls inside `finally`/`defer`/cleanup blocks are labeled `always` applies **before** precedence — a `finally` block contributes `always`, not `exception`, to the applicable set. Its exception-relativity remains path-relative transience per GM-4, computed at query time. An `if` inside a `finally` yields `conditional`.
+
+**Worked example.** A call inside an `if` inside a `for` inside a `catch` block: applicable labels = {`exception` (catch), `loop` (for), `conditional` (if)}. Maximum by precedence: `exception` > `loop` > `conditional` → the edge is labeled `exception`.
 
 ---
 
@@ -275,6 +321,7 @@ does not silently drop these edges; it emits a cut-marker edge instead:
 | `via-DI` | Binding is managed by a dependency injection container (Spring, Guice, Dagger, etc.) |
 | `via-FFI` | Call crosses a foreign-function boundary (JNI, Python C extensions, Rust `extern "C"`) |
 | `unresolved` | Resolution was attempted and produced no candidates (the symbol is genuinely unknown) |
+| `unexpanded-macro` | Call edges may exist inside code generated by an unexpanded proc macro at this site; expansion was not performed. **Status: core-extension** (emitted from Phase 1). |
 
 A cut-marker edge is still a queryable fact. Security engineers searching for
 all paths to a sink will filter *in* `reflective` edges; software engineers
@@ -386,7 +433,8 @@ this section covers the constructs that affect graph topology.
 | `panic!` / `unwrap()` / `expect()` | `panic` edge condition on the panic path |
 | `async fn` / `.await` | `calls:async` edge to the awaited function; runtime mediates execution; edge tagged `async` |
 | `extern "C"` / FFI call | Cut-marker `via-FFI` |
-| `macro_rules!` expansion | Edges resolved at the macro call site after expansion |
+| `macro_rules!` (declarative macro) | Call sites textually visible inside invocation arguments are extracted best-effort as `possible` edges, provenance rule `macro-textual` |
+| Proc-macro invocation / annotation | Code generated by the proc macro is a labeled blind spot: each site emits a cut-marker `unexpanded-macro` (GM-5.3) so the gap is queryable and countable; expansion-based resolution only under `cgx index --rust-expand` (Status: roadmap) |
 
 ### GM-8.3 — Go
 
@@ -510,7 +558,7 @@ suspension and resumption, any shared mutable state may have changed.
 ### GM-10.1 — The `suspends` node property
 
 `cgx` attaches a boolean `suspends = true` attribute to any call-site node
-that is a known suspension point. This property is node-level: it annotates the
+(GM-1.4) that is a known suspension point. This property is node-level: it annotates the
 call site in the caller, not the callee.
 
 `suspends` is the **TOCTOU primitive** in the graph model. A query of the form
@@ -549,11 +597,11 @@ schema alongside GM-9 and GM-10; lock-set queries (Q-24) depend on it.
 The **synchronization context** at a call site is the set of
 synchronization objects that are **held** (acquired but not yet released) when
 that call site executes. `cgx` models this as a **lock set** attribute on
-call-site nodes.
+call-site nodes (GM-1.4).
 
 ### GM-11.1 — Lock set attribute
 
-Each call-site node in the graph carries:
+Each call-site node (GM-1.4) in the graph carries:
 
 ```
 lock_set: Set<symbol>   # symbols of synchronization objects held at this site
@@ -815,6 +863,10 @@ supported in GM-6; GM-14 adds the queryable attribute:
 ```
 macro_origin: string | null    # name of the macro or generator, if applicable
 ```
+
+**Declarative macros (`macro_rules!`):** call sites textually visible inside invocation arguments are extracted with provenance `rule: macro-textual`. The `macro_origin` attribute names the macro.
+
+**Proc-macro provenance:** expansion-side provenance fields (span mapping from generated to source, `proc-macro` rule tag) have **Status: schema-room** — populated only under `cgx index --rust-expand` (roadmap). Until then, proc-macro invocation sites emit an `unexpanded-macro` cut marker (GM-5.3) rather than expansion-derived edges.
 
 Edges with a non-null `macro_origin` have reduced human auditability: the
 developer did not write the call site directly. Security queries can filter for
@@ -1297,6 +1349,67 @@ graph reachability, not constraint-based path-feasibility (which would require
 SMT solving). Guard-conditioned reachability (filtering edges by `edge_condition`)
 is cheap and exact for the structural condition; it does not prove that no
 path-infeasibility exists on other grounds.
+
+---
+
+---
+
+## GM-21 — `calls:super` Edge Kind
+
+**Status:** core-extension — the `inherits`/`overrides` edges and the call-site lowering already exist; this is a re-classification of an existing call edge plus one resolved attribute. No new entity kind required.
+
+A `calls:super` edge denotes a statically-bound delegation to a *named ancestor's* method body that deliberately bypasses virtual dispatch. The edge's target is the resolved ancestor body (single target, not a candidate set), and it carries a `bypassed_override` attribute = the FQN of the override that virtual dispatch *would* have selected for the receiver's static type (when one exists).
+
+**Per-language lowering:**
+
+| Language | Construct |
+|---|---|
+| Python | `super().m()` |
+| Java / C# / Kotlin | `super.m()` |
+| Scala | `super.m` / `super[Trait].m` |
+| Rust | `Trait::method(self)` / `BaseStruct::method(&self)` UFCS to a default |
+| C++ | `Base::m()` |
+| Ruby | `super` |
+
+---
+
+## GM-22 — Method-Resolution Order (Linearization)
+
+**Status:** schema-room — raw `inherits`/`implements` edges exist, but the *ordered linearization* is a new stored entity the graph lacks today. C3/trait-linearization is language-specific computation that must be reserved now so MRO-dependent queries do not force a later schema migration.
+
+A per-type ordered ancestor sequence `mro` attached to type nodes: the linearization the language uses to resolve a method or `super` call. For single-inheritance languages the MRO is the `inherits` chain; the value is the language's own algorithm result (Python C3, Scala trait linearization, Ruby ancestry, C++ with virtual-base de-duplication). A derived edge kind `resolves-to` (call-site → method body) records, for a `calls:virtual` or `calls:super` site, the body the MRO selects per candidate concrete type.
+
+**Per-language scope:** Python (C3), Scala (trait linearization), Ruby (module ancestry), C++ (virtual inheritance), Groovy/Kotlin mixins. Single-inheritance languages (Java classes, C#) populate it trivially from `inherits`.
+
+---
+
+## GM-23 — Default-Method Body Provenance
+
+**Status:** schema-room — `implements`/`overrides` give the relation but not the *body-provider* resolution for the not-overridden case; this is a new derived fact requiring default-method detection per language.
+
+A `provides-body` derived edge from a (concrete-type, abstract-or-interface-method) pair to the symbol that actually supplies the executed body when the concrete type does **not** override it — i.e. an interface/trait default method or an inherited base implementation. Makes the body provider a first-class candidate-set member for `calls:virtual` over default-method calls.
+
+**Per-language scope:** Java `default` methods; Scala/Rust trait default methods; C# default interface methods; Kotlin interface method bodies; Ruby module-included methods.
+
+---
+
+## GM-24 — Accessor / Property Override
+
+**Status:** schema-room — today `overrides` is method-to-method and `reads-field`/`writes-field` are method-to-field; representing an accessor that shadows a field is a new entity relationship the model lacks.
+
+Extends `overrides` to range over **accessor** symbols (getter/setter/property), and adds a `shadows-field` derived edge from a subclass accessor to the parent field or accessor it shadows. Lets field-read/field-write reasoning (GM `reads-field`/`writes-field`) account for an accessor interposed by a subclass.
+
+**Per-language scope:** C# `override` properties; Kotlin `val`/`var` with custom `get()`/`set()` override; Python `@property` override; Swift computed-property override; Java getter/setter override (by convention).
+
+---
+
+## GM-25 — Abstract-Method Fulfillment Map
+
+**Status:** core-extension — `is_abstract` and `overrides` exist; `fulfills` is the `overrides` relation restricted to an abstract target, and `unfulfilled_abstract` is a derived set over existing edges. No new stored entity required (uses GM-22's MRO when present, falls back to `inherits` chain).
+
+A `fulfills` derived edge from a concrete method to the abstract method (`is_abstract = true`) it satisfies, plus a derived per-(concrete-type) predicate `unfulfilled_abstract` listing abstract members with no fulfilling override reachable through the type's MRO. Exposes the mapping CHA/RTA already computes internally.
+
+**Per-language scope:** All languages with abstract methods/interfaces/traits: Java/C#/Kotlin/Scala abstract + interface; Rust trait required methods; Python `abc.abstractmethod`; C++ pure-virtual.
 
 ---
 

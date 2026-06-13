@@ -53,6 +53,7 @@ Both layers produce identical result objects: every result node and edge carries
 | Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 |
 | Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 |
 | Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 |
+| Q-32 | Override-contract drift queries (exception-widening, dropped-base-guard, field-footprint drift) | 2 |
 
 ---
 
@@ -252,6 +253,8 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 - `CALLS` — direct or transitive call edge
 - `DATA_FLOW` — value flow (from `docs/04-dataflow-and-provenance.md`)
 - `MEMBER_OF` — member-of-type relationship
+- `OVERRIDES`, `INHERITS`, `IMPLEMENTS` — structural object-model edges (lowercase canonical `edge_type` in GM-2.2; uppercase in MATCH patterns per the `member-of`/`MEMBER_OF` precedent)
+- `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` — Theme-13 object-model edges (GM-21..GM-25); uppercase in MATCH patterns only
 
 **Edge properties:**
 - `condition` — `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"`
@@ -262,7 +265,7 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 - `nodes(path)` — list of nodes on a path
 - `relationships(path)` — list of edges on a path
 - `length(path)` — hop count
-- `position_in(node, path)` — 0-based index of `node` within `path`; used by the ordering predicates in Q-22 and the TOCTOU query in Q-24
+- `position_in(node, path)` — 0-based index of `node` within `path`; used by the ordering predicates in Q-22 and the TOCTOU query in Q-24. `position_in` is defined over the symbol-node sequence of a path; call-site nodes never appear in `nodes(path)`. Site-level facts are accessed via `r.site.<attr>` on the path's relationships.
 - `last_node(path)` — the final node of `path` (e.g. `last_node(path).is_exit`); used by the acquire/release query in Q-22
 
 **Aggregates over list comprehensions:**
@@ -317,17 +320,23 @@ RETURN src.name, src.file, src.line,
 ORDER BY src.file, src.line
 ```
 
-### Q-10: SQL alternative
+### Q-10: SQL alternative (unstable, view-based)
 
-For v1 implementations that use SQLite storage, a recursive-CTE interface is available:
+**Status: core-extension** (the views ship with the SQLite backend).
+
+For v1 implementations that use SQLite storage, a recursive-CTE interface is available. Queries execute against a small set of documented, versioned SQL views; physical tables are not API and carry no stability guarantee.
+
+**Documented views:** `v_symbols`, `v_call_edges` (includes `site_id`, `edge_condition`, `confidence`, `introducing_commit`/`introducing_author` when present), `v_call_sites`, `v_provenance`. A `cgx_meta` view exposes `view_schema_version` (integer); view-breaking changes bump it. The feature is **unstable** in v1: the view set and columns may change between minor versions; pin `view_schema_version` in scripts.
+
+Physical tables remain readable (SQLite cannot hide them cheaply) but are documented as **not API, no stability guarantee, may vanish entirely**.
 
 ```bash
 cgx query --sql '
   WITH RECURSIVE callers(caller, callee, depth) AS (
-    SELECT caller, callee, 1 FROM call_edges WHERE callee = "crypto::hash"
+    SELECT caller, callee, 1 FROM v_call_edges WHERE callee = "crypto::hash"
     UNION ALL
     SELECT e.caller, r.callee, r.depth + 1
-    FROM call_edges e JOIN callers r ON e.callee = r.caller
+    FROM v_call_edges e JOIN callers r ON e.callee = r.caller
     WHERE r.depth < 5
   )
   SELECT DISTINCT caller, depth FROM callers ORDER BY depth, caller
@@ -539,8 +548,10 @@ Find all paths from any symbol to a known-dangerous function; assert none exist 
 cgx paths --from '**' --to dangerous::sink ./ \
     --assert-empty \
     --format sarif > security.sarif
-echo $?   # 0 = clean; 1 = paths found (CI fail)
+echo $?   # 0 = clean; 1 = paths found (CI fail); 4 = vacuously satisfied (gate tested nothing)
 ```
+
+> **Vacuity guard applies.** When combined with `--confidence certain`, this gate passes vacuously before a SCIP index is present (pre-SCIP, no edges are `certain`). The vacuity guard (exit code 4) fires in that case. See `docs/07-interfaces.md` IF-5 for the full vacuity guard definition and `--allow-vacuous` opt-out.
 
 See `docs/07-interfaces.md` for the full exit-code contract and `--assert-count` / `--assert-max` variants.
 
@@ -598,7 +609,8 @@ All subcommands and the query language support filtering on edge condition label
 | `always` | Edge traversed on all paths | Happy-path-only analysis |
 | `conditional` | Edge guarded by a data or branch condition | Conditional reachability |
 | `exception` | Edge traversed only during exceptional control flow | Exception-path analysis |
-| `loop` | Back-edge in a loop | Loop body analysis |
+| `loop` | Call site lexically inside a loop body (taken zero or more times) — see GM-3 | Loop body analysis |
+| `panic` | Edge on an unwinding/aborting path (exceptional class) | Panic-surface analysis |
 
 Subcommand flags:
 
@@ -642,6 +654,8 @@ Query language:
 MATCH (c)-[r:CALLS*1..5 {confidence: "certain"}]->(fn {name:"foo"})
 RETURN c.name
 ```
+
+> **Vacuity warning.** Confidence filters narrow assertion gates toward false safety: an `--assert-empty --confidence certain` gate passes vacuously green when no edge in the corpus is `certain` (e.g., pre-SCIP, most edges are `probable` or `possible`). The `--assert-empty` command detects and rejects vacuous passes by default (exit code 4). See `docs/07-interfaces.md` IF-5 for the full vacuity guard definition.
 
 ---
 
@@ -722,9 +736,34 @@ cgx paths --from '**::handle' --to db::write ./ \
     --assert-empty
 ```
 
-### Layer 2 — Query language
+### Normative semantics: guarded-cut reachability
 
-Two new path-quantifier clauses:
+`MATCH ALL ... MUST PASS THROUGH (g)` and `AVOIDING (g)` compile to **guarded-cut reachability**, not path enumeration. The definition:
+
+**Definition (guard-protection).** Given source set S, sink T, guard symbol G, over the call graph at the active confidence floor:
+
+1. Build the **residual graph** by:
+   a. **Node cut:** delete node G (and all its incident call edges).
+   b. **Dominance cut:** delete every call edge `e` whose call site `s` (via `e.site_id`) satisfies: ∃ `s' ∈ dominating_sites(s)` such that a call edge from `s'` resolves to `G` at confidence ≥ the query's confidence floor. (`dominating_sites(s)` = call sites in the same function whose CFG node dominates `s`'s CFG node, from the standard intraprocedural dominator tree on the caller's CFG.)
+2. **T is guard-protected from S w.r.t. G** iff T is unreachable from S in the residual graph.
+3. A **bypass finding** is any S→T path in the residual graph (reported with evidence, subject to `--max-paths`); the existence test itself is reachability (linear), not enumeration.
+
+**Stored vs. computed.** The dominator tree per function and `dominating_sites` per call site are intraprocedural, path-independent facts — stored at index time (Phase 3) on call-site nodes (GM-1.4). The cut and reachability test run at query time. Nothing path-relative is stored (transience invariant preserved).
+
+**Confidence ladder when CFG/dominance is absent** (Tier-2/3 languages, or Phase 1–2 before dominance ships):
+
+| `guard_analysis` | Meaning | Finding confidence |
+|---|---|---|
+| `"cut+dominance"` | Every caller on the path had dominance facts | `min` edge confidence on the path (so `certain` is reachable) |
+| `"cut-only"` | ≥1 caller on the path lacked dominance facts | Capped at `probable`; per-finding note names unanalyzed caller(s) ("inline sibling guards in these functions were not checked") |
+
+∀-guarantees ("guard-protected") are always sound-conservative: a guarantee is never granted because facts were missing. Phase-1/2 behavior is pure graph-cut, all findings `guard_analysis: "cut-only"`, capped at `probable`. The legacy node-membership semantics is **removed**, not kept as a fallback.
+
+> **Warning.** Node-membership (`NONE(n IN nodes(path))`) does not detect inline sibling guards and is **not** the must-pass-through semantics; it remains available as a weaker predicate. See below.
+
+Multiple guards (`--must-pass-through` repeated): cut applies per guard with AND semantics (each guard independently protects).
+
+### Layer 2 — Query language
 
 ```cypher
 -- ∀-path: ALL paths from handler to db::write pass through require_admin
@@ -733,13 +772,13 @@ MATCH path = (h {kind:"entrypoint"})-[:CALLS*]->(sink {name:"db::write"})
 WHERE NONE(n IN nodes(path) WHERE n.name = "require_admin")
 RETURN path
 
--- ∀-path with ALL quantifier (explicit form)
+-- ∀-path with ALL quantifier (explicit form — compiles to guarded-cut reachability)
 MATCH ALL path = (h {kind:"entrypoint"})-[:CALLS*]->(sink {name:"db::write"})
 MUST PASS THROUGH (check {name:"require_admin"})
 RETURN path
 ```
 
-The `MATCH ALL path` + `MUST PASS THROUGH` clause is the explicit ∀-path form. It is syntactic sugar for the `NONE`-based complement at the path-set level; both forms produce identical results.
+The `MATCH ALL path` + `MUST PASS THROUGH` clause is the explicit ∀-path form. It compiles to guarded-cut reachability (see above). The `NONE`-based complement is the weaker node-membership predicate — use `MATCH ALL ... MUST PASS THROUGH` for the normative semantics.
 
 `AVOIDING` is the complement:
 
@@ -749,11 +788,13 @@ AVOIDING (redactor {name:"redact_pii"})
 RETURN src.name, src.file, src.line
 ```
 
-When `MATCH ALL ... AVOIDING` returns zero paths, every path passes through the named node — the ∀ guarantee holds.
+When `MATCH ALL ... AVOIDING` returns zero paths, every path passes through the named node — the ∀ guarantee holds (subject to `guard_analysis` in output).
 
 ---
 
 ## Q-21: Path-Set Algebra (Complement, Intersection, Difference)
+
+> **Note.** Ordering/algebra forms written with `NONE` node-membership inherit the sibling-guard caveat from Q-20: inline sibling guards are not detected by the node-membership predicate. The dominance-correct forms arrive with Q-20 Phase-3 facts.
 
 **Status: core-extension** — path-set algebra extends Q-14 (negative path constraints) and Q-20 (quantifiers) to a composable predicate algebra over path sets.
 
@@ -815,6 +856,8 @@ RETURN path
 ---
 
 ## Q-22: Ordering and Pairing Predicates
+
+> **Note.** The `A BEFORE B ON ALL PATHS` and acquire/release forms written with `NONE` node-membership inherit the sibling-guard caveat from Q-20: inline sibling guards in callers are not detected by the node-membership predicate. The dominance-correct forms arrive with Q-20 Phase-3 facts.
 
 **Status: core-extension** (A-then-B on all paths and acquire/release pairs); the acquire/release subset is the tractable 2-state case. Full typestate ordering is `roadmap` — see GM-13.4.
 
@@ -1228,13 +1271,13 @@ cgx paths --from db::Connection::begin \
 
 ```bash
 cgx query '
-  MATCH path = (acquire {name:"db::Connection::begin"})-[:CALLS*]->(exit_node)
-  WHERE exit_node.is_return_site = true
+  MATCH path = (acquire {name:"db::Connection::begin"})-[:CALLS*]->(exit_fn)
+  WHERE ANY(r IN relationships(path) WHERE r.site.is_return_site = true)
     AND NONE(n IN nodes(path)
              WHERE n.name IN ["db::Connection::commit",
                                "db::Connection::rollback"])
   RETURN acquire.file, acquire.line,
-         exit_node.name, exit_node.file, exit_node.line,
+         exit_fn.name, exit_fn.file, exit_fn.line,
          ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
            AS on_exception_path
   ORDER BY on_exception_path DESC, acquire.file
@@ -2081,6 +2124,28 @@ cgx query '
 ```
 
 Zero results means every HTTP endpoint has at least one authz annotation or call-based guard — the ∀ coverage assertion for the authz layer.
+
+---
+
+### Object-model example: overrides that drop a base-class guard
+
+**Question:** Which overrides reach the same database-write sink as their base method without passing through the authorization guard the base method enforced on all paths?
+
+This demonstrates Q-32 (override-contract drift), specifically the dropped-guard sub-class. It applies corrected Q-20 ∀-path must-pass-through semantics: the guard set is derived from the base method's sub-graph rather than supplied by the user.
+
+**Full query:**
+
+```cypher
+-- illustrative: requires Q-32 (core-extension; depends on corrected Q-20 ∀-path)
+MATCH (sub:method)-[:OVERRIDES]->(base:method)
+MATCH ALL (base)-[:CALLS*]->(sink {sink_class:"db-write"}) MUST PASS THROUGH (g {guard_class:"authz"})
+MATCH ALL (sub)-[:CALLS*]->(sink {sink_class:"db-write"}) AVOIDING (g)
+RETURN sub.name, sub.file, sub.line
+```
+
+**Breaking it down.** The first `MATCH ALL ... MUST PASS THROUGH` confirms that the base method routes every path to the sink through a guard with `guard_class:"authz"`. The second `MATCH ALL ... AVOIDING` finds the same sink reachable from the override on a path that avoids that guard — the dropped-guard pattern. Because Q-32 is a query-class feature that depends on the corrected Q-20 ∀-path semantics, the query is gated with the illustrative comment.
+
+**Reading the result.** Non-empty results identify overrides that silently removed an authorization check the base method enforced. Each row names the override method and its source location. The guard set is derived from the base's sub-graph, not declared by the query author — this is the key difference from a plain Q-20 authorization-bypass query.
 
 ---
 

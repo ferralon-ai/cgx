@@ -1,0 +1,160 @@
+file: "src/errors.ts"
+defs:
+  - fqn: "ts_sample::errors::checkRange"
+    kind: function
+    line: 12
+    visibility: private
+  - fqn: "ts_sample::errors::formatResult"
+    kind: function
+    line: 17
+    visibility: private
+  - fqn: "ts_sample::errors::handleError"
+    kind: function
+    line: 45
+    visibility: private
+  - fqn: "ts_sample::errors::logInnerError"
+    kind: function
+    line: 73
+    visibility: private
+  - fqn: "ts_sample::errors::logOuterError"
+    kind: function
+    line: 74
+    visibility: private
+  - fqn: "ts_sample::errors::logParseError"
+    kind: function
+    line: 35
+    visibility: private
+  - fqn: "ts_sample::errors::logRethrow"
+    kind: function
+    line: 62
+    visibility: private
+  - fqn: "ts_sample::errors::nestedTry"
+    kind: function
+    line: 64
+    visibility: public
+  - fqn: "ts_sample::errors::parseToInt"
+    kind: function
+    line: 8
+    visibility: private
+  - fqn: "ts_sample::errors::readString"
+    kind: function
+    line: 4
+    visibility: private
+  - fqn: "ts_sample::errors::releaseResources"
+    kind: function
+    line: 49
+    visibility: private
+  - fqn: "ts_sample::errors::tryParse"
+    kind: function
+    line: 21
+    visibility: public
+  - fqn: "ts_sample::errors::validateAndParse"
+    kind: function
+    line: 53
+    visibility: public
+  - fqn: "ts_sample::errors::withCleanup"
+    kind: function
+    line: 39
+    visibility: public
+refs:
+  # tryParse: try body = always, catch body = exception
+  - caller: "ts_sample::errors::tryParse"
+    callee: "ts_sample::errors::readString"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 23
+  - caller: "ts_sample::errors::tryParse"
+    callee: "ts_sample::errors::parseToInt"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 24
+  - caller: "ts_sample::errors::tryParse"
+    callee: "ts_sample::errors::checkRange"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 25
+  - caller: "ts_sample::errors::tryParse"
+    callee: "ts_sample::errors::logParseError"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 28
+  # withCleanup: try=always, catch=exception, finally=always
+  - caller: "ts_sample::errors::withCleanup"
+    callee: "ts_sample::errors::formatResult"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 41
+  - caller: "ts_sample::errors::withCleanup"
+    callee: "ts_sample::errors::parseToInt"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 41
+  - caller: "ts_sample::errors::withCleanup"
+    callee: "ts_sample::errors::handleError"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 44
+  - caller: "ts_sample::errors::withCleanup"
+    callee: "ts_sample::errors::releaseResources"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 47
+  # validateAndParse: re-throw — catch body is exception
+  - caller: "ts_sample::errors::validateAndParse"
+    callee: "ts_sample::errors::parseToInt"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 55
+  - caller: "ts_sample::errors::validateAndParse"
+    callee: "ts_sample::errors::readString"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 55
+  - caller: "ts_sample::errors::validateAndParse"
+    callee: "ts_sample::errors::logRethrow"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 58
+  # nestedTry: inner catch = exception, outer catch = exception, middle = always
+  - caller: "ts_sample::errors::nestedTry"
+    callee: "ts_sample::errors::parseToInt"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 68
+  - caller: "ts_sample::errors::nestedTry"
+    callee: "ts_sample::errors::logInnerError"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 70
+  - caller: "ts_sample::errors::nestedTry"
+    callee: "ts_sample::errors::checkRange"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 73
+  - caller: "ts_sample::errors::nestedTry"
+    callee: "ts_sample::errors::formatResult"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 73
+  - caller: "ts_sample::errors::nestedTry"
+    callee: "ts_sample::errors::logOuterError"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 75
+imports: []

@@ -1,0 +1,116 @@
+file: "src/virtual_dispatch.rs"
+defs:
+  - fqn: "rust_sample::virtual_dispatch::Adder"
+    kind: type
+    line: 53
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Adder::transform"
+    kind: method
+    line: 56
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Cat"
+    kind: type
+    line: 13
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Cat::introduce"
+    kind: method
+    line: 21
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Cat::speak"
+    kind: method
+    line: 16
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Dog"
+    kind: type
+    line: 12
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Dog::speak"
+    kind: method
+    line: 15
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Doubler"
+    kind: type
+    line: 50
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Doubler::transform"
+    kind: method
+    line: 52
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Speak"
+    kind: type
+    is_abstract: true
+    line: 4
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Speak::introduce"
+    kind: method
+    line: 8
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Speak::speak"
+    kind: method
+    is_abstract: true
+    line: 5
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Transform"
+    kind: type
+    is_abstract: true
+    line: 47
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::Transform::transform"
+    kind: method
+    is_abstract: true
+    line: 48
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::apply_all"
+    kind: function
+    line: 63
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::make_speak"
+    kind: function
+    line: 28
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::make_speak_boxed"
+    kind: function
+    line: 33
+    visibility: public
+  - fqn: "rust_sample::virtual_dispatch::make_speak_static"
+    kind: function
+    line: 38
+    visibility: public
+refs:
+  - caller: "rust_sample::virtual_dispatch::Cat::introduce"
+    callee: "rust_sample::virtual_dispatch::Cat::speak"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 22
+  - caller: "rust_sample::virtual_dispatch::Speak::introduce"
+    callee: "rust_sample::virtual_dispatch::Speak::speak"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: probable
+    line: 9
+  - caller: "rust_sample::virtual_dispatch::apply_all"
+    callee: "rust_sample::virtual_dispatch::Transform::transform"
+    kind: calls:virtual
+    edge_condition: loop
+    confidence: probable
+    line: 65
+  - caller: "rust_sample::virtual_dispatch::make_speak"
+    callee: "rust_sample::virtual_dispatch::Speak::speak"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: probable
+    line: 30
+  - caller: "rust_sample::virtual_dispatch::make_speak_boxed"
+    callee: "rust_sample::virtual_dispatch::Speak::introduce"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: probable
+    line: 35
+  - caller: "rust_sample::virtual_dispatch::make_speak_static"
+    callee: "rust_sample::virtual_dispatch::Speak::speak"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 40
+imports: []

@@ -1,0 +1,145 @@
+file: "src/errors.rs"
+defs:
+  - fqn: "rust_sample::errors::AppError"
+    kind: type
+    line: 8
+    visibility: public
+  - fqn: "rust_sample::errors::AppError::fmt"
+    kind: method
+    line: 19
+    visibility: public
+  - fqn: "rust_sample::errors::AppError::from"
+    kind: method
+    line: 30
+    visibility: public
+  - fqn: "rust_sample::errors::check_range"
+    kind: function
+    line: 49
+    visibility: private
+  - fqn: "rust_sample::errors::do_something"
+    kind: function
+    line: 65
+    visibility: private
+  - fqn: "rust_sample::errors::format_result"
+    kind: function
+    line: 55
+    visibility: private
+  - fqn: "rust_sample::errors::handle_with_match"
+    kind: function
+    line: 69
+    visibility: public
+  - fqn: "rust_sample::errors::log_error"
+    kind: function
+    line: 63
+    visibility: private
+  - fqn: "rust_sample::errors::parse_int"
+    kind: function
+    line: 43
+    visibility: private
+  - fqn: "rust_sample::errors::pipeline"
+    kind: function
+    line: 83
+    visibility: public
+  - fqn: "rust_sample::errors::read_string"
+    kind: function
+    line: 36
+    visibility: private
+  - fqn: "rust_sample::errors::safe_divide"
+    kind: function
+    line: 79
+    visibility: public
+  - fqn: "rust_sample::errors::try_parse"
+    kind: function
+    line: 57
+    visibility: public
+refs:
+  # ? operator on Err -> exception edge
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::read_string"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 58
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::read_string"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 58
+    # Note: the ? operator produces both a call edge (always, the call itself)
+    # and an implicit exception edge for the Err return path.
+    # The exception edge represents the early-return path; the call itself is always.
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::parse_int"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 59
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::parse_int"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 59
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::check_range"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 60
+  - caller: "rust_sample::errors::try_parse"
+    callee: "rust_sample::errors::check_range"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 60
+  # Err(e) match arm -> exception edge on log_error call
+  - caller: "rust_sample::errors::handle_with_match"
+    callee: "rust_sample::errors::try_parse"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 70
+  - caller: "rust_sample::errors::handle_with_match"
+    callee: "rust_sample::errors::do_something"
+    kind: calls
+    edge_condition: conditional
+    confidence: certain
+    line: 71
+  - caller: "rust_sample::errors::handle_with_match"
+    callee: "rust_sample::errors::log_error"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 73
+  - caller: "rust_sample::errors::pipeline"
+    callee: "rust_sample::errors::try_parse"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 84
+  - caller: "rust_sample::errors::pipeline"
+    callee: "rust_sample::errors::try_parse"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 84
+  - caller: "rust_sample::errors::pipeline"
+    callee: "rust_sample::errors::check_range"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 85
+  - caller: "rust_sample::errors::pipeline"
+    callee: "rust_sample::errors::check_range"
+    kind: calls
+    edge_condition: exception
+    confidence: certain
+    line: 85
+  - caller: "rust_sample::errors::pipeline"
+    callee: "rust_sample::errors::format_result"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 86
+imports: []

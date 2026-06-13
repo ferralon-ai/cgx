@@ -1,0 +1,105 @@
+file: "src/spawn.rs"
+defs:
+  - fqn: "rust_sample::spawn::background_work"
+    kind: function
+    line: 7
+    visibility: private
+  - fqn: "rust_sample::spawn::handle_join_error"
+    kind: function
+    line: 17
+    visibility: private
+  - fqn: "rust_sample::spawn::log_task"
+    kind: function
+    line: 13
+    visibility: private
+  - fqn: "rust_sample::spawn::process_task"
+    kind: function
+    line: 11
+    visibility: private
+  - fqn: "rust_sample::spawn::spawn_and_join"
+    kind: function
+    line: 54
+    visibility: public
+  - fqn: "rust_sample::spawn::spawn_if"
+    kind: function
+    line: 27
+    visibility: public
+  - fqn: "rust_sample::spawn::spawn_many"
+    kind: function
+    line: 34
+    visibility: public
+  - fqn: "rust_sample::spawn::spawn_on_error"
+    kind: function
+    line: 42
+    visibility: public
+  - fqn: "rust_sample::spawn::spawn_one"
+    kind: function
+    line: 22
+    visibility: public
+  - fqn: "rust_sample::spawn::spawn_with_shared_state"
+    kind: function
+    line: 50
+    visibility: public
+refs:
+  # background_work awaits process_task — calls:async
+  - caller: "rust_sample::spawn::background_work"
+    callee: "rust_sample::spawn::process_task"
+    kind: calls:async
+    edge_condition: always
+    confidence: certain
+    line: 8
+  # process_task calls log_task — direct call
+  - caller: "rust_sample::spawn::process_task"
+    callee: "rust_sample::spawn::log_task"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 12
+  # spawn_one: tokio::spawn with background_work -> spawns edge, always
+  - caller: "rust_sample::spawn::spawn_one"
+    callee: "rust_sample::spawn::background_work"
+    kind: spawns
+    edge_condition: always
+    confidence: probable
+    line: 23
+  # spawn_if: tokio::spawn inside if -> spawns edge, conditional
+  - caller: "rust_sample::spawn::spawn_if"
+    callee: "rust_sample::spawn::background_work"
+    kind: spawns
+    edge_condition: conditional
+    confidence: probable
+    line: 29
+  # spawn_many: tokio::spawn inside for loop -> spawns edge, loop
+  - caller: "rust_sample::spawn::spawn_many"
+    callee: "rust_sample::spawn::background_work"
+    kind: spawns
+    edge_condition: loop
+    confidence: probable
+    line: 36
+  # spawn_on_error: tokio::spawn inside Err arm -> spawns edge, exception
+  - caller: "rust_sample::spawn::spawn_on_error"
+    callee: "rust_sample::spawn::process_task"
+    kind: calls:async
+    edge_condition: conditional
+    confidence: certain
+    line: 43
+  - caller: "rust_sample::spawn::spawn_on_error"
+    callee: "rust_sample::spawn::background_work"
+    kind: spawns
+    edge_condition: exception
+    confidence: probable
+    line: 45
+  # spawn_and_join: awaits the handle — calls:async (not spawns)
+  - caller: "rust_sample::spawn::spawn_and_join"
+    callee: "rust_sample::spawn::background_work"
+    kind: spawns
+    edge_condition: always
+    confidence: probable
+    line: 55
+  - caller: "rust_sample::spawn::spawn_and_join"
+    callee: "rust_sample::spawn::handle_join_error"
+    kind: calls:closure
+    edge_condition: exception
+    confidence: certain
+    line: 56
+imports: []

@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 
+# cgx-generated index store (build artifact, never committed)
+.cgx/
+
 # Editor / OS noise
 .DS_Store
 .idea/

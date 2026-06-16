@@ -37,7 +37,7 @@ A TUI (terminal user interface) is explicitly out of scope for v1.
 | IF-13 | MCP tool: `paths` |
 | IF-14 | MCP tool: `unused` |
 | IF-15 | MCP tool: `explain` |
-| IF-16 | MCP resources: `callgraph://symbols/{root}`, `callgraph://schema/{root}` |
+| IF-16 | MCP resources: `cgx://symbols/{root}`, `cgx://schema/{root}` |
 | IF-17 | MCP structured output: `structuredContent` + `outputSchema` per 2025-06-18 spec |
 | IF-18 | MCP pagination: `cursor` + `has_more` |
 | IF-19 | MCP token-efficiency: `max_results`, compact symbol IDs, `resource_link` for bulk evidence |
@@ -196,7 +196,7 @@ Call edge: main::baz -> crypto::hash
   Confidence:   certain
   Rule:         direct_call_resolution v1.2
   Graph build:  commit abc1234, indexed 2026-06-11T13:00:00Z
-  Index:        .callgraph/index.v2.db (sha256: deadbeef...)
+  Index:        .cgx/index.db (sha256: deadbeef...)
 ```
 
 Without `--explain`, provenance is available in `--format json` as structured fields on each result object. `--explain` adds the verbose rule annotation to human-readable output.
@@ -442,7 +442,7 @@ Returns the full provenance record for a single symbol: definition location, cal
       }
     ],
     "graph_version": "abc1234",
-    "index_file": ".callgraph/index.v2.db",
+    "index_file": ".cgx/index.db",
     "index_sha256": "deadbeef..."
   }
 }
@@ -452,10 +452,10 @@ Returns the full provenance record for a single symbol: definition location, cal
 
 Resources let an agent load schema or symbol lists once and cache them, avoiding repeated tool calls.
 
-**`callgraph://symbols/{root}`**  
+**`cgx://symbols/{root}`**  
 Returns the full symbol index for the repository at `{root}`: qualified names, kinds, file locations, and entrypoint flags. Agents use this to resolve unqualified names before calling focused tools.
 
-**`callgraph://schema/{root}`**  
+**`cgx://schema/{root}`**  
 Returns the graph schema: node types, edge types, condition label vocabulary, confidence tier definitions, and supported query language constructs. Agents load this once to understand what queries are valid without schema trial-and-error.
 
 Both resources are subscribable; the server sends a `notifications/resources/updated` event when the index changes (after `cgx index` completes).
@@ -499,13 +499,13 @@ Token budgets are a real constraint for AI agent contexts. `cgx mcp` implements 
     ],
     "callers_resource_link": {
       "type": "resource_link",
-      "uri": "callgraph://callers/db%3A%3Aquery/workspace"
+      "uri": "cgx://callers/db%3A%3Aquery/workspace"
     }
   }
 }
 ```
 
-**Lazy schema loading.** Tool schemas are registered but the `callgraph://schema/{root}` resource is not pushed unless requested. This avoids consuming the agent's context window with schema text on every session start.
+**Lazy schema loading.** Tool schemas are registered but the `cgx://schema/{root}` resource is not pushed unless requested. This avoids consuming the agent's context window with schema text on every session start.
 
 ---
 

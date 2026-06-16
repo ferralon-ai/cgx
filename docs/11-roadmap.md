@@ -64,7 +64,7 @@ The ordering prioritizes:
 **MCP STDIO server (basic surface):**
 - `cgx mcp` starts STDIO server
 - Tools: `callers`, `callees`, `paths`, `unused`, `explain` (IF-11 through IF-15)
-- Resources: `callgraph://symbols/{root}`, `callgraph://schema/{root}` (IF-16)
+- Resources: `cgx://symbols/{root}`, `cgx://schema/{root}` (IF-16)
 - `structuredContent` per 2025-06-18 MCP spec (IF-17)
 - Pagination: `cursor` + `has_more` (IF-18)
 - **Dirty-overlay correctness (IX-3 MCP overlay)**: post-edit queries via MCP reflect the edit; `include_dirty` defaults true on all MCP tools; per-call content-addressed overlay never written to persistent index
@@ -249,7 +249,7 @@ Phase 1 is complete when:
 - `max_results` capped at 200; default 20 for all tools
 - `resource_link` responses for large result sets (bulk caller/callee lists returned as resource URIs, not inlined)
 - Compact symbol IDs throughout (qualified names, not file paths, as primary identifiers)
-- `callgraph://schema/{root}` resource lazy-loaded (not pushed on session start)
+- `cgx://schema/{root}` resource lazy-loaded (not pushed on session start)
 
 **`graph_query` MCP tool (IF-10):**
 - Full Cypher-subset query language via MCP
@@ -265,7 +265,7 @@ Phase 1 is complete when:
 
 **MCP resource subscriptions:**
 - `notifications/resources/updated` events when `cgx index` completes
-- Agents that have loaded `callgraph://symbols/{root}` are notified and can refresh
+- Agents that have loaded `cgx://symbols/{root}` are notified and can refresh
 
 ### Exit criteria
 

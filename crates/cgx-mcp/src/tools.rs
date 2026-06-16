@@ -471,7 +471,10 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
     let session = session_for(args)?;
     let view = &session.view;
     let anchor = resolve(view, symbol)?;
-    let node = view.node(anchor).clone();
+    let node = view
+        .try_node(anchor)
+        .ok_or_else(|| ToolError::resolve(format!("no symbol matched pattern `{symbol}`")))?
+        .clone();
 
     // Direct (depth-1) callers and callees, with full edge context.
     let depth1 = PathWalker {

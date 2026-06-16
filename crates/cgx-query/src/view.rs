@@ -106,13 +106,21 @@ impl GraphView {
         &self.candidates
     }
 
-    /// The record for a node id. Panics if the id is out of range — ids supplied
-    /// by traversal always come from this view, so an out-of-range id is a bug.
+    /// The record for a node id.
+    ///
+    /// # Invariant
+    ///
+    /// The caller guarantees `n` is in range. This holds for ids produced by this
+    /// view's own traversal (`neighbors`/`PathWalker`/`bfs`) or by `resolve_symbol`,
+    /// which only ever yield positions into `self.nodes`. Use [`try_node`](Self::try_node)
+    /// at any boundary where the id originates from untrusted input (a CLI argument
+    /// or MCP tool parameter); this panics on an out-of-range id.
     pub fn node(&self, n: NodeId) -> &NodeRecord {
         &self.nodes[n.index()]
     }
 
-    /// The record for a node id, or `None` if out of range.
+    /// The record for a node id, or `None` if out of range. The non-panicking form
+    /// of [`node`](Self::node) for untrusted-input boundaries.
     pub fn try_node(&self, n: NodeId) -> Option<&NodeRecord> {
         self.nodes.get(n.index())
     }

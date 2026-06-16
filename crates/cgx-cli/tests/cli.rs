@@ -188,6 +188,21 @@ fn unknown_symbol_is_usage_error_exit_2() {
 }
 
 #[test]
+fn out_of_range_node_id_does_not_panic() {
+    // Boundary hardening: a query for a symbol that does not exist must take the
+    // graceful IF-4 "not found" path, never a panic/abort. In this CLI's contract
+    // an unresolved *symbol* is a usage error (exit 2); an unindexed *graph* is the
+    // exit-3 path. The load-bearing assertion is that neither crashes: a Rust panic
+    // would surface as exit 101 (or 134 on abort), which we explicitly reject.
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (_out, code) = run_cgx(&repo, &["callers", "no_such_symbol_zzz"]);
+    assert_ne!(code, 101, "must not panic on an unknown symbol");
+    assert_ne!(code, 134, "must not abort on an unknown symbol");
+    assert_eq!(code, 2, "unknown symbol takes the IF-4 not-found path (exit 2)");
+}
+
+#[test]
 fn query_without_index_is_graph_error_exit_3() {
     let (_tmp, repo) = fixture_repo();
     // No `cgx index` run.

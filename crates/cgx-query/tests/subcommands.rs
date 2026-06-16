@@ -3,7 +3,7 @@
 
 mod common;
 
-use cgx_core::{Confidence, EdgeCondition, EntrypointKind, SymbolKind, SymbolPattern};
+use cgx_core::{Confidence, EdgeCondition, EntrypointKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_query::{
     callees, callers, paths, reaches, reaches_all, unused, Direction, EdgeFilter, GraphView,
     PathWalker,
@@ -616,4 +616,20 @@ fn neighbors_primitive_respects_direction() {
         .map(|e| e.peer)
         .collect();
     assert_eq!(bwd, vec![a]);
+}
+
+// --- Boundary hardening: untrusted NodeId must not panic ---------------------
+
+#[test]
+fn out_of_range_node_id_does_not_panic() {
+    // A `GraphView` with a handful of nodes; the largest valid id is < node_count.
+    let v = view(GraphBuilder::new().func("a").func("b").func("c"));
+
+    // `try_node` is the boundary-safe accessor: a wildly out-of-range id (the kind
+    // an untrusted CLI/MCP input could construct) yields `None`, never a panic.
+    assert_eq!(v.try_node(NodeId(u32::MAX)), None);
+
+    // And a valid id still resolves through the same accessor.
+    let a = v.resolve_one(&SymbolPattern::fqn("a")).unwrap();
+    assert!(v.try_node(a).is_some());
 }

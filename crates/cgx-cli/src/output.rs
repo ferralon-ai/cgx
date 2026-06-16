@@ -27,7 +27,7 @@ pub enum Format {
 
 /// The cgx version string embedded in SARIF tool metadata.
 const CGX_VERSION: &str = env!("CARGO_PKG_VERSION");
-const CGX_INFO_URI: &str = "https://github.com/mightye/callgraph";
+const CGX_INFO_URI: &str = "https://github.com/ferralon-ai/cgx";
 
 fn confidence_str(c: Confidence) -> &'static str {
     match c {

@@ -5,7 +5,7 @@
 //! sorted, so the table is a pure function of the input set regardless of file
 //! order (architecture §3 determinism).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cgx_core::id::NodeId;
 use cgx_core::node::{NodeRecord, SymbolKind};
@@ -142,12 +142,25 @@ impl SymbolTable {
     pub fn resolve_member(&self, specifier: &str, name: &str) -> ResolveOutcome<'_> {
         let mut spec = specifier.to_owned();
         let mut nm = name.to_owned();
-        // Depth bound prevents an infinite loop on a pathological re-export cycle.
-        for _ in 0..16 {
+        // Cycle guard: a cyclic `pub use` / `export … from` chain (e.g. module A
+        // re-exports from B which re-exports from A) would otherwise loop forever.
+        // We record each re-export hop's key `(last-segment, name)` — the exact
+        // key used to look the next hop up — and stop the moment a hop repeats. A
+        // chain has at most as many distinct hops as there are re-export edges, so
+        // this terminates after finite, bounded work without a magic depth cap and
+        // without ever revisiting a node (no exponential blowup).
+        let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+        loop {
             match self.resolve_member_direct(&spec, &nm) {
                 ResolveOutcome::None => {
-                    let seg = last_segment(&spec);
-                    match self.reexports.get(&(seg.to_owned(), nm.clone())) {
+                    let key = (last_segment(&spec).to_owned(), nm.clone());
+                    if !visited.insert(key.clone()) {
+                        // We have already chased this exact re-export hop; the chain
+                        // is cyclic. Terminate cleanly with no resolution rather
+                        // than loop or overflow.
+                        return ResolveOutcome::None;
+                    }
+                    match self.reexports.get(&key) {
                         Some((next_spec, next_name)) => {
                             spec = next_spec.clone();
                             nm = next_name.clone();
@@ -158,7 +171,6 @@ impl SymbolTable {
                 other => return other,
             }
         }
-        ResolveOutcome::None
     }
 
     /// One hop of module-member resolution: try the specifier as a module prefix

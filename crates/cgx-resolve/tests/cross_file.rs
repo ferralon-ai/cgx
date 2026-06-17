@@ -405,6 +405,85 @@ fn re_export_chain_resolves_to_original_definition() {
 }
 
 #[test]
+fn cyclic_re_export_chain_terminates_and_resolves_sanely() {
+    // A pathological cycle: module `alpha` does `pub use crate::beta::foo` and
+    // module `beta` does `pub use crate::alpha::foo`, while `foo` is defined
+    // nowhere. A consumer imports `foo` from `crate::alpha` and calls it.
+    //
+    // The re-export chase must follow alpha→beta→alpha, detect the repeated hop
+    // via the visited-set cycle guard, and terminate cleanly: no infinite loop,
+    // no stack overflow, no spurious edge. The call is recorded as unresolved
+    // (LS-6 honesty) rather than silently mis-resolved.
+    let mut alpha = FileBuilder::new();
+    // A def anchors the file's module segment to `alpha` (see module_segment()).
+    alpha.def(
+        "crate::alpha::anchor",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    alpha.import("crate::beta", "foo", None, true, ScopeId::ROOT); // re_export
+    let alpha = alpha.build();
+
+    let mut beta = FileBuilder::new();
+    beta.def(
+        "crate::beta::anchor",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    beta.import("crate::alpha", "foo", None, true, ScopeId::ROOT); // re_export, closes the cycle
+    let beta = beta.build();
+
+    let mut con = FileBuilder::new();
+    let f = con.scope(ScopeId::ROOT, Some("crate::consumer::go"));
+    con.import("crate::alpha", "foo", None, false, ScopeId::ROOT);
+    con.def(
+        "crate::consumer::go",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    con.call(&["foo"], f, 2);
+    let consumer = con.build();
+
+    let inputs = vec![
+        input("src/alpha.rs", "rust", &alpha),
+        input("src/beta.rs", "rust", &beta),
+        input("src/consumer.rs", "rust", &consumer),
+    ];
+    // The link itself must return (the cycle guard is what stops it hanging).
+    let g = link(&inputs, &LinkOpts::default());
+
+    assert!(
+        g.edge_records().all(|e| e.rule != "import-ref"),
+        "a cyclic re-export with no real def must not produce a resolved import edge"
+    );
+    let unresolved_foo = g
+        .unresolved
+        .iter()
+        .find(|u| u.name_path == vec!["foo".to_string()]);
+    assert!(
+        unresolved_foo.is_some(),
+        "the unresolvable call through the cycle is recorded honestly (LS-6)"
+    );
+    assert_eq!(
+        unresolved_foo.unwrap().marker,
+        CutMarker::Unresolved,
+        "cyclic-chain dead end → Unresolved cut marker"
+    );
+}
+
+#[test]
 fn frontend_cut_marker_is_carried_onto_resolved_edge() {
     // A call the frontend flagged as via-FFI still resolves but keeps the marker.
     let direct = direct_file();

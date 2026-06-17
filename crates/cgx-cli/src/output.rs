@@ -10,7 +10,7 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord};
-use cgx_query::{NeighborResult, PathResult};
+use cgx_query::{Explanation, NeighborResult, PathResult};
 use serde_json::{json, Value};
 
 /// The output format selected by `--format` (IF-3 subset for Phase-1 CLI).
@@ -411,4 +411,82 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
             "hops": p.hops()
         }
     })
+}
+
+/// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text
+/// (default) or `--format json`. SARIF is not a meaningful shape for a single
+/// symbol's provenance, so `explain` supports only human/json (the dispatch scope).
+pub fn render_explanation(format: Format, e: &Explanation) -> String {
+    match format {
+        Format::Json => explanation_json(e),
+        _ => explanation_human(e),
+    }
+}
+
+fn explanation_human(e: &Explanation) -> String {
+    let n = &e.node;
+    let mut out = format!(
+        "{}  ({}:{})\n  kind: {}\n  callers: {}, callees: {}\n",
+        n.fqn,
+        n.file,
+        n.line_start,
+        node_kind_str(n),
+        e.callers_count,
+        e.callees_count
+    );
+    if e.edges.is_empty() {
+        out.push_str("  (no incident edges)\n");
+        return out;
+    }
+    out.push_str("  edges:\n");
+    for edge in &e.edges {
+        let arrow = if edge.incoming { "<-" } else { "->" };
+        out.push_str(&format!(
+            "    {} {}  ({}:{})  [{}]  [{}]\n",
+            arrow,
+            edge.peer.fqn,
+            edge.peer.file,
+            edge.peer.line_start,
+            condition_str(edge.condition),
+            confidence_str(edge.confidence),
+        ));
+    }
+    out
+}
+
+fn explanation_json(e: &Explanation) -> String {
+    let n = &e.node;
+    let edges: Vec<Value> = e
+        .edges
+        .iter()
+        .map(|edge| {
+            json!({
+                "direction": if edge.incoming { "incoming" } else { "outgoing" },
+                "peer": edge.peer.fqn,
+                "peer_file": edge.peer.file,
+                "peer_line": edge.peer.line_start,
+                "condition": condition_str(edge.condition),
+                "confidence": confidence_str(edge.confidence),
+            })
+        })
+        .collect();
+    let doc = json!({
+        "symbol": n.fqn,
+        "file": n.file,
+        "line": n.line_start,
+        "kind": node_kind_str(n),
+        "callers_count": e.callers_count,
+        "callees_count": e.callees_count,
+        "edges": edges,
+    });
+    let mut s = serde_json::to_string_pretty(&doc).expect("explanation doc serializes");
+    s.push('\n');
+    s
+}
+
+fn node_kind_str(node: &NodeRecord) -> String {
+    serde_json::to_value(node.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "symbol".into())
 }

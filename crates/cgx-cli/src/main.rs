@@ -25,7 +25,7 @@ use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
-use cgx_cli::output::{render, Format, ResultSet};
+use cgx_cli::output::{render, render_explanation, Format, ResultSet};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -71,6 +71,21 @@ enum Command {
         to: String,
         #[command(flatten)]
         query: QueryArgs,
+    },
+    /// Full provenance for one symbol: its definition, caller/callee counts, and
+    /// every direct incident edge with its condition and confidence (Q-6 / IF-15).
+    Explain {
+        /// The symbol to explain (FQN or short name).
+        symbol: String,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format (human or json; SARIF is not meaningful for one symbol).
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+        /// Do not auto-index when the `.cgx/` store is missing or stale.
+        #[arg(long)]
+        no_auto_index: bool,
     },
     /// Symbols not reachable from any entrypoint.
     Unused {
@@ -207,6 +222,12 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::Reaches { from, to, query } => run_reaches(&from, to.as_deref(), query),
         Command::Paths { from, to, query } => run_paths(&from, &to, query),
+        Command::Explain {
+            symbol,
+            repo,
+            format,
+            no_auto_index,
+        } => run_explain(&symbol, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -429,6 +450,34 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
         view.node_count() > 0,
         len,
     )
+}
+
+/// `cgx explain <symbol>` (Q-6 / IF-15): resolve the symbol and dump its full
+/// provenance. Reuses the shared [`cgx_query::explain`] logic — the same path the
+/// MCP `explain` tool drives, so there is no logic fork. An unknown symbol takes
+/// the IF-4 not-found path (exit 2 in this codebase); `explain` has no assertion
+/// or vacuity machinery (it is a single-symbol dump, not a gated result set).
+fn run_explain(
+    symbol: &str,
+    repo: Option<PathBuf>,
+    format: Format,
+    no_auto_index: bool,
+) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+    if !no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    let view = load_view(&repo_root)?;
+
+    let pat: SymbolPattern = parse_symbol(symbol);
+    let anchor = view
+        .resolve_one(&pat)
+        .map_err(|e| CliError::usage(format!("{e}")))?;
+    let explanation = cgx_query::explain(&view, anchor)
+        .ok_or_else(|| CliError::usage(format!("no symbol matched `{symbol}`")))?;
+
+    print!("{}", render_explanation(format, &explanation));
+    Ok(())
 }
 
 /// Render the result set, apply the assertion/vacuity rules, print, and translate

@@ -50,8 +50,8 @@ pub mod result;
 pub mod view;
 pub mod walk;
 
-pub use engine::{callees, callers, paths, reaches, reaches_all, resolve_anchor, unused};
+pub use engine::{callees, callers, explain, paths, reaches, reaches_all, resolve_anchor, unused};
 pub use filter::{ConditionFilter, Direction, EdgeFilter};
-pub use result::{NeighborResult, PathResult, PathStep, ReachResult};
+pub use result::{ExplainEdge, Explanation, NeighborResult, PathResult, PathStep, ReachResult};
 pub use view::{EdgeRef, GraphView, ResolveError};
 pub use walk::{Discovered, PathWalker, WalkStep, DEFAULT_MAX_PATHS};

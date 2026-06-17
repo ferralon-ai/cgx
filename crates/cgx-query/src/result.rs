@@ -77,6 +77,36 @@ impl PathResult {
     }
 }
 
+/// Full provenance for one symbol (`explain`, Q-6 / IF-15): its definition node
+/// together with every incident depth-1 edge, each carrying the condition (GM-3)
+/// and confidence (GM-5) that the surface emits. `edges` lists incoming callers
+/// first, then outgoing callees, each block in the deterministic neighbor order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// The explained symbol's definition record.
+    pub node: NodeRecord,
+    /// Direct (depth-1) incident edges: incoming callers, then outgoing callees.
+    pub edges: Vec<ExplainEdge>,
+    /// Number of direct callers (incoming edges).
+    pub callers_count: usize,
+    /// Number of direct callees (outgoing edges).
+    pub callees_count: usize,
+}
+
+/// One incident edge in an [`Explanation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainEdge {
+    /// `true` if the peer calls the explained symbol (incoming); `false` if the
+    /// explained symbol calls the peer (outgoing).
+    pub incoming: bool,
+    /// The peer symbol on the other end of the edge.
+    pub peer: NodeRecord,
+    /// The edge's condition (GM-3).
+    pub condition: EdgeCondition,
+    /// The edge's confidence (GM-5).
+    pub confidence: Confidence,
+}
+
 /// Whether one symbol can reach another (`reaches`).
 ///
 /// `witness` is the shortest discovery path when reachable (the proof), `None`

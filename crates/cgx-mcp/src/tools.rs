@@ -11,8 +11,8 @@
 
 use cgx_core::{Confidence, EdgeCondition, NodeId, SymbolKind, SymbolPattern};
 use cgx_query::{
-    callees, callers, paths as query_paths, resolve_anchor, unused, ConditionFilter, Direction,
-    EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker,
+    callees, callers, explain, paths as query_paths, resolve_anchor, unused, ConditionFilter,
+    Direction, EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -471,49 +471,32 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
     let session = session_for(args)?;
     let view = &session.view;
     let anchor = resolve(view, symbol)?;
-    let node = view
-        .try_node(anchor)
-        .ok_or_else(|| ToolError::resolve(format!("no symbol matched pattern `{symbol}`")))?
-        .clone();
+    let explanation = explain(view, anchor)
+        .ok_or_else(|| ToolError::resolve(format!("no symbol matched pattern `{symbol}`")))?;
 
-    // Direct (depth-1) callers and callees, with full edge context.
-    let depth1 = PathWalker {
-        filter: EdgeFilter::calls(),
-        max_depth: Some(1),
-        max_paths: None,
-    };
-    let incoming = callers(view, anchor, &depth1);
-    let outgoing = callees(view, anchor, &depth1);
+    let edges: Vec<Value> = explanation
+        .edges
+        .iter()
+        .map(|e| {
+            json!({
+                "direction": if e.incoming { "incoming" } else { "outgoing" },
+                "peer": e.peer.fqn,
+                "condition": condition_token(e.condition),
+                "confidence": confidence_token(e.confidence),
+                "peer_file": e.peer.file,
+                "peer_line": e.peer.line_start
+            })
+        })
+        .collect();
 
-    let mut edges: Vec<Value> = Vec::with_capacity(incoming.len() + outgoing.len());
-    for r in &incoming {
-        edges.push(json!({
-            "direction": "incoming",
-            "peer": r.node.fqn,
-            "condition": condition_token(r.condition),
-            "confidence": confidence_token(r.confidence),
-            "peer_file": r.node.file,
-            "peer_line": r.node.line_start
-        }));
-    }
-    for r in &outgoing {
-        edges.push(json!({
-            "direction": "outgoing",
-            "peer": r.node.fqn,
-            "condition": condition_token(r.condition),
-            "confidence": confidence_token(r.confidence),
-            "peer_file": r.node.file,
-            "peer_line": r.node.line_start
-        }));
-    }
-
+    let node = &explanation.node;
     let body = json!({
         "symbol": node.fqn,
         "file": node.file,
         "line": node.line_start,
         "kind": format!("{:?}", node.kind).to_lowercase(),
-        "callers_count": incoming.len(),
-        "callees_count": outgoing.len(),
+        "callers_count": explanation.callers_count,
+        "callees_count": explanation.callees_count,
         "edges": edges
     });
     Ok(with_session_meta(body, &session))

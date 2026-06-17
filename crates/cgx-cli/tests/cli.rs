@@ -269,6 +269,63 @@ fn second_run_hits_cache_zero_extracted() {
     assert_eq!(a, b, "repeat query over the cached index is byte-identical");
 }
 
+// --- cgx explain (Q-6 / IF-15) integration tests ---
+
+#[test]
+fn explain_happy_path_reports_provenance() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["explain", "alpha"]);
+    assert_eq!(code, 0, "explain of a known symbol exits 0: {out}");
+    // alpha is called by main and calls beta.
+    assert!(out.contains("rust_sample::alpha"), "names the symbol: {out}");
+    assert!(
+        out.contains("callers: 1, callees: 1"),
+        "reports caller/callee counts: {out}"
+    );
+    assert!(
+        out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
+        "lists both incident edges: {out}"
+    );
+}
+
+#[test]
+fn explain_json_format_is_valid_json() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["explain", "alpha", "--format", "json"]);
+    assert_eq!(code, 0, "explain --format json exits 0: {out}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out).expect("explain --format json emits valid JSON");
+    assert_eq!(parsed["callers_count"], 1, "json carries callers_count: {out}");
+    assert_eq!(parsed["callees_count"], 1, "json carries callees_count: {out}");
+    assert!(
+        parsed["edges"].as_array().map(|a| a.len()) == Some(2),
+        "json lists both edges: {out}"
+    );
+}
+
+#[test]
+fn explain_unknown_symbol_is_usage_error_exit_2() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (_out, code) = run_cgx(&repo, &["explain", "does_not_exist_zzz"]);
+    assert_ne!(code, 101, "must not panic on an unknown symbol");
+    assert_eq!(code, 2, "unknown symbol → IF-4 not-found path (exit 2)");
+}
+
+#[test]
+fn explain_auto_indexes_when_no_store_exists() {
+    let (_tmp, repo) = fixture_repo();
+    // No `cgx index` run: explain must auto-index then answer.
+    let (out, code) = run_cgx(&repo, &["explain", "main"]);
+    assert_eq!(code, 0, "explain auto-indexes and exits 0: {out}");
+    assert!(
+        repo.join(".cgx/HEAD.json").exists(),
+        "explain auto-index wrote the index pointer"
+    );
+}
+
 #[test]
 fn assert_empty_fires_when_results_exist_exit_1() {
     let (_tmp, repo) = fixture_repo();

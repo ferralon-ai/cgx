@@ -11,8 +11,8 @@
 
 use cgx_core::{Confidence, NodeId, SymbolKind, SymbolPattern};
 
-use crate::filter::Direction;
-use crate::result::{NeighborResult, PathResult, PathStep, ReachResult};
+use crate::filter::{Direction, EdgeFilter};
+use crate::result::{ExplainEdge, Explanation, NeighborResult, PathResult, PathStep, ReachResult};
 use crate::view::{GraphView, ResolveError};
 use crate::walk::{PathWalker, WalkStep};
 
@@ -265,6 +265,50 @@ pub fn unused(
         .collect();
     out.sort_by(|a, b| result_key(a).cmp(&result_key(b)));
     out
+}
+
+/// Q-6 `explain`: full provenance for one symbol — its definition record plus
+/// every direct (depth-1) incident edge with the condition (GM-3) and confidence
+/// (GM-5) that justified it. The single source of truth for both the CLI `explain`
+/// subcommand and the MCP `explain` tool (no logic fork).
+///
+/// `anchor` must be a node id in `view`. Returns `None` only if the id is out of
+/// range (the caller resolves the symbol first, so this is the boundary guard).
+pub fn explain(view: &GraphView, anchor: NodeId) -> Option<Explanation> {
+    let node = view.try_node(anchor)?.clone();
+
+    let depth1 = PathWalker {
+        filter: EdgeFilter::calls(),
+        max_depth: Some(1),
+        max_paths: None,
+    };
+    let incoming = callers(view, anchor, &depth1);
+    let outgoing = callees(view, anchor, &depth1);
+
+    let mut edges: Vec<ExplainEdge> = Vec::with_capacity(incoming.len() + outgoing.len());
+    for r in &incoming {
+        edges.push(ExplainEdge {
+            incoming: true,
+            peer: r.node.clone(),
+            condition: r.condition,
+            confidence: r.confidence,
+        });
+    }
+    for r in &outgoing {
+        edges.push(ExplainEdge {
+            incoming: false,
+            peer: r.node.clone(),
+            condition: r.condition,
+            confidence: r.confidence,
+        });
+    }
+
+    Some(Explanation {
+        node,
+        callers_count: incoming.len(),
+        callees_count: outgoing.len(),
+        edges,
+    })
 }
 
 /// Resolve a `--from`/`--to` endpoint pattern to a unique anchor, surfacing the

@@ -69,8 +69,13 @@ Find all symbols that call a given symbol, up to a specified depth.
 ```
 cgx callers <symbol> <path> [--depth N] [--confidence certain|probable|possible]
                              [--edge-condition always|conditional|exception|loop|panic]
+                             [--max-fanout N] [--through-sentinels]
                              [--at <ref>] [--format <fmt>]
 ```
+
+`--max-fanout N` caps the per-node breadth of the traversal and
+`--through-sentinels` expands through high-degree hub nodes that are otherwise
+reported as leaves; both are specified in Q-13.
 
 **Examples:**
 
@@ -95,6 +100,7 @@ Find all symbols a given symbol calls, transitively to a depth limit.
 ```
 cgx callees <symbol> <path> [--depth N] [--confidence certain|probable|possible]
                              [--edge-condition always|conditional|exception|loop|panic]
+                             [--max-fanout N] [--through-sentinels]
                              [--at <ref>] [--format <fmt>]
 ```
 
@@ -120,8 +126,13 @@ cgx paths --from <symbol> --to <symbol> <path>
           [--exclude-edge-condition exception|conditional|loop]
           [--only-edge-condition exception]
           [--max-depth N] [--max-paths N]
+          [--max-fanout N] [--through-sentinels]
           [--at <ref>] [--format <fmt>]
 ```
+
+`--max-fanout` and `--through-sentinels` bound per-node breadth (orthogonally to
+the `--max-depth` / `--max-paths` bounds, which limit path length and path
+count); see Q-13.
 
 **Examples:**
 
@@ -172,8 +183,14 @@ Trace all inbound provenance for a value at a named program point: which callers
 cgx pedigree <symbol-or-var> <path>
              [--at-function <fn>]
              [--depth N]
+             [--max-fanout N] [--through-sentinels]
              [--format <fmt>]
 ```
+
+A pedigree traversal stops at sentinel (hub) nodes by default and reports them
+as leaves with their degree (the summarised-pedigree default generalised in
+docs/04-dataflow-and-provenance.md DF-1.4); `--through-sentinels` expands through
+them and `--max-fanout N` caps per-node breadth. See Q-13.
 
 **Examples:**
 
@@ -249,6 +266,7 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 - `line`, `col` — source location
 - `kind` — `"function"`, `"method"`, `"field"`, `"type"`, `"module"`
 - `confidence` — `"certain"`, `"probable"`, `"possible"`
+- `in_degree`, `out_degree` — per-edge-kind inbound/outbound edge counts (GM-1.3 in `docs/03-code-graph-model.md`), keyed by edge kind: `n.in_degree.calls`, `n.out_degree.derives_from`, `n.in_degree.coerce`. Filterable and sortable — `WHERE n.in_degree.calls > 5000`, `ORDER BY n.in_degree.calls DESC` — for detecting and ranking hub nodes. Structural only; not coupled to `confidence`.
 
 **Edge types:**
 - `CALLS` — direct or transitive call edge
@@ -587,6 +605,84 @@ cgx query --at HEAD~1 '
 
 ---
 
+## Q-13: Depth and Fan-Out Limits
+
+Transitive traversals are bounded in two orthogonal dimensions. **Depth** is
+bounded by the simple-path guarantee and the explicit `--depth` / `--max-depth`
+flags (and `[:CALLS*min..max]` in the query language — see the `CALLS*`
+semantics above). **Fan-out** — the per-node breadth of the traversal — is
+bounded by `--max-fanout` and the sentinel mechanism. The two are independent: a
+shallow traversal can still enumerate an unbounded frontier if it hops into a
+high-degree hub, which depth limits alone do not prevent.
+
+### Per-node fan-out cap
+
+The transitive subcommands (`callers`, `callees`, `paths`, `pedigree`,
+`mutation-fanout`) and the query language accept `--max-fanout N`:
+
+- `--max-fanout N` caps the number of neighbors expanded at each visited node at
+  `N`. The cap applies per node, independently of the depth bound; it does not
+  interfere with the simple-path guarantee.
+- `--max-fanout 0` means **unbounded** — today's behavior, expanding every
+  neighbor at every node.
+- The default is a high-but-finite value. The concrete default is **TODO,
+  pending measurement of real degree distributions on representative repos**; a
+  figure around 2,000 is illustrative only and is not a committed default. The
+  same measurement sets the sentinel threshold (below) and is tracked in
+  docs/09-architecture.md ADR-10.
+
+### Sentinel (hot-node) handling
+
+A traversal that reaches a **sentinel** — a high-degree hub node — stops at it
+and reports it as a leaf, rather than expanding through it. Sentinels are
+auto-seeded from `in_degree` above a per-edge-kind threshold (the threshold is
+applied per the traversal's own edge kind — a `calls`-hub is a sentinel for a
+`callers`/`callees` traversal but not necessarily for a `derives-from`
+traversal) plus a user/config allowlist of well-known hubs (loggers, primitive
+types, `panic`/`assert`). This generalises the summarised-pedigree default
+(direct parents only) of docs/04-dataflow-and-provenance.md DF-1.4 to all
+transitive traversals.
+
+`--through-sentinels` overrides the default and expands through sentinels,
+enumerating their full neighborhood (subject to `--max-fanout`). The
+per-edge-kind sentinel threshold itself is **UNSET/TODO** pending the same
+degree-distribution measurement as the `--max-fanout` default.
+
+### Explicit truncation markers
+
+Truncation is always **explicit and visible** — a cut frontier is never silently
+presented as a complete one, consistent with the cut-marker honesty model of
+GM-5.3 (docs/03-code-graph-model.md). When a node's expansion is capped (by
+`--max-fanout`) or withheld (sentinel), that node carries three markers in the
+result:
+
+| Marker | Meaning |
+|---|---|
+| `truncated` | boolean — the node's frontier was cut; downstream consumers must treat its neighbor list as partial |
+| `degree_total` | the node's full degree for the traversal's edge kind (from GM-1.3 `in_degree` / `out_degree`) |
+| `degree_emitted` | the number of neighbors actually emitted (≤ `degree_total`; `degree_total − degree_emitted` were cut) |
+
+These markers are carried by every structured output format — `json`, `sarif`,
+`dot`, and `mermaid` — so that no format can mistake a cut frontier for a
+complete one. (Text output renders them inline on the truncated node.)
+
+### Ranking under truncation
+
+When a node's frontier is cut to `--max-fanout N`, the `N` emitted neighbors are
+selected **deterministically** by **confidence then relevance, with ties broken
+by symbol id**:
+
+1. **Confidence** descending (`certain` > `probable` > `possible`, per GM-5.1) —
+   the most reliably-resolved neighbors are kept first.
+2. **Relevance** — closest-to-query-root first (depth ascending; the same notion
+   as `--order relevance` in Q-17).
+3. **Symbol id** ascending as the final deterministic tie-break, so the emitted
+   set is identical on every run of the same query against the same index (the
+   Q-17 determinism contract). Degree is structural and plays no part in the
+   ranking beyond deciding that a cut occurs.
+
+---
+
 ## Q-17: Determinism Guarantees
 
 `cgx` provides a determinism contract: the same query against the same commit produces identical output on every run.
@@ -595,6 +691,7 @@ cgx query --at HEAD~1 '
 - **Reproducibility via `--at`.** Queries accept `--at <ref>` (commit SHA or branch name) to pin the query to a specific graph snapshot. `--at HEAD` is the default; `--at abc1234` re-queries a prior state.
 - **No randomness.** No random tie-breaking. No timestamp in default output. The JSON output includes a `graph_version` hash (commit SHA + index schema version) for audit trails.
 - **Same index, same answer.** The graph DB is append-write during indexing and read-only during query. Concurrent reads are safe; writes lock only during index updates.
+- **Deterministic truncation.** When a frontier is cut by `--max-fanout` (Q-13), the emitted neighbors are selected by confidence, then relevance, with ties broken by symbol id — so a truncated result is identical on every run of the same query against the same index.
 
 **Order control flags:**
 
@@ -1634,7 +1731,8 @@ cgx query '
 
 ```bash
 # Mutation fan-out from a named value at a given function
-cgx mutation-fanout <symbol-or-var> <path> [--at-function <fn>] [--depth N] [--format <fmt>]
+cgx mutation-fanout <symbol-or-var> <path> [--at-function <fn>] [--depth N] \
+                    [--max-fanout N] [--through-sentinels] [--format <fmt>]
 
 # Functions that mutate their first argument
 cgx query --effect writes-param(0) <path>

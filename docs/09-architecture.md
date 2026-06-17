@@ -366,11 +366,34 @@ are built on the first query that demands them and stored keyed by
 the tree or overlay changes, triggering a rebuild. The storage layer retains N
 recent keys and prunes via the existing GC.
 
+**Degree-gated closure materialization.** Closure materialization is **skipped
+for any node whose degree exceeds the sentinel threshold** (the per-edge-kind
+threshold that seeds sentinel detection — see docs/04-dataflow-and-provenance.md
+DF-1.4 and docs/05-queries.md Q-13). Hub nodes are traversed lazily on demand
+instead of having their closure precomputed and stored. Two reasons:
+
+- **Bounded artifact storage.** A single hub's closure can otherwise dominate
+  the size of the closure tables; gating on degree keeps the memoized-artifact
+  footprint proportional to the non-hub graph.
+- **Avoided rebuild churn.** A hub's closure is the part of the graph most
+  likely to change on each index update (a hub touches a large fraction of the
+  codebase), so materializing it would be invalidated and rebuilt most often.
+  Lazy traversal of hubs avoids that churn while keying (above) still guarantees
+  correctness when the tree changes.
+
+This gating is local to the lazy-memoization policy. It does not change the
+~5M-edge global strategy below; the two address different problems (see "Known
+scaling limits").
+
 ### Known scaling limits
 
-SQLite recursive CTEs begin to degrade on graphs with more than approximately
-5M edges (for depth-unbounded reachability queries). Mitigation options, in
-order of preference:
+There are two distinct scaling problems. They have different triggers and
+different mitigations; conflating them leads to the wrong fix.
+
+**1. Global edge-count limit.** SQLite recursive CTEs begin to degrade on graphs
+with more than approximately 5M edges (for depth-unbounded reachability
+queries). This is a property of the whole graph's edge count. Mitigation
+options, in order of preference:
 
 1. Pre-compute transitive closure and store as a materialized edge table
    (fast reads, higher storage cost, must be invalidated on index update).
@@ -378,6 +401,38 @@ order of preference:
    directly — applicable when the query scope is a bounded neighborhood.
 3. Evaluate upgrade to redb + petgraph if the primary query workload is
    large-graph traversal rather than relational filtering.
+
+**2. Local degree-distribution limit (supernodes).** Separately from the global
+limit, a small number of **supernodes** — nodes whose degree is orders of
+magnitude above the median (loggers, `assert`/panic helpers, allocators,
+ubiquitous types like `String`/`Result`/`Option`, shared error and config types,
+and provenance/mutation hubs) — make individual traversals blow up regardless of
+total edge count. This is a **local** problem: a 200k-edge graph with a single
+degree-50k node already exhibits it, and the global 5M-edge threshold never
+fires. A single hop into a supernode enumerates all its neighbors irrespective
+of the depth bound, so the global mitigations above do not address it.
+
+The supernode mitigations are layered and orthogonal to the global strategy:
+
+1. **Degree as a first-class fact.** `in_degree` / `out_degree` per edge kind
+   (docs/03-code-graph-model.md GM-1.3) are computed at index time so hubs are
+   detectable and queryable.
+2. **Degree-bounded traversal with explicit truncation.** `--max-fanout` and the
+   sentinel mechanism (docs/05-queries.md Q-13) bound per-node breadth and report
+   any cut frontier explicitly (`truncated` / `degree_total` / `degree_emitted`).
+3. **Degree-gated closure materialization.** ADR-10 (above) skips materializing
+   the closure of any node above the sentinel threshold, keeping memoized-artifact
+   storage bounded and avoiding rebuild churn on the part of the graph most likely
+   to change.
+
+The applicable mitigation is chosen by which problem is present: the global
+mitigations for whole-graph edge count, the supernode mitigations for local
+degree blowup. Note that the global mitigation "pre-compute transitive closure"
+(option 1 above) is the *most* expensive possible response to a supernode — a
+hub's closure is both large to compute and invalidated on every index update —
+which is exactly why ADR-10 gates it on degree. The concrete sentinel threshold
+and `--max-fanout` default are left **UNSET/TODO pending measurement of real
+degree distributions** on representative repositories.
 
 ---
 

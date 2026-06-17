@@ -103,6 +103,44 @@ Pedigree queries return the full fan-out DAG. Users can request a summarised
 view (direct parents only) or a full transitive closure (all ancestors to
 external sources or entrypoints).
 
+### DF-1.4 — Sentinel nodes and degree-bounded fan-out
+
+The summarised view of DF-1.3 (direct parents only) is the safe default for one
+class of node: **hubs**. A small number of nodes in any real codebase have a
+degree orders of magnitude above the median — high fan-in call targets (loggers,
+`assert`/panic helpers, allocators, shared validation), ubiquitous types
+(`String`, `Result`, `Option`, a shared `Error`), and the provenance/mutation
+hubs through which most values pass. Because pedigree (DF-1.3) and mutation
+fan-out (DF-17.3) are fan-out DAGs, any value passing through a hub inherits the
+hub's entire neighborhood; the blast radius of a traversal peaks precisely at
+these popular nodes. This is a **local** degree-distribution problem, distinct
+from the global edge-count scaling limit — see docs/09-architecture.md ("Known
+scaling limits").
+
+`cgx` generalises the summarised-pedigree default into a **sentinel** mechanism
+that applies to both pedigree and mutation fan-out (DF-17.3):
+
+- A **sentinel** is a node for which the summarised view (direct neighbors only)
+  is the default. A traversal that reaches a sentinel **stops at it and reports
+  it as a leaf**, annotating it with its degree (`in_degree` / `out_degree` per
+  edge kind, GM-1.3 in docs/03-code-graph-model.md), rather than expanding
+  through it. The sentinel is never silently dropped — it is reported as a node
+  whose expansion was withheld, so the cut is visible.
+- The sentinel set is **auto-seeded** from `in_degree` above a per-edge-kind
+  threshold (so a node that is a `calls` hub is not necessarily a `derives-from`
+  hub; the threshold is applied per the traversal's own edge kind), and is
+  **augmented by a user/config allowlist** of well-known hubs (loggers, primitive
+  types, `panic`/`assert`).
+- The default is overridable: a traversal run with `--through-sentinels`
+  (docs/05-queries.md Q-3/Q-13) expands through sentinels and enumerates their
+  full neighborhood, recovering today's unbounded behavior.
+
+The sentinel threshold is left **UNSET pending measurement on real degree
+distributions** (see docs/05-queries.md Q-13 and docs/09-architecture.md
+ADR-10); the threshold and the companion `--max-fanout` default are TODO until
+real-repo degree distributions are available. Sentinel membership is structural:
+it derives from degree (GM-1.3) alone and is not coupled to `confidence` (GM-5).
+
 ---
 
 ## DF-2 — Scope Entry/Exit Inventory
@@ -1153,6 +1191,16 @@ The fan-out is computed by forward traversal of escape edges (DF-16.1), capture 
 query is the **exposed-internal-state** class (analogous to SpotBugs `EI_EXPOSE_REP`): "which getter
 methods return a mutable reference to an internal field, and what code mutates the field through that
 reference?"
+
+Mutation fan-out is a fan-out DAG and is subject to the same sentinel/hot-node
+default as pedigree (DF-1.4): a forward traversal that reaches a sentinel stops
+at it and reports it as a leaf with its degree, rather than enumerating the
+hub's full outbound neighborhood. Sentinels are auto-seeded from `out_degree`
+above the per-edge-kind threshold (here the relevant kinds are the mutation and
+escape edges the fan-out walks) plus the config allowlist, and the default is
+overridable with `--through-sentinels` (docs/05-queries.md Q-13). This keeps a
+mutation-fanout query over a shared helper from degenerating into an enumeration
+of every value that helper can touch.
 
 ### DF-17.4 — Sanitization-invalidation rule
 

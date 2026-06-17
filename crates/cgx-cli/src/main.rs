@@ -166,6 +166,10 @@ struct QueryArgs {
     /// Suppress the ADR-08 vacuity guard (a vacuous pass exits 0, not 4).
     #[arg(long)]
     allow_vacuous: bool,
+    /// Do not auto-index when the `.cgx/` store is missing or stale; require an
+    /// explicit `cgx index` first (a missing index then exits 3).
+    #[arg(long)]
+    no_auto_index: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -220,18 +224,7 @@ fn run(command: Command) -> Result<(), CliError> {
 
 fn run_index(path: Option<PathBuf>) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
-    let registry = default_registry();
-    let mut store = open_store(&repo_root)?;
-    let outcome = index_path(&repo_root, &registry, &mut store)
-        .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
-
-    write_pointer(
-        &repo_root,
-        &IndexPointer {
-            graph_key: outcome.graph_key.clone(),
-            graph_id: outcome.graph_id.0,
-        },
-    )?;
+    let outcome = index_repo(&repo_root)?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
@@ -246,6 +239,55 @@ fn run_index(path: Option<PathBuf>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Index the committed `HEAD` tree of `repo_root` to `.cgx/` and persist the
+/// current-index pointer — the shared core of the explicit `cgx index` subcommand
+/// and the auto-index trigger ([`ensure_indexed`]). Deterministic and idempotent:
+/// a re-index of an unchanged tree extracts 0 blobs (IX-1) and rewrites an
+/// identical pointer.
+fn index_repo(repo_root: &Path) -> Result<cgx_index::IndexOutcome, CliError> {
+    let registry = default_registry();
+    let mut store = open_store(repo_root)?;
+    let outcome = index_path(repo_root, &registry, &mut store)
+        .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
+    write_pointer(
+        repo_root,
+        &IndexPointer {
+            graph_key: outcome.graph_key.clone(),
+            graph_id: outcome.graph_id.0,
+        },
+    )?;
+    Ok(outcome)
+}
+
+/// Ensure `repo_root` has a current, fresh `.cgx/` index before a query reads it
+/// (audit row #23). Auto-indexes the committed `HEAD` tree when no pointer exists,
+/// or when the pointer's tree OID differs from the current `HEAD` tree OID (a
+/// cheap staleness check). A no-op when the index is already current. With
+/// `--no-auto-index` the caller skips this entirely, so a missing index takes the
+/// usual exit-3 path.
+///
+/// Idempotent: the underlying pipeline performs zero extraction on an unchanged
+/// tree (IX-1), so a second query over the same committed state re-links cached
+/// facts without re-parsing.
+fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
+    // Not a git repo / no HEAD → `None`: we then fall back to "index iff the
+    // pointer is missing" (no staleness check is possible without a tree OID).
+    let current_tree = cgx_index::Repo::discover(repo_root)
+        .and_then(|r| r.head_tree_oid())
+        .ok();
+
+    match read_pointer(repo_root) {
+        Ok(ptr) => match &current_tree {
+            // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
+            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root).map(|_| ()),
+            // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
+            _ => Ok(()),
+        },
+        // No index yet: build one.
+        Err(_) => index_repo(repo_root).map(|_| ()),
+    }
+}
+
 /// Direction selector for the shared callers/callees path.
 enum NeighborDir {
     Callers,
@@ -257,8 +299,7 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
         NeighborDir::Callers => "callers",
         NeighborDir::Callees => "callees",
     };
-    let repo_root = resolve_repo(args.repo.clone())?;
-    let view = load_view(&repo_root)?;
+    let view = prepare_view(&args)?;
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
         Some(id) => id,
         // Zero-symbol match under --assert-empty: an empty, vacuous result.
@@ -292,8 +333,7 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
 }
 
 fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliError> {
-    let repo_root = resolve_repo(args.repo.clone())?;
-    let view = load_view(&repo_root)?;
+    let view = prepare_view(&args)?;
     let from_id = match resolve_anchor_lenient(&view, from, args.assert_empty)? {
         Some(id) => id,
         None => return emit("reaches", &args, ResultSet::Neighbors(vec![]), false, 0),
@@ -342,8 +382,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
 }
 
 fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
-    let repo_root = resolve_repo(args.repo.clone())?;
-    let view = load_view(&repo_root)?;
+    let view = prepare_view(&args)?;
     let (from_id, to_id) = match (
         resolve_anchor_lenient(&view, from, args.assert_empty)?,
         resolve_anchor_lenient(&view, to, args.assert_empty)?,
@@ -375,8 +414,7 @@ fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
 }
 
 fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
-    let repo_root = resolve_repo(args.repo.clone())?;
-    let view = load_view(&repo_root)?;
+    let view = prepare_view(&args)?;
     let walker = build_walker(&args);
     let kinds: Vec<SymbolKind> = kind.map(SymbolKind::from).into_iter().collect();
     let results = unused(&view, &[], &kinds, &walker);
@@ -688,6 +726,17 @@ fn resolve_repo(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
 fn open_store(repo_root: &Path) -> Result<SqliteStore, CliError> {
     let path = db_path(repo_root);
     SqliteStore::open(&path).map_err(|e| CliError::graph(format!("opening store {path:?}: {e}")))
+}
+
+/// Resolve the query's repo root, auto-index it unless opted out, and load the
+/// current Layer-2 graph — the shared entry every query subcommand uses so the
+/// auto-index trigger (audit row #23) and the IF-4 exit mapping live in one place.
+fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
+    let repo_root = resolve_repo(args.repo.clone())?;
+    if !args.no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    load_view(&repo_root)
 }
 
 /// Load the current Layer-2 graph into a queryable [`GraphView`].

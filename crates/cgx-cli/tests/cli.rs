@@ -203,11 +203,70 @@ fn out_of_range_node_id_does_not_panic() {
 }
 
 #[test]
-fn query_without_index_is_graph_error_exit_3() {
+fn query_without_index_with_no_auto_index_is_graph_error_exit_3() {
     let (_tmp, repo) = fixture_repo();
-    // No `cgx index` run.
-    let (_out, code) = run_cgx(&repo, &["callers", "beta"]);
-    assert_eq!(code, 3, "querying an un-indexed repo → exit 3");
+    // No `cgx index` run, and auto-index explicitly disabled.
+    let (_out, code) = run_cgx(&repo, &["callers", "beta", "--no-auto-index"]);
+    assert_eq!(
+        code, 3,
+        "querying an un-indexed repo with --no-auto-index → exit 3"
+    );
+}
+
+// --- auto-index (audit row #23) integration tests ---
+
+#[test]
+fn query_auto_indexes_when_no_store_exists() {
+    let (_tmp, repo) = fixture_repo();
+    // No `cgx index` run: the query must build the index itself, then answer.
+    assert!(
+        !repo.join(".cgx/HEAD.json").exists(),
+        "precondition: no index yet"
+    );
+    let (out, code) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(code, 0, "auto-indexed query should succeed: {out}");
+    assert!(
+        out.contains("rust_sample::alpha"),
+        "auto-indexed query answers correctly: {out}"
+    );
+    assert!(
+        repo.join(".cgx/HEAD.json").exists() && repo.join(".cgx/index.db").exists(),
+        "auto-index wrote .cgx/ like `cgx index` does"
+    );
+}
+
+/// The idempotence/determinism contract: a query auto-indexes on the first run;
+/// a subsequent explicit `cgx index` over the unchanged tree hits the Layer-1
+/// cache and extracts ZERO blobs (IX-1), proving the auto-index populated the same
+/// cache and is not redundantly re-parsing.
+#[test]
+fn second_run_hits_cache_zero_extracted() {
+    let (_tmp, repo) = fixture_repo();
+    // First query auto-indexes (cold: blobs are extracted).
+    let (_out, code) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(code, 0, "first auto-indexed query succeeds");
+    let pointer_after_auto = std::fs::read_to_string(repo.join(".cgx/HEAD.json")).unwrap();
+
+    // An explicit index over the now-warm cache must report `0 extracted`.
+    let (idx_out, idx_code) = run_cgx(&repo, &["index"]);
+    assert_eq!(idx_code, 0);
+    assert!(
+        idx_out.contains("0 extracted"),
+        "second pass over unchanged tree extracts 0 blobs (cache hit): {idx_out}"
+    );
+
+    // And the pointer the auto-index wrote is byte-identical to the explicit one
+    // (deterministic Layer-2 key).
+    let pointer_after_explicit = std::fs::read_to_string(repo.join(".cgx/HEAD.json")).unwrap();
+    assert_eq!(
+        pointer_after_auto, pointer_after_explicit,
+        "auto-index and explicit index produce an identical pointer"
+    );
+
+    // A second query over the warm store is still correct and byte-stable.
+    let (a, _) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    let (b, _) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    assert_eq!(a, b, "repeat query over the cached index is byte-identical");
 }
 
 #[test]

@@ -12,7 +12,9 @@
 use cgx_core::{Confidence, NodeId, SymbolKind, SymbolPattern};
 
 use crate::filter::{Direction, EdgeFilter};
-use crate::result::{ExplainEdge, Explanation, NeighborResult, PathResult, PathStep, ReachResult};
+use crate::result::{
+    ExplainEdge, Explanation, NeighborResult, PathResult, PathSet, PathStep, ReachResult,
+};
 use crate::view::{GraphView, ResolveError};
 use crate::walk::{PathWalker, WalkStep};
 
@@ -147,14 +149,18 @@ pub fn reaches_all(view: &GraphView, from: NodeId, walker: &PathWalker) -> Vec<N
 /// walker's edge-condition + confidence filter and surfacing per-path confidence
 /// and exceptional-class crossing (GM-4). Ordered deterministically by
 /// `(hops, source→sink node ids)`.
-pub fn paths(view: &GraphView, from: NodeId, to: NodeId, walker: &PathWalker) -> Vec<PathResult> {
+pub fn paths(view: &GraphView, from: NodeId, to: NodeId, walker: &PathWalker) -> PathSet {
     let raw = walker.enumerate_paths(view, from, to, Direction::Forward);
-    let mut results: Vec<PathResult> = raw
+    let mut paths: Vec<PathResult> = raw
+        .paths
         .into_iter()
         .map(|steps| build_path_result(view, &steps))
         .collect();
-    results.sort_by_key(path_key);
-    results
+    paths.sort_by_key(path_key);
+    PathSet {
+        paths,
+        truncation: raw.truncation,
+    }
 }
 
 /// Convert a BFS predecessor sequence into the [`WalkStep`] shape, recomputing the
@@ -281,6 +287,7 @@ pub fn explain(view: &GraphView, anchor: NodeId) -> Option<Explanation> {
         filter: EdgeFilter::calls(),
         max_depth: Some(1),
         max_paths: None,
+        max_steps: None,
     };
     let incoming = callers(view, anchor, &depth1);
     let outgoing = callees(view, anchor, &depth1);

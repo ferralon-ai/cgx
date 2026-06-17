@@ -9,6 +9,8 @@
 
 use cgx_core::{Confidence, EdgeCondition, EdgeRecord, NodeId, NodeRecord};
 
+pub use crate::walk::TruncationReason;
+
 /// One symbol reached by a `callers`/`callees` walk.
 ///
 /// `depth` is the hop count from the query anchor (1 = direct caller/callee).
@@ -74,6 +76,37 @@ impl PathResult {
     /// and by callers that want the bare node sequence.
     pub fn node_ids(&self) -> Vec<NodeId> {
         self.steps.iter().map(|s| s.node.id).collect()
+    }
+}
+
+/// The result of a `paths` query: the enumerated paths plus an honest truncation
+/// marker (the cut-marker idiom applied to traversal, not edges).
+///
+/// `truncation` is `Some` when a bound stopped the enumeration before the full
+/// simple-path set was explored — a work-budget cutoff on a dense graph, or a
+/// filled result cap. It is never an error and never a silent drop: the caller
+/// surfaces it (CLI marker line, JSON / `structuredContent` field) so a partial
+/// answer is never mistaken for a complete one. Deterministic: the same graph and
+/// bounds yield the same `paths` and the same `truncation`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathSet {
+    pub paths: Vec<PathResult>,
+    pub truncation: Option<TruncationReason>,
+}
+
+impl PathSet {
+    /// Number of enumerated paths.
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// Whether the enumeration was cut short by a bound.
+    pub fn truncated(&self) -> bool {
+        self.truncation.is_some()
     }
 }
 

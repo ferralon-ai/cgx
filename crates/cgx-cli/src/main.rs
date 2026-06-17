@@ -19,7 +19,8 @@ use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
-    callees, callers, paths as query_paths, reaches, unused, EdgeFilter, GraphView, PathWalker,
+    callees, callers, paths as query_paths, reaches, unused, EdgeFilter, GraphView, PathSet,
+    PathWalker,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
@@ -65,7 +66,9 @@ enum Command {
         #[command(flatten)]
         query: QueryArgs,
     },
-    /// Enumerate the call paths from `from` to `to`.
+    /// Enumerate the call paths from `from` to `to`. Bounded to depth 6 by default
+    /// (`--max-depth 0` lifts the depth limit; the search stays work-budgeted and
+    /// may report `[truncated]`).
     Paths {
         from: String,
         to: String,
@@ -169,7 +172,10 @@ struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
-    /// Maximum traversal depth.
+    /// Maximum traversal depth. For `paths`, omitting it applies a default depth
+    /// of 6 (the common case is bounded and fast); pass `--max-depth 0` for
+    /// unlimited depth, which stays protected by an internal work budget and may
+    /// report `[truncated]` on a dense graph.
     #[arg(long)]
     max_depth: Option<u32>,
     /// Minimum confidence floor (`possible`, `probable`, `certain`).
@@ -338,6 +344,7 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
         filter: EdgeFilter::calls(),
         max_depth: args.max_depth,
         max_paths: None,
+        max_steps: None,
     };
     let unfiltered = match dir {
         NeighborDir::Callers => callers(&view, anchor, &unfiltered_walker),
@@ -372,6 +379,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                     filter: EdgeFilter::calls(),
                     max_depth: args.max_depth,
                     max_paths: None,
+                    max_steps: None,
                 },
             );
             emit(
@@ -386,17 +394,29 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
         Some(to) => {
             let to_id = match resolve_anchor_lenient(&view, to, args.assert_empty)? {
                 Some(id) => id,
-                None => return emit("reaches", &args, ResultSet::Paths(vec![]), false, 0),
+                None => {
+                    return emit(
+                        "reaches",
+                        &args,
+                        ResultSet::Paths(PathSet::default()),
+                        false,
+                        0,
+                    )
+                }
             };
             let result = reaches(&view, from_id, to_id, &walker);
             let paths = result.witness.into_iter().collect::<Vec<_>>();
+            let count = paths.len();
             let matched = true; // both endpoints resolved above
             emit(
                 "reaches",
                 &args,
-                ResultSet::Paths(paths.clone()),
+                ResultSet::Paths(PathSet {
+                    paths,
+                    truncation: None,
+                }),
                 matched,
-                paths.len(),
+                count,
             )
         }
     }
@@ -410,9 +430,9 @@ fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
     ) {
         (Some(f), Some(t)) => (f, t),
         // Either endpoint unresolved under --assert-empty → empty, vacuous.
-        _ => return emit("paths", &args, ResultSet::Paths(vec![]), false, 0),
+        _ => return emit("paths", &args, ResultSet::Paths(PathSet::default()), false, 0),
     };
-    let walker = build_walker(&args);
+    let walker = build_paths_walker(&args);
     let results = query_paths(&view, from_id, to_id, &walker);
 
     let unfiltered = query_paths(
@@ -421,16 +441,18 @@ fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
         to_id,
         &PathWalker {
             filter: EdgeFilter::calls(),
-            max_depth: args.max_depth,
+            max_depth: paths_max_depth(args.max_depth),
             max_paths: None,
+            max_steps: None,
         },
     );
+    let unfiltered_len = unfiltered.len();
     emit(
         "paths",
         &args,
         ResultSet::Paths(results),
         true,
-        unfiltered.len(),
+        unfiltered_len,
     )
 }
 
@@ -759,6 +781,40 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
         filter,
         max_depth: args.max_depth,
         max_paths: None,
+        max_steps: None,
+    }
+}
+
+/// Default `--max-depth` for `paths` when the user passes none. An unbounded DFS
+/// over a dense graph never terminates, so the common `cgx paths a b` invocation
+/// is bounded by default; the user can widen it explicitly (or pass `--max-depth 0`
+/// for unlimited depth, which stays protected by the walker's step budget).
+const PATHS_DEFAULT_MAX_DEPTH: u32 = 6;
+
+/// Resolve the effective `paths` depth from `--max-depth`:
+/// - omitted → [`PATHS_DEFAULT_MAX_DEPTH`] (the bounded common case);
+/// - `0`     → `None` (unlimited depth, still capped by the work budget);
+/// - `n`     → `Some(n)` (honored as given).
+fn paths_max_depth(max_depth: Option<u32>) -> Option<u32> {
+    match max_depth {
+        None => Some(PATHS_DEFAULT_MAX_DEPTH),
+        Some(0) => None,
+        Some(n) => Some(n),
+    }
+}
+
+/// Build the `paths` walker, applying the default-depth policy. Confidence floor
+/// and the (default) work budget are shared with the other subcommands.
+fn build_paths_walker(args: &QueryArgs) -> PathWalker {
+    let mut filter = EdgeFilter::calls();
+    if let Some(c) = args.confidence {
+        filter = filter.with_min_confidence(c.into());
+    }
+    PathWalker {
+        filter,
+        max_depth: paths_max_depth(args.max_depth),
+        max_paths: None,
+        max_steps: None,
     }
 }
 

@@ -366,6 +366,7 @@ fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
         filter: neighbor_filter(args)?,
         max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_DEPTH)),
         max_paths: None,
+        max_steps: None,
     };
     let results = match dir {
         Direction::Backward => callers(&session.view, anchor, &walker),
@@ -404,8 +405,10 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
         filter,
         max_depth: Some(opt_u32(args, "max_depth")?.unwrap_or(DEFAULT_PATHS_MAX_DEPTH)),
         max_paths: None,
+        max_steps: None,
     };
-    let results = query_paths(&session.view, from_id, to_id, &walker);
+    let result = query_paths(&session.view, from_id, to_id, &walker);
+    let results = &result.paths;
 
     let limit = page_size(args, DEFAULT_PATHS_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
@@ -418,7 +421,11 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
         "paths": page,
         "total_matched": results.len(),
         "has_more": has_more,
-        "cursor": cursor
+        "cursor": cursor,
+        // ADR-06 honesty: a budget/cap cutoff is surfaced, never silent. `null`
+        // when the enumeration was complete.
+        "truncated": result.truncated(),
+        "truncation_reason": result.truncation.map(|r| r.token())
     });
     Ok(with_session_meta(body, &session))
 }

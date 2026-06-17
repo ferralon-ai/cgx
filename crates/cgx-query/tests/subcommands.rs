@@ -6,7 +6,7 @@ mod common;
 use cgx_core::{Confidence, EdgeCondition, EntrypointKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_query::{
     callees, callers, paths, reaches, reaches_all, unused, Direction, EdgeFilter, GraphView,
-    PathWalker,
+    PathWalker, TruncationReason,
 };
 
 use common::{id_of, GraphBuilder};
@@ -120,7 +120,8 @@ fn paths_enumerates_all_simple_paths() {
     let to = id_of(v.nodes(), "sink");
     let res = paths(&v, from, to, &PathWalker::default());
     assert_eq!(res.len(), 2);
-    for p in &res {
+    assert!(!res.truncated(), "complete enumeration is not truncated");
+    for p in &res.paths {
         assert_eq!(p.steps.first().unwrap().node.fqn, "main");
         assert_eq!(p.steps.last().unwrap().node.fqn, "sink");
     }
@@ -148,7 +149,7 @@ fn paths_exclude_exception_condition_drops_exception_path() {
     };
     let res = paths(&v, from, to, &walker);
     assert_eq!(res.len(), 1, "exception path should be excluded");
-    let only = &res[0];
+    let only = &res.paths[0];
     assert!(only.steps.iter().any(|s| s.node.fqn == "a"));
     assert!(!only.crosses_exceptional);
 }
@@ -180,6 +181,115 @@ fn paths_only_exception_condition_keeps_error_path() {
     assert!(res.is_empty());
 }
 
+// --- work-budget backstop + truncation honesty --------------------------------
+
+/// A dense diamond lattice: `n` ranks of `w` nodes each, every node in rank `r`
+/// calling every node in rank `r+1`, with a single source and sink. The number of
+/// source→sink simple paths is `w^(n-1)` — an exponential search tree the DFS must
+/// not exhaust. This is the synthetic analogue of the 100k-corpus hang.
+fn dense_lattice(ranks: usize, width: usize) -> GraphBuilder {
+    let mut g = GraphBuilder::new().func("src").func("sink");
+    for r in 0..ranks {
+        for c in 0..width {
+            g = g.func(&format!("n{r}_{c}"));
+        }
+    }
+    for c in 0..width {
+        g = g.calls("src", &format!("n0_{c}"));
+        g = g.calls(&format!("n{}_{c}", ranks - 1), "sink");
+    }
+    for r in 0..ranks - 1 {
+        for a in 0..width {
+            for b in 0..width {
+                g = g.calls(&format!("n{r}_{a}"), &format!("n{}_{b}", r + 1));
+            }
+        }
+    }
+    g
+}
+
+#[test]
+fn paths_step_budget_truncates_dense_graph_deterministically() {
+    // 8 ranks × 4 wide → 4^7 = 16384 simple paths, far more than a tiny budget can
+    // enumerate. Unbounded depth: only the work budget can stop it. The walk must
+    // terminate, set the StepBudget marker, and return a deterministic prefix.
+    let v = view(dense_lattice(8, 4));
+    let from = id_of(v.nodes(), "src");
+    let to = id_of(v.nodes(), "sink");
+    let walker = PathWalker {
+        max_steps: Some(500),
+        ..Default::default()
+    };
+    let a = paths(&v, from, to, &walker);
+    assert!(a.truncated(), "tiny budget on a dense graph must truncate");
+    assert_eq!(a.truncation, Some(TruncationReason::StepBudget));
+
+    // Determinism: same graph + same budget → identical partial set and marker.
+    let v2 = view(dense_lattice(8, 4));
+    let from2 = id_of(v2.nodes(), "src");
+    let to2 = id_of(v2.nodes(), "sink");
+    let b = paths(&v2, from2, to2, &walker);
+    assert_eq!(a.truncation, b.truncation);
+    assert_eq!(a.len(), b.len());
+    let ids_a: Vec<Vec<u32>> = a
+        .paths
+        .iter()
+        .map(|p| p.node_ids().iter().map(|i| i.0).collect())
+        .collect();
+    let ids_b: Vec<Vec<u32>> = b
+        .paths
+        .iter()
+        .map(|p| p.node_ids().iter().map(|i| i.0).collect())
+        .collect();
+    assert_eq!(ids_a, ids_b, "partial path set must be deterministic");
+}
+
+#[test]
+fn paths_complete_enumeration_is_not_truncated() {
+    // Ample budget on the same lattice: the full 4^7 set enumerates and the result
+    // is honestly marked complete (no truncation).
+    let v = view(dense_lattice(8, 4));
+    let from = id_of(v.nodes(), "src");
+    let to = id_of(v.nodes(), "sink");
+    let walker = PathWalker {
+        max_paths: Some(usize::MAX),
+        max_steps: Some(u64::MAX),
+        ..Default::default()
+    };
+    let res = paths(&v, from, to, &walker);
+    assert!(!res.truncated());
+    // One node chosen per rank: width^ranks distinct source→sink simple paths.
+    assert_eq!(res.len(), 4usize.pow(8));
+}
+
+#[test]
+fn paths_path_cap_truncation_is_marked() {
+    // A graph with three distinct source→sink paths, capped at two: the result is
+    // truncated with the PathCap reason.
+    let g = GraphBuilder::new()
+        .func("s")
+        .func("a")
+        .func("b")
+        .func("c")
+        .func("t")
+        .calls("s", "a")
+        .calls("s", "b")
+        .calls("s", "c")
+        .calls("a", "t")
+        .calls("b", "t")
+        .calls("c", "t");
+    let v = view(g);
+    let s = id_of(v.nodes(), "s");
+    let t = id_of(v.nodes(), "t");
+    let walker = PathWalker {
+        max_paths: Some(2),
+        ..Default::default()
+    };
+    let res = paths(&v, s, t, &walker);
+    assert_eq!(res.len(), 2);
+    assert_eq!(res.truncation, Some(TruncationReason::PathCap));
+}
+
 // --- GM-4.1 canonical transience ---------------------------------------------
 
 #[test]
@@ -198,7 +308,7 @@ fn transience_canonical_example_marks_d_exception_transient() {
     let d = id_of(v.nodes(), "D");
     let res = paths(&v, a, d, &PathWalker::default());
     assert_eq!(res.len(), 1);
-    let p = &res[0];
+    let p = &res.paths[0];
     assert!(p.crosses_exceptional);
     // D is reached after the exceptional edge: exception-transient (GM-4.1).
     let d_step = p.steps.iter().find(|s| s.node.fqn == "D").unwrap();
@@ -229,8 +339,8 @@ fn transience_not_set_on_non_exception_path() {
     let d = id_of(v.nodes(), "D");
     let res = paths(&v, x, d, &PathWalker::default());
     assert_eq!(res.len(), 1);
-    assert!(!res[0].crosses_exceptional);
-    let d_step = res[0].steps.iter().find(|s| s.node.fqn == "D").unwrap();
+    assert!(!res.paths[0].crosses_exceptional);
+    let d_step = res.paths[0].steps.iter().find(|s| s.node.fqn == "D").unwrap();
     assert!(!d_step.exception_transient);
 }
 
@@ -254,7 +364,7 @@ fn spawn_edge_resets_exceptional_domain() {
     let d = id_of(v.nodes(), "D");
     let res = paths(&v, a, d, &PathWalker::default());
     assert_eq!(res.len(), 1);
-    let p = &res[0];
+    let p = &res.paths[0];
     let b_step = p.steps.iter().find(|s| s.node.fqn == "B").unwrap();
     let c_step = p.steps.iter().find(|s| s.node.fqn == "C").unwrap();
     let d_step = p.steps.iter().find(|s| s.node.fqn == "D").unwrap();
@@ -453,8 +563,8 @@ fn paths_are_deterministically_ordered() {
     let t = id_of(v.nodes(), "t");
     let res = paths(&v, s, t, &PathWalker::default());
     assert_eq!(res.len(), 2);
-    assert_eq!(res[0].hops(), 1);
-    assert_eq!(res[1].hops(), 2);
+    assert_eq!(res.paths[0].hops(), 1);
+    assert_eq!(res.paths[1].hops(), 2);
 }
 
 // --- pattern resolution -------------------------------------------------------
@@ -560,7 +670,7 @@ fn calls_star_terminates_and_counts_distinct_over_3_node_scc() {
     // back-edge c -> a is cut by `on_path`).
     let ps = paths(&v, a, leaf, &PathWalker::default());
     assert_eq!(ps.len(), 1);
-    let seq: Vec<&str> = ps[0].steps.iter().map(|s| s.node.fqn.as_str()).collect();
+    let seq: Vec<&str> = ps.paths[0].steps.iter().map(|s| s.node.fqn.as_str()).collect();
     assert_eq!(seq, vec!["a", "b", "c", "leaf"]);
 }
 

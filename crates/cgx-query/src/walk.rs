@@ -30,6 +30,50 @@ use crate::view::GraphView;
 /// dense graph's path explosion bounded without the caller having to remember to.
 pub const DEFAULT_MAX_PATHS: usize = 1024;
 
+/// Default cap on total DFS traversal work for `paths` enumeration, applied when
+/// the caller sets none. This is the depth-independent backstop: the path cap
+/// ([`DEFAULT_MAX_PATHS`]) bounds *results found*, but on a dense graph the search
+/// tree is exponential and the cap is never reached, so the DFS would run forever.
+/// `DEFAULT_MAX_STEPS` bounds *work done* — counted as DFS node-visits (one per
+/// recursive descent) — and stops the walk when exhausted, marking the result
+/// truncated. Sized with headroom for legitimate large-but-finite searches while
+/// keeping a pathological dense graph well under a second.
+pub const DEFAULT_MAX_STEPS: u64 = 2_000_000;
+
+/// Why a `paths` enumeration stopped before exhausting the full simple-path set.
+/// `None` (absent) means the enumeration was complete; a value names which bound
+/// it hit. Mirrors the [`cgx_core::CutMarker`] honesty idiom: a budget cutoff is a
+/// surfaced fact, never a silent drop and never an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationReason {
+    /// The work budget ([`PathWalker::max_steps`]) was exhausted before the search
+    /// tree was fully explored — there may be paths the walk never reached.
+    StepBudget,
+    /// The result cap ([`PathWalker::max_paths`]) filled — there may be more paths
+    /// at or beyond the last one returned.
+    PathCap,
+}
+
+impl TruncationReason {
+    /// A stable kebab-case token for JSON / `structuredContent` surfaces.
+    pub fn token(self) -> &'static str {
+        match self {
+            TruncationReason::StepBudget => "step-budget",
+            TruncationReason::PathCap => "path-cap",
+        }
+    }
+}
+
+/// The outcome of a [`PathWalker::enumerate_paths`] call: the enumerated paths plus
+/// whether the enumeration was cut short by a bound (and which one).
+#[derive(Debug, Clone, Default)]
+pub struct PathEnumeration {
+    pub paths: Vec<Vec<WalkStep>>,
+    /// `Some` when a bound stopped the walk before the full simple-path set was
+    /// explored; `None` when the enumeration is complete.
+    pub truncation: Option<TruncationReason>,
+}
+
 /// Configuration shared by every traversal a walk performs.
 #[derive(Debug, Clone)]
 pub struct PathWalker {
@@ -40,6 +84,9 @@ pub struct PathWalker {
     /// Maximum number of paths to enumerate (`paths` only). `None` =
     /// [`DEFAULT_MAX_PATHS`].
     pub max_paths: Option<usize>,
+    /// Maximum DFS node-visits for `paths` enumeration (the depth-independent
+    /// work backstop). `None` = [`DEFAULT_MAX_STEPS`].
+    pub max_steps: Option<u64>,
 }
 
 impl Default for PathWalker {
@@ -48,6 +95,7 @@ impl Default for PathWalker {
             filter: EdgeFilter::calls(),
             max_depth: None,
             max_paths: None,
+            max_steps: None,
         }
     }
 }
@@ -80,6 +128,11 @@ impl PathWalker {
     /// The effective path cap.
     fn path_cap(&self) -> usize {
         self.max_paths.unwrap_or(DEFAULT_MAX_PATHS)
+    }
+
+    /// The effective work budget (DFS node-visits).
+    fn step_budget(&self) -> u64 {
+        self.max_steps.unwrap_or(DEFAULT_MAX_STEPS)
     }
 
     /// Whether `depth` is within the configured limit.
@@ -206,24 +259,34 @@ impl PathWalker {
     }
 
     /// Enumerate simple (acyclic) paths from `start` to `goal` in `dir`, within
-    /// the depth limit and capped at the path limit. Each path is the node
-    /// sequence plus the entering edge per node (source's entering edge is `None`)
-    /// plus the per-step `seen_exceptional` flag *before* entering that node.
+    /// the depth limit, capped at the path limit, and bounded by the work budget.
+    /// Each path is the node sequence plus the entering edge per node (source's
+    /// entering edge is `None`) plus the per-step `seen_exceptional` flag *before*
+    /// entering that node.
     ///
     /// DFS gives fork-point reset for free: `seen_exceptional` lives on the
     /// recursion stack, so backtracking to a fork restores the flag (GM-4.2).
     /// Paths are returned in a deterministic discovery order (neighbors visited in
     /// ascending peer/edge id), then the caller applies the result ordering.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// Returns a [`PathEnumeration`] whose `truncation` is `Some` when a bound
+    /// (work budget or path cap) stopped the walk before the search tree was fully
+    /// explored. Truncation is deterministic: the same graph and bounds visit the
+    /// same nodes in the same sorted-neighbor order and stop at the same point.
     pub fn enumerate_paths(
         &self,
         view: &GraphView,
         start: NodeId,
         goal: NodeId,
         dir: Direction,
-    ) -> Vec<Vec<WalkStep>> {
-        let cap = self.path_cap();
-        let mut paths: Vec<Vec<WalkStep>> = Vec::new();
+    ) -> PathEnumeration {
+        let mut walk = DfsState {
+            paths: Vec::new(),
+            cap: self.path_cap(),
+            steps: 0,
+            budget: self.step_budget(),
+            truncation: None,
+        };
         let mut stack: Vec<WalkStep> = vec![WalkStep {
             node: start,
             via: None,
@@ -233,17 +296,11 @@ impl PathWalker {
         if let Some(si) = checked_index(start, view.node_count()) {
             on_path[si] = true;
         }
-        self.dfs(
-            view,
-            start,
-            goal,
-            dir,
-            &mut stack,
-            &mut on_path,
-            &mut paths,
-            cap,
-        );
-        paths
+        self.dfs(view, start, goal, dir, &mut stack, &mut on_path, &mut walk);
+        PathEnumeration {
+            paths: walk.paths,
+            truncation: walk.truncation,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -255,14 +312,23 @@ impl PathWalker {
         dir: Direction,
         stack: &mut Vec<WalkStep>,
         on_path: &mut [bool],
-        paths: &mut Vec<Vec<WalkStep>>,
-        cap: usize,
+        walk: &mut DfsState,
     ) {
-        if paths.len() >= cap {
+        // Charge one unit of work per node-visit. Exhausting the budget stops the
+        // search regardless of depth — the dense-graph backstop.
+        walk.steps += 1;
+        if walk.steps > walk.budget {
+            walk.truncation = Some(TruncationReason::StepBudget);
+            return;
+        }
+        if walk.paths.len() >= walk.cap {
             return;
         }
         if node == goal && stack.len() > 1 {
-            paths.push(stack.clone());
+            walk.paths.push(stack.clone());
+            if walk.paths.len() >= walk.cap {
+                walk.truncation = Some(TruncationReason::PathCap);
+            }
             return;
         }
         let depth = (stack.len() - 1) as u32;
@@ -295,14 +361,26 @@ impl PathWalker {
                 via: Some(edge),
                 exception_transient: next_exc,
             });
-            self.dfs(view, peer, goal, dir, stack, on_path, paths, cap);
+            self.dfs(view, peer, goal, dir, stack, on_path, walk);
             stack.pop();
             on_path[pi] = false;
-            if paths.len() >= cap {
+            if walk.truncation == Some(TruncationReason::StepBudget)
+                || walk.paths.len() >= walk.cap
+            {
                 return;
             }
         }
     }
+}
+
+/// Mutable per-walk DFS bookkeeping, threaded through the recursion so the
+/// signature stays small as bounds accumulate.
+struct DfsState {
+    paths: Vec<Vec<WalkStep>>,
+    cap: usize,
+    steps: u64,
+    budget: u64,
+    truncation: Option<TruncationReason>,
 }
 
 /// One node on an enumerated walk, with the edge taken to enter it and the

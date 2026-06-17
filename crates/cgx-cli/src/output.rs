@@ -10,7 +10,7 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord};
-use cgx_query::{Explanation, NeighborResult, PathResult};
+use cgx_query::{Explanation, NeighborResult, PathResult, PathSet, TruncationReason};
 use serde_json::{json, Value};
 
 /// The output format selected by `--format` (IF-3 subset for Phase-1 CLI).
@@ -170,8 +170,8 @@ fn sarif_kind(node: &NodeRecord) -> String {
 pub enum ResultSet {
     /// `callers`/`callees`/`reaches-all`: reached symbols.
     Neighbors(Vec<NeighborResult>),
-    /// `paths`: enumerated paths.
-    Paths(Vec<PathResult>),
+    /// `paths`: enumerated paths plus the honest truncation marker.
+    Paths(PathSet),
     /// `unused`: whole symbols.
     Nodes(Vec<NodeRecord>),
 }
@@ -183,6 +183,14 @@ impl ResultSet {
             ResultSet::Neighbors(v) => v.len(),
             ResultSet::Paths(v) => v.len(),
             ResultSet::Nodes(v) => v.len(),
+        }
+    }
+
+    /// The truncation marker on a `paths` result, if any (the honesty signal).
+    pub fn truncation(&self) -> Option<TruncationReason> {
+        match self {
+            ResultSet::Paths(v) => v.truncation,
+            _ => None,
         }
     }
 
@@ -222,7 +230,7 @@ fn render_human(results: &ResultSet) -> String {
             }
         }
         ResultSet::Paths(v) => {
-            for (i, p) in v.iter().enumerate() {
+            for (i, p) in v.paths.iter().enumerate() {
                 lines.push(format!(
                     "path {} ({} hops, min-confidence={}{}):",
                     i + 1,
@@ -247,6 +255,9 @@ fn render_human(results: &ResultSet) -> String {
                     ));
                 }
             }
+            if let Some(reason) = v.truncation {
+                lines.push(truncation_marker(reason));
+            }
         }
     }
     if lines.is_empty() {
@@ -262,16 +273,37 @@ fn render_json(results: &ResultSet, vacuous: bool) -> String {
     let items: Vec<Value> = match results {
         ResultSet::Neighbors(v) => v.iter().map(|n| Finding::from_neighbor(n).json()).collect(),
         ResultSet::Nodes(v) => v.iter().map(|n| Finding::from_node(n).json()).collect(),
-        ResultSet::Paths(v) => v.iter().map(path_json).collect(),
+        ResultSet::Paths(v) => v.paths.iter().map(path_json).collect(),
     };
-    let doc = json!({
+    let mut doc = json!({
         "results": items,
         "count": results.len(),
         "vacuous": vacuous,
     });
+    // ADR-06 honesty: a `paths` budget/cap cutoff is surfaced, never silent.
+    if let ResultSet::Paths(_) = results {
+        let obj = doc.as_object_mut().expect("result doc is an object");
+        obj.insert("truncated".into(), json!(results.truncation().is_some()));
+        obj.insert(
+            "truncation_reason".into(),
+            json!(results.truncation().map(|r| r.token())),
+        );
+    }
     let mut s = serde_json::to_string_pretty(&doc).expect("result doc serializes");
     s.push('\n');
     s
+}
+
+/// The human-format marker line appended when a `paths` enumeration was cut short.
+fn truncation_marker(reason: TruncationReason) -> String {
+    match reason {
+        TruncationReason::StepBudget => {
+            "[truncated: search budget exhausted; narrow with --max-depth]".to_string()
+        }
+        TruncationReason::PathCap => {
+            "[truncated: path limit reached; more paths exist]".to_string()
+        }
+    }
 }
 
 fn path_json(p: &PathResult) -> Value {
@@ -317,8 +349,16 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
             .iter()
             .map(|n| Finding::from_node(n).sarif(&rid))
             .collect(),
-        ResultSet::Paths(v) => v.iter().map(|p| sarif_path_result(p, &rid)).collect(),
+        ResultSet::Paths(v) => v.paths.iter().map(|p| sarif_path_result(p, &rid)).collect(),
     };
+
+    if let Some(reason) = results.truncation() {
+        sarif_results.push(json!({
+            "ruleId": "cgx/truncated",
+            "level": "note",
+            "message": { "text": truncation_marker(reason) },
+        }));
+    }
 
     if vacuous {
         sarif_results.push(json!({
@@ -345,6 +385,10 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
                         "id": "cgx/vacuous-assertion",
                         "name": "vacuous-assertion",
                         "shortDescription": { "text": "An assertion passed without matching any symbols (ADR-08)." }
+                    }, {
+                        "id": "cgx/truncated",
+                        "name": "truncated",
+                        "shortDescription": { "text": "A paths enumeration was cut short by the depth/work budget; the result is partial." }
                     }]
                 }
             },

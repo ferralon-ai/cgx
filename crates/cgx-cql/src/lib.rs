@@ -34,6 +34,7 @@ pub use error::{CqlError, ErrorKind};
 pub use value::{PathValue, Value};
 
 use cgx_query::GraphView;
+pub use cgx_query::TruncationReason;
 
 /// The result of a successful query: a deterministic table.
 ///
@@ -42,11 +43,19 @@ use cgx_query::GraphView;
 /// query returned whole paths, `paths` carries the corresponding [`PathValue`]s
 /// in row order so the CLI can pick a path/graph emitter (dot/mermaid/d2);
 /// tabular queries leave it empty.
+///
+/// `truncation` is `Some` when a CQL var-length walk hit the [`PathWalker`]
+/// work budget (`DEFAULT_MAX_STEPS`) or path cap (`DEFAULT_MAX_PATHS`) before
+/// the search was fully explored — the same honesty signal Layer-1 `paths`
+/// surfaces via [`cgx_query::PathSet::truncation`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResultTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub paths: Vec<PathValue>,
+    /// Set when a var-length walk was cut short by the internal work budget or
+    /// path cap. `None` means the enumeration was complete.
+    pub truncation: Option<TruncationReason>,
 }
 
 /// Parse, plan, and evaluate `src` against `view`.
@@ -81,5 +90,6 @@ mod tests {
     fn result_table_default_is_empty() {
         let t = ResultTable::default();
         assert!(t.columns.is_empty() && t.rows.is_empty() && t.paths.is_empty());
+        assert!(t.truncation.is_none());
     }
 }

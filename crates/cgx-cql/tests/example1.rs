@@ -164,3 +164,58 @@ fn determinism_run_twice() {
                RETURN path"#;
     assert_eq!(run(&view, q).unwrap(), run(&view, q).unwrap());
 }
+
+// ── N3: var-length path walk is budget-bounded and surfaces truncation ────────
+
+/// Dense fixture: `src` → 33 middle-a nodes → 33 middle-b nodes → `dst`.
+/// There are 33 × 33 = 1089 simple paths (> DEFAULT_MAX_PATHS=1024) so the
+/// path-cap fires deterministically.  The test proves:
+/// (a) the walk *terminates* (no hang on a dense graph), and
+/// (b) `table.truncation` is `Some(PathCap)` (honesty marker present).
+#[test]
+fn dense_graph_terminates_and_emits_truncation_marker() {
+    use cgx_core::SymbolKind::Function;
+    use cgx_query::TruncationReason;
+
+    const MID_COUNT: usize = 33; // 33 × 33 = 1089 > DEFAULT_MAX_PATHS=1024
+
+    // Build the graph programmatically: src → mid_a_i, mid_a_i → mid_b_j, mid_b_j → dst.
+    let mut b = GraphBuilder::new()
+        .sym("src", Function, "src/src.rs", 1)
+        .sym("dst", Function, "src/dst.rs", 1);
+    for i in 0..MID_COUNT {
+        b = b.sym(&format!("mid_a_{i}"), Function, "src/mid.rs", (10 + i) as u32);
+    }
+    for j in 0..MID_COUNT {
+        b = b.sym(&format!("mid_b_{j}"), Function, "src/mid.rs", (100 + j) as u32);
+    }
+    for i in 0..MID_COUNT {
+        b = b.calls("src", &format!("mid_a_{i}"));
+    }
+    for i in 0..MID_COUNT {
+        for j in 0..MID_COUNT {
+            b = b.calls(&format!("mid_a_{i}"), &format!("mid_b_{j}"));
+        }
+    }
+    for j in 0..MID_COUNT {
+        b = b.calls(&format!("mid_b_{j}"), "dst");
+    }
+    let view = b.view();
+
+    let q = r#"MATCH path = (s{name:"src"})-[:CALLS*]->(d{name:"dst"}) RETURN path"#;
+    // Must terminate (no hang) within the test timeout.
+    let table = run(&view, q).unwrap_or_else(|e| panic!("{}", e.render(q)));
+
+    // (a) Terminated with ≤ DEFAULT_MAX_PATHS=1024 paths.
+    assert!(
+        table.paths.len() <= 1024,
+        "expected ≤ 1024 paths, got {}",
+        table.paths.len()
+    );
+    // (b) Truncation marker is present (PathCap fired).
+    assert_eq!(
+        table.truncation,
+        Some(TruncationReason::PathCap),
+        "expected PathCap truncation marker"
+    );
+}

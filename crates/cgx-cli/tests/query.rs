@@ -129,6 +129,49 @@ fn index(repo: &Path) {
     assert_eq!(code, 0, "index should succeed");
 }
 
+/// Two-commit fixture: the second commit adds `gamma`, which also calls `beta`.
+/// Used by the `--at` tests to prove a prior ref yields a different graph.
+fn two_commit_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = fixture_repo();
+    let main_v2 = "\
+mod helper;
+
+fn main() {
+    alpha();
+    gamma();
+}
+
+fn alpha() {
+    helper::beta();
+}
+
+fn orphan() {
+    helper::beta();
+}
+
+fn gamma() {
+    helper::beta();
+}
+";
+    std::fs::write(repo.join("src/main.rs"), main_v2).unwrap();
+    git(&repo, &["add", "src/main.rs"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "add gamma",
+            "--date=2020-01-02T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
 // --- P8: tabular output in every format -------------------------------------
 
 #[test]
@@ -354,6 +397,54 @@ fn query_plan_error_for_deferred_edge_type_exit_2() {
     assert!(
         stderr.contains("error:"),
         "plan error caret printed: {stderr}"
+    );
+}
+
+// --- P9a: --at ref pinning (shared across subcommands) -----------------------
+
+#[test]
+fn query_at_head_equals_no_at() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let q = "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name";
+    let (plain, c1) = run_cgx(&repo, &["query", q, "--format", "json"]);
+    let (at_head, c2) = run_cgx(&repo, &["query", q, "--at", "HEAD", "--format", "json"]);
+    assert_eq!(c1, 0);
+    assert_eq!(c2, 0, "--at HEAD query exits 0: {at_head}");
+    assert_eq!(plain, at_head, "--at HEAD must equal the no-`--at` result");
+}
+
+#[test]
+fn query_at_prior_commit_shows_different_graph() {
+    let (_tmp, repo) = two_commit_fixture();
+    let q = "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name";
+    let (head, ch) = run_cgx(&repo, &["query", q, "--at", "HEAD"]);
+    let (prior, cp) = run_cgx(&repo, &["query", q, "--at", "HEAD~1"]);
+    assert_eq!(ch, 0, "--at HEAD exits 0: {head}");
+    assert_eq!(cp, 0, "--at HEAD~1 exits 0: {prior}");
+    // HEAD has `gamma`; HEAD~1 does not.
+    assert!(head.contains("rust_sample::gamma"), "HEAD has gamma: {head}");
+    assert!(
+        !prior.contains("rust_sample::gamma"),
+        "HEAD~1 lacks gamma: {prior}"
+    );
+    assert_ne!(head, prior, "the two refs produce different graphs");
+}
+
+/// `--at` is shared via `QueryArgs`, so it retrofits onto Layer-1 subcommands too
+/// (Q-17). `callees` over a prior commit must not see the newer `gamma`.
+#[test]
+fn at_ref_is_shared_with_layer1_subcommands() {
+    let (_tmp, repo) = two_commit_fixture();
+    let (prior, code) = run_cgx(&repo, &["callees", "main", "--at", "HEAD~1"]);
+    assert_eq!(code, 0, "callees --at exits 0: {prior}");
+    assert!(
+        prior.contains("rust_sample::alpha"),
+        "alpha is reachable at HEAD~1: {prior}"
+    );
+    assert!(
+        !prior.contains("rust_sample::gamma"),
+        "gamma did not exist at HEAD~1: {prior}"
     );
 }
 

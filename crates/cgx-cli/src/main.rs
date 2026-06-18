@@ -183,6 +183,12 @@ struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
+    /// Pin the query to a git ref's graph (e.g. `HEAD`, `HEAD~1`, a tag, or a
+    /// commit SHA) instead of the auto-indexed working `HEAD`. Materializes that
+    /// ref in a detached worktree, indexes it, and queries the resulting graph
+    /// (Q-17). Shared across every subcommand that takes these query flags.
+    #[arg(long)]
+    at: Option<String>,
     /// Maximum traversal depth. For `paths`, omitting it applies a default depth
     /// of 6 (the common case is bounded and fast); pass `--max-depth 0` for
     /// unlimited depth, which stays protected by an internal work budget and may
@@ -891,10 +897,42 @@ fn open_store(repo_root: &Path) -> Result<SqliteStore, CliError> {
 /// auto-index trigger (audit row #23) and the IF-4 exit mapping live in one place.
 fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
     let repo_root = resolve_repo(args.repo.clone())?;
+    // `--at <ref>` pins the query to a specific commit's graph: resolve the ref,
+    // index its tree into a fresh store (reusing the `diff` `index_ref` machinery),
+    // and load that graph instead of the auto-indexed working HEAD. The `--at` path
+    // never touches the working-tree `.cgx/` pointer, so it cannot disturb a plain
+    // query's index.
+    if let Some(at) = &args.at {
+        return view_at_ref(&repo_root, at);
+    }
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
     load_view(&repo_root)
+}
+
+/// Load the [`GraphView`] for a single git ref (the `--at <ref>` path). Reuses the
+/// `diff` ref-indexing machinery: resolve the ref to a commit, materialize and
+/// index its tree via [`index_ref`], then read the resulting graph straight out of
+/// the store by id (no pointer involved).
+fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
+    std::fs::create_dir_all(cgx_dir(repo_root))
+        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    let db_file = db_path(repo_root);
+    let mut store =
+        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+
+    let blame = BlameRepo::discover(repo_root)
+        .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
+    let commit = blame
+        .resolve_commit(at)
+        .map_err(|e| CliError::usage(format!("resolving ref {at:?}: {e}")))?;
+
+    let graph_id = index_ref(repo_root, &commit, &mut store)?;
+    let graph = store
+        .read_graph(graph_id)
+        .map_err(|e| CliError::graph(format!("reading graph at {at}: {e}")))?;
+    Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 
 /// Load the current Layer-2 graph into a queryable [`GraphView`].

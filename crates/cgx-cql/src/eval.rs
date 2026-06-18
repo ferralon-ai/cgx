@@ -453,7 +453,38 @@ fn bind_node(b: &mut Binding, var: &Option<String>, id: NodeId) {
     }
 }
 
+/// The four aggregate function names, recognised case-insensitively for
+/// `MIN`/`MAX` (the spec writes them uppercase) and lowercase for
+/// `collect`/`count`.
+fn aggregate_name(name: &str) -> Option<&'static str> {
+    match name {
+        "collect" => Some("collect"),
+        "count" => Some("count"),
+        "MIN" | "min" => Some("min"),
+        "MAX" | "max" => Some("max"),
+        _ => Option::None,
+    }
+}
+
+/// Whether an expression *is* a top-level aggregate call. Aggregates do not nest
+/// (Cypher forbids `count(collect(x))`), so we only inspect the outermost call.
+fn is_aggregate_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if aggregate_name(&name.value).is_some())
+}
+
+/// Whether an argument is the `count(*)` star sentinel (parsed as a bare
+/// property whose head is `"*"`).
+fn is_star_arg(expr: &Expr) -> bool {
+    matches!(expr, Expr::Property { head, segments } if head.value == "*" && segments.is_empty())
+}
+
 /// Project the surviving bindings into a [`ResultTable`] per the RETURN clause.
+///
+/// When any RETURN item is an aggregate (`collect`/`count`/`MIN`/`MAX`) the
+/// stream is grouped by the non-aggregated keys (the Cypher implicit-grouping
+/// horizon, design §3.4): each distinct tuple of non-aggregate key values forms
+/// one output row, with the aggregates folded over the group's bindings. With no
+/// non-aggregate key the whole stream collapses to a single row.
 fn project(
     view: &GraphView,
     ret: &ReturnClause,
@@ -461,9 +492,22 @@ fn project(
 ) -> Result<ResultTable, CqlError> {
     let columns: Vec<String> = ret.items.iter().map(column_name).collect();
 
+    let has_aggregate = ret.items.iter().any(|i| is_aggregate_expr(&i.expr));
+    if has_aggregate {
+        return project_grouped(view, ret, columns, bindings);
+    }
+
     // Detect a single `RETURN path` (whole-path) return so the path channel is
     // populated for the graph emitters.
     let single_path_col = ret.items.len() == 1 && is_path_return(&ret.items[0]);
+
+    // Default (no ORDER BY) ordering: sort the *bindings* by their representative
+    // node id, which is canonical `(file, line_start, fqn)` order (IF-8). The
+    // projected-row tuple is the deterministic tiebreak.
+    let mut bindings = bindings;
+    if ret.order_by.is_empty() {
+        sort_bindings_default(view, ret, &mut bindings)?;
+    }
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut paths: Vec<PathValue> = Vec::new();
@@ -495,22 +539,11 @@ fn project(
         }
     }
 
-    // ORDER BY: explicit keys, else default to projected-row order which, for
-    // node-bearing rows, already follows ascending id ⇒ (file, line, fqn).
+    // ORDER BY: explicit keys override; otherwise the rows already follow the
+    // IF-8 default (bindings were pre-sorted by representative node id above),
+    // except after DISTINCT which re-sorted by the row tuple for dedup.
     if !ret.order_by.is_empty() {
         sort_rows(view, &ret.order_by, ret, &mut rows, &mut paths, single_path_col)?;
-    } else {
-        // Stable default order: sort by the row tuple for determinism.
-        rows.sort();
-        if single_path_col {
-            paths = rows
-                .iter()
-                .filter_map(|r| match &r[0] {
-                    Value::Path(p) => Some(p.clone()),
-                    _ => None,
-                })
-                .collect();
-        }
     }
 
     if let Some(limit) = ret.limit {
@@ -525,6 +558,233 @@ fn project(
         rows,
         paths,
     })
+}
+
+/// The representative node id of a binding for IF-8 default ordering: the
+/// smallest node id bound to any variable. Node ids are dense and assigned in
+/// canonical `(file, line_start, fqn)` order, so ordering by this id is exactly
+/// IF-8. Returns `None` for a binding with no node-valued variable.
+fn representative_node(b: &Binding) -> Option<NodeId> {
+    b.vars
+        .values()
+        .filter_map(|v| match v {
+            Value::Node(id) => Some(*id),
+            _ => Option::None,
+        })
+        .min()
+}
+
+/// Sort bindings into the IF-8 default order: by representative node id, with
+/// the projected-row tuple as the deterministic tiebreak. Used when no explicit
+/// ORDER BY is present so node-bearing results follow `(file, line_start, fqn)`.
+fn sort_bindings_default(
+    view: &GraphView,
+    ret: &ReturnClause,
+    bindings: &mut [Binding],
+) -> Result<(), CqlError> {
+    // Precompute the projected row of each binding for the tiebreak.
+    let mut keyed: Vec<(Option<NodeId>, Vec<Value>, usize)> = Vec::with_capacity(bindings.len());
+    for (i, b) in bindings.iter().enumerate() {
+        let mut row = Vec::with_capacity(ret.items.len());
+        for item in &ret.items {
+            row.push(eval_expr(view, &item.expr, b)?);
+        }
+        keyed.push((representative_node(b), row, i));
+    }
+    keyed.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => x.0.cmp(&y.0).then_with(|| a.1.cmp(&b.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+    let order: Vec<usize> = keyed.iter().map(|(_, _, i)| *i).collect();
+    let sorted: Vec<Binding> = order.iter().map(|&i| bindings[i].clone()).collect();
+    bindings.clone_from_slice(&sorted);
+    Ok(())
+}
+
+/// Project with implicit grouping: partition the binding stream by the
+/// non-aggregate RETURN-key tuple, then emit one row per group, folding the
+/// aggregates over the group's bindings (design §3.4).
+fn project_grouped(
+    view: &GraphView,
+    ret: &ReturnClause,
+    columns: Vec<String>,
+    bindings: Vec<Binding>,
+) -> Result<ResultTable, CqlError> {
+    // Which RETURN items are grouping keys (non-aggregates) vs aggregates.
+    let is_agg: Vec<bool> = ret.items.iter().map(|i| is_aggregate_expr(&i.expr)).collect();
+
+    // Build groups keyed by the tuple of non-aggregate key values, preserving
+    // first-seen order (made deterministic by a final sort).
+    let mut group_keys: Vec<Vec<Value>> = Vec::new();
+    let mut groups: Vec<Vec<Binding>> = Vec::new();
+    for b in bindings {
+        let mut key = Vec::new();
+        for (item, agg) in ret.items.iter().zip(&is_agg) {
+            if !agg {
+                key.push(eval_expr(view, &item.expr, &b)?);
+            }
+        }
+        match group_keys.iter().position(|k| k == &key) {
+            Some(idx) => groups[idx].push(b),
+            None => {
+                group_keys.push(key);
+                groups.push(vec![b]);
+            }
+        }
+    }
+
+    // No grouping key and no bindings ⇒ a single collapsed row (e.g. `count(*)`
+    // over an empty stream is 0, `collect(x)` is the empty list).
+    let no_keys = is_agg.iter().all(|&a| a);
+    if no_keys && groups.is_empty() {
+        groups.push(Vec::new());
+        group_keys.push(Vec::new());
+    }
+
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let mut row = Vec::with_capacity(ret.items.len());
+        for item in &ret.items {
+            if is_aggregate_expr(&item.expr) {
+                row.push(eval_aggregate(view, &item.expr, group)?);
+            } else {
+                // Non-aggregate keys are constant within a group; read from the
+                // first binding (the group is non-empty unless it is the
+                // single collapsed no-key group, which has no key columns).
+                let b = group.first().expect("non-key group is non-empty");
+                row.push(eval_expr(view, &item.expr, b)?);
+            }
+        }
+        rows.push(row);
+    }
+
+    if ret.distinct {
+        rows.sort();
+        rows.dedup();
+    }
+    if !ret.order_by.is_empty() {
+        let mut paths = Vec::new();
+        sort_rows(view, &ret.order_by, ret, &mut rows, &mut paths, false)?;
+    } else {
+        // Deterministic default for grouped output: the row tuple.
+        rows.sort();
+    }
+    if let Some(limit) = ret.limit {
+        rows.truncate(limit as usize);
+    }
+
+    Ok(ResultTable {
+        columns,
+        rows,
+        paths: Vec::new(),
+    })
+}
+
+/// Fold one aggregate call over a group's bindings.
+///
+/// - `count(*)` → number of distinct bindings in the group.
+/// - `count(x)` → number of bindings whose `x` is non-null (distinct binding
+///   count; with simple-path semantics the binding set is already the distinct
+///   reachable set, so this is the distinct-reachable count per the `CALLS*`
+///   note in §3.5).
+/// - `collect(x)` → the list of per-binding `x` values, in deterministic
+///   (IF-8 / node-id) order.
+/// - `MIN([...])` / `MAX([...])` → the extreme over a per-binding list
+///   comprehension's elements, using the value order (confidence tokens ordered
+///   certain > probable > possible, numbers/strings natural).
+fn eval_aggregate(
+    view: &GraphView,
+    expr: &Expr,
+    group: &[Binding],
+) -> Result<Value, CqlError> {
+    let (name, args) = match expr {
+        Expr::FunctionCall { name, args } => (name, args),
+        _ => unreachable!("eval_aggregate called on a non-call expr"),
+    };
+    let agg = aggregate_name(&name.value).expect("aggregate name");
+    match agg {
+        "count" => {
+            // `count(*)` parses as a single `*` sentinel argument; it counts every
+            // binding in the group. `count(x)` counts non-null `x`.
+            if args.is_empty() || is_star_arg(&args[0]) {
+                return Ok(Value::Int(group.len() as i64));
+            }
+            arity(name, args, 1)?;
+            let mut n = 0i64;
+            for b in group {
+                if !matches!(eval_expr(view, &args[0], b)?, Value::Null) {
+                    n += 1;
+                }
+            }
+            Ok(Value::Int(n))
+        }
+        "collect" => {
+            arity(name, args, 1)?;
+            // Order the group's bindings by representative node id (IF-8) so the
+            // collected list is deterministic regardless of enumeration order.
+            let mut ordered: Vec<&Binding> = group.iter().collect();
+            ordered.sort_by_key(|b| representative_node(b).map(|id| id.0));
+            let mut out = Vec::with_capacity(ordered.len());
+            for b in ordered {
+                let v = eval_expr(view, &args[0], b)?;
+                if !matches!(v, Value::Null) {
+                    out.push(v);
+                }
+            }
+            Ok(Value::List(out))
+        }
+        "min" | "max" => {
+            arity(name, args, 1)?;
+            // Gather every element across the group: the argument is a list
+            // (typically a list comprehension over a path) per binding, or a
+            // scalar per binding. Flatten one level of list.
+            let mut elems: Vec<Value> = Vec::new();
+            for b in group {
+                match eval_expr(view, &args[0], b)? {
+                    Value::List(items) => elems.extend(items.into_iter().filter(|v| !matches!(v, Value::Null))),
+                    Value::Null => {}
+                    scalar => elems.push(scalar),
+                }
+            }
+            if elems.is_empty() {
+                return Ok(Value::Null);
+            }
+            let pick = |a: &Value, b: &Value| aggregate_value_cmp(a, b);
+            let chosen = if agg == "min" {
+                elems.iter().min_by(|a, b| pick(a, b))
+            } else {
+                elems.iter().max_by(|a, b| pick(a, b))
+            };
+            Ok(chosen.cloned().unwrap_or(Value::Null))
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The ordering MIN/MAX uses. Confidence tokens have a domain order
+/// (certain > probable > possible) that differs from their lexicographic order,
+/// so two confidence strings compare by rank; everything else uses the value
+/// [`Ord`].
+fn aggregate_value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Value::Str(x), Value::Str(y)) = (a, b) {
+        if let (Some(rx), Some(ry)) = (confidence_rank(x), confidence_rank(y)) {
+            return rx.cmp(&ry);
+        }
+    }
+    a.cmp(b)
+}
+
+/// Rank of a confidence token for MIN/MAX (possible < probable < certain), or
+/// `None` if the string is not a confidence token.
+fn confidence_rank(s: &str) -> Option<u8> {
+    match s {
+        "possible" => Some(0),
+        "probable" => Some(1),
+        "certain" => Some(2),
+        _ => Option::None,
+    }
 }
 
 /// Sort rows (and the aligned path channel) by the ORDER BY keys.
@@ -584,10 +844,11 @@ fn eval_order_key(
     ret: &ReturnClause,
     row: &[Value],
 ) -> Result<Value, CqlError> {
-    // Match by output column name (alias or rendered expression).
+    // Match by output column name (alias) or by the item's rendered expression
+    // text, so `ORDER BY m.name` resolves against `RETURN m.name AS callee`.
     let target = order_expr_name(expr);
     for (i, item) in ret.items.iter().enumerate() {
-        if column_name(item) == target {
+        if column_name(item) == target || render_expr(&item.expr) == target {
             return Ok(row[i].clone());
         }
     }

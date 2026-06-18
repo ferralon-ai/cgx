@@ -1,0 +1,31 @@
+[package]
+name = "cgx-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The cgx binary: clap command surface wiring cgx-index + cgx-query over an on-disk store, with human/json/sarif output, the ADR-08 vacuity guard, and the IF-4 exit-code contract."
+
+[[bin]]
+name = "cgx"
+path = "src/main.rs"
+
+[dependencies]
+cgx-core.workspace = true
+cgx-diff = { path = "../cgx-diff" }
+cgx-doctor = { path = "../cgx-doctor" }
+cgx-index = { path = "../cgx-index" }
+cgx-mcp = { path = "../cgx-mcp" }
+cgx-query = { path = "../cgx-query" }
+cgx-store = { path = "../cgx-store" }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = "1"
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json = "1"
+tempfile = "3"

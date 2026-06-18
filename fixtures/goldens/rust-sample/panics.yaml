@@ -1,0 +1,113 @@
+file: "src/panics.rs"
+defs:
+  - fqn: "rust_sample::panics::check_invariant"
+    kind: function
+    line: 20
+    visibility: private
+  - fqn: "rust_sample::panics::checked_add"
+    kind: function
+    line: 38
+    visibility: public
+  - fqn: "rust_sample::panics::extract_and_parse"
+    kind: function
+    line: 32
+    visibility: public
+  - fqn: "rust_sample::panics::find_even"
+    kind: function
+    line: 43
+    visibility: public
+  - fqn: "rust_sample::panics::get_first"
+    kind: function
+    line: 11
+    visibility: private
+  - fqn: "rust_sample::panics::must_positive"
+    kind: function
+    line: 28
+    visibility: public
+  - fqn: "rust_sample::panics::parse_trusted"
+    kind: function
+    line: 15
+    visibility: private
+  - fqn: "rust_sample::panics::safe_or_panic"
+    kind: function
+    line: 47
+    visibility: public
+  - fqn: "rust_sample::panics::unreachable_branch"
+    kind: function
+    line: 24
+    visibility: private
+  - fqn: "rust_sample::panics::validate_positive"
+    kind: function
+    line: 5
+    visibility: private
+refs:
+  # panic! inside validate_positive -> panic edge
+  - caller: "rust_sample::panics::validate_positive"
+    callee: "core::panicking::panic_fmt"
+    kind: calls
+    edge_condition: panic
+    confidence: certain
+    line: 7
+    cut_marker: null
+  # expect() -> panic edge
+  - caller: "rust_sample::panics::get_first"
+    callee: "core::panicking::panic_fmt"
+    kind: calls
+    edge_condition: panic
+    confidence: certain
+    line: 12
+  # unwrap() -> panic edge
+  - caller: "rust_sample::panics::parse_trusted"
+    callee: "core::panicking::panic_fmt"
+    kind: calls
+    edge_condition: panic
+    confidence: certain
+    line: 16
+  # assert! -> panic edge
+  - caller: "rust_sample::panics::check_invariant"
+    callee: "core::panicking::panic_fmt"
+    kind: calls
+    edge_condition: panic
+    confidence: certain
+    line: 21
+  # must_positive delegates to validate_positive (panic in callee)
+  - caller: "rust_sample::panics::must_positive"
+    callee: "rust_sample::panics::validate_positive"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 29
+  # extract_and_parse: expect + parse_trusted
+  - caller: "rust_sample::panics::extract_and_parse"
+    callee: "rust_sample::panics::get_first"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 33
+  - caller: "rust_sample::panics::extract_and_parse"
+    callee: "rust_sample::panics::parse_trusted"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 34
+  # checked_add: calls check_invariant which may panic
+  - caller: "rust_sample::panics::checked_add"
+    callee: "rust_sample::panics::check_invariant"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 40
+  # safe_or_panic: conditional panic path
+  - caller: "rust_sample::panics::safe_or_panic"
+    callee: "rust_sample::panics::get_first"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 48
+  - caller: "rust_sample::panics::safe_or_panic"
+    callee: "rust_sample::panics::validate_positive"
+    kind: calls
+    edge_condition: conditional
+    confidence: certain
+    line: 50
+imports: []

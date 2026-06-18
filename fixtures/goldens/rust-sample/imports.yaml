@@ -1,0 +1,99 @@
+file: "src/imports.rs"
+defs:
+  - fqn: "rust_sample::imports::animal_chorus"
+    kind: function
+    line: 24
+    visibility: public
+  - fqn: "rust_sample::imports::double_via_reexport"
+    kind: function
+    line: 14
+    visibility: public
+  - fqn: "rust_sample::imports::make_dog_speak"
+    kind: function
+    line: 19
+    visibility: public
+  - fqn: "rust_sample::imports::parse_and_double"
+    kind: function
+    line: 30
+    visibility: public
+  - fqn: "rust_sample::imports::use_alias"
+    kind: function
+    line: 49
+    visibility: public
+  - fqn: "rust_sample::imports::utils"
+    kind: module
+    line: 37
+    visibility: public
+  - fqn: "rust_sample::imports::utils::run_chain"
+    kind: function
+    line: 40
+    visibility: public
+refs:
+  # double_via_reexport: calls sum_two which is direct::add via re-export
+  - caller: "rust_sample::imports::double_via_reexport"
+    callee: "rust_sample::direct::add"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 15
+  # make_dog_speak: calls Dog::speak (virtual dispatch via trait)
+  - caller: "rust_sample::imports::make_dog_speak"
+    callee: "rust_sample::virtual_dispatch::Dog::speak"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 21
+  # animal_chorus: virtual dispatch on each animal
+  - caller: "rust_sample::imports::animal_chorus"
+    callee: "rust_sample::virtual_dispatch::Speak::speak"
+    kind: calls:virtual
+    edge_condition: loop
+    confidence: probable
+    line: 27
+  # parse_and_double: cross-file call via use import
+  - caller: "rust_sample::imports::parse_and_double"
+    callee: "rust_sample::errors::try_parse"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 31
+  - caller: "rust_sample::imports::parse_and_double"
+    callee: "rust_sample::errors::try_parse"
+    kind: calls
+    edge_condition: exception
+    confidence: probable
+    line: 31
+  # utils::run_chain: calls direct::chain
+  - caller: "rust_sample::imports::utils::run_chain"
+    callee: "rust_sample::direct::chain"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 41
+  # use_alias: calls direct::add via alias sum_two
+  - caller: "rust_sample::imports::use_alias"
+    callee: "rust_sample::direct::add"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 51
+imports:
+  - from: "crate::direct"
+    name: "add"
+    re_export: true
+    alias: "sum_two"
+  - from: "crate::direct"
+    name: "Counter"
+    re_export: true
+  - from: "crate::errors"
+    name: "try_parse"
+    re_export: false
+  - from: "crate::virtual_dispatch"
+    name: "Cat"
+    re_export: false
+  - from: "crate::virtual_dispatch"
+    name: "Dog"
+    re_export: false
+  - from: "crate::virtual_dispatch"
+    name: "Speak"
+    re_export: false

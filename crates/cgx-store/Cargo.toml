@@ -1,0 +1,19 @@
+[package]
+name = "cgx-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx persistence layer: SQLite (rusqlite, bundled, WAL) store for per-blob graph fragments and per-tree linked graphs, with versioned v_* read views and advisory write locking."
+
+[dependencies]
+cgx-core = { path = "../cgx-core" }
+serde.workspace = true
+postcard.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+fd-lock = "4"
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3"

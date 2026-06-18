@@ -1,0 +1,100 @@
+file: "src/imports.ts"
+defs:
+  - fqn: "ts_sample::imports::doubleViaImport"
+    kind: function
+    line: 14
+    visibility: public
+  - fqn: "ts_sample::imports::formatAll"
+    kind: function
+    line: 50
+    visibility: public
+  - fqn: "ts_sample::imports::makeDogSpeak"
+    kind: function
+    line: 18
+    visibility: public
+  - fqn: "ts_sample::imports::reexportedAdd"
+    kind: function
+    line: 9
+    visibility: public
+  - fqn: "ts_sample::imports::speak"
+    kind: function
+    line: 48
+    visibility: public
+  - fqn: "ts_sample::imports::useCounter"
+    kind: function
+    line: 23
+    visibility: public
+  - fqn: "ts_sample::imports::useReexported"
+    kind: function
+    line: 29
+    visibility: public
+  - fqn: "ts_sample::imports::utils"
+    kind: constant
+    line: 33
+    visibility: public
+refs:
+  # doubleViaImport: resolves sumTwo alias -> direct::add (probable via import)
+  - caller: "ts_sample::imports::doubleViaImport"
+    callee: "ts_sample::direct::add"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 15
+  # makeDogSpeak: makeSpeak is imported -> probable resolution
+  - caller: "ts_sample::imports::makeDogSpeak"
+    callee: "ts_sample::virtual_dispatch::makeSpeak"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 20
+  # useCounter: Counter methods — certain once type is known
+  - caller: "ts_sample::imports::useCounter"
+    callee: "ts_sample::direct::Counter::increment"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 25
+  - caller: "ts_sample::imports::useCounter"
+    callee: "ts_sample::direct::Counter::get"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 26
+  # useReexported: resolves through re-export chain to direct::add
+  - caller: "ts_sample::imports::useReexported"
+    callee: "ts_sample::direct::add"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 30
+  # speak: calls virtual on Speakable interface
+  - caller: "ts_sample::imports::speak"
+    callee: "ts_sample::virtual_dispatch::Speakable::speak"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: possible
+    line: 49
+imports:
+  - from: "./direct"
+    name: "Counter"
+    re_export: false
+  - from: "./direct"
+    name: "add"
+    re_export: true
+    alias: "reexportedAdd"
+  - from: "./direct"
+    name: "add"
+    re_export: false
+    alias: "sumTwo"
+  - from: "./errors"
+    name: "*"
+    re_export: true
+  - from: "./virtual_dispatch"
+    name: "Dog"
+    re_export: false
+  - from: "./virtual_dispatch"
+    name: "Speakable"
+    re_export: false
+  - from: "./virtual_dispatch"
+    name: "makeSpeak"
+    re_export: false

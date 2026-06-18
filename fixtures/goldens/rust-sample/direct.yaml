@@ -1,0 +1,92 @@
+file: "src/direct.rs"
+defs:
+  - fqn: "rust_sample::direct::Counter"
+    kind: type
+    line: 23
+    visibility: public
+  - fqn: "rust_sample::direct::Counter::add_one"
+    kind: method
+    line: 34
+    visibility: private
+  - fqn: "rust_sample::direct::Counter::get"
+    kind: method
+    line: 38
+    visibility: public
+  - fqn: "rust_sample::direct::Counter::increment"
+    kind: method
+    line: 30
+    visibility: public
+  - fqn: "rust_sample::direct::Counter::new"
+    kind: method
+    line: 26
+    visibility: public
+  - fqn: "rust_sample::direct::add"
+    kind: function
+    line: 6
+    visibility: public
+  - fqn: "rust_sample::direct::chain"
+    kind: function
+    line: 42
+    visibility: public
+  - fqn: "rust_sample::direct::clone_value"
+    kind: function
+    line: 19
+    visibility: private
+  - fqn: "rust_sample::direct::identity"
+    kind: function
+    line: 14
+    visibility: public
+  - fqn: "rust_sample::direct::inner_add"
+    kind: function
+    line: 10
+    visibility: private
+  - fqn: "rust_sample::direct::step_a"
+    kind: function
+    line: 48
+    visibility: private
+  - fqn: "rust_sample::direct::step_b"
+    kind: function
+    line: 49
+    visibility: private
+  - fqn: "rust_sample::direct::step_c"
+    kind: function
+    line: 50
+    visibility: private
+refs:
+  - caller: "rust_sample::direct::Counter::increment"
+    callee: "rust_sample::direct::Counter::add_one"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 31
+  - caller: "rust_sample::direct::add"
+    callee: "rust_sample::direct::inner_add"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 7
+  - caller: "rust_sample::direct::chain"
+    callee: "rust_sample::direct::step_a"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 43
+  - caller: "rust_sample::direct::chain"
+    callee: "rust_sample::direct::step_b"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 44
+  - caller: "rust_sample::direct::chain"
+    callee: "rust_sample::direct::step_c"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 45
+  - caller: "rust_sample::direct::identity"
+    callee: "rust_sample::direct::clone_value"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 15
+imports: []

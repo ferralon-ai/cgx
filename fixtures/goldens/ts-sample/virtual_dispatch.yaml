@@ -1,0 +1,132 @@
+file: "src/virtual_dispatch.ts"
+defs:
+  - fqn: "ts_sample::virtual_dispatch::BaseAnimal"
+    kind: type
+    line: 38
+    visibility: public
+    is_abstract: true
+  - fqn: "ts_sample::virtual_dispatch::BaseAnimal::description"
+    kind: method
+    line: 50
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Cat"
+    kind: type
+    line: 21
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Cat::speak"
+    kind: method
+    line: 22
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Circle"
+    kind: type
+    line: 58
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Circle::area"
+    kind: method
+    line: 64
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Dog"
+    kind: type
+    line: 14
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Dog::introduce"
+    kind: method
+    line: 19
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Dog::speak"
+    kind: method
+    line: 15
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Rectangle"
+    kind: type
+    line: 68
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Rectangle::area"
+    kind: method
+    line: 75
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Shape"
+    kind: type
+    is_abstract: true
+    line: 55
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Shape::area"
+    kind: method
+    is_abstract: true
+    line: 56
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Shape::describe"
+    kind: method
+    line: 58
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::Speakable"
+    kind: type
+    is_abstract: true
+    line: 4
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::chorus"
+    kind: function
+    line: 36
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::introduceAnimal"
+    kind: function
+    line: 31
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::makeSpeak"
+    kind: function
+    line: 27
+    visibility: public
+  - fqn: "ts_sample::virtual_dispatch::totalArea"
+    kind: function
+    line: 79
+    visibility: public
+refs:
+  # Dog.introduce calls this.speak() — certain (concrete typed receiver)
+  - caller: "ts_sample::virtual_dispatch::Dog::introduce"
+    callee: "ts_sample::virtual_dispatch::Dog::speak"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 20
+  # makeSpeak: duck-typed param -> calls:virtual, possible
+  - caller: "ts_sample::virtual_dispatch::makeSpeak"
+    callee: "ts_sample::virtual_dispatch::Speakable::speak"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: possible
+    line: 28
+  # introduceAnimal: optional method call -> conditional
+  - caller: "ts_sample::virtual_dispatch::introduceAnimal"
+    callee: "ts_sample::virtual_dispatch::Speakable::introduce"
+    kind: calls:virtual
+    edge_condition: conditional
+    confidence: possible
+    line: 32
+  - caller: "ts_sample::virtual_dispatch::introduceAnimal"
+    callee: "ts_sample::virtual_dispatch::Speakable::speak"
+    kind: calls:virtual
+    edge_condition: conditional
+    confidence: possible
+    line: 32
+  # chorus: map callback -> virtual dispatch in loop
+  - caller: "ts_sample::virtual_dispatch::chorus"
+    callee: "ts_sample::virtual_dispatch::Speakable::speak"
+    kind: calls:virtual
+    edge_condition: loop
+    confidence: possible
+    line: 37
+  # BaseAnimal::description calls this.area() which is abstract -> virtual
+  - caller: "ts_sample::virtual_dispatch::Shape::describe"
+    callee: "ts_sample::virtual_dispatch::Shape::area"
+    kind: calls:virtual
+    edge_condition: always
+    confidence: probable
+    line: 59
+  # totalArea: reduce callback with virtual dispatch
+  - caller: "ts_sample::virtual_dispatch::totalArea"
+    callee: "ts_sample::virtual_dispatch::Shape::area"
+    kind: calls:virtual
+    edge_condition: loop
+    confidence: probable
+    line: 80
+imports: []

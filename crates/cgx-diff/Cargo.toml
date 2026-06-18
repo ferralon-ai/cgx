@@ -1,0 +1,19 @@
+[package]
+name = "cgx-diff"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx graph diff (IX-4) and edge-age / introducing-commit attribution (IX-9): compare two indexed trees by cgx-core's stable edge identity (added/removed/changed), and attribute the commit/age that introduced an edge via gix blame on its call-site lines, enabling 'edges newer than <ref>' gating."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-store = { path = "../cgx-store" }
+cgx-index = { path = "../cgx-index" }
+gix = { version = "0.80", default-features = false, features = ["blame", "revision"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+cgx-frontend.workspace = true
+tempfile = "3"

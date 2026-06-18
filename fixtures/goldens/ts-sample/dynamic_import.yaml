@@ -1,0 +1,76 @@
+file: "src/dynamic_import.ts"
+defs:
+  - fqn: "ts_sample::dynamic_import::conditionalLoad"
+    kind: function
+    line: 18
+    visibility: public
+  - fqn: "ts_sample::dynamic_import::loadAll"
+    kind: function
+    line: 25
+    visibility: public
+  - fqn: "ts_sample::dynamic_import::loadDirect"
+    kind: function
+    line: 5
+    visibility: public
+  - fqn: "ts_sample::dynamic_import::loadDynamic"
+    kind: function
+    line: 12
+    visibility: public
+  - fqn: "ts_sample::dynamic_import::requireDynamic"
+    kind: function
+    line: 35
+    visibility: public
+  - fqn: "ts_sample::dynamic_import::requireStatic"
+    kind: function
+    line: 41
+    visibility: public
+refs:
+  # loadDirect: string-literal import — probable resolution
+  - caller: "ts_sample::dynamic_import::loadDirect"
+    callee: "ts_sample::direct"
+    kind: calls:async
+    edge_condition: always
+    confidence: probable
+    line: 6
+    cut_marker: dynamic
+  # loadDynamic: variable specifier — dynamic cut marker
+  - caller: "ts_sample::dynamic_import::loadDynamic"
+    callee: "<unresolved>"
+    kind: calls:async
+    edge_condition: always
+    confidence: possible
+    line: 13
+    cut_marker: dynamic
+  # conditionalLoad: conditional + dynamic
+  - caller: "ts_sample::dynamic_import::conditionalLoad"
+    callee: "<unresolved>"
+    kind: calls:async
+    edge_condition: conditional
+    confidence: possible
+    line: 20
+    cut_marker: dynamic
+  # loadAll: loop + dynamic
+  - caller: "ts_sample::dynamic_import::loadAll"
+    callee: "<unresolved>"
+    kind: calls:async
+    edge_condition: loop
+    confidence: possible
+    line: 28
+    cut_marker: dynamic
+  # requireDynamic: dynamic cut marker
+  - caller: "ts_sample::dynamic_import::requireDynamic"
+    callee: "<unresolved>"
+    kind: calls
+    edge_condition: always
+    confidence: possible
+    line: 37
+    cut_marker: dynamic
+  # requireStatic: probable resolution
+  - caller: "ts_sample::dynamic_import::requireStatic"
+    callee: "ts_sample::direct"
+    kind: calls
+    edge_condition: always
+    confidence: probable
+    line: 43
+    cut_marker: dynamic
+imports: []

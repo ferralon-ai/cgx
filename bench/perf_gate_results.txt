@@ -1,0 +1,109 @@
+=== CGX AR-11 Performance Gate ===
+Date: 2026-06-17T21:29:12Z
+Machine: Darwin 25.5.0 arm64
+CPU: Apple M5
+CGX: /Users/eric/workspace/cgx/mlp-perf/target/release/cgx
+Corpus: /tmp/cgx-corpus
+Corpus: 51 .rs files, 96652 LOC
+
+--- [1] Cold index (3 runs) ---
+  run 1: 0.170s
+  run 2: 0.160s
+  run 3: 0.170s
+  cold index median: 0.170s
+
+--- [2] Re-index / cache-hit (3 runs) ---
+  run 1: 0.060s
+  run 2: 0.060s
+  run 3: 0.060s
+  re-index median: 0.060s
+
+--- [3] Doctor ---
+cgx doctor
+trust:  HIGH   — index looks sound
+
+nodes:           1850
+edges:           5250  (total)
+call edges:      5250  (call-family)
+
+confidence distribution (call edges):
+  certain:        0  (0.0%)
+  probable:    5250  (100.0%)
+  possible:       0  (0.0%)
+
+unresolved references:
+  0/5250 refs unresolved  (0.0%)
+
+file coverage:
+  (pipeline stats unavailable — run via `cgx index` to populate)
+
+cut-marker inventory (known blind spots):
+  unresolved:            0
+  unexpanded-macro:      0
+  via-ffi:               0
+  dynamic:               0
+  reflective:            0
+  via-di:                0
+
+anomalies:  none
+
+
+--- [4] Index stats (from last cold run) ---
+Indexed /private/tmp/cgx-corpus (a9a7d136e71273e4bb73366db8da6620eae2d7f9)
+  blobs: 51 indexed, 51 extracted, 0 cached, 1 unsupported
+  graph: 1850 nodes, 5250 edges, 85750 unresolved
+
+--- [5] Query latencies (warm, --no-auto-index, 3 runs each) ---
+[callers fn_m000_0000]
+  run 1: 0.000s
+  run 2: 0.000s
+  run 3: 0.000s
+  median: 0.000s
+[callees fn_m024_0000]
+  run 1: 0.000s
+  run 2: 0.000s
+  run 3: 0.000s
+  median: 0.000s
+[paths fn_m000_0000->fn_m049_0003 --max-depth 2]
+  run 1: 0.000s
+  run 2: 0.000s
+  run 3: 0.000s
+  median: 0.000s
+[unused --kind function]
+  run 1: 0.000s
+  run 2: 0.000s
+  run 3: 0.000s
+  median: 0.000s
+
+--- [6] First query with auto-index (cold .cgx/) ---
+  1st query (cold auto-index): 0.160s
+  2nd query (warm): 0.000s
+
+--- [7] Paths unbounded hang ---
+  cgx paths (unbounded on dense graph): HUNG >10 min, killed.
+  cgx paths --max-depth 5 (1 run):
+  --max-depth 5: 0.000s
+
+=== VERDICT ===
+Budget: index <30s, query <500ms (AR-11)
+
+Cold index median:       0.170s    (budget: <30s)
+Re-index median:         0.060s    (cache-hit OK)
+callers median:          0.000s    (budget: <0.500s)
+callees median:          0.000s    (budget: <0.500s)
+paths (--max-depth 2):   0.000s    (budget: <0.500s)
+unused median:           0.000s    (budget: <0.500s)
+paths (unbounded):       HUNG (>10 min)  FAIL
+1st query (auto-index):  0.160s    (= cold index + query)
+
+Index gate:   PASS (0.170s << 30s)
+Query gates:  PASS (all <0.010s << 0.500s)
+Paths (unbounded): FAIL — DFS exponential search on dense graph
+
+OVERALL AR-11: CONDITIONAL PASS
+  - index + callers/callees/unused: PASS
+  - paths (unbounded, dense graph): FAIL — needs max_paths default tighter or DFS pruning
+
+Dominant failure stage: paths DFS engine (not parse/store/query-load)
+  1850 nodes, 5250 edges, avg fanout ~2.8 -> exponential path count
+  rkyv/ascent not relevant here; this is algorithm complexity not I/O

@@ -1,0 +1,128 @@
+file: "src/closures.rs"
+defs:
+  - fqn: "rust_sample::closures::apply"
+    kind: function
+    line: 40
+    visibility: public
+  - fqn: "rust_sample::closures::closure_variable"
+    kind: function
+    line: 6
+    visibility: public
+  - fqn: "rust_sample::closures::double_all"
+    kind: function
+    line: 16
+    visibility: public
+  - fqn: "rust_sample::closures::filter_and_double"
+    kind: function
+    line: 58
+    visibility: public
+  - fqn: "rust_sample::closures::make_adder"
+    kind: function
+    line: 26
+    visibility: public
+  - fqn: "rust_sample::closures::negate"
+    kind: function
+    line: 52
+    visibility: private
+  - fqn: "rust_sample::closures::negate_list"
+    kind: function
+    line: 56
+    visibility: public
+  - fqn: "rust_sample::closures::nested_closures"
+    kind: function
+    line: 45
+    visibility: public
+  - fqn: "rust_sample::closures::sum_vec"
+    kind: function
+    line: 11
+    visibility: public
+  - fqn: "rust_sample::closures::transform_list"
+    kind: function
+    line: 48
+    visibility: public
+  - fqn: "rust_sample::closures::use_callback"
+    kind: function
+    line: 43
+    visibility: public
+  - fqn: "rust_sample::closures::use_captured_closure"
+    kind: function
+    line: 30
+    visibility: public
+refs:
+  # closure_variable: inline closure invoked
+  - caller: "rust_sample::closures::closure_variable"
+    callee: "<lambda>"
+    kind: calls:closure
+    edge_condition: always
+    confidence: certain
+    line: 8
+  # sum_vec: for loop over iter() — implicit:iterator
+  - caller: "rust_sample::closures::sum_vec"
+    callee: "core::iter::Iterator::next"
+    kind: calls
+    edge_condition: loop
+    confidence: certain
+    line: 13
+    implicit: iterator
+  # double_all: .map() closure
+  - caller: "rust_sample::closures::double_all"
+    callee: "<lambda>"
+    kind: calls:closure
+    edge_condition: loop
+    confidence: certain
+    line: 17
+  # use_captured_closure: calls make_adder, then invokes the returned closure
+  - caller: "rust_sample::closures::use_captured_closure"
+    callee: "rust_sample::closures::make_adder"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 31
+  - caller: "rust_sample::closures::use_captured_closure"
+    callee: "<lambda>"
+    kind: calls:closure
+    edge_condition: always
+    confidence: certain
+    line: 32
+  # apply: calls f (callback)
+  - caller: "rust_sample::closures::apply"
+    callee: "<callback:f>"
+    kind: calls:callback
+    edge_condition: always
+    confidence: possible
+    line: 41
+  # use_callback: calls apply with an inline closure as argument
+  - caller: "rust_sample::closures::use_callback"
+    callee: "rust_sample::closures::apply"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 44
+  # transform_list: calls f (function pointer callback)
+  - caller: "rust_sample::closures::transform_list"
+    callee: "<callback:f>"
+    kind: calls:callback
+    edge_condition: loop
+    confidence: possible
+    line: 50
+  # negate_list: passes negate as callback to transform_list
+  - caller: "rust_sample::closures::negate_list"
+    callee: "rust_sample::closures::transform_list"
+    kind: calls
+    edge_condition: always
+    confidence: certain
+    line: 56
+  # filter_and_double: two closures (filter predicate + map body)
+  - caller: "rust_sample::closures::filter_and_double"
+    callee: "<lambda>"
+    kind: calls:closure
+    edge_condition: loop
+    confidence: certain
+    line: 59
+  - caller: "rust_sample::closures::filter_and_double"
+    callee: "<lambda>"
+    kind: calls:closure
+    edge_condition: loop
+    confidence: certain
+    line: 60
+imports: []

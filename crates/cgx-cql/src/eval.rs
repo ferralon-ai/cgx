@@ -142,6 +142,40 @@ impl VarTypes {
     fn get(&self, name: &str) -> Option<VarType> {
         self.map.get(name).copied()
     }
+
+    /// Clone this scope, binding a comprehension/quantifier local variable to the
+    /// inferred element type (or leaving it untyped when unknown).
+    fn with_element(&self, var: &str, ty: Option<VarType>) -> VarTypes {
+        let mut child = VarTypes {
+            map: self.map.clone(),
+        };
+        match ty {
+            Some(t) => {
+                child.map.insert(var.to_string(), t);
+            }
+            None => {
+                // Unknown element type: drop any shadowed binding so the inner
+                // var is treated as an unvalidated free reference, not the outer
+                // variable of the same name.
+                child.map.remove(var);
+            }
+        }
+        child
+    }
+}
+
+/// Infer the element type of a list expression for plan-time validation:
+/// `relationships(p)` yields edges, `nodes(p)` yields nodes; anything else is
+/// unknown (validated at runtime).
+fn element_type(list: &Expr) -> Option<VarType> {
+    match list {
+        Expr::FunctionCall { name, .. } => match name.value.as_str() {
+            "relationships" => Some(VarType::Edge),
+            "nodes" => Some(VarType::Node),
+            _ => Option::None,
+        },
+        _ => Option::None,
+    }
 }
 
 /// Recursively validate that every property access in `expr` references a backed
@@ -185,20 +219,27 @@ fn validate_expr(expr: &Expr, types: &VarTypes) -> Result<(), CqlError> {
             Ok(())
         }
         Expr::ListComp {
+            var,
             list,
             filter,
             projection,
+        } => {
+            validate_expr(list, types)?;
+            let scoped = types.with_element(var, element_type(list));
+            if let Some(f) = filter {
+                validate_expr(f, &scoped)?;
+            }
+            validate_expr(projection, &scoped)
+        }
+        Expr::Quantifier {
+            var,
+            list,
+            predicate,
             ..
         } => {
             validate_expr(list, types)?;
-            if let Some(f) = filter {
-                validate_expr(f, types)?;
-            }
-            validate_expr(projection, types)
-        }
-        Expr::Quantifier { list, predicate, .. } => {
-            validate_expr(list, types)?;
-            validate_expr(predicate, types)
+            let scoped = types.with_element(var, element_type(list));
+            validate_expr(predicate, &scoped)
         }
         // A nested pattern predicate is lowered (and thus reject-checked) when it
         // is evaluated; its own properties are validated there.
@@ -630,13 +671,83 @@ pub fn eval_expr(view: &GraphView, expr: &Expr, b: &Binding) -> Result<Value, Cq
             Ok(Value::Bool(if *negated { !exists } else { exists }))
         }
         Expr::FunctionCall { name, args } => eval_function(view, name, args, b),
-        Expr::ListComp { .. } | Expr::Quantifier { .. } => {
-            // Path-scoped predicates / comprehensions land in P4.
-            Err(CqlError::plan(
-                0..0,
-                "list comprehensions and quantifiers are not yet implemented",
-            ))
+        Expr::ListComp {
+            var,
+            list,
+            filter,
+            projection,
+        } => eval_list_comp(view, var, list, filter.as_deref(), projection, b),
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => eval_quantifier(view, *kind, var, list, predicate, b),
+    }
+}
+
+/// Evaluate `[x IN list WHERE p | proj]`: filter the list by `p` (if present),
+/// then map each surviving element through `proj`, binding `x` per element.
+fn eval_list_comp(
+    view: &GraphView,
+    var: &str,
+    list: &Expr,
+    filter: Option<&Expr>,
+    projection: &Expr,
+    b: &Binding,
+) -> Result<Value, CqlError> {
+    let items = expect_list(eval_expr(view, list, b)?)?;
+    let mut out = Vec::new();
+    for item in items {
+        let mut scoped = b.clone();
+        scoped.vars.insert(var.to_string(), item);
+        if let Some(f) = filter {
+            if !truthy(&eval_expr(view, f, &scoped)?) {
+                continue;
+            }
         }
+        out.push(eval_expr(view, projection, &scoped)?);
+    }
+    Ok(Value::List(out))
+}
+
+/// Evaluate `NONE/ANY/ALL(x IN list WHERE pred)` with three-valued logic
+/// (null → false for the per-element predicate, design §3.3).
+fn eval_quantifier(
+    view: &GraphView,
+    kind: crate::ast::QuantifierKind,
+    var: &str,
+    list: &Expr,
+    predicate: &Expr,
+    b: &Binding,
+) -> Result<Value, CqlError> {
+    use crate::ast::QuantifierKind::*;
+    let items = expect_list(eval_expr(view, list, b)?)?;
+    let mut any = false;
+    let mut all = true;
+    for item in items {
+        let mut scoped = b.clone();
+        scoped.vars.insert(var.to_string(), item);
+        let holds = truthy(&eval_expr(view, predicate, &scoped)?);
+        any |= holds;
+        all &= holds;
+    }
+    let result = match kind {
+        None => !any,
+        Any => any,
+        All => all,
+    };
+    Ok(Value::Bool(result))
+}
+
+fn expect_list(v: Value) -> Result<Vec<Value>, CqlError> {
+    match v {
+        Value::List(items) => Ok(items),
+        Value::Null => Ok(Vec::new()),
+        _ => Err(CqlError::eval(
+            0..0,
+            "expected a list (e.g. from `nodes(p)` / `relationships(p)`)",
+        )),
     }
 }
 
@@ -845,16 +956,122 @@ fn pattern_exists(
 /// Evaluate a function call. The path/aggregate functions land in P4/P5; P3
 /// supports only what RETURN/WHERE need so far (none yet), so any call here is a
 /// deferred-feature Plan error with the function name.
+/// Evaluate a function call. P4 supplies the path functions over a bound path
+/// (`nodes`, `relationships`, `length`, `last_node`, `position_in`) plus `size`.
 fn eval_function(
-    _view: &GraphView,
+    view: &GraphView,
     name: &crate::ast::Spanned<String>,
-    _args: &[Expr],
-    _b: &Binding,
+    args: &[Expr],
+    b: &Binding,
 ) -> Result<Value, CqlError> {
-    Err(CqlError::plan(
-        name.span.clone(),
-        format!("function `{}` is not yet implemented", name.value),
-    ))
+    let fname = name.value.as_str();
+    match fname {
+        "nodes" => {
+            let p = expect_path_arg(view, fname, args, b)?;
+            Ok(Value::List(p.nodes.iter().map(|n| Value::Node(*n)).collect()))
+        }
+        "relationships" => {
+            let p = expect_path_arg(view, fname, args, b)?;
+            Ok(Value::List(p.edges.iter().map(|e| Value::Edge(*e)).collect()))
+        }
+        "length" => {
+            let p = expect_path_arg(view, fname, args, b)?;
+            Ok(Value::Int(p.edges.len() as i64))
+        }
+        "last_node" => {
+            let p = expect_path_arg(view, fname, args, b)?;
+            match p.nodes.last() {
+                Some(n) => Ok(Value::Node(*n)),
+                None => Ok(Value::Null),
+            }
+        }
+        "position_in" => {
+            arity(name, args, 2)?;
+            let needle = eval_expr(view, &args[0], b)?;
+            let p = expect_path(eval_expr(view, &args[1], b)?, name)?;
+            let target = match needle {
+                Value::Node(id) => id,
+                _ => {
+                    return Err(CqlError::eval(
+                        name.span.clone(),
+                        "position_in: first argument must be a node",
+                    ))
+                }
+            };
+            match p.nodes.iter().position(|n| *n == target) {
+                Some(i) => Ok(Value::Int(i as i64)),
+                None => Ok(Value::Null),
+            }
+        }
+        "size" => {
+            arity(name, args, 1)?;
+            match eval_expr(view, &args[0], b)? {
+                Value::List(items) => Ok(Value::Int(items.len() as i64)),
+                Value::Null => Ok(Value::Null),
+                _ => Err(CqlError::eval(
+                    name.span.clone(),
+                    "size: argument must be a list",
+                )),
+            }
+        }
+        _ => Err(CqlError::plan(
+            name.span.clone(),
+            format!("function `{fname}` is not supported in this release"),
+        )),
+    }
+}
+
+/// Evaluate a single-argument path function's argument to a [`PathValue`].
+fn expect_path_arg(
+    view: &GraphView,
+    fname: &str,
+    args: &[Expr],
+    b: &Binding,
+) -> Result<PathValue, CqlError> {
+    if args.len() != 1 {
+        return Err(CqlError::eval(
+            0..0,
+            format!("{fname}: expected exactly one argument"),
+        ));
+    }
+    match eval_expr(view, &args[0], b)? {
+        Value::Path(p) => Ok(p),
+        other => Err(CqlError::eval(
+            0..0,
+            format!(
+                "{fname}: argument must be a path, got a {} value",
+                value_type_name(&other)
+            ),
+        )),
+    }
+}
+
+fn expect_path(v: Value, name: &crate::ast::Spanned<String>) -> Result<PathValue, CqlError> {
+    match v {
+        Value::Path(p) => Ok(p),
+        other => Err(CqlError::eval(
+            name.span.clone(),
+            format!(
+                "{}: argument must be a path, got a {} value",
+                name.value,
+                value_type_name(&other)
+            ),
+        )),
+    }
+}
+
+fn arity(
+    name: &crate::ast::Spanned<String>,
+    args: &[Expr],
+    n: usize,
+) -> Result<(), CqlError> {
+    if args.len() != n {
+        return Err(CqlError::eval(
+            name.span.clone(),
+            format!("{}: expected {n} argument(s), got {}", name.value, args.len()),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

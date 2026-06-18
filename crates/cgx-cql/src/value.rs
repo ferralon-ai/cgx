@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn nan_sorts_last_without_panicking() {
-        let mut v = vec![Value::Float(f64::NAN), Value::Float(1.0), Value::Float(0.0)];
+        let mut v = [Value::Float(f64::NAN), Value::Float(1.0), Value::Float(0.0)];
         v.sort();
         assert_eq!(v[0], Value::Float(0.0));
         assert_eq!(v[1], Value::Float(1.0));

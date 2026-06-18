@@ -391,8 +391,8 @@ mod tests {
 
     #[test]
     fn float_class() {
-        assert_eq!(kinds("3.14 1.0e3 2E-2"), vec![
-            TokenKind::Float(3.14),
+        assert_eq!(kinds("3.25 1.0e3 2E-2"), vec![
+            TokenKind::Float(3.25),
             TokenKind::Float(1000.0),
             TokenKind::Float(0.02),
             TokenKind::Eof,

@@ -23,6 +23,7 @@
 
 pub mod ast;
 pub mod error;
+pub mod parser;
 pub mod token;
 pub mod value;
 
@@ -51,10 +52,10 @@ pub struct ResultTable {
 /// [`CqlError::render`](crate::error::CqlError::render).
 pub fn run(view: &GraphView, src: &str) -> Result<ResultTable, CqlError> {
     let _ = view;
-    let tokens = token::tokenize(src)?;
-    // P1: lexing is wired; parsing/lowering/eval land in later phases. The
+    let query = parser::parse(src)?;
+    // P2: lexing + parsing are wired; lowering/eval land in later phases. The
     // public contract above is final regardless.
-    let _ = tokens;
+    let _ = query;
     Err(CqlError::plan(0..src.len(), "query evaluation not yet implemented"))
 }
 

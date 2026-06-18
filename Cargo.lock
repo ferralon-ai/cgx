@@ -211,6 +211,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-cql"
+version = "0.1.0"
+dependencies = [
+ "cgx-core",
+ "cgx-query",
+]
+
+[[package]]
 name = "cgx-diff"
 version = "0.1.0"
 dependencies = [

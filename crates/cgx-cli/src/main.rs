@@ -26,7 +26,7 @@ use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
-use cgx_cli::output::{render, render_explanation, Format, ResultSet};
+use cgx_cli::output::{render, render_explanation, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -89,6 +89,17 @@ enum Command {
         /// Do not auto-index when the `.cgx/` store is missing or stale.
         #[arg(long)]
         no_auto_index: bool,
+    },
+    /// Run a Layer-2 CQL query (a Cypher subset) and render its result table.
+    ///
+    /// The positional `query` is either the inline query text, or `@path` to read
+    /// the query from a UTF-8 file (Q-9). Tabular results render as human/json/sarif;
+    /// `RETURN path` (path-shaped) results additionally support dot/mermaid/d2.
+    Query {
+        /// The CQL query text, or `@file.cql` to read it from a file.
+        query: String,
+        #[command(flatten)]
+        query_args: QueryArgs,
     },
     /// Symbols not reachable from any entrypoint.
     Unused {
@@ -234,6 +245,7 @@ fn run(command: Command) -> Result<(), CliError> {
             format,
             no_auto_index,
         } => run_explain(&symbol, repo, format, no_auto_index),
+        Command::Query { query, query_args } => run_query(&query, query_args),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -472,6 +484,47 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
         view.node_count() > 0,
         len,
     )
+}
+
+/// `cgx query '<cql>'` (P8): run a Layer-2 CQL query and render its result table.
+///
+/// The positional argument is the inline query text, or `@path` to read the query
+/// from a UTF-8 file (Q-9). Parse/plan errors render the CQL caret view to stderr
+/// and exit 2 (usage); a missing index takes the usual exit-3 path; an eval-time
+/// failure (unresolved symbol) exits 2.
+///
+/// ## Vacuity rule (documented deviation from the generic re-run)
+///
+/// A CQL query carries all its filtering *intrinsically* (inline `WHERE` and
+/// `{confidence:…}` clauses), so there is no external filter layer to strip for the
+/// ADR-08 clause-(b) re-run that `run_neighbors` uses; `unfiltered_count` therefore
+/// equals `filtered_count`. Clause (a) (zero-symbol match) maps to "the graph has
+/// no nodes": `any_symbol_matched = view.node_count() > 0`. Consequently
+/// `--assert-empty` over a *populated* graph that legitimately returns zero rows is
+/// a genuine (non-vacuous) pass; only a query against an empty graph passes
+/// vacuously (exit 4).
+fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
+    let src = match query.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| CliError::usage(format!("reading query file {path:?}: {e}")))?,
+        None => query.to_string(),
+    };
+
+    let view = prepare_view(&args)?;
+
+    let table = match cgx_cql::run(&view, &src) {
+        Ok(t) => t,
+        Err(e) => {
+            // Parse/plan/eval CQL errors: print the caret view to stderr, exit 2.
+            eprintln!("{}", e.render(&src));
+            return Err(CliError::usage(format!("{}", e)));
+        }
+    };
+
+    let any_symbol_matched = view.node_count() > 0;
+    let resolved = TableData::resolve(&view, &table);
+    let count = resolved.rows.len();
+    emit("query", &args, ResultSet::Table(resolved), any_symbol_matched, count)
 }
 
 /// `cgx explain <symbol>` (Q-6 / IF-15): resolve the symbol and dump its full

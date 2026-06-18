@@ -10,7 +10,7 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord};
-use cgx_query::{Explanation, NeighborResult, PathResult, PathSet, TruncationReason};
+use cgx_query::{Explanation, GraphView, NeighborResult, PathResult, PathSet, TruncationReason};
 use serde_json::{json, Value};
 
 /// The output format selected by `--format` (IF-3 subset for Phase-1 CLI).
@@ -174,6 +174,156 @@ pub enum ResultSet {
     Paths(PathSet),
     /// `unused`: whole symbols.
     Nodes(Vec<NodeRecord>),
+    /// `query`: a tabular CQL result — ordered columns and rows of resolved cells.
+    Table(TableData),
+}
+
+/// A tabular CQL result, resolved against the [`GraphView`] so the formatters need
+/// no further graph access. Built by [`TableData::resolve`] from a
+/// `cgx_cql::ResultTable`; columns and row order are preserved verbatim (the CQL
+/// engine already ordered them per IF-8).
+pub struct TableData {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+/// One rendered cell of a CQL result row. `cgx_cql::Value` graph ids are resolved
+/// to their records here so every formatter renders the same self-contained data.
+pub enum Cell {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    List(Vec<Cell>),
+    /// A bound node, resolved to its location fields.
+    Node {
+        fqn: String,
+        file: String,
+        line: u32,
+        kind: String,
+    },
+    /// A bound edge, resolved to its endpoints and edge context.
+    Edge {
+        kind: String,
+        condition: EdgeCondition,
+        confidence: Confidence,
+    },
+    /// A bound path, rendered as its node-fqn chain.
+    Path(Vec<String>),
+}
+
+impl TableData {
+    /// Resolve a `cgx_cql::ResultTable` into self-contained render cells against
+    /// `view`. Node/edge/path ids become their record fields here so the output
+    /// layer needs no `GraphView`.
+    pub fn resolve(view: &GraphView, table: &cgx_cql::ResultTable) -> TableData {
+        let rows = table
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|v| Cell::resolve(view, v)).collect())
+            .collect();
+        TableData {
+            columns: table.columns.clone(),
+            rows,
+        }
+    }
+}
+
+impl Cell {
+    fn resolve(view: &GraphView, v: &cgx_cql::Value) -> Cell {
+        use cgx_cql::Value as V;
+        match v {
+            V::Null => Cell::Null,
+            V::Bool(b) => Cell::Bool(*b),
+            V::Int(i) => Cell::Int(*i),
+            V::Float(f) => Cell::Float(*f),
+            V::Str(s) => Cell::Str(s.clone()),
+            V::List(items) => Cell::List(items.iter().map(|i| Cell::resolve(view, i)).collect()),
+            V::Node(id) => match view.try_node(*id) {
+                Some(n) => Cell::Node {
+                    fqn: n.fqn.clone(),
+                    file: n.file.clone(),
+                    line: n.line_start,
+                    kind: node_kind_str(n),
+                },
+                None => Cell::Null,
+            },
+            V::Edge(id) => match view.edge(*id) {
+                Some(e) => Cell::Edge {
+                    kind: format!("{:?}", e.kind),
+                    condition: e.condition,
+                    confidence: e.confidence,
+                },
+                None => Cell::Null,
+            },
+            V::Path(p) => Cell::Path(
+                p.nodes
+                    .iter()
+                    .map(|n| match view.try_node(*n) {
+                        Some(rec) => rec.fqn.clone(),
+                        None => String::new(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The plain-text rendering used by the human formatter and as the SARIF
+    /// message fallback.
+    fn display(&self) -> String {
+        match self {
+            Cell::Null => "null".to_string(),
+            Cell::Bool(b) => b.to_string(),
+            Cell::Int(i) => i.to_string(),
+            Cell::Float(f) => f.to_string(),
+            Cell::Str(s) => s.clone(),
+            Cell::List(items) => {
+                let inner: Vec<String> = items.iter().map(Cell::display).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Cell::Node { fqn, file, line, .. } => format!("{fqn} ({file}:{line})"),
+            Cell::Edge {
+                kind,
+                condition,
+                confidence,
+            } => format!(
+                "{kind} [{}] [{}]",
+                condition_str(*condition),
+                confidence_str(*confidence)
+            ),
+            Cell::Path(nodes) => nodes.join(" -> "),
+        }
+    }
+
+    /// The JSON rendering of a cell: scalars map to JSON scalars; a node becomes an
+    /// object with its location; an edge its context; a path its fqn chain.
+    fn json(&self) -> Value {
+        match self {
+            Cell::Null => Value::Null,
+            Cell::Bool(b) => json!(b),
+            Cell::Int(i) => json!(i),
+            Cell::Float(f) => json!(f),
+            Cell::Str(s) => json!(s),
+            Cell::List(items) => Value::Array(items.iter().map(Cell::json).collect()),
+            Cell::Node {
+                fqn,
+                file,
+                line,
+                kind,
+            } => json!({ "fqn": fqn, "file": file, "line": line, "kind": kind }),
+            Cell::Edge {
+                kind,
+                condition,
+                confidence,
+            } => json!({
+                "kind": kind,
+                "condition": condition_str(*condition),
+                "confidence": confidence_str(*confidence),
+            }),
+            Cell::Path(nodes) => json!(nodes),
+        }
+    }
 }
 
 impl ResultSet {
@@ -183,6 +333,7 @@ impl ResultSet {
             ResultSet::Neighbors(v) => v.len(),
             ResultSet::Paths(v) => v.len(),
             ResultSet::Nodes(v) => v.len(),
+            ResultSet::Table(t) => t.rows.len(),
         }
     }
 
@@ -259,6 +410,9 @@ fn render_human(results: &ResultSet) -> String {
                 lines.push(truncation_marker(reason));
             }
         }
+        ResultSet::Table(t) => {
+            return render_table_human(t);
+        }
     }
     if lines.is_empty() {
         "(no results)\n".to_string()
@@ -269,11 +423,58 @@ fn render_human(results: &ResultSet) -> String {
     }
 }
 
+/// Render a tabular CQL result as aligned, stable columns. Column widths are the
+/// max of the header and every cell's display width; an empty result still prints
+/// the header row so the shape is visible.
+fn render_table_human(t: &TableData) -> String {
+    if t.columns.is_empty() {
+        return "(no results)\n".to_string();
+    }
+    let ncols = t.columns.len();
+    let cells: Vec<Vec<String>> = t
+        .rows
+        .iter()
+        .map(|row| row.iter().map(Cell::display).collect())
+        .collect();
+
+    let mut widths: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            if i < ncols {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+        }
+    }
+
+    let fmt_row = |row: &[String]| -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(ncols);
+        for (i, width) in widths.iter().enumerate() {
+            let val = row.get(i).map(String::as_str).unwrap_or("");
+            let pad = width.saturating_sub(val.chars().count());
+            parts.push(format!("{val}{}", " ".repeat(pad)));
+        }
+        parts.join("  ").trim_end().to_string()
+    };
+
+    let mut out = String::new();
+    out.push_str(&fmt_row(&t.columns));
+    out.push('\n');
+    for row in &cells {
+        out.push_str(&fmt_row(row));
+        out.push('\n');
+    }
+    out
+}
+
 fn render_json(results: &ResultSet, vacuous: bool) -> String {
+    if let ResultSet::Table(t) = results {
+        return render_table_json(t, vacuous);
+    }
     let items: Vec<Value> = match results {
         ResultSet::Neighbors(v) => v.iter().map(|n| Finding::from_neighbor(n).json()).collect(),
         ResultSet::Nodes(v) => v.iter().map(|n| Finding::from_node(n).json()).collect(),
         ResultSet::Paths(v) => v.paths.iter().map(path_json).collect(),
+        ResultSet::Table(_) => unreachable!("handled above"),
     };
     let mut doc = json!({
         "results": items,
@@ -290,6 +491,25 @@ fn render_json(results: &ResultSet, vacuous: bool) -> String {
         );
     }
     let mut s = serde_json::to_string_pretty(&doc).expect("result doc serializes");
+    s.push('\n');
+    s
+}
+
+/// Render a tabular CQL result as `{ "columns": [...], "rows": [...] }`, where each
+/// row is an array of cell JSON values in column order (per the dispatch shape).
+fn render_table_json(t: &TableData, vacuous: bool) -> String {
+    let rows: Vec<Value> = t
+        .rows
+        .iter()
+        .map(|row| Value::Array(row.iter().map(Cell::json).collect()))
+        .collect();
+    let doc = json!({
+        "columns": t.columns,
+        "rows": rows,
+        "count": t.rows.len(),
+        "vacuous": vacuous,
+    });
+    let mut s = serde_json::to_string_pretty(&doc).expect("table doc serializes");
     s.push('\n');
     s
 }
@@ -350,6 +570,11 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
             .map(|n| Finding::from_node(n).sarif(&rid))
             .collect(),
         ResultSet::Paths(v) => v.paths.iter().map(|p| sarif_path_result(p, &rid)).collect(),
+        ResultSet::Table(t) => t
+            .rows
+            .iter()
+            .map(|row| sarif_table_row(t, row, &rid))
+            .collect(),
     };
 
     if let Some(reason) = results.truncation() {
@@ -394,6 +619,86 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
             },
             "results": sarif_results
         }]
+    })
+}
+
+/// One SARIF result for a tabular CQL row.
+///
+/// Physical location: derived from explicit `file`/`line` columns when the row has
+/// them (a `file` string column, optionally a `line` int column), else from the
+/// first node-valued cell's location. With no file at all, the result carries only
+/// a logical location built from the row's first string/node identifier, so every
+/// row still produces a valid, locatable SARIF result (never a silent drop).
+fn sarif_table_row(t: &TableData, row: &[Cell], rule_id: &str) -> Value {
+    let col = |name: &str| t.columns.iter().position(|c| c == name).and_then(|i| row.get(i));
+
+    // Explicit file/line columns take priority.
+    let explicit_file = col("file").and_then(|c| match c {
+        Cell::Str(s) => Some(s.clone()),
+        _ => None,
+    });
+    let explicit_line = col("line").and_then(|c| match c {
+        Cell::Int(i) => Some((*i).max(1) as u32),
+        _ => None,
+    });
+
+    // Else the first node cell's location.
+    let node_loc = row.iter().find_map(|c| match c {
+        Cell::Node {
+            fqn, file, line, ..
+        } => Some((fqn.clone(), file.clone(), (*line).max(1))),
+        _ => None,
+    });
+
+    // A logical name for the result: a `name`/`fqn` string column, else the first
+    // node fqn, else the first string cell.
+    let logical = col("name")
+        .or_else(|| col("fqn"))
+        .and_then(|c| match c {
+            Cell::Str(s) => Some(s.clone()),
+            Cell::Node { fqn, .. } => Some(fqn.clone()),
+            _ => None,
+        })
+        .or_else(|| node_loc.as_ref().map(|(fqn, _, _)| fqn.clone()))
+        .or_else(|| {
+            row.iter().find_map(|c| match c {
+                Cell::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+
+    let (file, line) = match (explicit_file, &node_loc) {
+        (Some(f), _) => (Some(f), explicit_line.unwrap_or(1)),
+        (None, Some((_, f, l))) => (Some(f.clone()), *l),
+        (None, None) => (None, 1),
+    };
+
+    let location = match file {
+        Some(f) => json!({
+            "physicalLocation": {
+                "artifactLocation": { "uri": f },
+                "region": { "startLine": line }
+            },
+            "logicalLocations": [{ "fullyQualifiedName": logical }]
+        }),
+        None => json!({
+            "logicalLocations": [{ "fullyQualifiedName": logical }]
+        }),
+    };
+
+    let message: Vec<String> = t
+        .columns
+        .iter()
+        .zip(row.iter())
+        .map(|(name, cell)| format!("{name}={}", cell.display()))
+        .collect();
+
+    json!({
+        "ruleId": rule_id,
+        "level": "note",
+        "message": { "text": message.join(", ") },
+        "locations": [location],
     })
 }
 

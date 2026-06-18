@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 cgx-core.workspace = true
+cgx-cql = { path = "../cgx-cql" }
 cgx-diff = { path = "../cgx-diff" }
 cgx-doctor = { path = "../cgx-doctor" }
 cgx-index = { path = "../cgx-index" }

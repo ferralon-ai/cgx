@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "cgx-core",
+ "cgx-cql",
  "cgx-diff",
  "cgx-doctor",
  "cgx-index",

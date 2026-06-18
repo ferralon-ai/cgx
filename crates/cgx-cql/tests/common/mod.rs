@@ -83,14 +83,19 @@ impl GraphBuilder {
         self.edge(src, dst, EdgeKind::Calls, cond, Confidence::Certain)
     }
 
-    /// A DATA_FLOW (`DerivesFrom`) edge.
+    /// A DATA_FLOW (`DerivesFrom`) edge at `certain` confidence.
     pub fn data_flow(self, src: &str, dst: &str) -> Self {
+        self.data_flow_conf(src, dst, Confidence::Certain)
+    }
+
+    /// A DATA_FLOW (`DerivesFrom`) edge at an explicit confidence.
+    pub fn data_flow_conf(self, src: &str, dst: &str, confidence: Confidence) -> Self {
         self.edge(
             src,
             dst,
             EdgeKind::DerivesFrom,
             EdgeCondition::Always,
-            Confidence::Certain,
+            confidence,
         )
     }
 

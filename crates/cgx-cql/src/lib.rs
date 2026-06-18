@@ -26,6 +26,7 @@ pub mod error;
 pub mod eval;
 pub mod lower;
 pub mod parser;
+pub mod proc;
 pub mod token;
 pub mod value;
 

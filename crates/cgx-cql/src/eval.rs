@@ -90,19 +90,28 @@ fn eval_reading(
                 }
                 plans.push(clause_plans);
             }
-            ReadingClause::Call(_) => {
-                return Err(CqlError::plan(
-                    0..0,
-                    "CALL procedures are not yet implemented",
-                ));
+            ReadingClause::Call(call) => {
+                // Validate the procedure name + YIELD column set at plan time so a
+                // reject fires even when the walk would have been empty. The
+                // yielded columns enter scope as untyped string free references
+                // (like WITH-carried columns), so they are not recorded in the
+                // typing map.
+                crate::proc::validate_call(call)?;
             }
         }
     }
-    // Plan-time property validation against the typing map.
+    // Plan-time property validation against the typing map (MATCH and CALL WHEREs).
     for clause in &part.reading {
-        if let ReadingClause::Match(m) = clause {
-            if let Some(w) = &m.where_clause {
-                validate_expr(w, &vartypes)?;
+        match clause {
+            ReadingClause::Match(m) => {
+                if let Some(w) = &m.where_clause {
+                    validate_expr(w, &vartypes)?;
+                }
+            }
+            ReadingClause::Call(call) => {
+                if let Some(w) = &call.where_clause {
+                    validate_expr(w, &vartypes)?;
+                }
             }
         }
     }
@@ -126,9 +135,14 @@ fn eval_reading(
     let mut bindings = input;
     let mut plan_iter = plans.into_iter();
     for clause in &part.reading {
-        if let ReadingClause::Match(m) = clause {
-            let clause_plans = plan_iter.next().expect("plan per MATCH clause");
-            bindings = eval_match(view, m, &clause_plans, bindings)?;
+        match clause {
+            ReadingClause::Match(m) => {
+                let clause_plans = plan_iter.next().expect("plan per MATCH clause");
+                bindings = eval_match(view, m, &clause_plans, bindings)?;
+            }
+            ReadingClause::Call(call) => {
+                bindings = crate::proc::eval_call(view, call, bindings)?;
+            }
         }
     }
     Ok(bindings)
@@ -542,7 +556,7 @@ fn peer_matches(view: &GraphView, plan: &PatternPlan, peer: NodeId) -> bool {
 /// Build a [`SymbolPattern`] from a `name`/`fqn` constraint string, applying the
 /// design §3.1 heuristics (glob if `*`/`?`, FQN if it contains `::`, else
 /// short-name).
-fn name_pattern(s: &str) -> SymbolPattern {
+pub(crate) fn name_pattern(s: &str) -> SymbolPattern {
     if s.contains('*') || s.contains('?') {
         SymbolPattern::glob(s.to_string())
     } else if s.contains("::") {
@@ -1184,7 +1198,7 @@ pub fn edge_field_value(edge: &cgx_core::EdgeRecord, field: EdgeField) -> Value 
     }
 }
 
-fn value_type_name(v: &Value) -> &'static str {
+pub(crate) fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "bool",

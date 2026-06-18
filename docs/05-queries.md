@@ -370,6 +370,89 @@ cgx query --sql '
 
 ---
 
+## Implementation status (v1)
+
+**Audience:** Engineers integrating `cgx query` today.
+
+The `cgx query` command is implemented in the `cgx-cql` crate (crates/cgx-cql). This section documents what runs today versus what the spec above describes but has not yet been built.
+
+### Supported in v1
+
+**MATCH patterns**
+- Single fixed-hop: `MATCH (a)-[:CALLS]->(b)`
+- Multi-relationship chain: `MATCH (a)-[:CALLS]->(b)-[:CALLS]->(c)` (interior nodes must be named)
+- Var-length: `*`, `*n`, `*n..`, `*..m`, `*n..m`
+- `path =` binding on single-relationship patterns: `MATCH p = (a)-[:CALLS*]->(b) RETURN p`
+- Multi-pattern (comma): `MATCH (m:method)-[:MEMBER_OF]->(t), (other)-[:CALLS]->(m)`
+
+**Edge types (MATCH `:TYPE` syntax)**
+- `CALLS`, `SPAWNS`, `DATA_FLOW`, `MEMBER_OF`, `CONTAINS`, `OVERRIDES`, `INHERITS`, `IMPLEMENTS`, `IMPORTS`, `REFERENCES`, `INSTANTIATES`, `THROWS`, `CATCHES`, `READS_FIELD`, `WRITES_FIELD`
+- Multi-type: `READS_FIELD|WRITES_FIELD`
+
+**Node properties**
+- `n.name`, `n.file`, `n.line`, `n.kind` (also as `:label` in pattern)
+
+**Edge properties**
+- `r.condition` (`always/conditional/loop/exception/panic`)
+- `r.confidence` (`possible/probable/certain`; ordering `certain > probable > possible` for MIN/MAX)
+- `r.kind`
+
+**WHERE predicates**
+- Comparison: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`
+- Boolean: `NOT`, `AND`, `OR`
+- Quantifiers: `NONE(x IN list WHERE p)`, `ANY(x IN list WHERE p)`, `ALL(x IN list WHERE p)`
+- List comprehensions: `[r IN relationships(p) | r.condition]`, `[x IN list WHERE p | expr]`
+- Bare pattern predicate: `NOT (m)<-[:CALLS]-()`
+
+**RETURN / projections**
+- Projections with `AS`, `DISTINCT`, `ORDER BY … ASC|DESC`, `LIMIT`
+- Aggregates: `collect(x)`, `count(*)`, `count(x)`, `MIN([…])`, `MAX([…])`
+- Path functions: `nodes(p)`, `relationships(p)`, `length(p)`, `last_node(p)`, `position_in(node, p)`, `size(list)`
+
+**WITH pipeline**
+- `WITH … WHERE` (scope barrier; all pipeline stages supported)
+
+**CALL procedures**
+- `CALL cgx.mutation_fanout(value) YIELD mutator, confidence`
+- `CALL cgx.pedigree(value) YIELD source, confidence`
+
+**CLI flags and formats**
+- `cgx query '<expr>'` and `cgx query @file.cql`
+- `--at <ref>` — pins the query to a specific git commit (also retrofitted onto Layer-1 subcommands)
+- `--format human` (aligned columns), `json`, `sarif` (tabular results)
+- `--format dot`, `mermaid`, `d2` (path-returning results only, i.e. `RETURN path`)
+- `--assert-empty`, `--allow-vacuous` (vacuity guard, exit codes identical to Layer-1)
+
+### Deferred in v1
+
+The items below are specified in the sections above but are not yet built. Each produces a clear `plan error: … (deferred)` message rather than a silent wrong answer or a generic syntax error.
+
+| Feature | Reason deferred |
+|---|---|
+| Theme-13 edge types: `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` | Object-model edge schema not yet produced by the frontend (object-model ADR in progress) |
+| `COMPATIBLE_WITH` predicate | Requires type reconstruction (`cgx.type_reconstruct`) which is deferred |
+| `IS EMPTY` predicate | Requires type reconstruction; deferred with type-reconstruct |
+| `cgx.type_reconstruct` procedure | Type-lineage extraction from the frontend is a follow-up cycle |
+| `--sql` (Q-10) | Follow-up cycle; SQLite backend not yet integrated |
+| `MATCH ALL … MUST PASS THROUGH / AVOIDING` (Q-20 guarded cut) | Requires call-site dominator facts at index time (Phase 3); planned follow-up |
+| `UNWIND` | Deferred clause |
+| `OPTIONAL MATCH` | Deferred clause |
+| `UNION` | Deferred clause |
+| `CREATE`, `SET`, `DELETE` | cgx query is a read-only language; write clauses will never be supported |
+| Query parameters `$name` | Deferred |
+| Arithmetic expressions (`+`, `-`, `*`, `/`) | Deferred |
+| Node properties: `col`, `scope`, `type`, `in_degree`, `out_degree`, `is_exit`, `introduced_in_branch`, `confidence` (on nodes), `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `transitive_effects`, `lock_set`, `suspends`, `async` | No backing field on a symbol node record in the current frontend |
+| Edge properties: `transformation`, `via`, `taint_label`, `site.*` | No backing field on an edge record in the current frontend |
+
+### Canonical-example substitutions
+
+Two of the three canonical examples reference properties that are not yet backed:
+
+- **Example 2** (`scope` on a node, `r.transformation` on a `DATA_FLOW` edge): the DATA_FLOW var-length pedigree *pattern* runs and returns real rows. The integration test for Example 2 projects `r.condition` instead of `r.transformation` and omits `scope` (both produce a `plan error` when used — see the reject contract in `crates/cgx-cql/tests/rejects.rs`).
+- **Example 3b** (`type` property on the `alloc` node): `type` has no backing field. The integration test substitutes a `{name:"new"}` match without the `type` attribute.
+
+---
+
 ## Worked Examples for Every Major Question Class
 
 ### Canonical Example 1: Non-exception paths from main::foo to vulnerable::bar

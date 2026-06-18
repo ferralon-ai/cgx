@@ -68,3 +68,20 @@ fn rejects_unknown_node_property() {
     let m = reject(r#"MATCH (a)-[:CALLS]->(b) RETURN a.wibble"#);
     assert!(m.contains("wibble"), "{m}");
 }
+
+#[test]
+fn rejects_anonymous_interior_node_in_chain() {
+    // A chained pattern joins on the interior node's variable; an anonymous
+    // interior node has nothing to join on, so it is a Plan reject.
+    let m = reject(r#"MATCH (a)-[:CALLS]->()-[:CALLS]->(c) RETURN c.name"#);
+    assert!(m.contains("interior"), "{m}");
+    assert!(m.contains("named"), "{m}");
+}
+
+#[test]
+fn rejects_path_binding_over_multi_relationship() {
+    // A `path =` binding spanning multiple relationships is not yet supported.
+    let m = reject(r#"MATCH p = (a)-[:CALLS]->(b)-[:CALLS]->(c) RETURN p"#);
+    assert!(m.contains("path"), "{m}");
+    assert!(m.contains("multi-relationship"), "{m}");
+}

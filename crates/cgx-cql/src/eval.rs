@@ -36,42 +36,57 @@ impl Binding {
     }
 }
 
-/// Evaluate a whole query. P3/P4 support a single part with one `MATCH` (plus
-/// optional `WHERE`) and a terminal `RETURN`; `WITH`/`CALL` pipelines land in
-/// later phases and are rejected here with a clear message.
+/// Evaluate a whole query as a `WITH`-chained pipeline (design §3.4). Each part
+/// is a run of reading clauses (`MATCH`) plus either a `WITH` that closes the
+/// part and feeds a new, smaller binding stream into the next part, or the
+/// terminal `RETURN` that projects the final table. `WITH` is the scope horizon:
+/// only its listed variables survive into the following part.
 pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
-    if query.parts.len() != 1 {
-        return Err(CqlError::plan(
-            0..0,
-            "WITH pipelines are not yet implemented (single MATCH … RETURN only)",
-        ));
-    }
-    let part = &query.parts[0];
-    if part.with.is_some() {
-        return Err(CqlError::plan(
-            0..0,
-            "WITH pipelines are not yet implemented (single MATCH … RETURN only)",
-        ));
-    }
-    let ret = part.ret.as_ref().ok_or_else(|| {
-        CqlError::plan(0..0, "query must end with a RETURN clause")
-    })?;
+    // Variables carried in from a preceding `WITH` (their static types are
+    // unknown — they are scalars/lists, not graph entities — so they are not
+    // recorded in the per-part typing map and act as free references).
+    let mut carried: Vec<Binding> = vec![Binding::default()];
 
-    // Collect every variable's static type (node / edge / path) and lower each
-    // pattern up front. Lowering rejects unsupported edge types and the node/edge
-    // properties baked into a pattern; the typing map then lets us validate every
-    // WHERE / RETURN property reference *at plan time*, so an unbacked property
-    // (`r.transformation`) is a reject even when the binding stream is empty.
+    let last = query.parts.len() - 1;
+    for (i, part) in query.parts.iter().enumerate() {
+        let bindings = eval_reading(view, part, carried)?;
+        match (&part.with, &part.ret) {
+            (Some(with), _) => {
+                debug_assert!(i != last, "non-final part must carry a WITH");
+                carried = project_with(view, with, bindings)?;
+            }
+            (None, Some(ret)) => {
+                debug_assert!(i == last, "RETURN only on the final part");
+                return project(view, ret, bindings);
+            }
+            (None, None) => {
+                return Err(CqlError::plan(0..0, "query part must end with WITH or RETURN"));
+            }
+        }
+    }
+    Err(CqlError::plan(0..0, "query must end with a RETURN clause"))
+}
+
+/// Lower and run one part's reading clauses against an input binding stream,
+/// returning the expanded + filtered stream. Performs the part-local plan-time
+/// property validation (so an unbacked property is rejected even when the stream
+/// is empty); carried-in `WITH` variables are free references and are not typed.
+fn eval_reading(
+    view: &GraphView,
+    part: &crate::ast::QueryPart,
+    input: Vec<Binding>,
+) -> Result<Vec<Binding>, CqlError> {
     let mut vartypes = VarTypes::default();
     let mut plans: Vec<Vec<PatternPlan>> = Vec::new();
     for clause in &part.reading {
         match clause {
             ReadingClause::Match(m) => {
-                let mut clause_plans = Vec::with_capacity(m.patterns.len());
+                let mut clause_plans = Vec::new();
                 for pat in &m.patterns {
-                    let plan = lower::lower_pattern(pat)?;
-                    vartypes.record(&plan);
-                    clause_plans.push(plan);
+                    for plan in lower::lower_pattern_chain(pat)? {
+                        vartypes.record(&plan);
+                        clause_plans.push(plan);
+                    }
                 }
                 plans.push(clause_plans);
             }
@@ -91,14 +106,24 @@ pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
             }
         }
     }
-    for item in &ret.items {
-        validate_expr(&item.expr, &vartypes)?;
+    if let Some(ret) = &part.ret {
+        for item in &ret.items {
+            validate_expr(&item.expr, &vartypes)?;
+        }
+        for ob in &ret.order_by {
+            validate_expr(&ob.expr, &vartypes)?;
+        }
     }
-    for ob in &ret.order_by {
-        validate_expr(&ob.expr, &vartypes)?;
+    if let Some(with) = &part.with {
+        for item in &with.items {
+            validate_expr(&item.expr, &vartypes)?;
+        }
+        if let Some(w) = &with.where_clause {
+            validate_expr(w, &vartypes)?;
+        }
     }
 
-    let mut bindings = vec![Binding::default()];
+    let mut bindings = input;
     let mut plan_iter = plans.into_iter();
     for clause in &part.reading {
         if let ReadingClause::Match(m) = clause {
@@ -106,8 +131,49 @@ pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
             bindings = eval_match(view, m, &clause_plans, bindings)?;
         }
     }
+    Ok(bindings)
+}
 
-    project(view, ret, bindings)
+/// Project a `WITH` clause: close the input binding stream, run the projection
+/// (with implicit grouping when an aggregate is present), and emit a new, smaller
+/// binding stream in which ONLY the `WITH`-listed columns survive (design §3.4 —
+/// the Cypher scope horizon). Each output binding maps every WITH column name
+/// (alias, else the rendered expression) to its value, so a following `MATCH`
+/// can reference it as a free variable (e.g. `WHERE NOT all_m.name IN reached`).
+///
+/// An optional `WITH … WHERE` filters the carried rows after projection.
+fn project_with(
+    view: &GraphView,
+    with: &crate::ast::WithClause,
+    bindings: Vec<Binding>,
+) -> Result<Vec<Binding>, CqlError> {
+    // Reuse RETURN projection by building an equivalent ReturnClause (the row
+    // shape and grouping rules are identical).
+    let ret = ReturnClause {
+        distinct: with.distinct,
+        items: with.items.clone(),
+        order_by: with.order_by.clone(),
+        limit: with.limit,
+    };
+    let table = project(view, &ret, bindings)?;
+    let names = &table.columns;
+
+    let mut out = Vec::with_capacity(table.rows.len());
+    for row in table.rows {
+        let mut b = Binding::default();
+        for (name, value) in names.iter().zip(row) {
+            b.vars.insert(name.clone(), value);
+        }
+        // A `WITH … WHERE` predicate filters the carried rows; it sees only the
+        // carried columns (free scalar/list references).
+        if let Some(filter) = &with.where_clause {
+            if !eval_predicate(view, filter, &b)? {
+                continue;
+            }
+        }
+        out.push(b);
+    }
+    Ok(out)
 }
 
 /// Static type of a bound variable, used for plan-time property validation.
@@ -278,9 +344,24 @@ fn expand_pattern(
     plan: &PatternPlan,
     input: Vec<Binding>,
 ) -> Result<Vec<Binding>, CqlError> {
-    let anchors = anchor_ids(view, &plan.anchor);
+    // A non-chained step resolves its anchor set once. A chained step anchors on
+    // a variable already bound in each input binding (the join key), so its
+    // anchor set is per-binding.
+    let shared_anchors = if plan.anchor_bound_var.is_none() {
+        Some(anchor_ids(view, &plan.anchor))
+    } else {
+        Option::None
+    };
     let mut out = Vec::new();
     for base in &input {
+        let anchors: Vec<NodeId> = match &plan.anchor_bound_var {
+            Some(var) => match base.get(var) {
+                Some(Value::Node(id)) => vec![*id],
+                // The join variable is unbound or not a node ⇒ no extension.
+                _ => Vec::new(),
+            },
+            None => shared_anchors.clone().expect("shared anchors for an unbound step"),
+        };
         for &anchor in &anchors {
             match &plan.cardinality {
                 Cardinality::SingleHop => {
@@ -409,14 +490,7 @@ fn expand_var_length(
 fn peer_goal_ids(view: &GraphView, plan: &PatternPlan) -> Vec<NodeId> {
     if let Some(p) = plan.peer_props.iter().find(|p| p.field == NodeField::Fqn) {
         if let Value::Str(s) = &p.value {
-            let pat = if s.contains('*') || s.contains('?') {
-                SymbolPattern::glob(s.clone())
-            } else if s.contains("::") {
-                SymbolPattern::fqn(s.clone())
-            } else {
-                SymbolPattern::short_name(s.clone())
-            };
-            return view.resolve_symbol(&pat);
+            return view.resolve_symbol(&name_pattern(s));
         }
     }
     // No name constraint: every node passing kind/prop filters is a candidate goal.
@@ -428,6 +502,12 @@ fn peer_goal_ids(view: &GraphView, plan: &PatternPlan) -> Vec<NodeId> {
 }
 
 /// Whether `peer` satisfies the pattern's peer-side kind/property constraints.
+///
+/// A `name`/`fqn` peer property is matched with the same `SymbolPattern`
+/// semantics the anchor uses (a short name like `"MyStruct"` matches the FQN
+/// `app::MyStruct`; a glob matches; an FQN matches exactly) so a name constraint
+/// behaves identically whether the constrained end is the anchor or the peer
+/// (e.g. the `(t{name:"MyStruct"})` end of a chained `…-[:MEMBER_OF]->(t)`).
 fn peer_matches(view: &GraphView, plan: &PatternPlan, peer: NodeId) -> bool {
     let node = match view.try_node(peer) {
         Some(n) => n,
@@ -439,12 +519,37 @@ fn peer_matches(view: &GraphView, plan: &PatternPlan, peer: NodeId) -> bool {
         }
     }
     for p in &plan.peer_props {
+        if p.field == NodeField::Fqn {
+            match &p.value {
+                Value::Str(s) => {
+                    let pat = name_pattern(s);
+                    if !pat.matches(node) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            continue;
+        }
         let got = node_field_value(node, p.field);
         if !values_equal(&got, &p.value) {
             return false;
         }
     }
     true
+}
+
+/// Build a [`SymbolPattern`] from a `name`/`fqn` constraint string, applying the
+/// design §3.1 heuristics (glob if `*`/`?`, FQN if it contains `::`, else
+/// short-name).
+fn name_pattern(s: &str) -> SymbolPattern {
+    if s.contains('*') || s.contains('?') {
+        SymbolPattern::glob(s.to_string())
+    } else if s.contains("::") {
+        SymbolPattern::fqn(s.to_string())
+    } else {
+        SymbolPattern::short_name(s.to_string())
+    }
 }
 
 fn bind_node(b: &mut Binding, var: &Option<String>, id: NodeId) {

@@ -47,6 +47,11 @@ pub enum Cardinality {
 pub struct PatternPlan {
     /// Optional `path =` binding name.
     pub path_var: Option<String>,
+    /// When this plan is a step in a chained pattern whose anchor is a variable
+    /// already bound by an earlier step (the join key), this names that
+    /// variable; the anchor set is then the single node bound to it rather than
+    /// a fresh resolution of [`anchor`](Self::anchor).
+    pub anchor_bound_var: Option<String>,
     /// Variable bound to the anchor node (the end we resolve up front).
     pub anchor_var: Option<String>,
     /// Variable bound to the peer node (the open end we walk to).
@@ -379,19 +384,125 @@ fn anchor_set(props: &[NodeProp], kinds: &Option<Vec<SymbolKind>>) -> AnchorSet 
 
 /// Lower a single-relationship pattern `(a)-[r]-(b)` into a [`PatternPlan`].
 ///
-/// Multi-step patterns (`(a)-[]-(b)-[]-(c)`) are not part of P3/P4 scope (the
-/// canonical examples are all single-relationship); they are rejected with a
-/// clear Plan message so the failure is explicit, never a wrong answer.
+/// Used by the bare pattern-predicate path (`NOT (m)<-[:CALLS]-()`), which is
+/// always single-relationship. Multi-step patterns are rejected here; full
+/// chained patterns go through [`lower_pattern_chain`].
 pub fn lower_pattern(pat: &PathPattern) -> Result<PatternPlan, CqlError> {
     if pat.steps.len() != 1 {
         return Err(CqlError::plan(
             0..0,
-            "only single-relationship patterns are supported in this release \
-             (multi-hop chains like `(a)-[]-(b)-[]-(c)` are deferred)",
+            "this position accepts only a single-relationship pattern",
         ));
     }
     let (rel, end_node) = &pat.steps[0];
     lower_single(pat.path_var.clone(), &pat.start, rel, end_node)
+}
+
+/// Lower a (possibly chained) pattern `(a)-[r1]->(b)-[r2]->(c)` into a sequence
+/// of [`PatternPlan`]s evaluated left to right (design §3.1). Step 1 anchors on
+/// its written start node (selectivity-chosen as today). Each later step anchors
+/// on the variable bound by the previous step's peer — the shared join key — so
+/// the chain is a left-deep join over the binding stream, preserving
+/// determinism (every step walks from a node already in the binding).
+///
+/// A chained pattern requires every interior node to carry a variable (the join
+/// key); an anonymous interior node `(a)-[]->()-[]->(c)` is rejected because
+/// there is nothing to join on.
+pub fn lower_pattern_chain(pat: &PathPattern) -> Result<Vec<PatternPlan>, CqlError> {
+    if pat.steps.is_empty() {
+        return Err(CqlError::plan(
+            0..0,
+            "a MATCH pattern must contain at least one relationship",
+        ));
+    }
+    if pat.steps.len() == 1 {
+        let (rel, end_node) = &pat.steps[0];
+        return Ok(vec![lower_single(
+            pat.path_var.clone(),
+            &pat.start,
+            rel,
+            end_node,
+        )?]);
+    }
+
+    // Chained: a `path =` binding over a multi-relationship pattern is not yet
+    // supported (the path channel is single-step today).
+    if pat.path_var.is_some() {
+        return Err(CqlError::plan(
+            0..0,
+            "a `path =` binding over a multi-relationship pattern is not yet supported",
+        ));
+    }
+
+    let mut plans = Vec::with_capacity(pat.steps.len());
+    let mut prev_node = &pat.start;
+    for (i, (rel, end_node)) in pat.steps.iter().enumerate() {
+        // The interior join node must be named so the next step can anchor on it.
+        if i + 1 < pat.steps.len() && end_node.var.is_none() {
+            return Err(CqlError::plan(
+                0..0,
+                "interior nodes of a multi-relationship pattern must be named \
+                 (they are the join keys, e.g. `(a)-[]->(b)-[]->(c)`)",
+            ));
+        }
+        let mut plan = lower_chained_step(prev_node, rel, end_node)?;
+        if i > 0 {
+            // Anchor on the previous step's peer variable (the join key).
+            plan.anchor_bound_var = prev_node.var.clone();
+        }
+        plans.push(plan);
+        prev_node = end_node;
+    }
+    Ok(plans)
+}
+
+/// Lower one step of a chain, forcing the anchor to be the written start node so
+/// the walk proceeds left to right (no selectivity flip — the start node is the
+/// join key for steps after the first, and keeping step 1 anchored on its start
+/// keeps the chain's direction consistent).
+fn lower_chained_step(
+    start: &NodePat,
+    rel: &RelPat,
+    end: &NodePat,
+) -> Result<PatternPlan, CqlError> {
+    let (start_props, start_kinds) = node_constraints(start)?;
+    let (end_props, end_kinds) = node_constraints(end)?;
+
+    let (kinds, invert) = if rel.types.is_empty() {
+        (Vec::new(), false)
+    } else {
+        rel_kinds_multi(&rel.types)?
+    };
+    let mut filter = if kinds.is_empty() {
+        EdgeFilter::calls()
+    } else {
+        EdgeFilter::calls().with_kinds(kinds)
+    };
+    filter = apply_rel_props(filter, rel)?;
+
+    let direction = walk_direction(rel.direction, invert);
+    let anchor = anchor_set(&start_props, &start_kinds);
+    let cardinality = match rel.var_len {
+        None => Cardinality::SingleHop,
+        Some(VarLen { min, max }) => Cardinality::VarLength {
+            min: min.unwrap_or(1),
+            max,
+        },
+    };
+
+    Ok(PatternPlan {
+        path_var: None,
+        anchor_bound_var: None,
+        anchor_var: start.var.clone(),
+        peer_var: end.var.clone(),
+        rel_var: rel.var.clone(),
+        anchor,
+        direction,
+        filter,
+        cardinality,
+        peer_kinds: end_kinds,
+        peer_props: end_props,
+    })
 }
 
 fn lower_single(
@@ -466,6 +577,7 @@ fn lower_single(
 
     Ok(PatternPlan {
         path_var,
+        anchor_bound_var: None,
         anchor_var,
         peer_var,
         rel_var: rel.var.clone(),

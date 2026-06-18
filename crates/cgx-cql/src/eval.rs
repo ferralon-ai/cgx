@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use cgx_core::{Confidence, EdgeCondition, EdgeId, NodeId, SymbolPattern};
-use cgx_query::{GraphView, PathWalker};
+use cgx_query::{GraphView, PathWalker, TruncationReason};
 
 use crate::ast::{
     BinOp, Expr, MatchClause, OrderBy, PathPattern, Query, ReadingClause, ReturnClause, ReturnItem,
@@ -46,10 +46,13 @@ pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
     // unknown — they are scalars/lists, not graph entities — so they are not
     // recorded in the per-part typing map and act as free references).
     let mut carried: Vec<Binding> = vec![Binding::default()];
+    // Accumulated truncation signal from any var-length walk in the query.
+    // Once set to `Some`, later walks may upgrade it but never downgrade it.
+    let mut truncation: Option<TruncationReason> = None;
 
     let last = query.parts.len() - 1;
     for (i, part) in query.parts.iter().enumerate() {
-        let bindings = eval_reading(view, part, carried)?;
+        let bindings = eval_reading(view, part, carried, &mut truncation)?;
         match (&part.with, &part.ret) {
             (Some(with), _) => {
                 debug_assert!(i != last, "non-final part must carry a WITH");
@@ -57,7 +60,7 @@ pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
             }
             (None, Some(ret)) => {
                 debug_assert!(i == last, "RETURN only on the final part");
-                return project(view, ret, bindings);
+                return project(view, ret, bindings, truncation);
             }
             (None, None) => {
                 return Err(CqlError::plan(0..0, "query part must end with WITH or RETURN"));
@@ -71,10 +74,15 @@ pub fn eval(view: &GraphView, query: &Query) -> Result<ResultTable, CqlError> {
 /// returning the expanded + filtered stream. Performs the part-local plan-time
 /// property validation (so an unbacked property is rejected even when the stream
 /// is empty); carried-in `WITH` variables are free references and are not typed.
+///
+/// `truncation` accumulates the walk-budget signal from any var-length patterns
+/// in this part; callers pass the same mutable reference across all parts so the
+/// signal is preserved through `WITH` boundaries.
 fn eval_reading(
     view: &GraphView,
     part: &crate::ast::QueryPart,
     input: Vec<Binding>,
+    truncation: &mut Option<TruncationReason>,
 ) -> Result<Vec<Binding>, CqlError> {
     let mut vartypes = VarTypes::default();
     let mut plans: Vec<Vec<PatternPlan>> = Vec::new();
@@ -138,7 +146,7 @@ fn eval_reading(
         match clause {
             ReadingClause::Match(m) => {
                 let clause_plans = plan_iter.next().expect("plan per MATCH clause");
-                bindings = eval_match(view, m, &clause_plans, bindings)?;
+                bindings = eval_match(view, m, &clause_plans, bindings, truncation)?;
             }
             ReadingClause::Call(call) => {
                 bindings = crate::proc::eval_call(view, call, bindings)?;
@@ -169,7 +177,9 @@ fn project_with(
         order_by: with.order_by.clone(),
         limit: with.limit,
     };
-    let table = project(view, &ret, bindings)?;
+    // WITH projection does not carry a truncation signal; truncation is
+    // accumulated across the whole query and attached to the final RETURN table.
+    let table = project(view, &ret, bindings, None)?;
     let names = &table.columns;
 
     let mut out = Vec::with_capacity(table.rows.len());
@@ -334,10 +344,11 @@ fn eval_match(
     clause: &MatchClause,
     plans: &[PatternPlan],
     input: Vec<Binding>,
+    truncation: &mut Option<TruncationReason>,
 ) -> Result<Vec<Binding>, CqlError> {
     let mut stream = input;
     for plan in plans {
-        stream = expand_pattern(view, plan, stream)?;
+        stream = expand_pattern(view, plan, stream, truncation)?;
     }
     if let Some(filter) = &clause.where_clause {
         let mut kept = Vec::new();
@@ -357,6 +368,7 @@ fn expand_pattern(
     view: &GraphView,
     plan: &PatternPlan,
     input: Vec<Binding>,
+    truncation: &mut Option<TruncationReason>,
 ) -> Result<Vec<Binding>, CqlError> {
     // A non-chained step resolves its anchor set once. A chained step anchors on
     // a variable already bound in each input binding (the join key), so its
@@ -382,7 +394,7 @@ fn expand_pattern(
                     expand_single_hop(view, plan, base, anchor, &mut out);
                 }
                 Cardinality::VarLength { min, max } => {
-                    expand_var_length(view, plan, base, anchor, *min, *max, &mut out);
+                    expand_var_length(view, plan, base, anchor, *min, *max, &mut out, truncation);
                 }
             }
         }
@@ -434,6 +446,12 @@ fn expand_single_hop(
 /// A var-length walk from the anchor. When a `path =` var is bound (or path
 /// predicates exist), each reachable peer's witness simple path is enumerated;
 /// otherwise the peer set alone is bound.
+///
+/// The `PathWalker` defaults (`DEFAULT_MAX_PATHS` / `DEFAULT_MAX_STEPS`) are
+/// honored so a dense graph terminates instead of hanging — matching the Layer-1
+/// `paths` perf gate. When enumeration is cut short, `truncation` is set (or
+/// upgraded) to surface the honesty marker to the caller.
+#[allow(clippy::too_many_arguments)]
 fn expand_var_length(
     view: &GraphView,
     plan: &PatternPlan,
@@ -442,7 +460,10 @@ fn expand_var_length(
     min: u32,
     max: Option<u32>,
     out: &mut Vec<Binding>,
+    truncation: &mut Option<TruncationReason>,
 ) {
+    // Use PathWalker defaults (None = DEFAULT_MAX_PATHS / DEFAULT_MAX_STEPS),
+    // which activates the same perf gate Layer-1 `paths` uses (GM-perf).
     let walker = PathWalker {
         filter: plan.filter.clone(),
         max_depth: max,
@@ -457,9 +478,15 @@ fn expand_var_length(
 
     if plan.path_var.is_some() {
         // Enumerate witness simple paths so path-scoped predicates (P4) and
-        // `RETURN path` see a concrete node/edge sequence.
+        // `RETURN path` see a concrete node/edge sequence. The walk is now
+        // budget-bounded; a `Some` truncation from any goal is propagated out.
         for &goal in &goals {
             let enumer = walker.enumerate_paths(view, anchor, goal, plan.direction);
+            // Accumulate truncation: once set, a later PathCap does not overwrite
+            // StepBudget (step-budget is the stronger signal).
+            if let Some(reason) = enumer.truncation {
+                upgrade_truncation(truncation, reason);
+            }
             for steps in &enumer.paths {
                 let hops = steps.len().saturating_sub(1) as u32;
                 if hops < min {
@@ -484,6 +511,8 @@ fn expand_var_length(
         // No path binding: bind the reachable peer set (BFS shortest-depth).
         // `goals` is already the set of nodes satisfying the peer constraints, so
         // a reachable node is admitted iff it is in that set.
+        // BFS does not enumerate exponential simple-path sets, so the budget is
+        // not relevant here — the BFS is always bounded by the graph size.
         for d in walker.bfs(view, anchor, plan.direction) {
             if d.depth < min {
                 continue;
@@ -496,6 +525,19 @@ fn expand_var_length(
             bind_node(&mut b, &plan.peer_var, d.node);
             out.push(b);
         }
+    }
+}
+
+/// Accumulate a `TruncationReason` into an existing accumulator.
+///
+/// `StepBudget` (work exhausted) is the stronger signal: if the accumulator
+/// already holds `StepBudget`, a later `PathCap` does not overwrite it.
+#[inline]
+fn upgrade_truncation(acc: &mut Option<TruncationReason>, reason: TruncationReason) {
+    match acc {
+        None => *acc = Some(reason),
+        Some(TruncationReason::PathCap) => *acc = Some(reason), // StepBudget wins
+        Some(TruncationReason::StepBudget) => {}                 // already the max
     }
 }
 
@@ -604,16 +646,19 @@ fn is_star_arg(expr: &Expr) -> bool {
 /// horizon, design §3.4): each distinct tuple of non-aggregate key values forms
 /// one output row, with the aggregates folded over the group's bindings. With no
 /// non-aggregate key the whole stream collapses to a single row.
+///
+/// `truncation` is forwarded into the result table unchanged.
 fn project(
     view: &GraphView,
     ret: &ReturnClause,
     bindings: Vec<Binding>,
+    truncation: Option<TruncationReason>,
 ) -> Result<ResultTable, CqlError> {
     let columns: Vec<String> = ret.items.iter().map(column_name).collect();
 
     let has_aggregate = ret.items.iter().any(|i| is_aggregate_expr(&i.expr));
     if has_aggregate {
-        return project_grouped(view, ret, columns, bindings);
+        return project_grouped(view, ret, columns, bindings, truncation);
     }
 
     // Detect a single `RETURN path` (whole-path) return so the path channel is
@@ -676,6 +721,7 @@ fn project(
         columns,
         rows,
         paths,
+        truncation,
     })
 }
 
@@ -730,6 +776,7 @@ fn project_grouped(
     ret: &ReturnClause,
     columns: Vec<String>,
     bindings: Vec<Binding>,
+    truncation: Option<TruncationReason>,
 ) -> Result<ResultTable, CqlError> {
     // Which RETURN items are grouping keys (non-aggregates) vs aggregates.
     let is_agg: Vec<bool> = ret.items.iter().map(|i| is_aggregate_expr(&i.expr)).collect();
@@ -798,6 +845,7 @@ fn project_grouped(
         columns,
         rows,
         paths: Vec::new(),
+        truncation,
     })
 }
 
@@ -1194,7 +1242,7 @@ pub fn edge_field_value(edge: &cgx_core::EdgeRecord, field: EdgeField) -> Value 
     match field {
         EdgeField::Condition => Value::Str(condition_token(edge.condition).to_string()),
         EdgeField::Confidence => Value::Str(confidence_token(edge.confidence).to_string()),
-        EdgeField::Kind => Value::Str(format!("{:?}", edge.kind)),
+        EdgeField::Kind => Value::Str(edge_kind_token(edge.kind).to_string()),
     }
 }
 
@@ -1473,6 +1521,36 @@ pub fn confidence_token(c: Confidence) -> &'static str {
         Confidence::Possible => "possible",
         Confidence::Probable => "probable",
         Confidence::Certain => "certain",
+    }
+}
+
+/// The canonical kebab-case token for an [`cgx_core::EdgeKind`], matching the
+/// `#[serde(rename_all = "kebab-case")]` attribute on that enum (e.g.
+/// `CallsVirtual` → `"calls-virtual"`). Used wherever an edge's `kind` is
+/// projected as a string so the output is consistent with the serde wire format
+/// instead of the Debug-derived PascalCase.
+pub fn edge_kind_token(k: cgx_core::EdgeKind) -> &'static str {
+    use cgx_core::EdgeKind::*;
+    match k {
+        Calls => "calls",
+        CallsVirtual => "calls-virtual",
+        CallsClosure => "calls-closure",
+        CallsCallback => "calls-callback",
+        CallsAsync => "calls-async",
+        CallsIndirect => "calls-indirect",
+        Spawns => "spawns",
+        Contains => "contains",
+        Imports => "imports",
+        DerivesFrom => "derives-from",
+        Overrides => "overrides",
+        Implements => "implements",
+        Inherits => "inherits",
+        References => "references",
+        Instantiates => "instantiates",
+        Throws => "throws",
+        Catches => "catches",
+        ReadsField => "reads-field",
+        WritesField => "writes-field",
     }
 }
 

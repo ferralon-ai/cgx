@@ -16,7 +16,7 @@
 mod common;
 
 use cgx_core::SymbolKind;
-use cgx_cql::{run, ErrorKind};
+use cgx_cql::{run, ErrorKind, Value};
 
 use common::GraphBuilder;
 
@@ -272,4 +272,27 @@ fn rejects_arithmetic_addition() {
     let m = reject(r#"MATCH (a)-[:CALLS]->(b) WHERE a.line + 1 = 5 RETURN a.name"#);
     assert!(m.contains("arithmetic") || m.contains("+"), "{m}");
     assert!(m.contains("deferred") || m.contains("not supported"), "{m}");
+}
+
+// ── N1: edge `r.kind` renders as kebab-case, not PascalCase Debug repr ────────
+
+/// `r.kind` must produce the serde-canonical kebab-case token (e.g. `"calls"`)
+/// rather than the `Debug`-derived PascalCase (`"Calls"`), consistent with node
+/// `kind` and edge `condition` tokens.
+#[test]
+fn edge_kind_projects_as_kebab_case() {
+    use cgx_core::SymbolKind::Function;
+    let view = GraphBuilder::new()
+        .sym("a", Function, "src/lib.rs", 1)
+        .sym("b", Function, "src/lib.rs", 2)
+        .calls("a", "b")
+        .view();
+    let q = r#"MATCH (a)-[r:CALLS]->(b) RETURN r.kind"#;
+    let table = run(&view, q).unwrap_or_else(|e| panic!("{}", e.render(q)));
+    assert_eq!(table.columns, vec!["r.kind"]);
+    assert_eq!(table.rows.len(), 1);
+    match &table.rows[0][0] {
+        Value::Str(s) => assert_eq!(s, "calls", "expected kebab-case `calls`, got `{s}`"),
+        v => panic!("expected Str, got {v:?}"),
+    }
 }

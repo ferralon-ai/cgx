@@ -265,7 +265,7 @@ impl Cell {
             },
             V::Edge(id) => match view.edge(*id) {
                 Some(e) => Cell::Edge {
-                    kind: format!("{:?}", e.kind),
+                    kind: cgx_cql::eval::edge_kind_token(e.kind).to_string(),
                     condition: e.condition,
                     confidence: e.confidence,
                 },

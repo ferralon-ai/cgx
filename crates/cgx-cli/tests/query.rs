@@ -448,6 +448,107 @@ fn at_ref_is_shared_with_layer1_subcommands() {
     );
 }
 
+// --- P9b: dot/mermaid/d2 path-graph emitters (shared) ------------------------
+
+/// The whole-path CQL query that yields a `main → beta` path (matches the Layer-1
+/// `paths main beta` result over the same fixture).
+const PATH_QUERY: &str = "MATCH p = (a)-[:CALLS*1..3]->(b) \
+     WHERE a.name = \"rust_sample::main\" AND b.name = \"rust_sample::helper::beta\" RETURN p";
+
+#[test]
+fn paths_dot_emitter() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["paths", "main", "beta", "--format", "dot"]);
+    assert_eq!(code, 0, "paths --format dot exits 0: {out}");
+    assert!(out.starts_with("digraph cgx {"), "dot header: {out}");
+    assert!(out.contains("->"), "dot has edges: {out}");
+    assert!(
+        out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
+        "dot labels carry the fqns: {out}"
+    );
+}
+
+#[test]
+fn paths_mermaid_emitter() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["paths", "main", "beta", "--format", "mermaid"]);
+    assert_eq!(code, 0, "paths --format mermaid exits 0: {out}");
+    assert!(out.starts_with("graph TD"), "mermaid header: {out}");
+    assert!(out.contains("-->"), "mermaid has edges: {out}");
+}
+
+#[test]
+fn paths_d2_emitter() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["paths", "main", "beta", "--format", "d2"]);
+    assert_eq!(code, 0, "paths --format d2 exits 0: {out}");
+    assert!(out.contains(" -> "), "d2 has node->node statements: {out}");
+    assert!(
+        out.contains("rust_sample::main"),
+        "d2 carries the fqns: {out}"
+    );
+}
+
+/// The shared-emitter contract: a CQL `RETURN path` query renders byte-identical
+/// graph source to the Layer-1 `paths` command over the same graph.
+#[test]
+fn return_path_query_dot_matches_layer1_paths() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (layer1, c1) = run_cgx(&repo, &["paths", "main", "beta", "--format", "dot"]);
+    let (cql, c2) = run_cgx(&repo, &["query", PATH_QUERY, "--format", "dot"]);
+    assert_eq!(c1, 0);
+    assert_eq!(c2, 0, "RETURN path --format dot exits 0: {cql}");
+    assert_eq!(
+        layer1, cql,
+        "CQL RETURN path and Layer-1 paths emit identical dot"
+    );
+}
+
+#[test]
+fn return_path_query_mermaid_and_d2() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (m, cm) = run_cgx(&repo, &["query", PATH_QUERY, "--format", "mermaid"]);
+    assert_eq!(cm, 0, "RETURN path --format mermaid exits 0: {m}");
+    assert!(m.starts_with("graph TD"), "mermaid header: {m}");
+    let (d, cd) = run_cgx(&repo, &["query", PATH_QUERY, "--format", "d2"]);
+    assert_eq!(cd, 0, "RETURN path --format d2 exits 0: {d}");
+    assert!(d.contains(" -> "), "d2 statements: {d}");
+}
+
+#[test]
+fn dot_on_tabular_query_is_usage_error_exit_2() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (_out, stderr, code) = run_cgx_full(
+        &repo,
+        &[
+            "query",
+            "MATCH (a)-[:CALLS]->(b) RETURN a.name",
+            "--format",
+            "dot",
+        ],
+    );
+    assert_eq!(code, 2, "dot on a tabular query → usage error exit 2");
+    assert!(
+        stderr.contains("path-returning"),
+        "error explains the path-only constraint: {stderr}"
+    );
+}
+
+#[test]
+fn mermaid_on_callers_is_usage_error_exit_2() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    // A non-path Layer-1 subcommand also rejects the path-graph emitters.
+    let (_out, _stderr, code) = run_cgx_full(&repo, &["callers", "beta", "--format", "mermaid"]);
+    assert_eq!(code, 2, "mermaid on `callers` → usage error exit 2");
+}
+
 #[test]
 fn query_without_index_with_no_auto_index_is_graph_error_exit_3() {
     let (_tmp, repo) = fixture_repo();

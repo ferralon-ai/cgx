@@ -528,9 +528,75 @@ fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
     };
 
     let any_symbol_matched = view.node_count() > 0;
+
+    // A `RETURN path` query populates the path channel. Render those through the
+    // shared `Paths` path so dot/mermaid/d2 (and human/json/sarif) match Layer-1
+    // `cgx paths`. A tabular result has no path channel: the path-graph emitters
+    // are then a usage error (they are only valid for path-returning queries).
+    if !table.paths.is_empty() {
+        let set = paths_from_cql(&view, &table.paths);
+        let count = set.len();
+        return emit("query", &args, ResultSet::Paths(set), any_symbol_matched, count);
+    }
+
+    if args.format.is_path_graph() {
+        return Err(CliError::usage(
+            "dot/mermaid/d2 are only valid for path-returning queries (RETURN path); \
+             this query returns a table — use --format human|json|sarif"
+                .to_string(),
+        ));
+    }
+
     let resolved = TableData::resolve(&view, &table);
     let count = resolved.rows.len();
     emit("query", &args, ResultSet::Table(resolved), any_symbol_matched, count)
+}
+
+/// Reconstruct a Layer-1 [`PathSet`] from a CQL query's path channel
+/// (`cgx_cql::PathValue`s), resolving node/edge ids against `view`. This lets a
+/// `RETURN path` query reuse the exact Layer-1 path rendering (every format,
+/// including the dot/mermaid/d2 emitters) instead of a parallel renderer.
+fn paths_from_cql(view: &GraphView, paths: &[cgx_cql::PathValue]) -> PathSet {
+    use cgx_query::{PathResult, PathStep};
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut steps = Vec::with_capacity(p.nodes.len());
+        let mut min_confidence = cgx_core::Confidence::Certain;
+        let mut crosses_exceptional = false;
+        for (i, node) in p.nodes.iter().enumerate() {
+            let rec = match view.try_node(*node) {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            // Edge i-1 is the one entering node i (the source node has no via).
+            let via = if i == 0 {
+                None
+            } else {
+                p.edges.get(i - 1).and_then(|e| view.edge(*e)).cloned()
+            };
+            if let Some(e) = &via {
+                min_confidence = min_confidence.min(e.confidence);
+                if e.condition.is_exceptional() {
+                    crosses_exceptional = true;
+                }
+            }
+            let exception_transient = crosses_exceptional;
+            steps.push(PathStep {
+                node: rec,
+                via,
+                exception_transient,
+            });
+        }
+        out.push(PathResult {
+            steps,
+            min_confidence,
+            crosses_exceptional,
+        });
+    }
+    PathSet {
+        paths: out,
+        truncation: None,
+    }
 }
 
 /// `cgx explain <symbol>` (Q-6 / IF-15): resolve the symbol and dump its full
@@ -570,6 +636,16 @@ fn emit(
     any_symbol_matched: bool,
     unfiltered_count: usize,
 ) -> Result<(), CliError> {
+    // The dot/mermaid/d2 emitters are path-graph only: reject them for any
+    // non-path result (callers/callees/unused/reaches-all, or a tabular query).
+    if args.format.is_path_graph() && !matches!(results, ResultSet::Paths(_)) {
+        return Err(CliError::usage(format!(
+            "{:?} format is only valid for path-returning results \
+             (`paths`, `reaches <from> <to>`, or a CQL `RETURN path` query)",
+            args.format
+        )));
+    }
+
     let spec = AssertionSpec {
         assert_empty: args.assert_empty,
         allow_vacuous: args.allow_vacuous,

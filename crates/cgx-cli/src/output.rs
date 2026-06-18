@@ -23,6 +23,20 @@ pub enum Format {
     Json,
     /// SARIF 2.1.0 (OASIS), one `run` with a tool driver, rules, and results.
     Sarif,
+    /// Graphviz DOT source (`digraph`) — path-shaped results only.
+    Dot,
+    /// Mermaid flowchart source (`graph TD`) — path-shaped results only.
+    Mermaid,
+    /// D2 (d2lang) source — path-shaped results only.
+    D2,
+}
+
+impl Format {
+    /// Whether this format is one of the path-graph emitters (dot/mermaid/d2),
+    /// which are valid only for path-shaped results.
+    pub fn is_path_graph(self) -> bool {
+        matches!(self, Format::Dot | Format::Mermaid | Format::D2)
+    }
 }
 
 /// The cgx version string embedded in SARIF tool metadata.
@@ -364,7 +378,147 @@ pub fn render(subcommand: &str, format: Format, results: &ResultSet, vacuous: bo
         Format::Human => render_human(results),
         Format::Json => render_json(results, vacuous),
         Format::Sarif => sarif_document(subcommand, results, vacuous).to_string(),
+        // Path-graph emitters. The CLI gates these to path-shaped results before
+        // dispatch (a tabular query + dot/mermaid/d2 is a usage error), so anything
+        // other than a `Paths` set here is empty graph source.
+        Format::Dot => render_dot(graph_data(results)),
+        Format::Mermaid => render_mermaid(graph_data(results)),
+        Format::D2 => render_d2(graph_data(results)),
     }
+}
+
+/// A directed graph distilled from a path-shaped result: a deduped, ordered node
+/// list and the directed edges between consecutive path steps. This is the single
+/// shape every path-graph emitter (dot/mermaid/d2) renders, so Layer-1 `paths` and
+/// a CQL `RETURN path` query produce identical graph source.
+struct GraphData {
+    /// Node fqns in first-seen order (stable: paths arrive in deterministic order).
+    nodes: Vec<String>,
+    /// Directed edges `(src_fqn, dst_fqn, edge_label)` in path order, deduped.
+    edges: Vec<(String, String, String)>,
+}
+
+/// Build [`GraphData`] from a result set's path channel. A non-path result yields
+/// an empty graph (the CLI never reaches this with a tabular result).
+fn graph_data(results: &ResultSet) -> GraphData {
+    let mut nodes: Vec<String> = Vec::new();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    let mut seen_node: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_edge: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+
+    if let ResultSet::Paths(set) = results {
+        for p in &set.paths {
+            for step in &p.steps {
+                let fqn = step.node.fqn.clone();
+                if seen_node.insert(fqn.clone()) {
+                    nodes.push(fqn);
+                }
+            }
+            for pair in p.steps.windows(2) {
+                let src = pair[0].node.fqn.clone();
+                let dst = pair[1].node.fqn.clone();
+                let label = pair[1]
+                    .via
+                    .as_ref()
+                    .map(|e| condition_str(e.condition).to_string())
+                    .unwrap_or_default();
+                let edge = (src, dst, label);
+                if seen_edge.insert(edge.clone()) {
+                    edges.push(edge);
+                }
+            }
+        }
+    }
+    GraphData { nodes, edges }
+}
+
+/// A stable identifier for a node in graph source: `n0`, `n1`, … assigned in the
+/// node's first-seen order so the mapping is deterministic.
+fn node_ids(g: &GraphData) -> std::collections::HashMap<&str, String> {
+    g.nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), format!("n{i}")))
+        .collect()
+}
+
+/// Escape a string for a Graphviz / D2 double-quoted label.
+fn quote(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Render path-shaped results as Graphviz DOT (`digraph`). Dependency-free string
+/// templating — we emit `.dot` source text, never a rendered image.
+fn render_dot(g: GraphData) -> String {
+    let ids = node_ids(&g);
+    let mut out = String::from("digraph cgx {\n  rankdir=LR;\n");
+    for n in &g.nodes {
+        out.push_str(&format!(
+            "  {} [label=\"{}\"];\n",
+            ids[n.as_str()],
+            quote(n)
+        ));
+    }
+    for (src, dst, label) in &g.edges {
+        if label.is_empty() {
+            out.push_str(&format!("  {} -> {};\n", ids[src.as_str()], ids[dst.as_str()]));
+        } else {
+            out.push_str(&format!(
+                "  {} -> {} [label=\"{}\"];\n",
+                ids[src.as_str()],
+                ids[dst.as_str()],
+                quote(label)
+            ));
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Render path-shaped results as a Mermaid flowchart (`graph TD`).
+fn render_mermaid(g: GraphData) -> String {
+    let ids = node_ids(&g);
+    let mut out = String::from("graph TD\n");
+    for n in &g.nodes {
+        out.push_str(&format!("  {}[\"{}\"]\n", ids[n.as_str()], quote(n)));
+    }
+    for (src, dst, label) in &g.edges {
+        if label.is_empty() {
+            out.push_str(&format!("  {} --> {}\n", ids[src.as_str()], ids[dst.as_str()]));
+        } else {
+            out.push_str(&format!(
+                "  {} -->|{}| {}\n",
+                ids[src.as_str()],
+                quote(label),
+                ids[dst.as_str()]
+            ));
+        }
+    }
+    out
+}
+
+/// Render path-shaped results as D2 (d2lang) source: `node -> node` statements
+/// with quoted labels. We emit `.d2` SOURCE TEXT only (no d2 toolchain dependency).
+fn render_d2(g: GraphData) -> String {
+    let ids = node_ids(&g);
+    let mut out = String::new();
+    for n in &g.nodes {
+        out.push_str(&format!("{}: \"{}\"\n", ids[n.as_str()], quote(n)));
+    }
+    for (src, dst, label) in &g.edges {
+        if label.is_empty() {
+            out.push_str(&format!("{} -> {}\n", ids[src.as_str()], ids[dst.as_str()]));
+        } else {
+            out.push_str(&format!(
+                "{} -> {}: \"{}\"\n",
+                ids[src.as_str()],
+                ids[dst.as_str()],
+                quote(label)
+            ));
+        }
+    }
+    out
 }
 
 fn render_human(results: &ResultSet) -> String {

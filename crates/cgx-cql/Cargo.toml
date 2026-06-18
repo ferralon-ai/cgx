@@ -1,0 +1,15 @@
+[package]
+name = "cgx-cql"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx Layer-2 query language: a Cypher subset that lowers MATCH patterns onto the cgx-query GraphView/PathWalker/EdgeFilter primitives — a deterministic frontend, not a second execution path."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-query = { path = "../cgx-query" }
+
+[dev-dependencies]
+proptest.workspace = true

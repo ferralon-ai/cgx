@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "cgx-core",
+ "cgx-cql",
  "cgx-diff",
  "cgx-doctor",
  "cgx-index",
@@ -208,6 +209,15 @@ dependencies = [
  "proptest",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "cgx-cql"
+version = "0.1.0"
+dependencies = [
+ "cgx-core",
+ "cgx-query",
+ "proptest",
 ]
 
 [[package]]

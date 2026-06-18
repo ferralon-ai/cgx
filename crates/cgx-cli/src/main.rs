@@ -26,7 +26,7 @@ use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
-use cgx_cli::output::{render, render_explanation, Format, ResultSet};
+use cgx_cli::output::{render, render_explanation, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -89,6 +89,17 @@ enum Command {
         /// Do not auto-index when the `.cgx/` store is missing or stale.
         #[arg(long)]
         no_auto_index: bool,
+    },
+    /// Run a Layer-2 CQL query (a Cypher subset) and render its result table.
+    ///
+    /// The positional `query` is either the inline query text, or `@path` to read
+    /// the query from a UTF-8 file (Q-9). Tabular results render as human/json/sarif;
+    /// `RETURN path` (path-shaped) results additionally support dot/mermaid/d2.
+    Query {
+        /// The CQL query text, or `@file.cql` to read it from a file.
+        query: String,
+        #[command(flatten)]
+        query_args: QueryArgs,
     },
     /// Symbols not reachable from any entrypoint.
     Unused {
@@ -172,6 +183,12 @@ struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
+    /// Pin the query to a git ref's graph (e.g. `HEAD`, `HEAD~1`, a tag, or a
+    /// commit SHA) instead of the auto-indexed working `HEAD`. Materializes that
+    /// ref in a detached worktree, indexes it, and queries the resulting graph
+    /// (Q-17). Shared across every subcommand that takes these query flags.
+    #[arg(long)]
+    at: Option<String>,
     /// Maximum traversal depth. For `paths`, omitting it applies a default depth
     /// of 6 (the common case is bounded and fast); pass `--max-depth 0` for
     /// unlimited depth, which stays protected by an internal work budget and may
@@ -191,6 +208,12 @@ struct QueryArgs {
     /// explicit `cgx index` first (a missing index then exits 3).
     #[arg(long)]
     no_auto_index: bool,
+    /// [DEFERRED] SQL recursive-CTE interface (not implemented in this release).
+    ///
+    /// Recognized so users receive a clear deferral message instead of a generic
+    /// unknown-flag error. Passing this flag always exits 2.
+    #[arg(long, hide = true)]
+    sql: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -234,6 +257,7 @@ fn run(command: Command) -> Result<(), CliError> {
             format,
             no_auto_index,
         } => run_explain(&symbol, repo, format, no_auto_index),
+        Command::Query { query, query_args } => run_query(&query, query_args),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -474,6 +498,122 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
     )
 }
 
+/// `cgx query '<cql>'` (P8): run a Layer-2 CQL query and render its result table.
+///
+/// The positional argument is the inline query text, or `@path` to read the query
+/// from a UTF-8 file (Q-9). Parse/plan errors render the CQL caret view to stderr
+/// and exit 2 (usage); a missing index takes the usual exit-3 path; an eval-time
+/// failure (unresolved symbol) exits 2.
+///
+/// ## Vacuity rule (documented deviation from the generic re-run)
+///
+/// A CQL query carries all its filtering *intrinsically* (inline `WHERE` and
+/// `{confidence:…}` clauses), so there is no external filter layer to strip for the
+/// ADR-08 clause-(b) re-run that `run_neighbors` uses; `unfiltered_count` therefore
+/// equals `filtered_count`. Clause (a) (zero-symbol match) maps to "the graph has
+/// no nodes": `any_symbol_matched = view.node_count() > 0`. Consequently
+/// `--assert-empty` over a *populated* graph that legitimately returns zero rows is
+/// a genuine (non-vacuous) pass; only a query against an empty graph passes
+/// vacuously (exit 4).
+fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
+    if args.sql {
+        return Err(CliError::usage(
+            "the --sql recursive-CTE interface is not implemented in this release".to_string(),
+        ));
+    }
+    let src = match query.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| CliError::usage(format!("reading query file {path:?}: {e}")))?,
+        None => query.to_string(),
+    };
+
+    let view = prepare_view(&args)?;
+
+    let table = match cgx_cql::run(&view, &src) {
+        Ok(t) => t,
+        Err(e) => {
+            // Parse/plan/eval CQL errors: print the caret view to stderr, exit 2.
+            eprintln!("{}", e.render(&src));
+            return Err(CliError::usage(format!("{}", e)));
+        }
+    };
+
+    let any_symbol_matched = view.node_count() > 0;
+
+    // A `RETURN path` query populates the path channel. Render those through the
+    // shared `Paths` path so dot/mermaid/d2 (and human/json/sarif) match Layer-1
+    // `cgx paths`. A tabular result has no path channel: the path-graph emitters
+    // are then a usage error (they are only valid for path-returning queries).
+    if !table.paths.is_empty() {
+        let mut set = paths_from_cql(&view, &table.paths);
+        // Propagate the CQL walk's truncation signal so the same `[truncated]`
+        // marker and JSON `truncated`/`truncation_reason` fields that Layer-1
+        // `paths` emits appear when the budget fired.
+        set.truncation = table.truncation;
+        let count = set.len();
+        return emit("query", &args, ResultSet::Paths(set), any_symbol_matched, count);
+    }
+
+    if args.format.is_path_graph() {
+        return Err(CliError::usage(
+            "dot/mermaid/d2 are only valid for path-returning queries (RETURN path); \
+             this query returns a table — use --format human|json|sarif"
+                .to_string(),
+        ));
+    }
+
+    let resolved = TableData::resolve(&view, &table);
+    let count = resolved.rows.len();
+    emit("query", &args, ResultSet::Table(resolved), any_symbol_matched, count)
+}
+
+/// Reconstruct a Layer-1 [`PathSet`] from a CQL query's path channel
+/// (`cgx_cql::PathValue`s), resolving node/edge ids against `view`. This lets a
+/// `RETURN path` query reuse the exact Layer-1 path rendering (every format,
+/// including the dot/mermaid/d2 emitters) instead of a parallel renderer.
+fn paths_from_cql(view: &GraphView, paths: &[cgx_cql::PathValue]) -> PathSet {
+    use cgx_query::{PathResult, PathStep};
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut steps = Vec::with_capacity(p.nodes.len());
+        let mut min_confidence = cgx_core::Confidence::Certain;
+        let mut crosses_exceptional = false;
+        for (i, node) in p.nodes.iter().enumerate() {
+            let rec = match view.try_node(*node) {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            // Edge i-1 is the one entering node i (the source node has no via).
+            let via = if i == 0 {
+                None
+            } else {
+                p.edges.get(i - 1).and_then(|e| view.edge(*e)).cloned()
+            };
+            if let Some(e) = &via {
+                min_confidence = min_confidence.min(e.confidence);
+                if e.condition.is_exceptional() {
+                    crosses_exceptional = true;
+                }
+            }
+            let exception_transient = crosses_exceptional;
+            steps.push(PathStep {
+                node: rec,
+                via,
+                exception_transient,
+            });
+        }
+        out.push(PathResult {
+            steps,
+            min_confidence,
+            crosses_exceptional,
+        });
+    }
+    PathSet {
+        paths: out,
+        truncation: None,
+    }
+}
+
 /// `cgx explain <symbol>` (Q-6 / IF-15): resolve the symbol and dump its full
 /// provenance. Reuses the shared [`cgx_query::explain`] logic — the same path the
 /// MCP `explain` tool drives, so there is no logic fork. An unknown symbol takes
@@ -511,6 +651,16 @@ fn emit(
     any_symbol_matched: bool,
     unfiltered_count: usize,
 ) -> Result<(), CliError> {
+    // The dot/mermaid/d2 emitters are path-graph only: reject them for any
+    // non-path result (callers/callees/unused/reaches-all, or a tabular query).
+    if args.format.is_path_graph() && !matches!(results, ResultSet::Paths(_)) {
+        return Err(CliError::usage(format!(
+            "{:?} format is only valid for path-returning results \
+             (`paths`, `reaches <from> <to>`, or a CQL `RETURN path` query)",
+            args.format
+        )));
+    }
+
     let spec = AssertionSpec {
         assert_empty: args.assert_empty,
         allow_vacuous: args.allow_vacuous,
@@ -838,10 +988,42 @@ fn open_store(repo_root: &Path) -> Result<SqliteStore, CliError> {
 /// auto-index trigger (audit row #23) and the IF-4 exit mapping live in one place.
 fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
     let repo_root = resolve_repo(args.repo.clone())?;
+    // `--at <ref>` pins the query to a specific commit's graph: resolve the ref,
+    // index its tree into a fresh store (reusing the `diff` `index_ref` machinery),
+    // and load that graph instead of the auto-indexed working HEAD. The `--at` path
+    // never touches the working-tree `.cgx/` pointer, so it cannot disturb a plain
+    // query's index.
+    if let Some(at) = &args.at {
+        return view_at_ref(&repo_root, at);
+    }
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
     load_view(&repo_root)
+}
+
+/// Load the [`GraphView`] for a single git ref (the `--at <ref>` path). Reuses the
+/// `diff` ref-indexing machinery: resolve the ref to a commit, materialize and
+/// index its tree via [`index_ref`], then read the resulting graph straight out of
+/// the store by id (no pointer involved).
+fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
+    std::fs::create_dir_all(cgx_dir(repo_root))
+        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    let db_file = db_path(repo_root);
+    let mut store =
+        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+
+    let blame = BlameRepo::discover(repo_root)
+        .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
+    let commit = blame
+        .resolve_commit(at)
+        .map_err(|e| CliError::usage(format!("resolving ref {at:?}: {e}")))?;
+
+    let graph_id = index_ref(repo_root, &commit, &mut store)?;
+    let graph = store
+        .read_graph(graph_id)
+        .map_err(|e| CliError::graph(format!("reading graph at {at}: {e}")))?;
+    Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 
 /// Load the current Layer-2 graph into a queryable [`GraphView`].

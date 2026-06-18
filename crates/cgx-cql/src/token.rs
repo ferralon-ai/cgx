@@ -182,10 +182,35 @@ impl<'s> Lexer<'s> {
             (b'-', _) => (TokenKind::Dash, 1),
             _ => {
                 let ch_len = char_len(self.src, start);
+                let ch = &self.src[start..start + ch_len];
+                // Recognised-but-deferred characters get Plan errors so the user
+                // sees a clear "not supported" message rather than a cryptic
+                // "unexpected character" failure (design §7).
+                match b {
+                    b'$' => {
+                        return Err(CqlError::new(
+                            start..start + ch_len,
+                            ErrorKind::Plan,
+                            "query parameters (`$name`) are not supported in this \
+                             release (deferred)".to_string(),
+                        ));
+                    }
+                    b'+' | b'/' | b'%' => {
+                        return Err(CqlError::new(
+                            start..start + ch_len,
+                            ErrorKind::Plan,
+                            format!(
+                                "arithmetic operator `{ch}` is not supported in this \
+                                 release (arithmetic expressions are deferred)"
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
                 return Err(CqlError::new(
                     start..start + ch_len,
                     ErrorKind::Parse,
-                    format!("unexpected character `{}`", &self.src[start..start + ch_len]),
+                    format!("unexpected character `{ch}`"),
                 ));
             }
         };

@@ -96,6 +96,17 @@ impl Parser {
             }
         }
         if !self.at_eof() {
+            // `UNION` after a RETURN is a recognised-but-deferred clause; give a
+            // Plan error rather than a confusing "unexpected trailing input".
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                if name.eq_ignore_ascii_case("UNION") {
+                    let span = self.peek_span();
+                    return Err(CqlError::plan(
+                        span,
+                        "`UNION` is not supported in this release (deferred)",
+                    ));
+                }
+            }
             return Err(self.err_here(format!("unexpected trailing input {}", describe(self.peek()))));
         }
         // The final part must RETURN.
@@ -125,6 +136,43 @@ impl Parser {
             return Ok(QueryPart { reading, ret: Some(ret), with: None });
         }
 
+        // Recognised-but-deferred clause keywords that would otherwise surface as
+        // a confusing syntax error. Each gets a Plan error naming the feature and
+        // stating it is deferred, per design §7 and §5.
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            let span = self.peek_span();
+            match name.to_ascii_uppercase().as_str() {
+                "CREATE" | "SET" | "DELETE" | "DETACH" => {
+                    return Err(CqlError::plan(
+                        span,
+                        format!(
+                            "`{name}` is not supported: cgx query is a read-only language; \
+                             write clauses (CREATE/SET/DELETE) are deferred"
+                        ),
+                    ));
+                }
+                "UNWIND" => {
+                    return Err(CqlError::plan(
+                        span,
+                        "`UNWIND` is not supported in this release (deferred)",
+                    ));
+                }
+                "OPTIONAL" => {
+                    return Err(CqlError::plan(
+                        span,
+                        "`OPTIONAL MATCH` is not supported in this release (deferred)",
+                    ));
+                }
+                "UNION" => {
+                    return Err(CqlError::plan(
+                        span,
+                        "`UNION` is not supported in this release (deferred)",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         if reading.is_empty() {
             return Err(self.err_here(format!(
                 "expected MATCH, CALL, WITH, or RETURN, found {}",
@@ -138,6 +186,17 @@ impl Parser {
 
     fn parse_match(&mut self) -> Result<MatchClause, CqlError> {
         self.expect(&TokenKind::Match, "MATCH")?;
+        // `MATCH ALL … MUST PASS THROUGH / AVOIDING` (Q-20 guarded cut) is
+        // recognised but deferred; intercept before the `(` check to give a
+        // Plan error rather than a confusing "expected `(`" message.
+        if matches!(self.peek(), TokenKind::All) {
+            let span = self.peek_span();
+            return Err(CqlError::plan(
+                span,
+                "`MATCH ALL … MUST PASS THROUGH/AVOIDING` (Q-20 guarded-cut) is \
+                 not supported in this release (deferred)",
+            ));
+        }
         let mut patterns = vec![self.parse_path_pattern()?];
         while self.eat(&TokenKind::Comma) {
             patterns.push(self.parse_path_pattern()?);
@@ -237,6 +296,18 @@ impl Parser {
 
     fn parse_rel_types(&mut self) -> Result<Vec<Spanned<String>>, CqlError> {
         let (name, span) = self.expect_ident("relationship type after `:`")?;
+        // `CALLS:super` — a sub-type qualifier using `:` is the Theme-13 syntax
+        // (not yet supported). Give a Plan error with a clear message.
+        if matches!(self.peek(), TokenKind::Colon) {
+            let colon_span = self.peek_span();
+            return Err(CqlError::plan(
+                colon_span,
+                format!(
+                    "sub-type qualifier `{name}:…` (e.g. `CALLS:super`) is recognised \
+                     but not supported in this release (Theme-13, deferred)"
+                ),
+            ));
+        }
         let mut types = vec![Spanned::new(name, span)];
         while self.eat(&TokenKind::Pipe) {
             let (name, span) = self.expect_ident("relationship type after `|`")?;
@@ -461,6 +532,16 @@ impl Parser {
             TokenKind::Gt => BinOp::Gt,
             TokenKind::Ge => BinOp::Ge,
             TokenKind::In => BinOp::In,
+            // `IS [NOT] EMPTY` / `IS NULL` — recognised-but-deferred; give a
+            // Plan error with a clear message rather than a confusing parse fail.
+            TokenKind::Ident(name) if name.eq_ignore_ascii_case("IS") => {
+                let span = self.peek_span();
+                return Err(CqlError::plan(
+                    span,
+                    "`IS EMPTY` / `IS NULL` predicates are not supported in this \
+                     release (IS EMPTY requires type reconstruction; deferred)",
+                ));
+            }
             _ => return Ok(lhs),
         };
         let span = self.peek_span();

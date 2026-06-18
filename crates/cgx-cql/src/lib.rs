@@ -23,6 +23,8 @@
 
 pub mod ast;
 pub mod error;
+pub mod eval;
+pub mod lower;
 pub mod parser;
 pub mod token;
 pub mod value;
@@ -51,12 +53,8 @@ pub struct ResultTable {
 /// Errors carry a byte span into `src`; render them with
 /// [`CqlError::render`](crate::error::CqlError::render).
 pub fn run(view: &GraphView, src: &str) -> Result<ResultTable, CqlError> {
-    let _ = view;
     let query = parser::parse(src)?;
-    // P2: lexing + parsing are wired; lowering/eval land in later phases. The
-    // public contract above is final regardless.
-    let _ = query;
-    Err(CqlError::plan(0..src.len(), "query evaluation not yet implemented"))
+    eval::eval(view, &query)
 }
 
 #[cfg(test)]

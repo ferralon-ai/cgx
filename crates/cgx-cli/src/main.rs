@@ -208,6 +208,12 @@ struct QueryArgs {
     /// explicit `cgx index` first (a missing index then exits 3).
     #[arg(long)]
     no_auto_index: bool,
+    /// [DEFERRED] SQL recursive-CTE interface (not implemented in this release).
+    ///
+    /// Recognized so users receive a clear deferral message instead of a generic
+    /// unknown-flag error. Passing this flag always exits 2.
+    #[arg(long, hide = true)]
+    sql: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -510,6 +516,11 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
 /// a genuine (non-vacuous) pass; only a query against an empty graph passes
 /// vacuously (exit 4).
 fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
+    if args.sql {
+        return Err(CliError::usage(
+            "the --sql recursive-CTE interface is not implemented in this release".to_string(),
+        ));
+    }
     let src = match query.strip_prefix('@') {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| CliError::usage(format!("reading query file {path:?}: {e}")))?,
@@ -534,7 +545,11 @@ fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
     // `cgx paths`. A tabular result has no path channel: the path-graph emitters
     // are then a usage error (they are only valid for path-returning queries).
     if !table.paths.is_empty() {
-        let set = paths_from_cql(&view, &table.paths);
+        let mut set = paths_from_cql(&view, &table.paths);
+        // Propagate the CQL walk's truncation signal so the same `[truncated]`
+        // marker and JSON `truncated`/`truncation_reason` fields that Layer-1
+        // `paths` emits appear when the budget fired.
+        set.truncation = table.truncation;
         let count = set.len();
         return emit("query", &args, ResultSet::Paths(set), any_symbol_matched, count);
     }

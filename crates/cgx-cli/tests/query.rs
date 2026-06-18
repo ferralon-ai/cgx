@@ -562,3 +562,27 @@ fn query_without_index_with_no_auto_index_is_graph_error_exit_3() {
     );
     assert_eq!(code, 3, "un-indexed repo with --no-auto-index → exit 3");
 }
+
+// --- N2: --sql deferral message + exit 2 -------------------------------------
+
+/// `--sql` is a recognized flag that returns a clear deferral error (exit 2)
+/// naming the not-yet-implemented interface, never clap's generic unknown-flag
+/// message.
+#[test]
+fn sql_flag_defers_with_clear_message_exit_2() {
+    let (_tmp, repo) = fixture_repo();
+    // No index needed: the --sql check fires before any graph I/O.
+    let (_out, stderr, code) = run_cgx_full(
+        &repo,
+        &["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name", "--sql"],
+    );
+    assert_eq!(code, 2, "--sql → deferral error → exit 2; stderr={stderr}");
+    assert!(
+        stderr.contains("--sql") || stderr.contains("recursive-CTE"),
+        "--sql deferral message names the feature: {stderr}"
+    );
+    assert!(
+        stderr.contains("not implemented"),
+        "--sql deferral message says not-implemented: {stderr}"
+    );
+}

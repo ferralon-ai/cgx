@@ -635,6 +635,23 @@ fn push_edge(edges: &mut Vec<EdgeWithProvenance>, b: EdgeBuild<'_>) {
     });
 }
 
+/// Canonicalize a candidate destination set: sort by `node_id` and dedup. The
+/// **single** canonical-candidate-set discipline (GM-2.1, determinism §4) — the
+/// link pass *and* the CHA post-pass ([`crate::cha`]) both route through this so
+/// candidate ordering, dedup, and the single→`probable` / multi→`possible` band
+/// are defined in exactly one place. Returns the confidence band for the
+/// (deduped) set: one target ⇒ [`Confidence::Probable`], several ⇒
+/// [`Confidence::Possible`].
+pub(crate) fn canonicalize_candidate_dsts(dsts: &mut Vec<NodeId>) -> Confidence {
+    dsts.sort_by_key(|id| id.0);
+    dsts.dedup();
+    if dsts.len() == 1 {
+        Confidence::Probable
+    } else {
+        Confidence::Possible
+    }
+}
+
 /// Emit one edge per candidate, all sharing a candidate group, at `possible`
 /// (multiple) or `probable` (single). Records the candidate table rows.
 #[allow(clippy::too_many_arguments)]
@@ -650,18 +667,11 @@ fn emit_candidate_set(
     caller_fqn: &str,
     span: &Span,
 ) {
-    // Sort candidates by node id for determinism; single hit → probable, else
-    // possible (the over-approximation band, GM-5.1).
-    let mut ordered: Vec<&DefEntry> = hits.to_vec();
-    ordered.sort_by_key(|a| a.node_id.0);
-    ordered.dedup_by(|a, b| a.node_id == b.node_id);
-
-    let confidence = if ordered.len() == 1 {
-        Confidence::Probable
-    } else {
-        Confidence::Possible
-    };
-    let group = if ordered.len() > 1 {
+    // Canonicalize the dst set through the shared helper so ordering/dedup/band
+    // match the CHA post-pass exactly.
+    let mut dsts: Vec<NodeId> = hits.iter().map(|d| d.node_id).collect();
+    let confidence = canonicalize_candidate_dsts(&mut dsts);
+    let group = if dsts.len() > 1 {
         let g = *next_group;
         *next_group += 1;
         Some(g)
@@ -674,11 +684,11 @@ fn emit_candidate_set(
         Tier::ScopeGraph
     };
 
-    for (rank, def) in ordered.iter().enumerate() {
+    for (rank, dst) in dsts.iter().enumerate() {
         if let Some(g) = group {
             candidates.push(Candidate {
                 candidate_group: g,
-                dst: def.node_id,
+                dst: *dst,
                 rank: rank as u32,
             });
         }
@@ -686,7 +696,7 @@ fn emit_candidate_set(
             edges,
             EdgeBuild {
                 src: caller_id,
-                dst: def.node_id,
+                dst: *dst,
                 kind: edge_kind(raw.kind, virtual_dispatch),
                 confidence,
                 tier,

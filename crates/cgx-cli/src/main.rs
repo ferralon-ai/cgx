@@ -300,6 +300,12 @@ fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>) -> Result<(), CliErro
             scip.upgraded_certain, scip.upgraded_probable, scip.dep_edges, scip.collisions
         );
     }
+    if s.cha.sites_rescoped > 0 {
+        println!(
+            "  cha: {} sites trait-scoped, {} supernode (cut-marked)",
+            s.cha.sites_rescoped, s.cha.supernode_sites
+        );
+    }
     Ok(())
 }
 

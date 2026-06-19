@@ -27,7 +27,7 @@ use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
-use cgx_resolve::{link, FileInput, LinkOpts, ResolvedGraph};
+use cgx_resolve::{link, run_cha, ChaStats, FileInput, LinkOpts, ResolvedGraph};
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
 
@@ -63,6 +63,9 @@ pub struct IndexStats {
     pub unresolved: usize,
     /// SCIP re-label counters, present only when an index was run with `--scip`.
     pub scip: Option<ScipStats>,
+    /// CHA trait-scoping counters. CHA is pure graph analysis and always runs
+    /// (with or without `--scip`), so these are always present.
+    pub cha: ChaStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -208,6 +211,18 @@ pub(crate) fn apply_scip(
 fn read_scip(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map_err(|e| IndexError::Scip(format!("reading SCIP index {path:?}: {e}")))
+}
+
+/// Apply the CHA trait-scoping post-pass (design §4.2) to `graph` in place,
+/// replacing the link pass's name-scoped virtual-dispatch candidate sets with
+/// trait-scoped sets from the P3 lattice. Pure graph analysis with no external
+/// input, so it always runs — per the precedence ladder (§5) it runs **after**
+/// [`apply_scip`] so SCIP-settled sites are left alone. Updates the edge count
+/// and the `cha` counters.
+pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.cha = run_cha(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
 }
 
 /// Materialize `graph` into the store under `tree_oid`, returning its graph id.

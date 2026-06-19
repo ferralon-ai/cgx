@@ -65,11 +65,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod cha;
 mod graph;
 mod input;
 mod link;
 mod symtab;
 
+pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
 pub use graph::{ResolvedGraph, UnresolvedRef};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};

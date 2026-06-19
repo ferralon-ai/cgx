@@ -294,20 +294,14 @@ pub fn explain(view: &GraphView, anchor: NodeId) -> Option<Explanation> {
 
     let mut edges: Vec<ExplainEdge> = Vec::with_capacity(incoming.len() + outgoing.len());
     for r in &incoming {
-        edges.push(ExplainEdge {
-            incoming: true,
-            peer: r.node.clone(),
-            condition: r.condition,
-            confidence: r.confidence,
-        });
+        // For an incoming edge the peer calls the explained symbol, so the call
+        // site lives in the peer's body.
+        edges.push(explain_edge(true, r, &r.node));
     }
     for r in &outgoing {
-        edges.push(ExplainEdge {
-            incoming: false,
-            peer: r.node.clone(),
-            condition: r.condition,
-            confidence: r.confidence,
-        });
+        // For an outgoing edge the explained symbol calls the peer, so the call
+        // site lives in the explained symbol's body.
+        edges.push(explain_edge(false, r, &node));
     }
 
     Some(Explanation {
@@ -316,6 +310,44 @@ pub fn explain(view: &GraphView, anchor: NodeId) -> Option<Explanation> {
         callees_count: outgoing.len(),
         edges,
     })
+}
+
+/// Build an [`ExplainEdge`], copying the resolution provenance (`tier`/`rule`)
+/// off the discovery edge (`NeighborResult.via`) and deriving the render-only
+/// `resolution_source` + call-site span. `call_site_node` is the symbol whose
+/// body contains the call (the peer for incoming edges, the explained symbol for
+/// outgoing ones); the `EdgeRecord` carries no span, so file:line is taken from
+/// that node (IF-6 "source file:line").
+fn explain_edge(
+    incoming: bool,
+    r: &NeighborResult,
+    call_site_node: &cgx_core::NodeRecord,
+) -> ExplainEdge {
+    let tier = r.via.tier;
+    let resolution_source = if tier == cgx_core::Tier::Scip {
+        Some("scip".to_string())
+    } else {
+        None
+    };
+    let site = if r.via.kind.is_call() {
+        Some(cgx_core::Span::new(
+            call_site_node.file.clone(),
+            call_site_node.line_start,
+            None,
+        ))
+    } else {
+        None
+    };
+    ExplainEdge {
+        incoming,
+        peer: r.node.clone(),
+        condition: r.condition,
+        confidence: r.confidence,
+        tier,
+        rule: r.via.rule.clone(),
+        resolution_source,
+        site,
+    }
 }
 
 /// Resolve a `--from`/`--to` endpoint pattern to a unique anchor, surfacing the

@@ -7,7 +7,7 @@
 //! carry the resolved [`NodeRecord`]/[`EdgeRecord`] by value so the caller has
 //! file:line provenance without re-querying the view.
 
-use cgx_core::{Confidence, EdgeCondition, EdgeRecord, NodeId, NodeRecord};
+use cgx_core::{Confidence, EdgeCondition, EdgeRecord, NodeId, NodeRecord, Span, Tier};
 
 pub use crate::walk::TruncationReason;
 
@@ -138,6 +138,18 @@ pub struct ExplainEdge {
     pub condition: EdgeCondition,
     /// The edge's confidence (GM-5).
     pub confidence: Confidence,
+    /// Resolution tier that produced the edge (GM-5.2): `NameSyntactic`,
+    /// `ScopeGraph`, `Scip`, or `ChaRta`.
+    pub tier: Tier,
+    /// Producing rule name (denormalized provenance, e.g. `scip-occurrence`,
+    /// `cha-trait-set`, `rta-pruned`, `scope-ref`).
+    pub rule: String,
+    /// Render-only provenance source. `Some("scip")` when `tier == Tier::Scip`;
+    /// derived from `tier`, not a stored field (IF-6 SCIP provenance).
+    pub resolution_source: Option<String>,
+    /// Source location of the call site (file:line), when derivable from the
+    /// call-bearing node; `None` for structural edges or when unavailable.
+    pub site: Option<Span>,
 }
 
 /// Whether one symbol can reach another (`reaches`).

@@ -287,6 +287,11 @@ fn explain_happy_path_reports_provenance() {
         out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
         "lists both incident edges: {out}"
     );
+    // P7/IF-6: each incident edge now renders its resolution tier and rule.
+    assert!(
+        out.contains("tier=") && out.contains("rule="),
+        "human format surfaces tier/rule provenance: {out}"
+    );
 }
 
 #[test]
@@ -302,6 +307,60 @@ fn explain_json_format_is_valid_json() {
     assert!(
         parsed["edges"].as_array().map(|a| a.len()) == Some(2),
         "json lists both edges: {out}"
+    );
+    // P7/IF-6: every edge carries the new provenance fields (tier/rule always
+    // present; resolution_source/site are nullable).
+    for edge in parsed["edges"].as_array().expect("edges array") {
+        assert!(edge["tier"].is_string(), "edge carries a tier string: {out}");
+        assert!(edge["rule"].is_string(), "edge carries a rule string: {out}");
+        assert!(
+            edge.as_object().unwrap().contains_key("resolution_source"),
+            "edge carries a resolution_source key: {out}"
+        );
+        assert!(
+            edge.as_object().unwrap().contains_key("site"),
+            "edge carries a site key: {out}"
+        );
+    }
+}
+
+#[test]
+fn confidence_certain_floor_returns_only_certain_edges() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    // `main` transitively reaches `alpha` via a same-file lexical call (certain)
+    // and `helper::beta` via a cross-module call (below certain).
+    let (all, code) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    assert_eq!(code, 0, "unfiltered callees succeed: {all}");
+    let all: serde_json::Value = serde_json::from_str(&all).expect("json");
+    let all_names: Vec<&str> = all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert!(all_names.iter().any(|n| n.ends_with("alpha")));
+    assert!(all_names.iter().any(|n| n.ends_with("beta")));
+
+    // `--confidence certain` keeps only the certain edge.
+    let (certain, code) = run_cgx(
+        &repo,
+        &["callees", "main", "--confidence", "certain", "--format", "json"],
+    );
+    assert_eq!(code, 0, "filtered callees succeed: {certain}");
+    let certain: serde_json::Value = serde_json::from_str(&certain).expect("json");
+    let results = certain["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|r| r["confidence"] == serde_json::json!("certain")),
+        "every surviving edge is certain: {certain}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|r| r["fqn"].as_str().unwrap().ends_with("beta")),
+        "the weaker cross-module edge is filtered out: {certain}"
     );
 }
 

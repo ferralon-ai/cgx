@@ -9,7 +9,7 @@
 //! tool performs any network or LLM call; given the same tree, every tool is a
 //! pure function of its arguments.
 
-use cgx_core::{Confidence, EdgeCondition, NodeId, SymbolKind, SymbolPattern};
+use cgx_core::{Confidence, EdgeCondition, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
     callees, callers, explain, paths as query_paths, resolve_anchor, unused, ConditionFilter,
     Direction, EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker,
@@ -90,6 +90,7 @@ fn paths_tool() -> Value {
                 "max_results":            { "type": "integer", "default": DEFAULT_PATHS_MAX_RESULTS },
                 "exclude_edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "only_edge_condition":    { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
+                "confidence":             { "type": "string", "enum": ["certain","probable","possible"] },
                 "cursor":                 { "type": "string" },
                 "include_dirty":          include_dirty_prop()
             },
@@ -266,6 +267,16 @@ fn confidence_token(c: Confidence) -> &'static str {
     }
 }
 
+fn tier_token(t: Tier) -> &'static str {
+    match t {
+        Tier::NameSyntactic => "name_syntactic",
+        Tier::ScopeGraph => "scope_graph",
+        Tier::Scip => "scip",
+        Tier::ChaRta => "cha_rta",
+        Tier::PointsTo => "points_to",
+    }
+}
+
 /// Build the edge filter from the optional `edge_condition` / `confidence` args.
 fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
     let mut filter = EdgeFilter::calls();
@@ -401,6 +412,9 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
     } else if let Some(c) = opt_str(args, "exclude_edge_condition") {
         filter.condition = ConditionFilter::Exclude(parse_condition(c)?);
     }
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
     let walker = PathWalker {
         filter,
         max_depth: Some(opt_u32(args, "max_depth")?.unwrap_or(DEFAULT_PATHS_MAX_DEPTH)),
@@ -491,7 +505,11 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
                 "condition": condition_token(e.condition),
                 "confidence": confidence_token(e.confidence),
                 "peer_file": e.peer.file,
-                "peer_line": e.peer.line_start
+                "peer_line": e.peer.line_start,
+                "tier": tier_token(e.tier),
+                "rule": e.rule,
+                "resolution_source": e.resolution_source,
+                "site": e.site.as_ref().map(|s| json!({ "file": s.file, "line": s.line }))
             })
         })
         .collect();

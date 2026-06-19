@@ -37,6 +37,8 @@ struct EdgeSpec {
     kind: EdgeKind,
     condition: EdgeCondition,
     confidence: Confidence,
+    tier: Tier,
+    rule: String,
 }
 
 impl Default for GraphBuilder {
@@ -143,6 +145,28 @@ impl GraphBuilder {
         )
     }
 
+    /// A call edge stamped with an explicit resolution `tier`/`rule` (and
+    /// confidence) — for asserting `explain` provenance (P7/IF-6).
+    pub fn calls_prov(
+        mut self,
+        src: &str,
+        dst: &str,
+        confidence: Confidence,
+        tier: Tier,
+        rule: &str,
+    ) -> Self {
+        self.edges.push(EdgeSpec {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            kind: EdgeKind::Calls,
+            condition: EdgeCondition::Always,
+            confidence,
+            tier,
+            rule: rule.to_string(),
+        });
+        self
+    }
+
     fn edge(
         mut self,
         src: &str,
@@ -157,6 +181,8 @@ impl GraphBuilder {
             kind,
             condition,
             confidence,
+            tier: Tier::ScopeGraph,
+            rule: "test".to_string(),
         });
         self
     }
@@ -206,8 +232,8 @@ impl GraphBuilder {
                 kind: e.kind,
                 condition: e.condition,
                 confidence: e.confidence,
-                tier: Tier::ScopeGraph,
-                rule: "test".to_string(),
+                tier: e.tier,
+                rule: e.rule.clone(),
                 site_id: None,
                 stmt_index: None,
                 cut_markers: Default::default(),

@@ -334,6 +334,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-scip"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "cgx-store"
 version = "0.1.0"
 dependencies = [

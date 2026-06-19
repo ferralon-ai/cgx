@@ -19,12 +19,28 @@
 //! extracted; files no adapter handles are skipped and counted, never
 //! mis-parsed.
 
-use crate::error::Result;
+pub mod scip_relabel;
+
+use std::path::{Path, PathBuf};
+
+use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{link, FileInput, LinkOpts, ResolvedGraph};
+use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
+
+pub use scip_relabel::ScipStats;
+
+/// Optional ingestion sources layered onto a base index run. `Default` (all
+/// `None`) reproduces the Phase-1 pipeline byte-for-byte.
+#[derive(Debug, Clone, Default)]
+pub struct IndexOpts {
+    /// Path to a `.scip` index to ingest for the SCIP upgrade-only re-label pass
+    /// (design §3.5). `None` ⇒ no SCIP pass; the graph is stored as linked.
+    pub scip: Option<PathBuf>,
+}
 
 /// Counters describing what an index run did. The incremental win is observable
 /// here: a re-index of an unchanged tree reports `blobs_extracted == 0` and
@@ -45,6 +61,8 @@ pub struct IndexStats {
     pub edges: usize,
     /// Refs that resolved to no target (recorded as cut markers, never dropped).
     pub unresolved: usize,
+    /// SCIP re-label counters, present only when an index was run with `--scip`.
+    pub scip: Option<ScipStats>,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -163,6 +181,33 @@ pub(crate) fn extract_and_link<S: FactStore>(
     stats.unresolved = graph.unresolved.len();
 
     Ok((graph, stats))
+}
+
+/// Apply the SCIP upgrade-only re-label pass (design §3.5) to `graph` in place
+/// when `opts.scip` is set, updating `stats` with the SCIP counters and any edge
+/// count change (dependency edges). A `None` `opts.scip` is a no-op — the graph
+/// and stats are byte-identical to the Phase-1 path.
+pub(crate) fn apply_scip(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    opts: &IndexOpts,
+) -> Result<()> {
+    let Some(scip_path) = opts.scip.as_ref() else {
+        return Ok(());
+    };
+    let bytes = read_scip(scip_path)?;
+    let resolver = ScipResolver::from_bytes(&bytes)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
+    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+    stats.scip = Some(scip_stats);
+    Ok(())
+}
+
+fn read_scip(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| IndexError::Scip(format!("reading SCIP index {path:?}: {e}")))
 }
 
 /// Materialize `graph` into the store under `tree_oid`, returning its graph id.

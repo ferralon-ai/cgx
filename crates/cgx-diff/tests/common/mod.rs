@@ -61,7 +61,7 @@ impl TestRepo {
     /// Index the current committed HEAD tree into the store, returning its graph.
     pub fn index_head(&mut self) -> (GraphId, LinkedGraph) {
         let registry = default_registry();
-        let outcome = index_path(&self.path, &registry, &mut self.store).expect("index");
+        let outcome = index_path(&self.path, &registry, &mut self.store, &Default::default()).expect("index");
         let graph = self.store.read_graph(outcome.graph_id).expect("read");
         (outcome.graph_id, graph)
     }

@@ -556,14 +556,39 @@ fn emit_candidate_set(
 /// Sort nodes/edges into canonical order, assign dense edge ids, sort candidates.
 fn finalize(
     nodes: Vec<NodeWithProvenance>,
-    mut edges: Vec<EdgeWithProvenance>,
-    mut candidates: Vec<Candidate>,
+    edges: Vec<EdgeWithProvenance>,
+    candidates: Vec<Candidate>,
     mut unresolved: Vec<UnresolvedRef>,
 ) -> ResolvedGraph {
-    // Nodes are already in canonical order with assigned ids (build_nodes).
+    unresolved.sort();
+    let mut graph = ResolvedGraph {
+        nodes,
+        edges,
+        candidates,
+        unresolved,
+    };
+    canonicalize(&mut graph);
+    graph
+}
+
+/// Re-establish the canonical edge order, dense [`EdgeId`] assignment, and
+/// candidate-set order on an already-built [`ResolvedGraph`].
+///
+/// This is the determinism contract (architecture §4): edges are sorted by
+/// `(src, dst, kind, stmt_index, candidate_group)` — matching
+/// [`cgx_core::sort::edge_sort_key`] — and assigned dense ids by position;
+/// candidates are sorted by `(group, rank, dst)`. Nodes are left untouched (the
+/// link step assigns their ids once at build time, before any post-pass runs).
+///
+/// [`link`] calls this internally. A post-pass that mutates edge endpoints or
+/// candidate-group membership (e.g. the SCIP relabel pass redirecting a `dst` or
+/// collapsing a group) must call it again before the graph is stored, so stored
+/// `EdgeId`s stay canonical (§7). A pass that rewrites only
+/// `confidence`/`tier`/`rule` leaves the sort key untouched and need not call it.
+pub fn canonicalize(graph: &mut ResolvedGraph) {
     // Edges: canonical order is (src, dst, kind, stmt_index, candidate_group),
     // matching cgx_core::sort::edge_sort_key. Assign dense ids by position.
-    edges.sort_by(|a, b| {
+    graph.edges.sort_by(|a, b| {
         let ka = (
             a.edge.src.0,
             a.edge.dst.0,
@@ -580,20 +605,11 @@ fn finalize(
         );
         ka.cmp(&kb)
     });
-    for (i, e) in edges.iter_mut().enumerate() {
+    for (i, e) in graph.edges.iter_mut().enumerate() {
         e.edge.id = EdgeId(i as u32);
     }
 
-    candidates.sort_by(|a, b| {
+    graph.candidates.sort_by(|a, b| {
         (a.candidate_group, a.rank, a.dst.0).cmp(&(b.candidate_group, b.rank, b.dst.0))
     });
-
-    unresolved.sort();
-
-    ResolvedGraph {
-        nodes,
-        edges,
-        candidates,
-        unresolved,
-    }
 }

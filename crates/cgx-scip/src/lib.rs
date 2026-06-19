@@ -31,6 +31,8 @@
 #![warn(missing_debug_implementations)]
 
 pub mod symbol;
+#[cfg(feature = "test-support")]
+pub mod testsupport;
 pub mod wire;
 
 use std::collections::BTreeMap;

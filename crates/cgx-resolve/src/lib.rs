@@ -72,7 +72,7 @@ mod symtab;
 
 pub use graph::{ResolvedGraph, UnresolvedRef};
 pub use input::{FileInput, LinkOpts};
-pub use link::link;
+pub use link::{canonicalize, link};
 
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.

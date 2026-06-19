@@ -28,8 +28,8 @@ use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{
-    link, run_cha, run_rta, run_sig, ChaStats, FileInput, LinkOpts, ResolvedGraph, RtaStats,
-    SigStats,
+    link, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, EffectStats, FileInput,
+    LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
@@ -75,6 +75,9 @@ pub struct IndexStats {
     /// Signature-keyed indirect-call (closure / fn-pointer) counters. Pure graph
     /// analysis that always runs, so these are always present.
     pub sig: SigStats,
+    /// GM-12 transitive effect-closure counters. Pure graph analysis that always
+    /// runs last (after confidence settles), so these are always present.
+    pub effects: EffectStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -258,6 +261,17 @@ pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.sig = run_sig(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
+}
+
+/// Apply the GM-12 transitive effect-closure post-pass (P8b, design §2.2 (E), §8)
+/// to `graph` in place, populating every node's `transitive_effects` from its
+/// `own_effects` unioned over the call family (excluding `Spawns`). It runs **last**
+/// — after every confidence pass (SCIP/CHA/RTA/sig) has settled — so the closure
+/// rides the improved edge precision. It mutates only node effect attributes (not
+/// edges or candidate groups), so no re-canonicalization is required. Updates the
+/// `effects` counters.
+pub(crate) fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.effects = run_effect_closure(graph);
 }
 
 /// Materialize `graph` into the store under `tree_oid`, returning its graph id.

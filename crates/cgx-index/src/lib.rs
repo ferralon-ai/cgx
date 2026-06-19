@@ -105,6 +105,7 @@ pub fn index_path(
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_effects(&mut graph, &mut stats);
     let graph_id = pipeline::store_graph(store, &tree_oid, None, graph)?;
     Ok(IndexOutcome {
         graph_key: tree_oid,
@@ -137,6 +138,7 @@ pub fn index_workdir(
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_effects(&mut graph, &mut stats);
     let graph_id = pipeline::store_graph(store, &key, None, graph)?;
     Ok(IndexOutcome {
         graph_key: key,

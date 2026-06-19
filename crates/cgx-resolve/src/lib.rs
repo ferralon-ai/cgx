@@ -66,6 +66,7 @@
 #![warn(missing_debug_implementations)]
 
 mod cha;
+mod effects;
 mod graph;
 mod input;
 mod link;
@@ -74,6 +75,7 @@ mod sig;
 mod symtab;
 
 pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
+pub use effects::{run_effect_closure, EffectStats};
 pub use graph::{ResolvedGraph, UnresolvedRef};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};

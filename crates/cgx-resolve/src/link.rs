@@ -7,7 +7,7 @@ use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
 use cgx_core::node::{EntrypointKind, NodeRecord, NodeWithProvenance, SymbolKind};
 use cgx_core::provenance::{Provenance, Span};
-use cgx_frontend::facts::{RawRef, RefKind, ScopeId, ScopeTree, SymbolDef};
+use cgx_frontend::facts::{ImplRelation, RawRef, RefKind, RelationKind, ScopeId, ScopeTree, SymbolDef};
 
 use crate::graph::{ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
@@ -63,6 +63,15 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
                 &mut unresolved,
                 &mut next_group,
             );
+        }
+    }
+
+    // --- Structural type/trait-lattice edges (GM-2.2): Implements / Inherits /
+    // Overrides. These are declared relations, not call sites, so they resolve
+    // by FQN-or-short-name against the symbol table and never carry a site_id. ---
+    for file in inputs {
+        for rel in &file.facts.impl_relations {
+            resolve_impl_relation(file, rel, &def_to_node, &table, &mut edges);
         }
     }
 
@@ -339,6 +348,144 @@ fn resolve_ref(
         name_path: raw.name_path.iter().cloned().collect(),
         span,
         marker: CutMarker::Unresolved,
+    });
+}
+
+/// Resolve one structural type/trait-lattice relation into a graph edge
+/// (`Implements` / `Inherits` / `Overrides`). The subject/object name paths are
+/// resolved against the symbol table; ambiguous or unresolved endpoints leave no
+/// edge (honest: a relation we cannot ground is silently absent, not invented).
+fn resolve_impl_relation(
+    file: &FileInput<'_>,
+    rel: &ImplRelation,
+    def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    table: &SymbolTable,
+    edges: &mut Vec<EdgeWithProvenance>,
+) {
+    let (src, dst, kind) = match rel.kind {
+        RelationKind::Implements | RelationKind::Inherits => {
+            // subject/object are type/trait short names; resolve the unique Type def.
+            let Some(src) = resolve_type_node(table, &rel.subject) else {
+                return;
+            };
+            let Some(dst) = resolve_type_node(table, &rel.object) else {
+                return;
+            };
+            let kind = if rel.kind == RelationKind::Implements {
+                EdgeKind::Implements
+            } else {
+                EdgeKind::Inherits
+            };
+            (src, dst, kind)
+        }
+        RelationKind::Overrides => {
+            // subject is the impl method's full FQN; object is `[Trait, method]`.
+            let impl_fqn = rel.subject.join("::");
+            let Some(src) = def_to_node.get(impl_fqn.as_str()).copied() else {
+                return;
+            };
+            let Some(dst) = resolve_trait_method(table, &rel.object) else {
+                return;
+            };
+            if src == dst {
+                return; // a default method matched to itself: no override.
+            }
+            (src, dst, EdgeKind::Overrides)
+        }
+    };
+
+    let span = Span::new(file.path.clone(), rel.span.line, rel.span.col);
+    push_structural_edge(edges, src, dst, kind, &span);
+}
+
+/// Resolve a type/trait name path to a unique `Type` node id. Prefers an exact
+/// FQN match; falls back to a unique `Type` def with the matching short name.
+fn resolve_type_node(table: &SymbolTable, name_path: &[String]) -> Option<NodeId> {
+    let joined = name_path.join("::");
+    if let Some(d) = table.def_by_fqn(&joined) {
+        if matches!(d.kind, SymbolKind::Type) {
+            return Some(d.node_id);
+        }
+    }
+    let last = name_path.last()?;
+    let types: Vec<&DefEntry> = table
+        .defs_by_short(last)
+        .iter()
+        .filter(|d| matches!(d.kind, SymbolKind::Type))
+        .collect();
+    match types.as_slice() {
+        [only] => Some(only.node_id),
+        _ => None, // unresolved or ambiguous → no edge.
+    }
+}
+
+/// Resolve a `[Trait, method]` path to the trait's method node. Prefers an exact
+/// `Trait::method` FQN; falls back to a unique Method/Function whose FQN ends in
+/// `Trait::method`.
+fn resolve_trait_method(table: &SymbolTable, name_path: &[String]) -> Option<NodeId> {
+    if name_path.len() < 2 {
+        return None;
+    }
+    let trait_name = &name_path[name_path.len() - 2];
+    let method = name_path.last()?;
+    let exact = format!("{trait_name}::{method}");
+    if let Some(d) = table.def_by_fqn(&exact) {
+        if matches!(d.kind, SymbolKind::Method | SymbolKind::Function) {
+            return Some(d.node_id);
+        }
+    }
+    let suffix = format!("::{trait_name}::{method}");
+    let hits: Vec<&DefEntry> = table
+        .defs_by_short(method)
+        .iter()
+        .filter(|d| {
+            matches!(d.kind, SymbolKind::Method | SymbolKind::Function) && d.fqn.ends_with(&suffix)
+        })
+        .collect();
+    match hits.as_slice() {
+        [only] => Some(only.node_id),
+        _ => None,
+    }
+}
+
+/// Push a structural (non-call) edge at `Certain`/`ScopeGraph`: these relations
+/// are stated directly in source (`impl Trait for T`), so they are not
+/// over-approximations. No site_id, no candidate group.
+fn push_structural_edge(
+    edges: &mut Vec<EdgeWithProvenance>,
+    src: NodeId,
+    dst: NodeId,
+    kind: EdgeKind,
+    span: &Span,
+) {
+    let rule = match kind {
+        EdgeKind::Implements => "impl-relation",
+        EdgeKind::Inherits => "supertrait",
+        EdgeKind::Overrides => "trait-override",
+        _ => "impl-relation",
+    };
+    let record = EdgeRecord {
+        id: EdgeId(0),
+        src,
+        dst,
+        kind,
+        condition: cgx_core::condition::EdgeCondition::Always,
+        confidence: Confidence::Certain,
+        tier: Tier::ScopeGraph,
+        rule: rule.to_owned(),
+        site_id: None,
+        stmt_index: None,
+        cut_markers: CutMarkers::new(),
+        implicit: None,
+        candidate_group: None,
+        established_by: None,
+        cfg_condition: None,
+        macro_origin: None,
+    };
+    let prov = Provenance::new(span.clone(), rule, Tier::ScopeGraph, String::new());
+    edges.push(EdgeWithProvenance {
+        edge: record,
+        provenance: prov,
     });
 }
 

@@ -58,8 +58,8 @@ pub mod registry;
 // --- Primary surface ---
 
 pub use facts::{
-    CutHint, EntrypointHint, ExportFact, FileFacts, ImportFact, ImportedName, Name, RawRef,
-    RefKind, Scope, ScopeId, ScopeTree, SymbolDef,
+    CutHint, EntrypointHint, ExportFact, FileFacts, ImplRelation, ImportFact, ImportedName, Name,
+    RawRef, RefKind, RelationKind, Scope, ScopeId, ScopeTree, SymbolDef,
 };
 pub use fallback::FallbackFrontend;
 pub use frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};

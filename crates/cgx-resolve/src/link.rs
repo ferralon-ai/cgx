@@ -219,6 +219,49 @@ fn resolve_ref(
     };
     let virtual_receiver = matches!(raw.kind, RefKind::CallVirtualReceiver);
 
+    // --- Step 0: indirect call through a function value (closure / fn-pointer /
+    // callback). These cannot be bound to a single target by name: the value that
+    // flows to the call site is not named at the call (`f(x)` where `f` is a
+    // closure binding or a `fn(i32) -> i32` parameter). The frontend has no static
+    // type for the value, so name resolution would either misfire on an unrelated
+    // same-named def or leave it dangling. Emit a single placeholder edge carrying
+    // the syntactic call-site arity in the denormalized `rule` (`indirect:<arity>`
+    // — same no-schema encoding pattern as the SCIP dep-attr suffix). The P6
+    // signature post-pass (`crate::sig`) replaces it with the signature-compatible
+    // candidate set over `Lambda` + free `Function` nodes. Arity-less sites encode
+    // `indirect:?`. (DF-18 value-flow narrowing — which closure actually flows here
+    // — is Phase 3 and explicitly out of scope.)
+    if matches!(raw.kind, RefKind::CallClosure | RefKind::CallCallback) {
+        let arity_tag = raw.arity.map(|a| a.to_string()).unwrap_or_else(|| "?".to_owned());
+        push_edge(
+            edges,
+            EdgeBuild {
+                src: caller_id,
+                // Self-edge sentinel: the placeholder has no real target until the
+                // signature post-pass expands it; `canonicalize` keeps it stable and
+                // `crate::sig::run_sig` drops it when building the candidate set.
+                dst: caller_id,
+                kind: edge_kind(raw.kind, false),
+                confidence: Confidence::Possible,
+                tier: Tier::NameSyntactic,
+                rule: "indirect",
+                raw,
+                caller_fqn: &caller.fqn,
+                span: &span,
+                candidate_group: None,
+            },
+        );
+        // Stamp the call-site arity into the denormalized rule string
+        // (`indirect:<arity>`) — `EdgeBuild::rule` is `&'static`, so the dynamic
+        // arity tag is written after the push. Read back by `crate::sig`.
+        if let Some(e) = edges.last_mut() {
+            let r = format!("indirect:{arity_tag}");
+            e.edge.rule = r.clone();
+            e.provenance.rule = r;
+        }
+        return;
+    }
+
     // --- Step 1: same-file lexical resolution (Pass A). ---
     // A bare name (single segment) that resolves to a same-file def in an
     // enclosing scope is a direct, unambiguous call → certain (Tier 1 intra-file).

@@ -63,7 +63,7 @@ mod registry;
 pub use error::{IndexError, Result};
 pub use git::{compute_blob_oid, Repo, SourceFile};
 pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
-pub use cgx_resolve::{ChaStats, RtaStats};
+pub use cgx_resolve::{ChaStats, RtaStats, SigStats};
 pub use pipeline::{IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 
@@ -104,6 +104,7 @@ pub fn index_path(
     pipeline::apply_scip(&mut graph, &mut stats, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats);
     let graph_id = pipeline::store_graph(store, &tree_oid, None, graph)?;
     Ok(IndexOutcome {
         graph_key: tree_oid,
@@ -135,6 +136,7 @@ pub fn index_workdir(
     pipeline::apply_scip(&mut graph, &mut stats, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats);
     let graph_id = pipeline::store_graph(store, &key, None, graph)?;
     Ok(IndexOutcome {
         graph_key: key,

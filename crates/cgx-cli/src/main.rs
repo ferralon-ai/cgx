@@ -312,6 +312,12 @@ fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>) -> Result<(), CliErro
             s.rta.sites_pruned, s.rta.candidates_dropped, s.rta.sites_guarded_by_cut
         );
     }
+    if s.sig.sites_resolved > 0 || s.sig.sites_unmatched > 0 {
+        println!(
+            "  sig: {} indirect sites resolved, {} unmatched, {} supernode (cut-marked)",
+            s.sig.sites_resolved, s.sig.sites_unmatched, s.sig.supernode_sites
+        );
+    }
     Ok(())
 }
 

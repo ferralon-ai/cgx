@@ -27,7 +27,10 @@ use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
-use cgx_resolve::{link, run_cha, run_rta, ChaStats, FileInput, LinkOpts, ResolvedGraph, RtaStats};
+use cgx_resolve::{
+    link, run_cha, run_rta, run_sig, ChaStats, FileInput, LinkOpts, ResolvedGraph, RtaStats,
+    SigStats,
+};
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
 
@@ -69,6 +72,9 @@ pub struct IndexStats {
     /// RTA instantiation-pruning counters. RTA is pure graph analysis and always
     /// runs after CHA, so these are always present.
     pub rta: RtaStats,
+    /// Signature-keyed indirect-call (closure / fn-pointer) counters. Pure graph
+    /// analysis that always runs, so these are always present.
+    pub sig: SigStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -237,6 +243,19 @@ pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// construction view is incomplete. Updates the edge count and the `rta` counters.
 pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.rta = run_rta(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+}
+
+/// Apply the signature-keyed indirect-call post-pass (P6, design §4.4) to `graph`
+/// in place, replacing the link pass's indirect-call placeholder edges
+/// (`rule = "indirect:<arity>"`) with signature-compatible candidate sets over
+/// `Lambda` + free `Function` nodes (`possible`, `rule = "sig-compat"`). It acts on
+/// a disjoint set of edge kinds (`CallsClosure`/`CallsCallback`/`CallsIndirect`)
+/// from CHA/RTA's `CallsVirtual`, so ordering relative to them is immaterial; it
+/// runs last. Updates the edge count and the `sig` counters.
+pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.sig = run_sig(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
 }

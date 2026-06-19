@@ -69,12 +69,14 @@ mod cha;
 mod graph;
 mod input;
 mod link;
+mod rta;
 mod symtab;
 
 pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
 pub use graph::{ResolvedGraph, UnresolvedRef};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};
+pub use rta::{run_rta, RtaStats};
 
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.

@@ -27,7 +27,7 @@ use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
-use cgx_resolve::{link, run_cha, ChaStats, FileInput, LinkOpts, ResolvedGraph};
+use cgx_resolve::{link, run_cha, run_rta, ChaStats, FileInput, LinkOpts, ResolvedGraph, RtaStats};
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
 
@@ -66,6 +66,9 @@ pub struct IndexStats {
     /// CHA trait-scoping counters. CHA is pure graph analysis and always runs
     /// (with or without `--scip`), so these are always present.
     pub cha: ChaStats,
+    /// RTA instantiation-pruning counters. RTA is pure graph analysis and always
+    /// runs after CHA, so these are always present.
+    pub rta: RtaStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -221,6 +224,19 @@ fn read_scip(path: &Path) -> Result<Vec<u8>> {
 /// and the `cha` counters.
 pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.cha = run_cha(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+}
+
+/// Apply the RTA instantiation-pruning post-pass (design §4.3) to `graph` in
+/// place, narrowing the CHA trait-scoped candidate sets to the reachably
+/// instantiated types and upgrading the survivors `possible → probable`. Pure
+/// graph analysis with no external input, so it always runs — per the precedence
+/// ladder (§5) it runs **after** [`apply_cha`] (RTA narrows CHA's set). The
+/// cut-marker guard (design §4.3 step 3) prevents pruning a site whose
+/// construction view is incomplete. Updates the edge count and the `rta` counters.
+pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.rta = run_rta(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
 }

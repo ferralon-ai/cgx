@@ -306,6 +306,12 @@ fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>) -> Result<(), CliErro
             s.cha.sites_rescoped, s.cha.supernode_sites
         );
     }
+    if s.rta.sites_pruned > 0 || s.rta.sites_guarded_by_cut > 0 {
+        println!(
+            "  rta: {} sites pruned ({} candidates dropped), {} cut-guarded",
+            s.rta.sites_pruned, s.rta.candidates_dropped, s.rta.sites_guarded_by_cut
+        );
+    }
     Ok(())
 }
 

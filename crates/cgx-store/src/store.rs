@@ -317,8 +317,8 @@ impl FactStore for SqliteStore {
         {
             let mut node_stmt = tx.prepare(
                 "INSERT INTO nodes(graph_id, node_id, kind, fqn, file, line_start, line_end,
-                                   lang, visibility, entrypoint_kind, signature, data)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                                   lang, visibility, entrypoint_kind, signature, own_effects, data)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
             for n in &g.nodes {
                 node_stmt.execute(params![
@@ -333,6 +333,7 @@ impl FactStore for SqliteStore {
                     enum_token(n.visibility),
                     n.entrypoint_kind.map(enum_token),
                     n.signature.as_ref().map(|s| s.canonical()),
+                    effect_labels(n.own_effects),
                     encode(n)?,
                 ])?;
             }
@@ -470,4 +471,15 @@ fn enum_token<T: serde::Serialize>(value: T) -> String {
     // these enums all `#[serde(rename_all=...)]` to a unit string, which we
     // recover via a tiny in-crate serializer.
     crate::token::to_token(&value)
+}
+
+/// Render an [`EffectSet`](cgx_core::EffectSet) to the denormalized `own_effects`
+/// column: the canonical effect labels in fixed iteration order, `,`-joined
+/// (e.g. `blocking,io.file`). Empty set → empty string. Deterministic.
+fn effect_labels(effects: cgx_core::EffectSet) -> String {
+    effects
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }

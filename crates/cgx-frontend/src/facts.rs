@@ -16,6 +16,7 @@
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::ImplicitKind;
+use cgx_core::effect::EffectSet;
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::Signature;
@@ -277,6 +278,24 @@ pub struct EntrypointHint {
     pub kind: EntrypointKind,
 }
 
+/// A syntactic own-effect fact for one symbol (GM-12 Phase 1, architecture §5).
+///
+/// The frontend detects effects by the *names* of the call/macro targets in a
+/// function's body (a heuristic, hence `possible`-grade — see
+/// [`EffectSet`](cgx_core::effect::EffectSet)). It records the union of effects
+/// for one definition, keyed by that definition's local FQN; the resolver stamps
+/// the set onto the matching node's
+/// [`own_effects`](cgx_core::node::NodeRecord::own_effects) at link time. A
+/// frontend that detects no effects emits no fact for the symbol.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectFact {
+    /// Local FQN of the symbol these effects belong to (matches a
+    /// [`SymbolDef::fqn`]).
+    pub fqn: String,
+    /// The detected own-effect set for that symbol.
+    pub effects: EffectSet,
+}
+
 /// A hint that some call edges are structurally invisible at this site
 /// (architecture §5 `CutHint`, GM-5.3 / ADR-07). The frontend records the cut
 /// so the edge is never silently dropped; the resolver stamps the marker on the
@@ -312,6 +331,9 @@ pub struct FileFacts {
     pub entrypoint_hints: Vec<EntrypointHint>,
     /// Cut hints (GM-5.3 / ADR-07).
     pub cut_hints: Vec<CutHint>,
+    /// Syntactic own-effect facts (GM-12 Phase 1), one per symbol with any
+    /// detected effect.
+    pub effects: Vec<EffectFact>,
 }
 
 impl FileFacts {
@@ -339,6 +361,7 @@ impl FileFacts {
         self.exports.sort();
         self.entrypoint_hints.sort();
         self.cut_hints.sort();
+        self.effects.sort();
         for r in &mut self.refs {
             r.cut_markers.sort_unstable();
             r.cut_markers.dedup();
@@ -356,5 +379,6 @@ impl FileFacts {
             && self.exports.is_empty()
             && self.entrypoint_hints.is_empty()
             && self.cut_hints.is_empty()
+            && self.effects.is_empty()
     }
 }

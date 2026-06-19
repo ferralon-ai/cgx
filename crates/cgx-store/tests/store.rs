@@ -38,6 +38,36 @@ fn linked_graph_round_trips_identically() {
 }
 
 #[test]
+fn own_effects_survive_the_round_trip() {
+    use cgx_core::Effect;
+    let mut store = open();
+    let g = sample_graph();
+    let id = store.put_graph(&TreeOid::new("tree-fx"), None, &g).unwrap();
+    let back = store.read_graph(id).unwrap();
+
+    // node1 in the sample graph carries io.file + nondeterministic.
+    let n1 = back.nodes.iter().find(|n| n.id.0 == 1).expect("node 1");
+    assert!(n1.own_effects.contains(Effect::IoFile));
+    assert!(n1.own_effects.contains(Effect::Nondeterministic));
+    assert_eq!(n1.own_effects.len(), 2);
+    // transitive_effects is P8b's job: unpopulated in Phase 1.
+    assert!(n1.transitive_effects.is_empty());
+}
+
+#[test]
+fn own_effects_column_is_denormalized_for_sql() {
+    let mut store = open();
+    store
+        .put_graph(&TreeOid::new("tree-fxcol"), None, &sample_graph())
+        .unwrap();
+    // The canonical-string projection is queryable via the v_symbols view.
+    let n = store
+        .query_count("SELECT COUNT(*) FROM v_symbols WHERE own_effects = 'io.file,nondeterministic'")
+        .unwrap();
+    assert_eq!(n, 1, "denormalized own_effects column reflects the label list");
+}
+
+#[test]
 fn empty_graph_round_trips() {
     let mut store = open();
     let g = LinkedGraph::default();
@@ -276,6 +306,8 @@ prop_compose! {
             is_abstract: false,
             entrypoint_kind: None,
             signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
         }
     }
 }

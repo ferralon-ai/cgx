@@ -16,6 +16,8 @@ fn node(fqn: &str, file: &str, line: u32) -> NodeRecord {
         is_abstract: false,
         entrypoint_kind: None,
         signature: None,
+        own_effects: cgx_core::EffectSet::new(),
+        transitive_effects: cgx_core::EffectSet::new(),
     }
 }
 

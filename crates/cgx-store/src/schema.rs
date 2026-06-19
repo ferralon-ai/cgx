@@ -19,12 +19,18 @@
 
 /// Physical schema version. Bumped when the table layout changes incompatibly;
 /// opening a file with a higher version is a hard error (forward-incompatible).
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 (GM-12 Phase 1): adds the `nodes.own_effects` denormalized column. The
+/// authoritative effect data rides in the `data` blob (postcard of `NodeRecord`);
+/// the column is a `--sql`-visible projection of the canonical effect-label list.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// View-schema version (ADR-05), surfaced via the `cgx_meta` view. Bumped only on
 /// view-breaking changes (renamed/removed columns or views), independently of the
 /// physical `SCHEMA_VERSION`.
-pub const VIEW_SCHEMA_VERSION: i64 = 1;
+///
+/// v2 (GM-12 Phase 1): `v_symbols` gains an additive `own_effects` column.
+pub const VIEW_SCHEMA_VERSION: i64 = 2;
 
 /// `cgx_meta_kv` key under which the physical schema version is stored.
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -73,6 +79,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     visibility  TEXT NOT NULL,
     entrypoint_kind TEXT,
     signature   TEXT,                    -- canonical signature string, denormalized
+    own_effects TEXT NOT NULL DEFAULT '', -- GM-12: canonical effect labels, ','-joined
     data        BLOB NOT NULL,           -- canonical postcard of the NodeRecord
     PRIMARY KEY (graph_id, node_id)
 );
@@ -113,7 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(graph_id, src);
 -- ---- ADR-05 versioned read views (the only SQL-visible contract) -------------
 CREATE VIEW IF NOT EXISTS v_symbols AS
     SELECT graph_id, node_id, kind, fqn, file, line_start, line_end,
-           lang, visibility, entrypoint_kind, signature
+           lang, visibility, entrypoint_kind, signature, own_effects
     FROM nodes;
 
 CREATE VIEW IF NOT EXISTS v_call_edges AS

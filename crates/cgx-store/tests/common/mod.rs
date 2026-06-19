@@ -27,6 +27,8 @@ pub fn sample_graph() -> LinkedGraph {
                 type_params: vec![],
                 receiver: None,
             }),
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
         },
         NodeRecord {
             id: NodeId(1),
@@ -50,6 +52,11 @@ pub fn sample_graph() -> LinkedGraph {
                 type_params: vec![],
                 receiver: Some("Conn".into()),
             }),
+            own_effects: cgx_core::EffectSet::from_iter_canonical([
+                cgx_core::Effect::IoFile,
+                cgx_core::Effect::Nondeterministic,
+            ]),
+            transitive_effects: cgx_core::EffectSet::new(),
         },
         NodeRecord {
             id: NodeId(2),
@@ -63,6 +70,8 @@ pub fn sample_graph() -> LinkedGraph {
             is_abstract: false,
             entrypoint_kind: None,
             signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
         },
     ];
 

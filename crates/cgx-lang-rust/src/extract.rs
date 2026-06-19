@@ -13,17 +13,19 @@
 //! `loop` only inside a loop *body*, `exception` inside an `Err`-arm body or as
 //! the `?`-twin of a call, and `panic` at the panicking macro/method site itself.
 
+use crate::effects::effects_of_call;
 use crate::module::module_path_for;
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::ImplicitKind;
+use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::{Param, Signature};
 use cgx_frontend::{
-    CutHint, EntrypointHint, EntrypointKind, ExportFact, FileCtx, FileFacts, FrontendError,
-    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, RawRef, RefKind, RelationKind,
-    RelPath, ScopeId, SymbolDef,
+    CutHint, EffectFact, EntrypointHint, EntrypointKind, ExportFact, FileCtx, FileFacts,
+    FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, RawRef, RefKind,
+    RelationKind, RelPath, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use tree_sitter::{Node, Parser};
@@ -41,7 +43,7 @@ impl RustFrontend {
 
 /// Version of the Rust extraction rules; bumping invalidates cached fragments
 /// (architecture §3 `frontend_version`).
-const RUST_FRAGMENT_VERSION: u32 = 1;
+const RUST_FRAGMENT_VERSION: u32 = 2;
 
 impl LanguageFrontend for RustFrontend {
     fn lang(&self) -> Lang {
@@ -156,6 +158,10 @@ struct Builder<'a> {
     file: String,
     facts: FileFacts,
     extern_fns: Vec<String>,
+    /// Accumulated syntactic own-effects (GM-12 Phase 1), keyed by the enclosing
+    /// definition's local FQN. Flushed into `facts.effects` in [`Builder::finish`].
+    /// A `BTreeMap` keeps the flush order deterministic.
+    effects: std::collections::BTreeMap<String, EffectSet>,
 }
 
 impl<'a> Builder<'a> {
@@ -165,11 +171,32 @@ impl<'a> Builder<'a> {
             file: file.to_string(),
             facts: FileFacts::empty(),
             extern_fns: Vec::new(),
+            effects: std::collections::BTreeMap::new(),
         }
     }
 
-    fn finish(self) -> FileFacts {
+    fn finish(mut self) -> FileFacts {
+        for (fqn, set) in self.effects {
+            if !set.is_empty() {
+                self.facts.effects.push(EffectFact { fqn, effects: set });
+            }
+        }
         self.facts
+    }
+
+    /// Record detected own-effects against the function whose body encloses the
+    /// current site. Inside a function/method body, `ctx.fqn_prefix` is that
+    /// callable's FQN (set by [`Ctx::enter_body`]); at module level there is no
+    /// enclosing callable and the keyed FQN will not match any callable def, so
+    /// the resolver drops it harmlessly.
+    fn record_effects(&mut self, ctx: &Ctx, set: EffectSet) {
+        if set.is_empty() {
+            return;
+        }
+        self.effects
+            .entry(ctx.fqn_prefix.clone())
+            .or_default()
+            .union_with(set);
     }
 
     /// Pre-scan for `extern "C" { fn name; }` declarations so call sites to them
@@ -641,6 +668,9 @@ impl<'a> Builder<'a> {
     fn walk_call_expression(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         if let Some(func) = node.child_by_field_name("function") {
             let func_text = self.text(func);
+            // GM-12 own-effect detection: the textual callee implies effects
+            // regardless of which call form (plain / constructor / method) follows.
+            self.record_effects(ctx, effects_of_call(&func_text));
             if is_spawn_path(&func_text) {
                 self.record_spawn(node, ctx, stmt_index);
                 self.walk_spawn_children(node, ctx, stmt_index);
@@ -986,6 +1016,9 @@ impl<'a> Builder<'a> {
     // --- spawn ---
 
     fn record_spawn(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        // The spawn site is both a Spawns *edge* (recorded below) and a `spawns`
+        // own-effect *label* on the enclosing function (GM-12).
+        self.record_effects(ctx, EffectSet::single(Effect::Spawns));
         let Some(args) = node.child_by_field_name("arguments") else {
             return;
         };

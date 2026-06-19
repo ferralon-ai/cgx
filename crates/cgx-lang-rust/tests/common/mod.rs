@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use cgx_core::condition::EdgeCondition;
+use cgx_core::effect::EffectSet;
 use cgx_frontend::{
     FileCtx, FileFacts, LanguageFrontend, RawRef, RefKind, RelationKind, SymbolDef,
 };
@@ -99,6 +100,17 @@ pub fn relations_of(facts: &FileFacts, kind: RelationKind) -> Vec<(String, Strin
         .filter(|r| r.kind == kind)
         .map(|r| (r.subject.join("::"), r.object.join("::")))
         .collect()
+}
+
+/// The detected own-effects for the symbol with the given FQN. Empty set when
+/// the frontend recorded no effect fact for that FQN.
+pub fn effects_of(facts: &FileFacts, fqn: &str) -> EffectSet {
+    facts
+        .effects
+        .iter()
+        .find(|e| e.fqn == fqn)
+        .map(|e| e.effects)
+        .unwrap_or_default()
 }
 
 /// All Instantiate refs' target name paths (joined with `::`).

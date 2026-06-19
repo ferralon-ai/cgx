@@ -100,6 +100,17 @@ fn build_nodes(
                 .iter()
                 .find(|(fqn, _)| *fqn == def.fqn)
                 .map(|(_, k)| *k);
+            // GM-12 Phase 1: stamp the frontend's syntactic own-effects onto the
+            // matching def. Only callable kinds carry effects; a non-callable def
+            // with a same-named effect fact (cannot happen for the Rust frontend,
+            // which keys by enclosing-fn FQN) would still pick it up harmlessly.
+            let own_effects = file
+                .facts
+                .effects
+                .iter()
+                .find(|e| e.fqn == def.fqn)
+                .map(|e| e.effects)
+                .unwrap_or_default();
             let record = NodeRecord {
                 id: NodeId(0), // assigned after sort
                 kind: def.kind,
@@ -112,6 +123,9 @@ fn build_nodes(
                 is_abstract: def.is_abstract,
                 entrypoint_kind,
                 signature,
+                own_effects,
+                // P8b populates this via the transitive closure pass; empty here.
+                transitive_effects: cgx_core::EffectSet::new(),
             };
             let prov = Provenance::new(
                 def.span.clone(),

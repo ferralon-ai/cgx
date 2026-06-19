@@ -35,6 +35,8 @@ fn node(id: u32, fqn: &str, file: &str, line: u32) -> NodeWithProvenance {
             is_abstract: false,
             entrypoint_kind: None,
             signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
         },
         provenance: Provenance::new(Span::new(file, line, None), "def", Tier::ScopeGraph, String::new()),
     }

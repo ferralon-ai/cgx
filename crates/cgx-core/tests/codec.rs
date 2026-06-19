@@ -28,6 +28,11 @@ fn sample_node() -> NodeRecord {
             type_params: vec![],
             receiver: Some("Connection".into()),
         }),
+        own_effects: cgx_core::EffectSet::from_iter_canonical([
+            cgx_core::Effect::IoFile,
+            cgx_core::Effect::Blocking,
+        ]),
+        transitive_effects: cgx_core::EffectSet::new(),
     }
 }
 

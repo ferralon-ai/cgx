@@ -323,6 +323,8 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             is_abstract: false,
             entrypoint_kind: None,
             signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
         });
         self.external_nodes.insert(qname.to_string(), idx);
         NodeId(self.graph.nodes.len() as u32 + idx as u32)

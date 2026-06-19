@@ -376,6 +376,19 @@ cgx query --sql '
 
 The `cgx query` command is implemented in the `cgx-cql` crate (crates/cgx-cql). This section documents what runs today versus what the spec above describes but has not yet been built.
 
+> **v0.2 update (shipped).** As of the v0.2 "Semantic precision" release:
+> - **`--confidence` now discriminates.** CHA/RTA `dyn Trait` resolution and SCIP enrichment raise
+>   edge tiers, so a `probable`/`certain` floor (CLI or `{confidence: "certain"}` in CQL) excludes
+>   lower-tier edges instead of accepting everything. Pre-v0.2 the flag parsed but did not narrow.
+> - **`cgx index --scip <index.scip>`** is available: an upgrade-only re-label pass over a
+>   **user-supplied** SCIP index (cgx does not generate one). It records `resolution_source: scip`
+>   provenance and cross-crate `scip-dep:` edges.
+> - **`cgx explain`** shows per-edge provenance: confidence **tier**, the resolution **rule**,
+>   `resolution_source`, and the call **site**.
+>
+> Effect node attributes (`own_effects`/`transitive_effects`) exist on nodes from v0.2 but are **not**
+> queryable as CQL node properties yet (see "Deferred in v1" — effect *queries* are a later phase).
+
 ### Supported in v1
 
 **MATCH patterns**

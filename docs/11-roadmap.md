@@ -33,7 +33,7 @@ The ordering prioritizes:
 - Edge condition labels (`always`, `conditional`) from AST structure; `exception` labeling for explicit `try`/`catch`/`recover`/`?` patterns; `panic` labeling for `panic!`/`unwrap`/`abort` paths (syntactic approximation)
 - **GM-9 — Spawn edges**: `spawns` edge kind for thread/task/goroutine spawn sites; syntactic detection of `tokio::spawn`, `thread::spawn`, `go` statements, unhandled `async` IIFEs; `.then`/`.catch` continuations are tracked as `calls:async` edges (not spawn) per LS-7.1; detached error domain flag (exceptional propagation stops at spawn edges)
 - **GM-10 — Suspension points**: `suspends` property on call-site nodes for `await`/`yield` points; per-language lowering table per LS-7
-- **GM-12 — Function effect system (syntactic tier)**: syntactic effect labels (`blocking`, `spawns`, `io.file`, `io.net`, `io.proc`, `dynamic-code`, `nondeterministic`) on function nodes; transitive closure deferred to Phase 2
+- **GM-12 — Function effect system (syntactic tier)**: syntactic effect labels (`blocking`, `spawns`, `io.file`, `io.net`, `io.proc`, `dynamic-code`, `nondeterministic`) on function nodes; transitive closure deferred to Phase 2. *(Shipped in Phase 2/v0.2, not Phase 1: syntactic own-effects (P8a) and the transitive closure (P8b) both landed in v0.2. See the Phase 2 status note below.)*
 - **GM-13 — Resource lifecycle pairs (schema reservation)**: built-in per-language pair defaults declared in config schema; `acquire`/`release` attributes reserved on call-edge nodes; pairing analysis deferred to Phase 3
 - **GM-11 — Synchronization context (schema reservation)**: lock-set attribute schema reserved on call edges; lock identity tracking deferred to Phase 3
 - **GM-14 — Code-trust boundaries (syntactic tier)**: `unsafe` region and FFI boundary (`extern "C"`, JNI, `#[no_mangle]`) detection syntactically; cut-marker `via-FFI` on crossing edges; dependency-edge attribution via SCIP in Phase 2
@@ -133,6 +133,26 @@ Phase 1 is complete when:
 **Persona question themes addressed:**
 - Extends all Phase 1 themes with higher-fidelity results
 - Security engineer filtering by confidence tier (Q3, Q7, Q10)
+
+### Phase 2 status: shipped in v0.2
+
+Phase 2 shipped as the **v0.2 "Semantic precision"** release. What landed:
+
+- **SCIP ingestion** — `cgx index --scip <index.scip>`: upgrade-only re-label (`certain` for free
+  fns / inherent methods, `probable` for trait/dyn), with GM-14 cross-crate `scip-dep:` edges.
+  *Caveat:* the user must **supply** a SCIP index (e.g. `rust-analyzer --emit=scip`); cgx does not
+  generate one. Validated on synthetic fixtures — real-emitter end-to-end verification is a
+  documented v0.2 follow-up (rust-analyzer was unavailable in the build environment).
+- **CHA/RTA `dyn Trait` resolution** (automatic, no `--scip` needed): trait-scoped candidate sets
+  (`possible`), RTA prune to instantiated types (`probable`), cut-marker-guarded.
+- **Discriminating `--confidence`** — `probable`/`certain` floors now exclude lower-tier edges.
+- **`--explain` provenance** (tier / rule / resolution_source / site) and the MCP `confidence` param.
+- **GM-12 effects** — syntactic own-effects + transitive closure (`own_effects`/`transitive_effects`
+  node attrs). *Caveat:* heuristic, name-based, `possible`-grade; no v0.2 query consumes effects yet
+  (effect queries are Phase 3).
+
+Not advertised: Rust closure / fn-ptr indirect-call resolution (the Rust frontend emits no
+indirect-call refs; closure sig-sets exist on the TypeScript frontend only).
 
 ---
 
@@ -489,7 +509,7 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | GM-9 | Spawn edges | schema-room | Phase 1 | Phase 1 (syntactic), Phase 2 (semantic) | `spawns` edge kind; syntactic detection of thread/task spawn sites in Phase 1; SCIP-level cross-crate spawn resolution in Phase 2 |
 | GM-10 | Suspension points | schema-room | Phase 1 | Phase 1 | Syntactic: `await`/`yield` call-site property; per-language lowering in LS-7 |
 | GM-11 | Synchronization context and lock sets | schema-room | Phase 1 | Phase 3 | Reserve lock-set attribute on call edges in Phase 1; intra-function lock tracking in Phase 3; interprocedural summary in Phase 3 |
-| GM-12 | Function effect system | core-extension | Phase 1 | Phase 1 (syntactic), Phase 2 (transitive) | Syntactic effects (`blocking`, `spawns`, `io.*`) in Phase 1; transitive closure after edge confidence improves in Phase 2 |
+| GM-12 | Function effect system | core-extension | Phase 1 | Phase 2 (syntactic own + transitive) | Syntactic own-effects (`blocking`, `spawns`, `io.*`) and the transitive closure both shipped in Phase 2/v0.2 (P8a/P8b) as `own_effects`/`transitive_effects` node attrs; heuristic, `possible`-grade. No query consumes effects yet — effect queries are Phase 3 |
 | GM-13 | Resource lifecycle pairs | schema-room | Phase 1 | Phase 3 | Declare built-in pairs per language in Phase 1; Q-22 pairing predicate analysis in Phase 3 |
 | GM-14 | Code-trust boundaries | schema-room | Phase 1 | Phase 1 (unsafe/FFI syntactic), Phase 2 (dependency edges via SCIP) | `unsafe` region and FFI boundary detection is syntactic and available in Phase 1; cross-crate dependency edges with package+version require SCIP enrichment in Phase 2 |
 | DF-9 | Join (union) pedigree nodes | core-extension | Phase 3 | Phase 3 | Extends the pedigree model in Phase 3's dataflow implementation |

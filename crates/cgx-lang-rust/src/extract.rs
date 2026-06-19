@@ -14,7 +14,7 @@
 //! the `?`-twin of a call, and `panic` at the panicking macro/method site itself.
 
 use crate::effects::effects_of_call;
-use crate::module::module_path_for;
+use crate::module::module_path_for_pkg;
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::ImplicitKind;
@@ -42,8 +42,10 @@ impl RustFrontend {
 }
 
 /// Version of the Rust extraction rules; bumping invalidates cached fragments
-/// (architecture §3 `frontend_version`).
-const RUST_FRAGMENT_VERSION: u32 = 2;
+/// (architecture §3 `frontend_version`). v3: FQN crate root now derives from the
+/// owning `Cargo.toml` package for `src/`-at-root / no-`src` layouts (previously
+/// the hardcoded `rust_sample` default), so v2 fragments may carry stale roots.
+const RUST_FRAGMENT_VERSION: u32 = 3;
 
 impl LanguageFrontend for RustFrontend {
     fn lang(&self) -> Lang {
@@ -72,7 +74,7 @@ impl LanguageFrontend for RustFrontend {
             None => return Ok(FileFacts::empty()),
         };
 
-        let module_prefix = module_path_for(ctx.path.as_str());
+        let module_prefix = module_path_for_pkg(ctx.path.as_str(), ctx.package.as_deref());
         let mut builder = Builder::new(src, ctx.path.as_str());
         // First pass over top-level items collects extern fn names so calls to
         // them can be marked via-FFI regardless of declaration order.

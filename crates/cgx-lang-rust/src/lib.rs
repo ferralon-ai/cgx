@@ -41,4 +41,4 @@ mod extract;
 mod module;
 
 pub use extract::RustFrontend;
-pub use module::module_path_for;
+pub use module::{module_path_for, module_path_for_pkg};

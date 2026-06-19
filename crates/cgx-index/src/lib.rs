@@ -55,6 +55,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cargo_pkg;
 mod error;
 mod git;
 mod pipeline;

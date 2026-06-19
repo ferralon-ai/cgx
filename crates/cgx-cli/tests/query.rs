@@ -186,11 +186,11 @@ fn query_tabular_human_aligns_columns() {
     // Header row carries the column names; a body row carries an edge.
     assert!(out.contains("a.name") && out.contains("b.name"), "header: {out}");
     assert!(
-        out.contains("rust_sample::main") && out.contains("rust_sample::alpha"),
+        out.contains("fixture::main") && out.contains("fixture::alpha"),
         "main -> alpha row present: {out}"
     );
     assert!(
-        out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::helper::beta"),
         "beta appears as a callee: {out}"
     );
 }
@@ -276,7 +276,7 @@ fn query_sarif_logical_location_when_no_file_column() {
     assert!(!results.is_empty(), "results present: {out}");
     let logical = &results[0]["locations"][0]["logicalLocations"][0]["fullyQualifiedName"];
     assert!(
-        logical.as_str().map(|s| s.contains("rust_sample")).unwrap_or(false),
+        logical.as_str().map(|s| s.contains("fixture")).unwrap_or(false),
         "logical location carries the fqn: {out}"
     );
 }
@@ -302,7 +302,7 @@ fn query_reads_at_file_source() {
     let (out, code) = run_cgx(&repo, &["query", &format!("@{}", qfile.display())]);
     assert_eq!(code, 0, "@file query exits 0: {out}");
     assert!(
-        out.contains("rust_sample::main"),
+        out.contains("fixture::main"),
         "@file query produces rows: {out}"
     );
 }
@@ -423,9 +423,9 @@ fn query_at_prior_commit_shows_different_graph() {
     assert_eq!(ch, 0, "--at HEAD exits 0: {head}");
     assert_eq!(cp, 0, "--at HEAD~1 exits 0: {prior}");
     // HEAD has `gamma`; HEAD~1 does not.
-    assert!(head.contains("rust_sample::gamma"), "HEAD has gamma: {head}");
+    assert!(head.contains("fixture::gamma"), "HEAD has gamma: {head}");
     assert!(
-        !prior.contains("rust_sample::gamma"),
+        !prior.contains("fixture::gamma"),
         "HEAD~1 lacks gamma: {prior}"
     );
     assert_ne!(head, prior, "the two refs produce different graphs");
@@ -439,11 +439,11 @@ fn at_ref_is_shared_with_layer1_subcommands() {
     let (prior, code) = run_cgx(&repo, &["callees", "main", "--at", "HEAD~1"]);
     assert_eq!(code, 0, "callees --at exits 0: {prior}");
     assert!(
-        prior.contains("rust_sample::alpha"),
+        prior.contains("fixture::alpha"),
         "alpha is reachable at HEAD~1: {prior}"
     );
     assert!(
-        !prior.contains("rust_sample::gamma"),
+        !prior.contains("fixture::gamma"),
         "gamma did not exist at HEAD~1: {prior}"
     );
 }
@@ -453,7 +453,7 @@ fn at_ref_is_shared_with_layer1_subcommands() {
 /// The whole-path CQL query that yields a `main → beta` path (matches the Layer-1
 /// `paths main beta` result over the same fixture).
 const PATH_QUERY: &str = "MATCH p = (a)-[:CALLS*1..3]->(b) \
-     WHERE a.name = \"rust_sample::main\" AND b.name = \"rust_sample::helper::beta\" RETURN p";
+     WHERE a.name = \"fixture::main\" AND b.name = \"fixture::helper::beta\" RETURN p";
 
 #[test]
 fn paths_dot_emitter() {
@@ -464,7 +464,7 @@ fn paths_dot_emitter() {
     assert!(out.starts_with("digraph cgx {"), "dot header: {out}");
     assert!(out.contains("->"), "dot has edges: {out}");
     assert!(
-        out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::main") && out.contains("fixture::helper::beta"),
         "dot labels carry the fqns: {out}"
     );
 }
@@ -487,7 +487,7 @@ fn paths_d2_emitter() {
     assert_eq!(code, 0, "paths --format d2 exits 0: {out}");
     assert!(out.contains(" -> "), "d2 has node->node statements: {out}");
     assert!(
-        out.contains("rust_sample::main"),
+        out.contains("fixture::main"),
         "d2 carries the fqns: {out}"
     );
 }

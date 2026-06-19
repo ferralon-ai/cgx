@@ -8,24 +8,50 @@
 //! - `src/main.rs`, `src/lib.rs`, and any `mod.rs` map to their directory's
 //!   module (no extra segment from the file stem).
 //! - `src/errors.rs` → `<crate>::errors`; `src/a/b.rs` → `<crate>::a::b`.
-//! - The crate name is the segment before `src/`, or a default when the path is
-//!   already rooted at `src/` (the fixtures live at `src/…` with an implicit
-//!   crate root).
+//! - The crate name is the segment before `src/`, or — when the path is already
+//!   rooted at `src/` (a single-crate-at-root layout) or has no `src/` at all —
+//!   the owning package name supplied by the indexer (from `Cargo.toml`),
+//!   falling back to a default only when nothing is known.
 //!
 //! [`FileCtx`]: cgx_frontend::FileCtx
 
-/// Default crate name when the path is rooted at `src/` with no crate segment in
-/// front of it. Matches the WP-02 Rust fixture crate (`rust-sample` → the Rust
-/// identifier `rust_sample`).
+/// Default crate name when neither the path nor the indexer supplies a crate
+/// root (no crate directory before `src/`, and no owning `Cargo.toml` package).
+/// Matches the WP-02 Rust fixture crate (`rust-sample` → the Rust identifier
+/// `rust_sample`), a true last resort.
 const DEFAULT_CRATE: &str = "rust_sample";
 
-/// Derive the `::`-separated module path prefix for a repo-relative Rust file.
+/// Derive the `::`-separated module path prefix for a repo-relative Rust file,
+/// with no knowledge of the owning package. Equivalent to
+/// [`module_path_for_pkg`] with `package = None`: the crate root is read off the
+/// path (the workspace-layout case) or falls back to [`DEFAULT_CRATE`].
 ///
 /// The returned string never has a trailing `::`; a top-level `src/main.rs`
 /// yields just the crate name. Path separators are normalized to `/`.
 pub fn module_path_for(rel_path: &str) -> String {
+    module_path_for_pkg(rel_path, None)
+}
+
+/// Derive the `::`-separated module path prefix for a repo-relative Rust file,
+/// preferring `package` (the owning `Cargo.toml`'s `[package] name`, already
+/// normalized to the Rust crate identifier) when the crate root cannot be read
+/// off the path.
+///
+/// Crate-root precedence:
+/// 1. the directory immediately before `src/` (workspace layout — unchanged);
+/// 2. else `package` (single-crate-at-root / no-`src` layout);
+/// 3. else [`DEFAULT_CRATE`] (no `Cargo.toml` was found).
+///
+/// `package` is assumed already normalized (hyphens → underscores); the indexer
+/// normalizes when it parses `Cargo.toml` so the FQN matches the crate
+/// identifier rust-analyzer emits in SCIP symbols.
+pub fn module_path_for_pkg(rel_path: &str, package: Option<&str>) -> String {
     let norm = rel_path.replace('\\', "/");
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+
+    // The fallback crate root for the cases where the path carries no crate
+    // directory: the owning package (preferred) or the last-resort default.
+    let fallback_crate = || package.map(str::to_string).unwrap_or_else(|| DEFAULT_CRATE.to_string());
 
     // Find the `src` boundary. Everything before it (if anything) is the crate
     // directory; everything after it forms the module path.
@@ -34,7 +60,7 @@ pub fn module_path_for(rel_path: &str) -> String {
     let (crate_name, mod_segments): (String, &[&str]) = match src_idx {
         Some(i) => {
             let crate_name = if i == 0 {
-                DEFAULT_CRATE.to_string()
+                fallback_crate()
             } else {
                 // The directory immediately before `src` is the crate name.
                 to_crate_ident(segments[i - 1])
@@ -42,8 +68,8 @@ pub fn module_path_for(rel_path: &str) -> String {
             (crate_name, &segments[i + 1..])
         }
         // No `src/` in the path: treat the whole thing as module segments under
-        // the default crate.
-        None => (DEFAULT_CRATE.to_string(), &segments[..]),
+        // the owning package (or the default).
+        None => (fallback_crate(), &segments[..]),
     };
 
     let mut out = crate_name;

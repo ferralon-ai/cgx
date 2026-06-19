@@ -124,9 +124,9 @@ fn callees_finds_transitive_target() {
     let (out, code) = run_cgx(&repo, &["callees", "main"]);
     assert_eq!(code, 0);
     // main → alpha → beta: both appear.
-    assert!(out.contains("rust_sample::alpha"), "alpha reached: {out}");
+    assert!(out.contains("fixture::alpha"), "alpha reached: {out}");
     assert!(
-        out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::helper::beta"),
         "beta reached: {out}"
     );
 }
@@ -139,11 +139,11 @@ fn callers_finds_all_callers_of_beta() {
     assert_eq!(code, 0);
     // beta is called directly by alpha and orphan.
     assert!(
-        out.contains("rust_sample::alpha"),
+        out.contains("fixture::alpha"),
         "alpha is a caller: {out}"
     );
     assert!(
-        out.contains("rust_sample::orphan"),
+        out.contains("fixture::orphan"),
         "orphan is a caller: {out}"
     );
 }
@@ -226,7 +226,7 @@ fn query_auto_indexes_when_no_store_exists() {
     let (out, code) = run_cgx(&repo, &["callees", "main"]);
     assert_eq!(code, 0, "auto-indexed query should succeed: {out}");
     assert!(
-        out.contains("rust_sample::alpha"),
+        out.contains("fixture::alpha"),
         "auto-indexed query answers correctly: {out}"
     );
     assert!(
@@ -278,13 +278,13 @@ fn explain_happy_path_reports_provenance() {
     let (out, code) = run_cgx(&repo, &["explain", "alpha"]);
     assert_eq!(code, 0, "explain of a known symbol exits 0: {out}");
     // alpha is called by main and calls beta.
-    assert!(out.contains("rust_sample::alpha"), "names the symbol: {out}");
+    assert!(out.contains("fixture::alpha"), "names the symbol: {out}");
     assert!(
         out.contains("callers: 1, callees: 1"),
         "reports caller/callee counts: {out}"
     );
     assert!(
-        out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::main") && out.contains("fixture::helper::beta"),
         "lists both incident edges: {out}"
     );
     // P7/IF-6: each incident edge now renders its resolution tier and rule.
@@ -422,7 +422,7 @@ fn unused_reports_orphan() {
     assert_eq!(code, 0);
     // `orphan` is reachable from no entrypoint (only `main` is).
     assert!(
-        out.contains("rust_sample::orphan"),
+        out.contains("fixture::orphan"),
         "orphan is unused: {out}"
     );
 }

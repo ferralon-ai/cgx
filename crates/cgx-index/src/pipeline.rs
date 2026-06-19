@@ -23,6 +23,7 @@ pub mod scip_relabel;
 
 use std::path::{Path, PathBuf};
 
+use crate::cargo_pkg::PackageMap;
 use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
@@ -102,6 +103,12 @@ pub(crate) fn extract_and_link<S: FactStore>(
 
     let mut stats = IndexStats::default();
 
+    // Resolve each file's owning package from the Cargo manifests in the source
+    // set (workspace-aware), so FQNs root at the real crate name even for the
+    // `src/`-at-root / no-`src` layouts the path alone can't disambiguate. This
+    // is what lets the `--scip` join match real rust-analyzer symbols.
+    let pkg_map = PackageMap::from_sources(sources);
+
     // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
     // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
@@ -136,7 +143,9 @@ pub(crate) fn extract_and_link<S: FactStore>(
         .par_iter()
         .map(|src| {
             let rel = RelPath::new(src.rel_path.clone());
-            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone());
+            let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+                .with_package(package);
             let facts = registry.extract(&src.content, &ctx)?;
             let bytes = encode(&facts)?;
             let version = registry.frontend_for(&rel).fragment_version();

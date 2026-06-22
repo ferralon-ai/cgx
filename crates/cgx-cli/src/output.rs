@@ -13,6 +13,8 @@ use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
 use cgx_query::{Explanation, GraphView, NeighborResult, PathResult, PathSet, TruncationReason};
 use serde_json::{json, Value};
 
+use crate::forest::{self, ForestData};
+
 /// The output format selected by `--format` (IF-3 subset for Phase-1 CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Format {
@@ -192,8 +194,15 @@ fn sarif_kind(node: &NodeRecord) -> String {
 /// The result set a subcommand produced, in a format-agnostic shape so all three
 /// emitters share one rendering path (and the assertion layer one count).
 pub enum ResultSet {
-    /// `callers`/`callees`/`reaches-all`: reached symbols.
-    Neighbors(Vec<NeighborResult>),
+    /// `callers`/`callees`/`reaches-all`: reached symbols. `forest` is the resolved
+    /// induced sub-graph used for the default human (forest) rendering; the
+    /// `results` vec backs the unchanged JSON/SARIF flat-neighbor path. `forest` is
+    /// `None` only when the command has no forest view (none today — kept optional
+    /// so an empty/zero-match result need not synthesize a payload).
+    Neighbors {
+        results: Vec<NeighborResult>,
+        forest: Option<ForestData>,
+    },
     /// `paths`: enumerated paths plus the honest truncation marker.
     Paths(PathSet),
     /// `unused`: whole symbols.
@@ -354,7 +363,7 @@ impl ResultSet {
     /// The result count the assertion layer gates on (IF-5).
     pub fn len(&self) -> usize {
         match self {
-            ResultSet::Neighbors(v) => v.len(),
+            ResultSet::Neighbors { results, .. } => results.len(),
             ResultSet::Paths(v) => v.len(),
             ResultSet::Nodes(v) => v.len(),
             ResultSet::Table(t) => t.rows.len(),
@@ -534,10 +543,18 @@ fn render_d2(g: GraphData) -> String {
 fn render_human(results: &ResultSet) -> String {
     let mut lines: Vec<String> = Vec::new();
     match results {
-        ResultSet::Neighbors(v) => {
-            for n in v {
-                lines.push(Finding::from_neighbor(n).human_line());
+        // Neighbor sets (callers/callees/reaches <from>) render as the ASCII
+        // forest by default — the native human view. When the result is empty the
+        // forest payload renders nothing, so we fall through to `(no results)`.
+        ResultSet::Neighbors { forest, .. } => {
+            if let Some(data) = forest {
+                let rendered = forest::render(data);
+                if rendered.is_empty() {
+                    return "(no results)\n".to_string();
+                }
+                return rendered;
             }
+            return "(no results)\n".to_string();
         }
         ResultSet::Nodes(v) => {
             for node in v {
@@ -635,7 +652,9 @@ fn render_json(results: &ResultSet, vacuous: bool) -> String {
         return render_table_json(t, vacuous);
     }
     let items: Vec<Value> = match results {
-        ResultSet::Neighbors(v) => v.iter().map(|n| Finding::from_neighbor(n).json()).collect(),
+        ResultSet::Neighbors { results, .. } => {
+            results.iter().map(|n| Finding::from_neighbor(n).json()).collect()
+        }
         ResultSet::Nodes(v) => v.iter().map(|n| Finding::from_node(n).json()).collect(),
         ResultSet::Paths(v) => v.paths.iter().map(path_json).collect(),
         ResultSet::Table(_) => unreachable!("handled above"),
@@ -725,7 +744,7 @@ fn path_json(p: &PathResult) -> Value {
 pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> Value {
     let rid = rule_id(subcommand);
     let mut sarif_results: Vec<Value> = match results {
-        ResultSet::Neighbors(v) => v
+        ResultSet::Neighbors { results, .. } => results
             .iter()
             .map(|n| Finding::from_neighbor(n).sarif(&rid))
             .collect(),

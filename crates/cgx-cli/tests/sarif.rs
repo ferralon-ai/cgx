@@ -57,15 +57,18 @@ fn edge(id: u32, src: u32, dst: u32, cond: EdgeCondition, conf: Confidence) -> E
 fn sample_neighbors() -> ResultSet {
     let n = node(2, "auth::validate", "src/auth.rs", 42);
     let e = edge(0, 1, 2, EdgeCondition::Exception, Confidence::Probable);
-    ResultSet::Neighbors(vec![NeighborResult {
-        node: n,
-        depth: 1,
-        via: e,
-        condition: EdgeCondition::Exception,
-        confidence: Confidence::Probable,
-        min_confidence_on_path: Confidence::Probable,
-        exception_transient: true,
-    }])
+    ResultSet::Neighbors {
+        results: vec![NeighborResult {
+            node: n,
+            depth: 1,
+            via: e,
+            condition: EdgeCondition::Exception,
+            confidence: Confidence::Probable,
+            min_confidence_on_path: Confidence::Probable,
+            exception_transient: true,
+        }],
+        forest: None,
+    }
 }
 
 #[test]
@@ -105,7 +108,14 @@ fn sarif_surfaces_confidence_and_condition_properties() {
 
 #[test]
 fn vacuous_pass_adds_note_level_result() {
-    let doc = sarif_document("paths", &ResultSet::Neighbors(vec![]), true);
+    let doc = sarif_document(
+        "paths",
+        &ResultSet::Neighbors {
+            results: vec![],
+            forest: None,
+        },
+        true,
+    );
     let results = doc["runs"][0]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1, "the vacuous note is the only result");
     assert_eq!(

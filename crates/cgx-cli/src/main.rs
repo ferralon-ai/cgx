@@ -19,13 +19,14 @@ use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
-    callees, callers, paths as query_paths, reaches, search_symbols, unused, EdgeFilter, GraphView,
-    PathSet, PathWalker,
+    callees, callers, neighborhood, paths as query_paths, reaches, search_symbols, unused,
+    Direction, EdgeFilter, GraphView, PathSet, PathWalker, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
+use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
@@ -233,6 +234,13 @@ struct QueryArgs {
     /// report `[truncated]` on a dense graph.
     #[arg(long)]
     max_depth: Option<u32>,
+    /// Forest shape for the human view of `callers`/`callees`/`reaches <from>`:
+    /// `full` (default) expands every call edge, so a callee reached from two
+    /// callers appears under each; `spanning` renders each symbol once under its
+    /// shortest-path parent, annotating extra call sites. Ignored by non-forest
+    /// commands (`paths`, `unused`) and by machine formats.
+    #[arg(long, value_enum, default_value_t = TreeMode::Full)]
+    tree: TreeMode,
     /// Minimum confidence floor (`possible`, `probable`, `certain`).
     #[arg(long, value_enum)]
     confidence: Option<ConfidenceArg>,
@@ -425,19 +433,24 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
         Some(id) => id,
         // Zero-symbol match under --assert-empty: an empty, vacuous result.
-        None => return emit(subcommand, &args, ResultSet::Neighbors(vec![]), false, 0),
+        None => return emit(subcommand, &args, empty_neighbors(&args), false, 0),
     };
 
-    let walker = build_walker(&args);
+    let walker = build_forest_walker(&args);
+    let walk_dir = match dir {
+        NeighborDir::Callers => Direction::Backward,
+        NeighborDir::Callees => Direction::Forward,
+    };
     let results = match dir {
         NeighborDir::Callers => callers(&view, anchor, &walker),
         NeighborDir::Callees => callees(&view, anchor, &walker),
     };
+    let subgraph = neighborhood(&view, anchor, &walker, walk_dir);
 
     // Vacuity clause (b): re-run with filters stripped to learn the unfiltered count.
     let unfiltered_walker = PathWalker {
         filter: EdgeFilter::calls(),
-        max_depth: args.max_depth,
+        max_depth: forest_max_depth(args.max_depth),
         max_paths: None,
         max_steps: None,
     };
@@ -449,30 +462,61 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
     emit(
         subcommand,
         &args,
-        ResultSet::Neighbors(results),
+        neighbors_with_forest(&view, &args, results, subgraph),
         true,
         unfiltered.len(),
     )
+}
+
+/// Build a [`ResultSet::Neighbors`] carrying both the flat neighbor list (for
+/// JSON/SARIF) and the resolved forest payload (for the default human view).
+fn neighbors_with_forest(
+    view: &GraphView,
+    args: &QueryArgs,
+    results: Vec<cgx_query::NeighborResult>,
+    subgraph: Subgraph,
+) -> ResultSet {
+    let forest = ForestData::resolve(view, &subgraph, args.tree, args.max_depth);
+    ResultSet::Neighbors {
+        results,
+        forest: Some(forest),
+    }
+}
+
+/// An empty neighbor result (zero-match under `--assert-empty`), with an empty
+/// forest payload so the human path still prints `(no results)`.
+fn empty_neighbors(args: &QueryArgs) -> ResultSet {
+    let forest = ForestData::resolve(
+        &GraphView::new(Vec::new(), Vec::new(), Vec::new()),
+        &Subgraph::default(),
+        args.tree,
+        args.max_depth,
+    );
+    ResultSet::Neighbors {
+        results: Vec::new(),
+        forest: Some(forest),
+    }
 }
 
 fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliError> {
     let view = prepare_view(&args)?;
     let from_id = match resolve_anchor_lenient(&view, from, args.assert_empty)? {
         Some(id) => id,
-        None => return emit("reaches", &args, ResultSet::Neighbors(vec![]), false, 0),
+        None => return emit("reaches", &args, empty_neighbors(&args), false, 0),
     };
-    let walker = build_walker(&args);
-
     match to {
-        // `from → *`: every reachable symbol (callees machinery).
+        // `from → *`: every reachable symbol (callees machinery), as a forest. Uses
+        // the forest walker so the depth-3 default bounds the neighborhood walk.
         None => {
+            let walker = build_forest_walker(&args);
             let results = callees(&view, from_id, &walker);
+            let subgraph = neighborhood(&view, from_id, &walker, Direction::Forward);
             let unfiltered = callees(
                 &view,
                 from_id,
                 &PathWalker {
                     filter: EdgeFilter::calls(),
-                    max_depth: args.max_depth,
+                    max_depth: forest_max_depth(args.max_depth),
                     max_paths: None,
                     max_steps: None,
                 },
@@ -480,7 +524,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
             emit(
                 "reaches",
                 &args,
-                ResultSet::Neighbors(results),
+                neighbors_with_forest(&view, &args, results, subgraph),
                 true,
                 unfiltered.len(),
             )
@@ -499,6 +543,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                     )
                 }
             };
+            let walker = build_walker(&args);
             let result = reaches(&view, from_id, to_id, &walker);
             let paths = result.witness.into_iter().collect::<Vec<_>>();
             let count = paths.len();
@@ -1043,6 +1088,26 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
         max_depth: args.max_depth,
         max_paths: None,
         max_steps: None,
+    }
+}
+
+/// Resolve the effective neighborhood depth for the forest human view: an explicit
+/// `--max-depth` is honored as given; when unset it defaults to
+/// [`DEFAULT_TREE_DEPTH`] so the induced subgraph the walk collects — and thus both
+/// the `full` and `spanning` renders that consume it — is bounded by default. This
+/// is the single place the depth-3 default is applied, so the walk itself is
+/// bounded (no unbounded collection) and both tree modes inherit the same bound.
+fn forest_max_depth(max_depth: Option<u32>) -> Option<u32> {
+    Some(max_depth.unwrap_or(DEFAULT_TREE_DEPTH))
+}
+
+/// Build the neighborhood walker for the forest human path. Identical to
+/// [`build_walker`] except the depth is resolved via [`forest_max_depth`] so the
+/// depth-3 default bounds the walk when `--max-depth` is unset.
+fn build_forest_walker(args: &QueryArgs) -> PathWalker {
+    PathWalker {
+        max_depth: forest_max_depth(args.max_depth),
+        ..build_walker(args)
     }
 }
 

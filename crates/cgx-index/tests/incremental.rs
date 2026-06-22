@@ -15,12 +15,12 @@ fn reindex_unchanged_tree_does_no_extraction() {
     let registry = default_registry();
     let mut store = mem_store();
 
-    let first = index_path(&repo, &registry, &mut store).unwrap();
+    let first = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert!(first.stats.blobs_extracted > 0, "first run must extract");
     assert_eq!(first.stats.blobs_cached, 0, "first run has no cache");
 
     // Second run against the SAME store: every blob OID is already cached.
-    let second = index_path(&repo, &registry, &mut store).unwrap();
+    let second = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         second.stats.blobs_extracted, 0,
         "incremental no-op must re-extract nothing: {:?}",
@@ -42,7 +42,7 @@ fn changing_one_file_reextracts_only_that_blob() {
     let registry = default_registry();
     let mut store = mem_store();
 
-    let first = index_path(&repo, &registry, &mut store).unwrap();
+    let first = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     let total = first.stats.blobs_indexed;
 
     // Edit one source file and commit a new tree.
@@ -53,7 +53,7 @@ fn changing_one_file_reextracts_only_that_blob() {
     );
     commit_all(&repo, "edit direct");
 
-    let second = index_path(&repo, &registry, &mut store).unwrap();
+    let second = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         second.stats.blobs_extracted, 1,
         "exactly the one changed blob should re-extract: {:?}",
@@ -74,7 +74,7 @@ fn branch_switch_reextracts_only_changed_blobs() {
     let mut store = mem_store();
 
     // Index main.
-    let main = index_path(&repo, &registry, &mut store).unwrap();
+    let main = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     let total = main.stats.blobs_indexed;
 
     // Branch, change one file, commit, index the branch tip.
@@ -92,7 +92,7 @@ fn branch_switch_reextracts_only_changed_blobs() {
     );
     commit_all(&repo, "branch edit");
 
-    let feature = index_path(&repo, &registry, &mut store).unwrap();
+    let feature = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         feature.stats.blobs_extracted, 1,
         "branch switch should only re-extract the diverged blob: {:?}",
@@ -112,7 +112,7 @@ fn branch_switch_reextracts_only_changed_blobs() {
         .status()
         .unwrap();
     assert!(st.success());
-    let back = index_path(&repo, &registry, &mut store).unwrap();
+    let back = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         back.stats.blobs_extracted, 0,
         "returning to main extracts nothing: {:?}",
@@ -128,11 +128,11 @@ fn two_index_runs_produce_byte_identical_graph() {
 
     // Two fully independent stores; same committed tree.
     let mut store_a = mem_store();
-    let out_a = index_path(&repo, &registry, &mut store_a).unwrap();
+    let out_a = index_path(&repo, &registry, &mut store_a, &Default::default()).unwrap();
     let graph_a = read_graph(&store_a, out_a.graph_id);
 
     let mut store_b = mem_store();
-    let out_b = index_path(&repo, &registry, &mut store_b).unwrap();
+    let out_b = index_path(&repo, &registry, &mut store_b, &Default::default()).unwrap();
     let graph_b = read_graph(&store_b, out_b.graph_id);
 
     assert_eq!(out_a.graph_key, out_b.graph_key, "same tree OID key");
@@ -146,10 +146,10 @@ fn determinism_holds_for_typescript_too() {
     let registry = default_registry();
 
     let mut store_a = mem_store();
-    let id_a = index_path(&repo, &registry, &mut store_a).unwrap().graph_id;
+    let id_a = index_path(&repo, &registry, &mut store_a, &Default::default()).unwrap().graph_id;
     let a = read_graph(&store_a, id_a);
     let mut store_b = mem_store();
-    let id_b = index_path(&repo, &registry, &mut store_b).unwrap().graph_id;
+    let id_b = index_path(&repo, &registry, &mut store_b, &Default::default()).unwrap().graph_id;
     let b = read_graph(&store_b, id_b);
     assert_eq!(a, b);
 }

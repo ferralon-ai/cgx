@@ -16,6 +16,7 @@
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::ImplicitKind;
+use cgx_core::effect::EffectSet;
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::Signature;
@@ -121,6 +122,40 @@ pub struct RawRef {
     /// Cut markers the frontend already knows apply at this site (e.g. a call
     /// inside an `unsafe extern` block, a reflective dispatch). Sorted/deduped.
     pub cut_markers: SmallVec<[CutMarker; 1]>,
+}
+
+/// What kind of structural type/trait relation an [`ImplRelation`] records — the
+/// pre-resolution view of the GM-2.2 lattice edge kinds the resolver assigns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum RelationKind {
+    /// A type implements a trait (`impl Trait for T` → `T → Trait`).
+    Implements,
+    /// A trait inherits from a supertrait (`trait Sub: Super` → `Sub → Super`).
+    Inherits,
+    /// An impl method overrides a trait method (`Type::m → Trait::m`).
+    Overrides,
+}
+
+/// A structural type/trait-lattice relation extracted from a file (GM-2.2).
+///
+/// Unlike a [`RawRef`] (a call/use site), this records a *declared* relation
+/// between two named symbols: `subject` and `object` are name paths as written
+/// in source (`["Circle"]` → `["Shape"]` for `impl Shape for Circle`). The
+/// resolver maps both names to node ids and emits the corresponding structural
+/// [`EdgeKind`](cgx_core::edge::EdgeKind). For [`RelationKind::Overrides`],
+/// `subject` is the impl method's local FQN segments and `object` is the trait
+/// method's `[Trait, method]` path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ImplRelation {
+    pub kind: RelationKind,
+    /// The relation's source symbol, segment by segment.
+    pub subject: SmallVec<[Name; 2]>,
+    /// The relation's target symbol, segment by segment.
+    pub object: SmallVec<[Name; 2]>,
+    /// Source span of the declaring construct (the `impl`/`trait` header).
+    pub span: Span,
 }
 
 /// An import fact (architecture §5 `ImportFact`).
@@ -243,6 +278,24 @@ pub struct EntrypointHint {
     pub kind: EntrypointKind,
 }
 
+/// A syntactic own-effect fact for one symbol (GM-12 Phase 1, architecture §5).
+///
+/// The frontend detects effects by the *names* of the call/macro targets in a
+/// function's body (a heuristic, hence `possible`-grade — see
+/// [`EffectSet`](cgx_core::effect::EffectSet)). It records the union of effects
+/// for one definition, keyed by that definition's local FQN; the resolver stamps
+/// the set onto the matching node's
+/// [`own_effects`](cgx_core::node::NodeRecord::own_effects) at link time. A
+/// frontend that detects no effects emits no fact for the symbol.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectFact {
+    /// Local FQN of the symbol these effects belong to (matches a
+    /// [`SymbolDef::fqn`]).
+    pub fqn: String,
+    /// The detected own-effect set for that symbol.
+    pub effects: EffectSet,
+}
+
 /// A hint that some call edges are structurally invisible at this site
 /// (architecture §5 `CutHint`, GM-5.3 / ADR-07). The frontend records the cut
 /// so the edge is never silently dropped; the resolver stamps the marker on the
@@ -266,6 +319,8 @@ pub struct FileFacts {
     pub defs: Vec<SymbolDef>,
     /// Raw, unresolved references / call sites.
     pub refs: Vec<RawRef>,
+    /// Structural type/trait-lattice relations (Implements/Inherits/Overrides).
+    pub impl_relations: Vec<ImplRelation>,
     /// Import facts.
     pub imports: Vec<ImportFact>,
     /// Export facts.
@@ -276,6 +331,9 @@ pub struct FileFacts {
     pub entrypoint_hints: Vec<EntrypointHint>,
     /// Cut hints (GM-5.3 / ADR-07).
     pub cut_hints: Vec<CutHint>,
+    /// Syntactic own-effect facts (GM-12 Phase 1), one per symbol with any
+    /// detected effect.
+    pub effects: Vec<EffectFact>,
 }
 
 impl FileFacts {
@@ -298,10 +356,12 @@ impl FileFacts {
     pub fn canonicalize(&mut self) {
         self.defs.sort();
         self.refs.sort();
+        self.impl_relations.sort();
         self.imports.sort();
         self.exports.sort();
         self.entrypoint_hints.sort();
         self.cut_hints.sort();
+        self.effects.sort();
         for r in &mut self.refs {
             r.cut_markers.sort_unstable();
             r.cut_markers.dedup();
@@ -314,9 +374,11 @@ impl FileFacts {
     pub fn is_degraded_empty(&self) -> bool {
         self.defs.is_empty()
             && self.refs.is_empty()
+            && self.impl_relations.is_empty()
             && self.imports.is_empty()
             && self.exports.is_empty()
             && self.entrypoint_hints.is_empty()
             && self.cut_hints.is_empty()
+            && self.effects.is_empty()
     }
 }

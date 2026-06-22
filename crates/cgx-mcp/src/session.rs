@@ -25,7 +25,9 @@
 //! difference — the overlay digest is a function of the *edited* content only,
 //! and is identical across runs (determinism).
 
-use cgx_index::{compute_blob_oid, default_registry, index_path, index_workdir, Repo, SourceFile};
+use cgx_index::{
+    compute_blob_oid, default_registry, index_path, index_workdir, IndexOpts, Repo, SourceFile,
+};
 use cgx_query::GraphView;
 use cgx_store::{FactStore, SqliteStore};
 use std::collections::BTreeMap;
@@ -58,7 +60,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .map_err(|e| ToolError::index(format!("opening in-memory store: {e}")))?;
 
     if !include_dirty {
-        let outcome = index_path(root, &registry, &mut store)
+        let outcome = index_path(root, &registry, &mut store, &IndexOpts::default())
             .map_err(|e| ToolError::index(format!("indexing committed tree: {e}")))?;
         let view = load_view(&store, outcome.graph_id)?;
         return Ok(GraphSession {
@@ -87,7 +89,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .map_err(|e| ToolError::index(e.to_string()))?;
     let dirty_oids = dirty_synthetic_oids(&committed, &working);
 
-    let outcome = index_workdir(root, &workdir, &registry, &mut store)
+    let outcome = index_workdir(root, &workdir, &registry, &mut store, &IndexOpts::default())
         .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
     let view = load_view(&store, outcome.graph_id)?;
 

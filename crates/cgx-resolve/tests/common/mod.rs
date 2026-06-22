@@ -14,8 +14,8 @@ use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::{Param, Signature};
 use cgx_frontend::facts::{
-    EntrypointHint, ExportFact, FileFacts, ImportFact, ImportedName, RawRef, RefKind, ScopeId,
-    SymbolDef,
+    EntrypointHint, ExportFact, FileFacts, ImplRelation, ImportFact, ImportedName, RawRef, RefKind,
+    RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::smallvec;
 
@@ -161,6 +161,35 @@ impl FileBuilder {
             re_export,
             scope,
             span: Span::new("f", 1, Some(1)),
+        });
+        self
+    }
+
+    /// Add an instantiation ref (`T { .. }`, `T::new(..)`) at `scope`.
+    pub fn instantiate(&mut self, name_path: &[&str], scope: ScopeId, line: u32) -> &mut Self {
+        self.raw_ref(
+            name_path,
+            scope,
+            line,
+            RefKind::Instantiate,
+            EdgeCondition::Always,
+            None,
+        )
+    }
+
+    /// Add a structural type/trait-lattice relation.
+    pub fn relation(
+        &mut self,
+        kind: RelationKind,
+        subject: &[&str],
+        object: &[&str],
+        line: u32,
+    ) -> &mut Self {
+        self.facts.impl_relations.push(ImplRelation {
+            kind,
+            subject: subject.iter().map(|s| s.to_string()).collect(),
+            object: object.iter().map(|s| s.to_string()).collect(),
+            span: Span::new("f", line, Some(1)),
         });
         self
     }

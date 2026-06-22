@@ -1,0 +1,333 @@
+# cgx CLI Reference
+
+**Audience:** Engineers and AI agents driving cgx from the command line.
+
+Run `cgx --version` first. Parse the `0.<MINOR>.<PATCH>` after `cgx `. A capability tagged
+`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.1**.
+See `reference/versions.md` for the full ladder.
+
+> **Phantom flags — do not emit these.** They appear in upstream cookbook examples but cause
+> exit 2 in the real binary: `--depth`, `--base`, `--head`, `--from`, `--to`, `--from-class`,
+> `--to-class`, `--avoiding`, `--only-edge-condition`, `--calls-to-sink-class`, `--kind fn`,
+> and a trailing `./` positional in place of `--repo ./`. The correct names are in the
+> signatures below. See ground truth §F for the complete list.
+
+---
+
+## Index store
+
+The index lives at `.cgx/` in the repository root (`HEAD.json` + `index.db` SQLite).
+Auto-index is **on by default**: a missing `.cgx/` triggers an automatic build before the
+first query. Pass `--no-auto-index` to require an explicit index; the command exits 3 if
+the index is absent. Force a rebuild at any time with `cgx index .`. There is no
+`prune` or `clean` subcommand.
+
+---
+
+## Subcommands
+
+### `index` — build or rebuild the graph index
+
+Since: v0.1
+
+```
+cgx index <PATH>
+```
+
+| Argument | Default | Notes |
+|---|---|---|
+| `<PATH>` | required | Repository root or any subdirectory |
+
+**Example:**
+```bash
+cgx index .
+```
+
+---
+
+### `callers` — find symbols that call a given symbol
+
+Since: v0.1
+
+```
+cgx callers [OPTIONS] <SYMBOL>
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<SYMBOL>` | required | Exact qualified symbol name |
+| `--repo <PATH>` | CWD | Repository root |
+| `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+| `--at <REF>` | HEAD | Pin query to git ref |
+| `--max-depth <N>` | unlimited | Traversal depth (use `--max-depth`, not `--depth`) |
+| `--confidence <LEVEL>` | `possible` | Minimum floor: `possible`, `probable`, `certain` |
+| `--assert-empty` | off | CI: exit 1 if results found |
+| `--allow-vacuous` | off | Suppress exit 4 vacuity guard |
+| `--no-auto-index` | off | Exit 3 if index missing instead of auto-building |
+
+**Example:**
+```bash
+cgx callers MyModule::my_fn --max-depth 3 --format json
+```
+
+---
+
+### `callees` — find symbols a given symbol calls
+
+Since: v0.1
+
+```
+cgx callees [OPTIONS] <SYMBOL>
+```
+
+Accepts the same flags as `callers`.
+
+**Example:**
+```bash
+cgx callees MyModule::my_fn --max-depth 2 --format sarif
+```
+
+---
+
+### `reaches` — test whether one symbol can reach another
+
+Since: v0.1
+
+```
+cgx reaches [OPTIONS] <FROM> [TO]
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<FROM>` | required | Source symbol (exact qualified name) |
+| `[TO]` | optional | Target symbol; omit to enumerate all reachable symbols |
+| `--repo`, `--format`, `--at`, `--max-depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+
+**Example:**
+```bash
+cgx reaches FromFn ToFn --format dot
+```
+
+---
+
+### `paths` — enumerate call paths between two symbols
+
+Since: v0.1
+
+```
+cgx paths [OPTIONS] <FROM> <TO>
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<FROM>` | required | Source symbol |
+| `<TO>` | required | Target symbol |
+| `--max-depth <N>` | 6 | `0` = unlimited (work-budgeted) |
+| `--repo`, `--format`, `--at`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+
+**Example:**
+```bash
+cgx paths FromFn ToFn --max-depth 0 --format mermaid
+```
+
+---
+
+### `explain` — show provenance for a symbol
+
+Since: v0.1
+
+```
+cgx explain [OPTIONS] <SYMBOL>
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<SYMBOL>` | required | Exact qualified symbol name |
+| `--repo <PATH>` | CWD | |
+| `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+| `--no-auto-index` | off | |
+
+`explain` does **not** accept `--at`, `--assert-empty`, or `--confidence`.
+
+**Example:**
+```bash
+cgx explain MyModule::my_fn --format json
+```
+
+---
+
+### `query` — run a CQL expression against the call graph
+
+Since: v0.1 (CALLS-graph subset only — see `reference/query-language.md`)
+
+```
+cgx query [OPTIONS] <QUERY>
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<QUERY>` | required | Inline CQL string or `@/path/to/file.cql` |
+| `--repo`, `--format`, `--at`, `--max-depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+
+**Shell quoting rule:** wrap the whole query in single quotes; use double quotes inside
+for string literals. Single-quoted strings cause a parse error (`unexpected character '\''`).
+
+**Example:**
+```bash
+cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "my_fn" RETURN a.name, a.file LIMIT 10'
+```
+
+**What works today (v0.1):** `MATCH (a)-[:CALLS]->(b)`, node props `name/kind/file/line`,
+edge props `condition/confidence`, `IN [..]`, `<>`, bounded `*N` hops, `ANY/NONE`
+quantifiers, `@file.cql`, `--at`. See `reference/query-language.md` for the full
+supported/unsupported clause list.
+
+> **Never emit unbounded `CALLS*` — it hangs.** Always bound the hops: `CALLS*2`.
+
+---
+
+### `unused` — find symbols not reachable from any entrypoint
+
+Since: v0.1
+
+```
+cgx unused [OPTIONS]
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--kind <KIND>` | (all) | `function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint` — use the full word, not `fn` |
+| `--repo`, `--format`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+| `--max-depth`, `--at` | — | Accepted (exit 0) but inert for the whole-graph unused computation |
+
+`unused` has **no name or pattern filter**. To find unused symbols matching a pattern,
+run `cgx unused` (optionally with `--kind`) then grep the output.
+
+**Example:**
+```bash
+cgx unused --kind function --format sarif
+```
+
+---
+
+### `doctor` — inspect index health
+
+Since: v0.1
+
+```
+cgx doctor [OPTIONS]
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--repo <PATH>` | CWD | |
+| `--format <FMT>` | `human` | `human`, `json` |
+
+`doctor` does not accept `--at`, `--assert-empty`, `--confidence`, or `--no-auto-index`.
+
+**Example:**
+```bash
+cgx doctor --format json
+```
+
+Sample output:
+```
+trust:  HIGH   — index looks sound
+nodes:           2798
+edges:          13185  (total)
+call edges:     13171  (call-family)
+confidence distribution (call edges):
+  certain:     1369  (10.4%)
+  probable:    2823  (21.4%)
+  possible:    8979  (68.2%)
+unresolved references: 0/13171 refs unresolved  (0.0%)
+anomalies:  none
+```
+
+---
+
+### `diff` — compute graph diff between two refs
+
+Since: v0.1 (`--newer-than` only; full diff filters at v0.4)
+
+```
+cgx diff [OPTIONS] <BASE> <HEAD>
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<BASE>` | required | Base ref — **positional**, not `--base` |
+| `<HEAD>` | required | Head ref — **positional**, not `--head` |
+| `--newer-than` | off | Only new edges added at `<HEAD>` |
+| `--repo <PATH>` | CWD | |
+| `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+
+`diff` does not accept `--at`, `--assert-empty`, `--confidence`, or `--no-auto-index`.
+
+**Example:**
+```bash
+cgx diff HEAD~1 HEAD --format json
+```
+
+---
+
+### `mcp` — start the MCP STDIO server
+
+Since: v0.1
+
+```
+cgx mcp [OPTIONS]
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--root <PATH>` | CWD | Repository root served by the MCP server |
+
+Reads from stdin, writes to stdout using MCP STDIO transport (NDJSON). Five functional
+tools: `callers`, `callees`, `paths`, `unused`, `explain`. The `graph_query` tool is
+registered but **always returns an unimplemented error** — use `cgx query` via CLI
+instead. See `reference/mcp.md` for full tool schemas and MCP-vs-CLI differences.
+
+**Example:**
+```bash
+cgx mcp --root /path/to/repo
+```
+
+---
+
+## Shared flags — subcommand applicability
+
+| Flag | callers | callees | reaches | paths | query | unused | explain | doctor | diff | mcp |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
+| `--format <FMT>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
+| `--at <REF>` | Y | Y | Y | Y | Y | Y* | — | — | — | — |
+| `--max-depth <N>` | Y | Y | Y | Y | Y | Y* | — | — | — | — |
+| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | Y | — | — | — | — |
+| `--assert-empty` | Y | Y | Y | Y | Y | Y | — | — | — | — |
+| `--allow-vacuous` | Y | Y | Y | Y | Y | Y | — | — | — | — |
+| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | — | — | — |
+| `--newer-than` | — | — | — | — | — | — | — | — | Y | — |
+
+**`--format` values:** `human` (default), `json`, `sarif`, `dot`, `mermaid`, `d2`.
+`dot`, `mermaid`, and `d2` are meaningful only for path-shaped results (`reaches`,
+`paths`, or `RETURN path` queries).
+
+**`*` (on `unused`):** the binary accepts `--at`, `--max-depth`, and `--confidence` on
+`unused` (exit 0); `--max-depth`/`--at` have no effect on the unused-symbol computation,
+which is whole-graph. `--confidence` applies the edge-confidence floor when deciding
+whether an incoming edge counts as a caller.
+
+**`--confidence` values:** `possible` (default floor), `probable`, `certain`.
+Note: `certain` and `probable` are only discriminating after SCIP enrichment (v0.2).
+In v0.1 most edges are labeled `possible`; an `--assert-empty --confidence certain`
+gate may pass vacuously (exit 4). See `reference/output-and-exit.md`.
+
+---
+
+## See also
+
+- `reference/query-language.md` — supported and unsupported CQL clauses for `cgx query`
+- `reference/output-and-exit.md` — output format details, exit-code contract, CI assertion mode
+- `reference/mcp.md` — MCP tool schemas, MCP-vs-CLI defaults, pagination
+- `reference/versions.md` — full version ladder and capability since-tags

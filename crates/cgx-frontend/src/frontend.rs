@@ -83,13 +83,20 @@ impl fmt::Display for RelPath {
 ///
 /// Carries only what extraction needs and nothing the frontend must not see
 /// (no store handle, no git): the repo-relative path (drives module-path
-/// construction) and the blob OID (stamped into provenance as `index_id`).
+/// construction), the blob OID (stamped into provenance as `index_id`), and the
+/// owning package name (the crate root for FQN derivation when it cannot be read
+/// off the path — e.g. a `src/`-at-root single-crate layout).
 #[derive(Debug, Clone)]
 pub struct FileCtx {
     /// Repo-relative path of the file being extracted.
     pub path: RelPath,
     /// Git blob OID of the file at index time; recorded in provenance.
     pub blob_oid: String,
+    /// The owning package name (from the nearest ancestor `Cargo.toml`'s
+    /// `[package] name`), already normalized to the Rust crate identifier
+    /// (hyphens → underscores). `None` ⇒ the frontend derives the crate root
+    /// from the path alone (the workspace-layout case, unchanged).
+    pub package: Option<String>,
 }
 
 impl FileCtx {
@@ -97,7 +104,15 @@ impl FileCtx {
         FileCtx {
             path: RelPath::new(path),
             blob_oid: blob_oid.into(),
+            package: None,
         }
+    }
+
+    /// Set the owning package name (the crate root used for FQN derivation when
+    /// the path carries no crate directory before `src/`).
+    pub fn with_package(mut self, package: Option<String>) -> Self {
+        self.package = package;
+        self
     }
 }
 

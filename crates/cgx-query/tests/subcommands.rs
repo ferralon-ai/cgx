@@ -3,10 +3,10 @@
 
 mod common;
 
-use cgx_core::{Confidence, EdgeCondition, EntrypointKind, NodeId, SymbolKind, SymbolPattern};
+use cgx_core::{Confidence, EdgeCondition, EntrypointKind, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
-    callees, callers, paths, reaches, reaches_all, unused, Direction, EdgeFilter, GraphView,
-    PathWalker, TruncationReason,
+    callees, callers, explain, paths, reaches, reaches_all, unused, Direction, EdgeFilter,
+    GraphView, PathWalker, TruncationReason,
 };
 
 use common::{id_of, GraphBuilder};
@@ -742,4 +742,87 @@ fn out_of_range_node_id_does_not_panic() {
     // And a valid id still resolves through the same accessor.
     let a = v.resolve_one(&SymbolPattern::fqn("a")).unwrap();
     assert!(v.try_node(a).is_some());
+}
+
+// --- Q-6 / IF-6: explain surfaces tier / rule / provenance ------------------
+
+#[test]
+fn explain_surfaces_scip_provenance_on_a_scip_upgraded_edge() {
+    // A free-fn call SCIP resolved uniquely: caller -[certain @ Scip]-> callee.
+    let g = GraphBuilder::new().func("caller").func("callee").calls_prov(
+        "caller",
+        "callee",
+        Confidence::Certain,
+        Tier::Scip,
+        "scip-occurrence",
+    );
+    let v = view(g);
+    let callee = id_of(v.nodes(), "callee");
+    let e = explain(&v, callee).expect("explain");
+
+    let edge = e
+        .edges
+        .iter()
+        .find(|x| x.incoming && x.peer.fqn == "caller")
+        .expect("incoming edge from caller");
+    assert_eq!(edge.tier, Tier::Scip);
+    assert_eq!(edge.rule, "scip-occurrence");
+    assert_eq!(edge.resolution_source.as_deref(), Some("scip"));
+    assert_eq!(edge.confidence, Confidence::Certain);
+    // The call site lives in the caller's body, so file:line comes from `caller`.
+    let site = edge.site.as_ref().expect("call site span");
+    assert_eq!(site.file, v.node(id_of(v.nodes(), "caller")).file);
+}
+
+#[test]
+fn explain_surfaces_cha_provenance_on_a_dyn_dispatch_edge() {
+    // A CHA trait-scoped candidate edge: caller -[possible @ ChaRta]-> impl_method.
+    let g = GraphBuilder::new()
+        .func("caller")
+        .func("Circle_area")
+        .calls_prov(
+            "caller",
+            "Circle_area",
+            Confidence::Possible,
+            Tier::ChaRta,
+            "cha-trait-set",
+        );
+    let v = view(g);
+    let callee = id_of(v.nodes(), "Circle_area");
+    let e = explain(&v, callee).expect("explain");
+
+    let edge = e
+        .edges
+        .iter()
+        .find(|x| x.incoming && x.peer.fqn == "caller")
+        .expect("incoming edge from caller");
+    assert_eq!(edge.tier, Tier::ChaRta);
+    assert_eq!(edge.rule, "cha-trait-set");
+    // resolution_source is scip-only; a CHA edge has none.
+    assert_eq!(edge.resolution_source, None);
+}
+
+#[test]
+fn explain_outgoing_edge_takes_site_from_the_explained_symbol() {
+    // explained -[scip]-> callee: for an outgoing edge the call site is in the
+    // explained symbol's body, not the peer's.
+    let g = GraphBuilder::new().func("explained").func("callee").calls_prov(
+        "explained",
+        "callee",
+        Confidence::Certain,
+        Tier::Scip,
+        "scip-occurrence",
+    );
+    let v = view(g);
+    let explained = id_of(v.nodes(), "explained");
+    let e = explain(&v, explained).expect("explain");
+
+    let edge = e
+        .edges
+        .iter()
+        .find(|x| !x.incoming && x.peer.fqn == "callee")
+        .expect("outgoing edge to callee");
+    let site = edge.site.as_ref().expect("call site span");
+    assert_eq!(site.file, v.node(explained).file);
+    assert_eq!(site.line, v.node(explained).line_start);
 }

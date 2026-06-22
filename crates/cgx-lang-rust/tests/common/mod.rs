@@ -5,7 +5,10 @@
 #![allow(dead_code)]
 
 use cgx_core::condition::EdgeCondition;
-use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RawRef, RefKind, SymbolDef};
+use cgx_core::effect::EffectSet;
+use cgx_frontend::{
+    FileCtx, FileFacts, LanguageFrontend, RawRef, RefKind, RelationKind, SymbolDef,
+};
 use cgx_lang_rust::RustFrontend;
 use std::path::PathBuf;
 
@@ -66,5 +69,56 @@ pub fn refs_to<'a>(facts: &'a FileFacts, callee_last: &str) -> Vec<&'a RawRef> {
         .refs
         .iter()
         .filter(|r| r.name_path.last().map(String::as_str) == Some(callee_last))
+        .collect()
+}
+
+/// Whether an `impl_relations` entry of the given kind has the given subject and
+/// object name paths (joined with `::`).
+pub fn has_relation(facts: &FileFacts, kind: RelationKind, subject: &str, object: &str) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == kind && r.subject.join("::") == subject && r.object.join("::") == object
+    })
+}
+
+/// Whether an Overrides relation exists whose subject FQN ends with
+/// `subject_suffix` and whose object equals `object` (the trait method path).
+/// The subject is the impl method's full FQN (module-prefixed), so callers match
+/// the trailing `Type::method` segment without pinning the module derivation.
+pub fn has_override_suffix(facts: &FileFacts, subject_suffix: &str, object: &str) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == RelationKind::Overrides
+            && r.subject.join("::").ends_with(subject_suffix)
+            && r.object.join("::") == object
+    })
+}
+
+/// All relations of a given kind, as `(subject, object)` joined-name pairs.
+pub fn relations_of(facts: &FileFacts, kind: RelationKind) -> Vec<(String, String)> {
+    facts
+        .impl_relations
+        .iter()
+        .filter(|r| r.kind == kind)
+        .map(|r| (r.subject.join("::"), r.object.join("::")))
+        .collect()
+}
+
+/// The detected own-effects for the symbol with the given FQN. Empty set when
+/// the frontend recorded no effect fact for that FQN.
+pub fn effects_of(facts: &FileFacts, fqn: &str) -> EffectSet {
+    facts
+        .effects
+        .iter()
+        .find(|e| e.fqn == fqn)
+        .map(|e| e.effects)
+        .unwrap_or_default()
+}
+
+/// All Instantiate refs' target name paths (joined with `::`).
+pub fn instantiations(facts: &FileFacts) -> Vec<String> {
+    facts
+        .refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Instantiate)
+        .map(|r| r.name_path.join("::"))
         .collect()
 }

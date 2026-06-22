@@ -19,12 +19,32 @@
 //! extracted; files no adapter handles are skipped and counted, never
 //! mis-parsed.
 
-use crate::error::Result;
+pub mod scip_relabel;
+
+use std::path::{Path, PathBuf};
+
+use crate::cargo_pkg::PackageMap;
+use crate::error::{IndexError, Result};
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
-use cgx_resolve::{link, FileInput, LinkOpts, ResolvedGraph};
+use cgx_resolve::{
+    link, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, EffectStats, FileInput,
+    LinkOpts, ResolvedGraph, RtaStats, SigStats,
+};
+use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
+
+pub use scip_relabel::ScipStats;
+
+/// Optional ingestion sources layered onto a base index run. `Default` (all
+/// `None`) reproduces the Phase-1 pipeline byte-for-byte.
+#[derive(Debug, Clone, Default)]
+pub struct IndexOpts {
+    /// Path to a `.scip` index to ingest for the SCIP upgrade-only re-label pass
+    /// (design §3.5). `None` ⇒ no SCIP pass; the graph is stored as linked.
+    pub scip: Option<PathBuf>,
+}
 
 /// Counters describing what an index run did. The incremental win is observable
 /// here: a re-index of an unchanged tree reports `blobs_extracted == 0` and
@@ -45,6 +65,20 @@ pub struct IndexStats {
     pub edges: usize,
     /// Refs that resolved to no target (recorded as cut markers, never dropped).
     pub unresolved: usize,
+    /// SCIP re-label counters, present only when an index was run with `--scip`.
+    pub scip: Option<ScipStats>,
+    /// CHA trait-scoping counters. CHA is pure graph analysis and always runs
+    /// (with or without `--scip`), so these are always present.
+    pub cha: ChaStats,
+    /// RTA instantiation-pruning counters. RTA is pure graph analysis and always
+    /// runs after CHA, so these are always present.
+    pub rta: RtaStats,
+    /// Signature-keyed indirect-call (closure / fn-pointer) counters. Pure graph
+    /// analysis that always runs, so these are always present.
+    pub sig: SigStats,
+    /// GM-12 transitive effect-closure counters. Pure graph analysis that always
+    /// runs last (after confidence settles), so these are always present.
+    pub effects: EffectStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -68,6 +102,12 @@ pub(crate) fn extract_and_link<S: FactStore>(
     use rayon::prelude::*;
 
     let mut stats = IndexStats::default();
+
+    // Resolve each file's owning package from the Cargo manifests in the source
+    // set (workspace-aware), so FQNs root at the real crate name even for the
+    // `src/`-at-root / no-`src` layouts the path alone can't disambiguate. This
+    // is what lets the `--scip` join match real rust-analyzer symbols.
+    let pkg_map = PackageMap::from_sources(sources);
 
     // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
     // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
@@ -103,7 +143,9 @@ pub(crate) fn extract_and_link<S: FactStore>(
         .par_iter()
         .map(|src| {
             let rel = RelPath::new(src.rel_path.clone());
-            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone());
+            let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+                .with_package(package);
             let facts = registry.extract(&src.content, &ctx)?;
             let bytes = encode(&facts)?;
             let version = registry.frontend_for(&rel).fragment_version();
@@ -163,6 +205,82 @@ pub(crate) fn extract_and_link<S: FactStore>(
     stats.unresolved = graph.unresolved.len();
 
     Ok((graph, stats))
+}
+
+/// Apply the SCIP upgrade-only re-label pass (design §3.5) to `graph` in place
+/// when `opts.scip` is set, updating `stats` with the SCIP counters and any edge
+/// count change (dependency edges). A `None` `opts.scip` is a no-op — the graph
+/// and stats are byte-identical to the Phase-1 path.
+pub(crate) fn apply_scip(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    opts: &IndexOpts,
+) -> Result<()> {
+    let Some(scip_path) = opts.scip.as_ref() else {
+        return Ok(());
+    };
+    let bytes = read_scip(scip_path)?;
+    let resolver = ScipResolver::from_bytes(&bytes)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
+    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+    stats.scip = Some(scip_stats);
+    Ok(())
+}
+
+fn read_scip(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| IndexError::Scip(format!("reading SCIP index {path:?}: {e}")))
+}
+
+/// Apply the CHA trait-scoping post-pass (design §4.2) to `graph` in place,
+/// replacing the link pass's name-scoped virtual-dispatch candidate sets with
+/// trait-scoped sets from the P3 lattice. Pure graph analysis with no external
+/// input, so it always runs — per the precedence ladder (§5) it runs **after**
+/// [`apply_scip`] so SCIP-settled sites are left alone. Updates the edge count
+/// and the `cha` counters.
+pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.cha = run_cha(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+}
+
+/// Apply the RTA instantiation-pruning post-pass (design §4.3) to `graph` in
+/// place, narrowing the CHA trait-scoped candidate sets to the reachably
+/// instantiated types and upgrading the survivors `possible → probable`. Pure
+/// graph analysis with no external input, so it always runs — per the precedence
+/// ladder (§5) it runs **after** [`apply_cha`] (RTA narrows CHA's set). The
+/// cut-marker guard (design §4.3 step 3) prevents pruning a site whose
+/// construction view is incomplete. Updates the edge count and the `rta` counters.
+pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.rta = run_rta(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+}
+
+/// Apply the signature-keyed indirect-call post-pass (P6, design §4.4) to `graph`
+/// in place, replacing the link pass's indirect-call placeholder edges
+/// (`rule = "indirect:<arity>"`) with signature-compatible candidate sets over
+/// `Lambda` + free `Function` nodes (`possible`, `rule = "sig-compat"`). It acts on
+/// a disjoint set of edge kinds (`CallsClosure`/`CallsCallback`/`CallsIndirect`)
+/// from CHA/RTA's `CallsVirtual`, so ordering relative to them is immaterial; it
+/// runs last. Updates the edge count and the `sig` counters.
+pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.sig = run_sig(graph);
+    stats.edges = graph.edges.len();
+    stats.nodes = graph.nodes.len();
+}
+
+/// Apply the GM-12 transitive effect-closure post-pass (P8b, design §2.2 (E), §8)
+/// to `graph` in place, populating every node's `transitive_effects` from its
+/// `own_effects` unioned over the call family (excluding `Spawns`). It runs **last**
+/// — after every confidence pass (SCIP/CHA/RTA/sig) has settled — so the closure
+/// rides the improved edge precision. It mutates only node effect attributes (not
+/// edges or candidate groups), so no re-canonicalization is required. Updates the
+/// `effects` counters.
+pub(crate) fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+    stats.effects = run_effect_closure(graph);
 }
 
 /// Materialize `graph` into the store under `tree_oid`, returning its graph id.

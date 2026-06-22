@@ -1,5 +1,6 @@
 //! Node taxonomy (GM-1) and the call-site node kind reserved by ADR-01.
 
+use crate::effect::EffectSet;
 use crate::id::{NodeId, SiteId};
 use crate::provenance::Provenance;
 use crate::signature::Signature;
@@ -112,6 +113,18 @@ pub struct NodeRecord {
     /// Structured signature (ADR-04); `None` for non-callable kinds or when the
     /// surface declares none.
     pub signature: Option<Signature>,
+    /// Syntactic own-effects this symbol performs directly (GM-12 Phase 1). A
+    /// name-based heuristic stamped by the language frontend, so `possible`-grade:
+    /// it reflects what the body's call/macro targets *look like*, not a proven
+    /// effect. Empty for non-callable kinds and pure functions.
+    #[serde(default)]
+    pub own_effects: EffectSet,
+    /// Transitive effects: this symbol's own effects unioned with those of
+    /// everything it (transitively) calls (GM-12 Phase 2 / P8b). **Unpopulated in
+    /// Phase 1** — always empty until the P8b closure pass fills it. The field is
+    /// reserved now so P8b needs no schema change.
+    #[serde(default)]
+    pub transitive_effects: EffectSet,
 }
 
 /// A call-site node record (GM-1.4 / ADR-01). Subordinate node kind.

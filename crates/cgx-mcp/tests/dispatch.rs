@@ -91,6 +91,56 @@ fn make_dirty(repo: &Path) {
     std::fs::write(repo.join("src/main.rs"), SRC_MAIN_DIRTY).unwrap();
 }
 
+/// A two-file fixture that produces edges of *mixed* confidence: `caller_fn`
+/// makes a same-file lexical call to `local_fn` (certain) and a cross-module
+/// call to `other::remote_fn` (resolved by name → below `certain`). Used to
+/// prove the MCP `confidence` floor discriminates.
+const MIXED_MAIN_RS: &str = r#"
+mod other;
+
+fn local_fn() -> i32 { 1 }
+
+fn caller_fn() -> i32 {
+    let a = local_fn();
+    let b = other::remote_fn();
+    a + b
+}
+"#;
+
+const MIXED_OTHER_RS: &str = r#"
+pub fn remote_fn() -> i32 { 2 }
+"#;
+
+/// Create a committed two-file Rust repo with mixed-confidence call edges.
+fn init_mixed_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), MIXED_MAIN_RS).unwrap();
+    std::fs::write(repo.join("src/other.rs"), MIXED_OTHER_RS).unwrap();
+
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "cgx-test"]);
+    run_git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
 // --- request helpers --------------------------------------------------------
 
 fn req(id: i64, method: &str, params: Value) -> Request {
@@ -283,6 +333,74 @@ fn explain_reports_caller_and_callee_counts() {
     assert!(structured["edges"].as_array().unwrap().iter().any(|e| {
         e["direction"] == json!("outgoing") && e["peer"].as_str().unwrap().ends_with("leaf")
     }));
+}
+
+#[test]
+fn callees_confidence_certain_floor_drops_weaker_edges() {
+    let (_t, repo) = init_mixed_repo();
+    // Without a floor, `caller_fn` reaches both the same-file `local_fn` (certain)
+    // and the cross-module `remote_fn` (below certain).
+    let all = call_tool(&repo, "callees", json!({ "symbol": "caller_fn" }));
+    let all_names = result_names(&all, "results");
+    assert!(
+        all_names.iter().any(|n| n.ends_with("local_fn")),
+        "unfiltered callees include the certain edge: {all_names:?}"
+    );
+    assert!(
+        all_names.iter().any(|n| n.ends_with("remote_fn")),
+        "unfiltered callees include the weaker cross-module edge: {all_names:?}"
+    );
+
+    // With `confidence: certain`, only the certain edge survives.
+    let certain = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "confidence": "certain" }),
+    );
+    for r in certain["results"].as_array().expect("results array") {
+        assert_eq!(
+            r["confidence"], json!("certain"),
+            "every surviving edge is certain: {r}"
+        );
+    }
+    let certain_names = result_names(&certain, "results");
+    assert!(
+        !certain_names.iter().any(|n| n.ends_with("remote_fn")),
+        "the weaker cross-module edge is filtered out: {certain_names:?}"
+    );
+}
+
+#[test]
+fn paths_accepts_confidence_floor_in_input_schema() {
+    let request = req(1, "tools/list", json!({}));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    let tools = resp.result.expect("result")["tools"].clone();
+    let paths = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("paths"))
+        .expect("paths tool");
+    assert!(
+        paths["inputSchema"]["properties"]["confidence"].is_object(),
+        "paths tool declares a confidence param"
+    );
+}
+
+#[test]
+fn explain_edges_surface_tier_and_rule_provenance() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "explain", json!({ "symbol": "helper" }));
+    let edges = structured["edges"].as_array().expect("edges array");
+    assert!(!edges.is_empty(), "helper has incident edges");
+    for e in edges {
+        assert!(e["tier"].is_string(), "edge surfaces tier: {e}");
+        assert!(e["rule"].is_string(), "edge surfaces rule: {e}");
+        assert!(
+            e.as_object().unwrap().contains_key("resolution_source"),
+            "edge surfaces resolution_source key: {e}"
+        );
+    }
 }
 
 #[test]

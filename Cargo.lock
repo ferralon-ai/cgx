@@ -183,7 +183,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cgx-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "cgx-core",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "proptest",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-cql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-query",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-diff"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-frontend",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-doctor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-index",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-frontend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "serde",
@@ -263,13 +263,14 @@ dependencies = [
 
 [[package]]
 name = "cgx-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-frontend",
  "cgx-lang-rust",
  "cgx-lang-ts",
  "cgx-resolve",
+ "cgx-scip",
  "cgx-store",
  "gix",
  "rayon",
@@ -280,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-lang-rust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-frontend",
@@ -291,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-lang-ts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-frontend",
@@ -304,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-index",
@@ -317,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-store",
@@ -325,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "cgx-resolve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "cgx-frontend",
@@ -334,8 +335,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-scip"
+version = "0.2.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "cgx-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgx-core",
  "fd-lock",
@@ -2711,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

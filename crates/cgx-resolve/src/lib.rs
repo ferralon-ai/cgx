@@ -65,14 +65,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod cha;
+mod effects;
 mod graph;
 mod input;
 mod link;
+mod rta;
+mod sig;
 mod symtab;
 
+pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
+pub use effects::{run_effect_closure, EffectStats};
 pub use graph::{ResolvedGraph, UnresolvedRef};
 pub use input::{FileInput, LinkOpts};
-pub use link::link;
+pub use link::{canonicalize, link};
+pub use rta::{run_rta, RtaStats};
+pub use sig::{run_sig, SigStats};
 
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.

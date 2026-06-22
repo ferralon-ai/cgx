@@ -1,0 +1,19 @@
+[package]
+name = "cgx-scip"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Hand-rolled read-only SCIP (protobuf) wire decoder + SCIP-symbol → cgx-qname mapper. Zero dependencies; swap-point for a future prost reader behind the typed ScipIndex."
+
+[features]
+# Exposes the test-only `.scip` encoder (`testsupport`) so downstream crates can
+# build synthetic-but-valid SCIP byte streams in their own tests without
+# rust-analyzer. Off by default; never compiled into the production read-only API.
+test-support = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

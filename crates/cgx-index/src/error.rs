@@ -33,6 +33,10 @@ pub enum IndexError {
     /// The store rejected a read or write.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// Reading or parsing a `.scip` index supplied via `--scip` failed.
+    #[error("scip error: {0}")]
+    Scip(String),
 }
 
 impl From<CodecError> for IndexError {

@@ -58,8 +58,8 @@ pub mod registry;
 // --- Primary surface ---
 
 pub use facts::{
-    CutHint, EntrypointHint, ExportFact, FileFacts, ImportFact, ImportedName, Name, RawRef,
-    RefKind, Scope, ScopeId, ScopeTree, SymbolDef,
+    CutHint, EffectFact, EntrypointHint, ExportFact, FileFacts, ImplRelation, ImportFact,
+    ImportedName, Name, RawRef, RefKind, RelationKind, Scope, ScopeId, ScopeTree, SymbolDef,
 };
 pub use fallback::FallbackFrontend;
 pub use frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
@@ -70,6 +70,7 @@ pub use registry::FrontendRegistry;
 pub use cgx_core::condition::EdgeCondition;
 pub use cgx_core::cut::CutMarker;
 pub use cgx_core::edge::ImplicitKind;
+pub use cgx_core::effect::{Effect, EffectSet};
 pub use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 pub use cgx_core::provenance::Span;
 pub use cgx_core::signature::Signature;

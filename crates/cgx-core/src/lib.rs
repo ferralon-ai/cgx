@@ -13,6 +13,8 @@
 //!   [`ImplicitKind`], [`EstablishedBy`], [`EdgeRecord`], [`Candidate`].
 //! - Edge conditions ([`condition`]): the five-value [`EdgeCondition`] set with
 //!   the ADR-03 precedence rule.
+//! - Effects ([`effect`]): the GM-12 syntactic effect labels ([`Effect`]) and the
+//!   `u16`-bitset [`EffectSet`] carried as a node's own/transitive effects.
 //! - Confidence ([`confidence`]): the [`Confidence`] ladder and resolution
 //!   [`Tier`]s.
 //! - Cut markers ([`cut`]): [`CutMarker`] / [`CutMarkers`] (GM-5.3, ADR-07).
@@ -37,6 +39,7 @@ pub mod condition;
 pub mod confidence;
 pub mod cut;
 pub mod edge;
+pub mod effect;
 pub mod id;
 pub mod node;
 pub mod pattern;
@@ -50,6 +53,7 @@ pub use condition::EdgeCondition;
 pub use confidence::{Confidence, Tier};
 pub use cut::{CutMarker, CutMarkers};
 pub use edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance, EstablishedBy, ImplicitKind};
+pub use effect::{Effect, EffectSet};
 pub use id::{EdgeId, NodeId, NodeSortKey, SiteId};
 pub use node::{
     CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, Visibility,

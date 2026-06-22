@@ -180,7 +180,7 @@ fn full_pipeline_two_run_byte_identity() {
         let db_a = dir.path().join("store_a.db");
         let mut store = SqliteStore::open(&db_a).unwrap();
         let registry = cgx_index::default_registry();
-        let outcome = cgx_index::index_path(repo_root, &registry, &mut store).unwrap();
+        let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default()).unwrap();
         let data = store.dump_node_edge_data(outcome.graph_id).unwrap();
         let rep = cgx_doctor::report(&store, outcome.graph_id).unwrap();
         (data, outcome.graph_id, rep)
@@ -191,7 +191,7 @@ fn full_pipeline_two_run_byte_identity() {
         let db_b = dir.path().join("store_b.db");
         let mut store = SqliteStore::open(&db_b).unwrap();
         let registry = cgx_index::default_registry();
-        let outcome = cgx_index::index_path(repo_root, &registry, &mut store).unwrap();
+        let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default()).unwrap();
         let data = store.dump_node_edge_data(outcome.graph_id).unwrap();
         let rep = cgx_doctor::report(&store, outcome.graph_id).unwrap();
         (data, outcome.graph_id, rep)

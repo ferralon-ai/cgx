@@ -9,7 +9,7 @@
 //! (IF-8); formatters preserve that order and never iterate a `HashMap`, so two
 //! runs over the same index produce byte-identical output.
 
-use cgx_core::{Confidence, EdgeCondition, NodeRecord};
+use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
 use cgx_query::{Explanation, GraphView, NeighborResult, PathResult, PathSet, TruncationReason};
 use serde_json::{json, Value};
 
@@ -58,6 +58,16 @@ fn condition_str(c: EdgeCondition) -> &'static str {
         EdgeCondition::Loop => "loop",
         EdgeCondition::Exception => "exception",
         EdgeCondition::Panic => "panic",
+    }
+}
+
+fn tier_str(t: Tier) -> &'static str {
+    match t {
+        Tier::NameSyntactic => "name_syntactic",
+        Tier::ScopeGraph => "scope_graph",
+        Tier::Scip => "scip",
+        Tier::ChaRta => "cha_rta",
+        Tier::PointsTo => "points_to",
     }
 }
 
@@ -945,14 +955,23 @@ fn explanation_human(e: &Explanation) -> String {
     for edge in &e.edges {
         let arrow = if edge.incoming { "<-" } else { "->" };
         out.push_str(&format!(
-            "    {} {}  ({}:{})  [{}]  [{}]\n",
+            "    {} {}  ({}:{})  [{}]  [{}]  tier={}  rule={}",
             arrow,
             edge.peer.fqn,
             edge.peer.file,
             edge.peer.line_start,
             condition_str(edge.condition),
             confidence_str(edge.confidence),
+            tier_str(edge.tier),
+            edge.rule,
         ));
+        if let Some(src) = &edge.resolution_source {
+            out.push_str(&format!("  resolution_source={src}"));
+        }
+        if let Some(site) = &edge.site {
+            out.push_str(&format!("  site={}:{}", site.file, site.line));
+        }
+        out.push('\n');
     }
     out
 }
@@ -970,6 +989,10 @@ fn explanation_json(e: &Explanation) -> String {
                 "peer_line": edge.peer.line_start,
                 "condition": condition_str(edge.condition),
                 "confidence": confidence_str(edge.confidence),
+                "tier": tier_str(edge.tier),
+                "rule": edge.rule,
+                "resolution_source": edge.resolution_source,
+                "site": edge.site.as_ref().map(|s| json!({ "file": s.file, "line": s.line })),
             })
         })
         .collect();

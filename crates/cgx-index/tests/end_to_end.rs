@@ -17,7 +17,7 @@ fn index_fixture(fixture: &str) -> (tempfile::TempDir, cgx_store::SqliteStore, G
     let (tmp, repo) = init_fixture_repo(fixture);
     let registry = default_registry();
     let mut store = mem_store();
-    let outcome = index_path(&repo, &registry, &mut store).unwrap();
+    let outcome = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     let g = read_graph(&store, outcome.graph_id);
     (tmp, store, GraphIndexHolder { graph: g })
 }
@@ -214,7 +214,7 @@ fn both_fixtures_index_only_source_files() {
     let (tmp_r, _repo_r) = init_fixture_repo("rust-sample");
     let registry = default_registry();
     let mut store = mem_store();
-    let r = index_path(tmp_r.path().join("repo"), &registry, &mut store).unwrap();
+    let r = index_path(tmp_r.path().join("repo"), &registry, &mut store, &Default::default()).unwrap();
     assert!(r.stats.blobs_indexed >= 14, "{:?}", r.stats);
     assert!(
         r.stats.blobs_unsupported >= 1,

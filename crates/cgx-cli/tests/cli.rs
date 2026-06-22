@@ -124,9 +124,9 @@ fn callees_finds_transitive_target() {
     let (out, code) = run_cgx(&repo, &["callees", "main"]);
     assert_eq!(code, 0);
     // main → alpha → beta: both appear.
-    assert!(out.contains("rust_sample::alpha"), "alpha reached: {out}");
+    assert!(out.contains("fixture::alpha"), "alpha reached: {out}");
     assert!(
-        out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::helper::beta"),
         "beta reached: {out}"
     );
 }
@@ -139,11 +139,11 @@ fn callers_finds_all_callers_of_beta() {
     assert_eq!(code, 0);
     // beta is called directly by alpha and orphan.
     assert!(
-        out.contains("rust_sample::alpha"),
+        out.contains("fixture::alpha"),
         "alpha is a caller: {out}"
     );
     assert!(
-        out.contains("rust_sample::orphan"),
+        out.contains("fixture::orphan"),
         "orphan is a caller: {out}"
     );
 }
@@ -226,7 +226,7 @@ fn query_auto_indexes_when_no_store_exists() {
     let (out, code) = run_cgx(&repo, &["callees", "main"]);
     assert_eq!(code, 0, "auto-indexed query should succeed: {out}");
     assert!(
-        out.contains("rust_sample::alpha"),
+        out.contains("fixture::alpha"),
         "auto-indexed query answers correctly: {out}"
     );
     assert!(
@@ -278,14 +278,19 @@ fn explain_happy_path_reports_provenance() {
     let (out, code) = run_cgx(&repo, &["explain", "alpha"]);
     assert_eq!(code, 0, "explain of a known symbol exits 0: {out}");
     // alpha is called by main and calls beta.
-    assert!(out.contains("rust_sample::alpha"), "names the symbol: {out}");
+    assert!(out.contains("fixture::alpha"), "names the symbol: {out}");
     assert!(
         out.contains("callers: 1, callees: 1"),
         "reports caller/callee counts: {out}"
     );
     assert!(
-        out.contains("rust_sample::main") && out.contains("rust_sample::helper::beta"),
+        out.contains("fixture::main") && out.contains("fixture::helper::beta"),
         "lists both incident edges: {out}"
+    );
+    // P7/IF-6: each incident edge now renders its resolution tier and rule.
+    assert!(
+        out.contains("tier=") && out.contains("rule="),
+        "human format surfaces tier/rule provenance: {out}"
     );
 }
 
@@ -302,6 +307,60 @@ fn explain_json_format_is_valid_json() {
     assert!(
         parsed["edges"].as_array().map(|a| a.len()) == Some(2),
         "json lists both edges: {out}"
+    );
+    // P7/IF-6: every edge carries the new provenance fields (tier/rule always
+    // present; resolution_source/site are nullable).
+    for edge in parsed["edges"].as_array().expect("edges array") {
+        assert!(edge["tier"].is_string(), "edge carries a tier string: {out}");
+        assert!(edge["rule"].is_string(), "edge carries a rule string: {out}");
+        assert!(
+            edge.as_object().unwrap().contains_key("resolution_source"),
+            "edge carries a resolution_source key: {out}"
+        );
+        assert!(
+            edge.as_object().unwrap().contains_key("site"),
+            "edge carries a site key: {out}"
+        );
+    }
+}
+
+#[test]
+fn confidence_certain_floor_returns_only_certain_edges() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    // `main` transitively reaches `alpha` via a same-file lexical call (certain)
+    // and `helper::beta` via a cross-module call (below certain).
+    let (all, code) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    assert_eq!(code, 0, "unfiltered callees succeed: {all}");
+    let all: serde_json::Value = serde_json::from_str(&all).expect("json");
+    let all_names: Vec<&str> = all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap())
+        .collect();
+    assert!(all_names.iter().any(|n| n.ends_with("alpha")));
+    assert!(all_names.iter().any(|n| n.ends_with("beta")));
+
+    // `--confidence certain` keeps only the certain edge.
+    let (certain, code) = run_cgx(
+        &repo,
+        &["callees", "main", "--confidence", "certain", "--format", "json"],
+    );
+    assert_eq!(code, 0, "filtered callees succeed: {certain}");
+    let certain: serde_json::Value = serde_json::from_str(&certain).expect("json");
+    let results = certain["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|r| r["confidence"] == serde_json::json!("certain")),
+        "every surviving edge is certain: {certain}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|r| r["fqn"].as_str().unwrap().ends_with("beta")),
+        "the weaker cross-module edge is filtered out: {certain}"
     );
 }
 
@@ -363,7 +422,7 @@ fn unused_reports_orphan() {
     assert_eq!(code, 0);
     // `orphan` is reachable from no entrypoint (only `main` is).
     assert!(
-        out.contains("rust_sample::orphan"),
+        out.contains("fixture::orphan"),
         "orphan is unused: {out}"
     );
 }

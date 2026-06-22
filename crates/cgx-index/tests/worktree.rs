@@ -24,7 +24,7 @@ fn workdir_index_includes_uncommitted_file() {
         "pub fn brand_new_entrypoint() -> i32 { helper() }\npub fn helper() -> i32 { 7 }\n",
     );
 
-    let out = index_workdir(&repo, &repo, &registry, &mut store).unwrap();
+    let out = index_workdir(&repo, &repo, &registry, &mut store, &Default::default()).unwrap();
     let g = read_graph(&store, out.graph_id);
     let idx = GraphIndex::new(&g);
     assert!(
@@ -44,12 +44,12 @@ fn committed_then_workdir_shares_layer1_cache() {
     let mut store = mem_store();
 
     // 1) Index the committed tree (warms the Layer-1 cache).
-    let committed = index_path(&repo, &registry, &mut store).unwrap();
+    let committed = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert!(committed.stats.blobs_extracted > 0);
 
     // 2) Index the working directory with NO edits — every file's content matches
     //    its committed blob, so every blob OID is a cache hit (IX-6 sharing).
-    let work = index_workdir(&repo, &repo, &registry, &mut store).unwrap();
+    let work = index_workdir(&repo, &repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         work.stats.blobs_extracted, 0,
         "clean working dir must hit the committed Layer-1 cache: {:?}",
@@ -64,7 +64,7 @@ fn dirty_edit_reextracts_only_dirty_blob() {
     let registry = default_registry();
     let mut store = mem_store();
 
-    let committed = index_path(&repo, &registry, &mut store).unwrap();
+    let committed = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     let total = committed.stats.blobs_indexed;
 
     // Edit one file WITHOUT committing; index the working dir.
@@ -73,7 +73,7 @@ fn dirty_edit_reextracts_only_dirty_blob() {
         "src/direct.rs",
         "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
     );
-    let work = index_workdir(&repo, &repo, &registry, &mut store).unwrap();
+    let work = index_workdir(&repo, &repo, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         work.stats.blobs_extracted, 1,
         "only the dirty blob re-extracts: {:?}",
@@ -98,7 +98,7 @@ fn second_worktree_shares_layer1_cache() {
     let mut store = mem_store();
 
     // Index the main checkout's committed tree.
-    let main = index_path(&repo, &registry, &mut store).unwrap();
+    let main = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
     assert!(main.stats.blobs_extracted > 0);
 
     // Create a linked worktree on a new branch (shares .git/objects).
@@ -121,7 +121,7 @@ fn second_worktree_shares_layer1_cache() {
     );
 
     // Indexing the worktree's working dir: same content -> all cache hits.
-    let work = index_workdir(&repo, &wt_dir, &registry, &mut store).unwrap();
+    let work = index_workdir(&repo, &wt_dir, &registry, &mut store, &Default::default()).unwrap();
     assert_eq!(
         work.stats.blobs_extracted, 0,
         "worktree with identical content must reuse the shared Layer-1 cache: {:?}",

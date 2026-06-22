@@ -53,6 +53,20 @@ pub fn init_fixture_repo(fixture: &str) -> (tempfile::TempDir, PathBuf) {
     (tmp, repo)
 }
 
+/// Create a fresh, empty, deterministic git repo in a temp dir (no fixture copy).
+/// Caller writes files with [`write_file`] then commits with [`commit_all`].
+/// Returns the temp dir (kept alive by the caller) and the repo path.
+pub fn init_empty_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "cgx-test"]);
+    run_git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    (tmp, repo)
+}
+
 fn run_git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -85,6 +99,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// [`commit_all`] to commit a new tree).
 pub fn write_file(repo: &Path, rel: &str, text: &str) {
     let path = repo.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
     std::fs::write(&path, text).unwrap();
 }
 

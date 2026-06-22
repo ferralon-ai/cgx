@@ -1,0 +1,7 @@
+[package]
+name = "scip_relabel"
+version = "0.1.0"
+edition = "2021"
+
+# A deliberately tiny crate for the SCIP re-label integration + determinism
+# tests. See REGEN.md for how to (re)generate the real `.scip` blob.

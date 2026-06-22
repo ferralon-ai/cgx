@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 
 use cgx_core::{NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::BlameRepo;
-use cgx_index::{default_registry, index_path};
+use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
     callees, callers, paths as query_paths, reaches, unused, EdgeFilter, GraphView, PathSet,
@@ -45,6 +45,13 @@ enum Command {
     Index {
         /// Path to the repository (defaults to the current directory).
         path: Option<PathBuf>,
+        /// Path to a `.scip` index (e.g. from `rust-analyzer scip`) to ingest for
+        /// the SCIP semantic-precision re-label pass: name-matched call edges are
+        /// upgraded to `certain`/`probable` where SCIP gives a precise resolution,
+        /// and cross-crate dependency edges are recorded (Phase 2). Omitted ⇒ the
+        /// Phase-1 syntactic graph, unchanged.
+        #[arg(long, value_name = "SCIP_INDEX")]
+        scip: Option<PathBuf>,
     },
     /// Symbols that (transitively) call `symbol`.
     Callers {
@@ -246,7 +253,7 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path } => run_index(path),
+        Command::Index { path, scip } => run_index(path, scip),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::Reaches { from, to, query } => run_reaches(&from, to.as_deref(), query),
@@ -273,9 +280,9 @@ fn run(command: Command) -> Result<(), CliError> {
     }
 }
 
-fn run_index(path: Option<PathBuf>) -> Result<(), CliError> {
+fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
-    let outcome = index_repo(&repo_root)?;
+    let outcome = index_repo(&repo_root, &IndexOpts { scip })?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
@@ -287,6 +294,30 @@ fn run_index(path: Option<PathBuf>) -> Result<(), CliError> {
         "  graph: {} nodes, {} edges, {} unresolved",
         s.nodes, s.edges, s.unresolved
     );
+    if let Some(scip) = &s.scip {
+        println!(
+            "  scip: {} certain, {} probable, {} dep edges, {} collisions",
+            scip.upgraded_certain, scip.upgraded_probable, scip.dep_edges, scip.collisions
+        );
+    }
+    if s.cha.sites_rescoped > 0 {
+        println!(
+            "  cha: {} sites trait-scoped, {} supernode (cut-marked)",
+            s.cha.sites_rescoped, s.cha.supernode_sites
+        );
+    }
+    if s.rta.sites_pruned > 0 || s.rta.sites_guarded_by_cut > 0 {
+        println!(
+            "  rta: {} sites pruned ({} candidates dropped), {} cut-guarded",
+            s.rta.sites_pruned, s.rta.candidates_dropped, s.rta.sites_guarded_by_cut
+        );
+    }
+    if s.sig.sites_resolved > 0 || s.sig.sites_unmatched > 0 {
+        println!(
+            "  sig: {} indirect sites resolved, {} unmatched, {} supernode (cut-marked)",
+            s.sig.sites_resolved, s.sig.sites_unmatched, s.sig.supernode_sites
+        );
+    }
     Ok(())
 }
 
@@ -295,10 +326,10 @@ fn run_index(path: Option<PathBuf>) -> Result<(), CliError> {
 /// and the auto-index trigger ([`ensure_indexed`]). Deterministic and idempotent:
 /// a re-index of an unchanged tree extracts 0 blobs (IX-1) and rewrites an
 /// identical pointer.
-fn index_repo(repo_root: &Path) -> Result<cgx_index::IndexOutcome, CliError> {
+fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutcome, CliError> {
     let registry = default_registry();
     let mut store = open_store(repo_root)?;
-    let outcome = index_path(repo_root, &registry, &mut store)
+    let outcome = index_path(repo_root, &registry, &mut store, opts)
         .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
     write_pointer(
         repo_root,
@@ -330,12 +361,12 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
     match read_pointer(repo_root) {
         Ok(ptr) => match &current_tree {
             // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
-            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root).map(|_| ()),
+            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &IndexOpts::default()).map(|_| ()),
             // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
             _ => Ok(()),
         },
         // No index yet: build one.
-        Err(_) => index_repo(repo_root).map(|_| ()),
+        Err(_) => index_repo(repo_root, &IndexOpts::default()).map(|_| ()),
     }
 }
 
@@ -752,7 +783,7 @@ fn index_ref(
     }
 
     let registry = default_registry();
-    let outcome = index_path(&worktree_path, &registry, store)
+    let outcome = index_path(&worktree_path, &registry, store, &IndexOpts::default())
         .map_err(|e| CliError::graph(format!("indexing ref {commit_hex}: {e}")))?;
 
     // Remove the worktree before returning (cleanup regardless of index result).

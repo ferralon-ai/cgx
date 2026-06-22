@@ -1,0 +1,14 @@
+# Tiny fixture crate for the SCIP integration test (decision R7).
+#
+# This crate is NOT a workspace member; it is a standalone crate that
+# `rust-analyzer scip` is run over to produce `index.scip` (the committed
+# binary fixture for the P-later integration test). See REGEN.md.
+[package]
+name = "scip-sample"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[workspace]

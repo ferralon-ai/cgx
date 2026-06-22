@@ -51,7 +51,9 @@ pub mod search;
 pub mod view;
 pub mod walk;
 
-pub use engine::{callees, callers, explain, paths, reaches, reaches_all, resolve_anchor, unused};
+pub use engine::{
+    callees, callers, explain, neighborhood, paths, reaches, reaches_all, resolve_anchor, unused,
+};
 pub use search::{search_symbols, SearchError, SymbolHit};
 pub use filter::{ConditionFilter, Direction, EdgeFilter};
 pub use result::{
@@ -60,5 +62,6 @@ pub use result::{
 };
 pub use view::{EdgeRef, GraphView, ResolveError};
 pub use walk::{
-    Discovered, PathEnumeration, PathWalker, WalkStep, DEFAULT_MAX_PATHS, DEFAULT_MAX_STEPS,
+    Discovered, EdgeRec, PathEnumeration, PathWalker, Subgraph, WalkStep, DEFAULT_MAX_PATHS,
+    DEFAULT_MAX_STEPS,
 };

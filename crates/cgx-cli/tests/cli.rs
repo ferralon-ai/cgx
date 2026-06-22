@@ -148,6 +148,146 @@ fn callers_finds_all_callers_of_beta() {
     );
 }
 
+/// The default human view of `callees` is the ASCII forest: the anchor is the
+/// bare root line and its callees hang off box-drawing prefixes (no `depth=`).
+#[test]
+fn callees_human_default_is_forest() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(code, 0);
+    // Anchor root line, then box-drawing children.
+    assert!(out.contains("fixture::main"), "anchor is the root: {out}");
+    assert!(
+        out.contains("├─ ") || out.contains("└─ "),
+        "forest box-drawing prefixes present: {out}"
+    );
+    assert!(!out.contains("depth="), "depth= field dropped from forest: {out}");
+}
+
+/// `--tree spanning` switches the human view to the spanning forest (each node
+/// once). The mode flag is accepted and changes output for the three commands.
+#[test]
+fn tree_spanning_flag_switches_mode() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    // `callers beta` reaches beta from alpha and orphan; both modes still name
+    // the callers, and the flag is accepted (exit 0).
+    let (full, cf) = run_cgx(&repo, &["callers", "beta", "--tree", "full"]);
+    let (spanning, cs) = run_cgx(&repo, &["callers", "beta", "--tree", "spanning"]);
+    assert_eq!(cf, 0, "full mode exits 0: {full}");
+    assert_eq!(cs, 0, "spanning mode exits 0: {spanning}");
+    assert!(spanning.contains("fixture::alpha"), "alpha present in spanning: {spanning}");
+    assert!(spanning.contains("fixture::orphan"), "orphan present in spanning: {spanning}");
+}
+
+/// A deeper fixture: a linear call chain `c0 → c1 → c2 → c3 → c4 → c5` (depth 5),
+/// so the depth-3 default has something to clip. Returns (tempdir, repo path).
+fn deep_chain_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    // c0 is the entry; each ck calls c{k+1}. Depth from c0: c1=1 … c5=5.
+    let body = "\
+fn c0() { c1(); }
+fn c1() { c2(); }
+fn c2() { c3(); }
+fn c3() { c4(); }
+fn c4() { c5(); }
+fn c5() { let _ = 1 + 1; }
+
+fn main() { c0(); }
+";
+    std::fs::write(repo.join("src/main.rs"), body).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+/// SPANNING mode must inherit the depth-3 default when `--max-depth` is unset:
+/// on a depth-5 chain from `c0`, the walk stops at depth 3 (c1,c2,c3 present;
+/// c4,c5 absent) for BOTH spanning and full. This is the criterion-4 regression:
+/// before the walker-level default, spanning collected an unbounded subgraph and
+/// rendered all the way to c5.
+#[test]
+fn spanning_honors_default_depth_three_when_unset() {
+    let (_tmp, repo) = deep_chain_repo();
+    index(&repo);
+
+    let (spanning, cs) = run_cgx(&repo, &["callees", "c0", "--tree", "spanning"]);
+    assert_eq!(cs, 0, "spanning exits 0: {spanning}");
+    assert!(spanning.contains("fixture::c1"), "c1 (depth1) present: {spanning}");
+    assert!(spanning.contains("fixture::c2"), "c2 (depth2) present: {spanning}");
+    assert!(spanning.contains("fixture::c3"), "c3 (depth3) present: {spanning}");
+    assert!(!spanning.contains("fixture::c4"), "c4 (depth4) clipped at default depth 3: {spanning}");
+    assert!(!spanning.contains("fixture::c5"), "c5 (depth5) clipped at default depth 3: {spanning}");
+
+    // Full mode bounds identically at the default.
+    let (full, cf) = run_cgx(&repo, &["callees", "c0", "--tree", "full"]);
+    assert_eq!(cf, 0, "full exits 0: {full}");
+    assert!(full.contains("fixture::c3"), "c3 present in full: {full}");
+    assert!(!full.contains("fixture::c4"), "c4 clipped in full: {full}");
+}
+
+/// An explicit `--max-depth` overrides the depth-3 default for BOTH modes: on the
+/// same depth-5 chain `--max-depth 5` reaches c5; `--max-depth 1` stops at c1.
+#[test]
+fn explicit_max_depth_overrides_default_for_both_modes() {
+    let (_tmp, repo) = deep_chain_repo();
+    index(&repo);
+
+    for mode in ["full", "spanning"] {
+        let (deep, c) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--max-depth", "5"]);
+        assert_eq!(c, 0, "{mode} --max-depth 5 exits 0: {deep}");
+        assert!(deep.contains("fixture::c5"), "{mode} --max-depth 5 reaches c5: {deep}");
+
+        let (shallow, c2) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--max-depth", "1"]);
+        assert_eq!(c2, 0, "{mode} --max-depth 1 exits 0: {shallow}");
+        assert!(shallow.contains("fixture::c1"), "{mode} --max-depth 1 has c1: {shallow}");
+        assert!(!shallow.contains("fixture::c2"), "{mode} --max-depth 1 stops before c2: {shallow}");
+    }
+}
+
+/// Two runs of the default (forest) human view over the same index are
+/// byte-identical — the determinism contract extended to the new renderer.
+#[test]
+fn forest_human_output_is_byte_identical_across_runs() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (a, ca) = run_cgx(&repo, &["callees", "main"]);
+    let (b, cb) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(ca, 0);
+    assert_eq!(cb, 0);
+    assert_eq!(a, b, "two forest renders must be byte-identical");
+
+    let (c, _) = run_cgx(&repo, &["callers", "beta", "--tree", "spanning"]);
+    let (d, _) = run_cgx(&repo, &["callers", "beta", "--tree", "spanning"]);
+    assert_eq!(c, d, "spanning forest is byte-identical across runs");
+}
+
 /// The convergence criterion: two runs of the same query over the same index
 /// produce byte-identical output (architecture §4 determinism).
 #[test]

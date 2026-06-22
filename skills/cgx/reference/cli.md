@@ -58,16 +58,22 @@ cgx callers [OPTIONS] <SYMBOL>
 | `<SYMBOL>` | required | Exact qualified symbol name |
 | `--repo <PATH>` | CWD | Repository root |
 | `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+| `--tree <MODE>` | `full` | Human forest shape: `full` (expand every call edge) or `spanning` (each symbol once, `(+N call sites)` for extra callers). Human format only. |
 | `--at <REF>` | HEAD | Pin query to git ref |
-| `--max-depth <N>` | unlimited | Traversal depth (use `--max-depth`, not `--depth`) |
+| `--max-depth <N>` | unlimited (forest: 3) | Traversal depth (use `--max-depth`, not `--depth`). The human forest applies a default depth of 3 when unset; an explicit value overrides it. |
 | `--confidence <LEVEL>` | `possible` | Minimum floor: `possible`, `probable`, `certain` |
 | `--assert-empty` | off | CI: exit 1 if results found |
 | `--allow-vacuous` | off | Suppress exit 4 vacuity guard |
 | `--no-auto-index` | off | Exit 3 if index missing instead of auto-building |
 
+The default human view of `callers`/`callees` is an ASCII call **forest** (the
+anchor is the root; callers/callees hang off `├─ │ └─` box-drawing prefixes). See
+[output-and-exit.md](output-and-exit.md). Machine formats are unchanged.
+
 **Example:**
 ```bash
 cgx callers MyModule::my_fn --max-depth 3 --format json
+cgx callees MyModule::my_fn --tree spanning
 ```
 
 ---
@@ -101,11 +107,18 @@ cgx reaches [OPTIONS] <FROM> [TO]
 |---|---|---|
 | `<FROM>` | required | Source symbol (exact qualified name) |
 | `[TO]` | optional | Target symbol; omit to enumerate all reachable symbols |
+| `--tree <MODE>` | `full` | Forest shape for the `reaches <FROM>` (no `TO`) human view; see `callers`. Ignored for `reaches <FROM> <TO>`. |
 | `--repo`, `--format`, `--at`, `--max-depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+
+`reaches <FROM>` (no `TO`) enumerates the reachable set and renders it as the
+human forest, like `callees`. `reaches <FROM> <TO>` answers a single
+reachability question and renders its witness **path** (not a forest), so the
+`dot`/`mermaid`/`d2` graph formats apply to it as before.
 
 **Example:**
 ```bash
 cgx reaches FromFn ToFn --format dot
+cgx reaches FromFn --tree spanning
 ```
 
 ---

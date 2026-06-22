@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use cgx_core::{EdgeRecord, NodeId};
+use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeRecord, NodeId};
 
 use crate::filter::{Direction, EdgeFilter};
 use crate::view::GraphView;
@@ -112,6 +112,36 @@ fn advance_exceptional(before: bool, edge: &EdgeRecord) -> bool {
     before || edge.condition.is_exceptional()
 }
 
+/// One induced edge in a [`Subgraph`], in **traversal orientation**: `src` is the
+/// node the walk expands *from* and `dst` the peer it reaches (so for `callees`
+/// this is caller → callee, and for `callers` it is callee → caller). The forest
+/// roots at the anchor and a node's out-edges here are its children. `condition`
+/// (GM-3) / `confidence` (GM-5) are the underlying call edge's, carried verbatim
+/// for the rendered tag. Both endpoints are nodes in the same `Subgraph`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRec {
+    pub src: NodeId,
+    pub dst: NodeId,
+    /// The producing edge's id (a stable tiebreak for deterministic ordering).
+    pub edge_id: EdgeId,
+    pub condition: EdgeCondition,
+    pub confidence: Confidence,
+}
+
+/// The induced sub-graph of a bounded neighbor walk: the reached nodes plus every
+/// admitted edge among them in **traversal orientation** (see [`EdgeRec`]). This
+/// is the shape both forest renderers (full + spanning) build their adjacency from
+/// — see [`PathWalker::neighborhood`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subgraph {
+    /// The walk roots (the anchor). The forest renders one tree per root.
+    pub roots: Vec<NodeId>,
+    /// Every reached node, including the anchor, in ascending id order.
+    pub nodes: Vec<NodeId>,
+    /// The induced edges in traversal orientation, in `(src, dst, edge id)` order.
+    pub edges: Vec<EdgeRec>,
+}
+
 /// A node discovered by [`PathWalker::bfs`], with its discovery metadata.
 #[derive(Debug, Clone)]
 pub struct Discovered {
@@ -196,6 +226,77 @@ impl PathWalker {
 
         out.sort_by_key(|d| (d.depth, d.node.0));
         out
+    }
+
+    /// The bounded directional neighborhood of `anchor`: every node reached by a
+    /// depth-bounded walk in `dir` (the anchor plus its [`bfs`](Self::bfs)
+    /// frontier), together with the **induced** admitted call-edge set among those
+    /// nodes — every admitted edge whose both endpoints are in the reached set,
+    /// not just the shortest-path discovery edges.
+    ///
+    /// This is the single source of truth both forest renderers consume: unlike
+    /// [`bfs`](Self::bfs), which keeps only each node's first (shortest) discovery
+    /// edge, the induced edge set retains the full who-calls-whom adjacency so a
+    /// full-expansion tree can show a callee under every caller that reaches it.
+    ///
+    /// `roots` is the anchor (in canonical direction the anchor is always the sole
+    /// root). `nodes` and `edges` are returned in deterministic order (nodes by id;
+    /// edges by `(src id, dst id, edge id)`).
+    pub fn neighborhood(
+        &self,
+        view: &GraphView,
+        anchor: NodeId,
+        dir: Direction,
+    ) -> Subgraph {
+        let n = view.node_count();
+        let mut in_set = vec![false; n];
+        if let Some(ai) = checked_index(anchor, n) {
+            in_set[ai] = true;
+        }
+        let mut nodes: Vec<NodeId> = vec![anchor];
+        for d in self.bfs(view, anchor, dir) {
+            if let Some(i) = checked_index(d.node, n) {
+                if !in_set[i] {
+                    in_set[i] = true;
+                    nodes.push(d.node);
+                }
+            }
+        }
+
+        // Induced edge set in **traversal orientation**: for every reached node,
+        // every admitted neighbor (in walk direction `dir`) that is also reached,
+        // recorded as `src = the node we expand from`, `dst = the peer reached`.
+        // For `callees` this is caller → callee; for `callers` it is callee →
+        // caller. Either way the forest roots at the anchor and expands outward,
+        // and a node's out-edges here are exactly its children in the tree. The
+        // edge's own condition/confidence are carried verbatim for the tag.
+        let mut edges: Vec<EdgeRec> = Vec::new();
+        for &node in &nodes {
+            for er in view.neighbors(node, dir, &self.filter) {
+                let pi = match checked_index(er.peer, n) {
+                    Some(pi) => pi,
+                    None => continue,
+                };
+                if !in_set[pi] {
+                    continue;
+                }
+                edges.push(EdgeRec {
+                    src: node,
+                    dst: er.peer,
+                    edge_id: er.edge.id,
+                    condition: er.edge.condition,
+                    confidence: er.edge.confidence,
+                });
+            }
+        }
+        nodes.sort_by_key(|id| id.0);
+        edges.sort_by_key(|e| (e.src.0, e.dst.0, e.edge_id.0));
+
+        Subgraph {
+            roots: vec![anchor],
+            nodes,
+            edges,
+        }
     }
 
     /// Whether `goal` is reachable from `start` in `dir` within the depth limit.

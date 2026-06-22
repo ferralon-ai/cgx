@@ -15,7 +15,7 @@ Every subcommand accepts `--format <FMT>`. The default is `human`.
 
 | Format | Since | Best for |
 |--------|-------|----------|
-| `human` | v0.1 | Reading at a terminal. File:line evidence, hop count, edge conditions inline. |
+| `human` | v0.1 | Reading at a terminal. `callers`/`callees`/`reaches <from>` render an ASCII call **forest** (see §1.1); `paths`/`unused` render a list. File:line evidence and edge/confidence tags inline. |
 | `json` | v0.1 | Scripting, agents, CI pipelines. Structured envelope with `count` and `results[]`. |
 | `sarif` | v0.1 | Security tooling. SARIF 2.1.0 — uploads to GitHub Advanced Security, VS Code SARIF viewer, and any OASIS-compliant tool. |
 | `dot` | v0.1 | Path-shaped results only. Feeds `dot -Tsvg` or any Graphviz consumer for SVG/PNG artifacts. Use for large graphs (Mermaid has a node limit). |
@@ -25,6 +25,41 @@ Every subcommand accepts `--format <FMT>`. The default is `human`.
 **Path-shaped restriction:** `dot`, `mermaid`, and `d2` are only meaningful for output that describes a
 graph path — the `reaches` and `paths` subcommands, or a `cgx query` that uses `RETURN path`. Applying
 them to flat-list results (e.g., `callers`, `unused`) produces degenerate or empty graphs.
+
+### 1.1 The human call forest (`callers` / `callees` / `reaches <from>`)
+
+The default human view of the neighbor-set commands is an ASCII forest: the
+queried symbol is the bare root line and the symbols it calls (or that call it)
+hang off `├─ │ └─` box-drawing prefixes. Depth is shown by indentation — there is
+no `depth=` field.
+
+Each child line is `fqn  file:line`, then non-default tags only:
+
+- condition: `[if]` (conditional), `[exc]` (exception), `loop`/`panic` verbatim;
+  `always` is omitted.
+- confidence: `[probable]`, `[possible]`; `certain` is omitted.
+
+`--tree <full|spanning>` (default `full`). Both modes bound the walk to depth 3
+when `--max-depth` is unset (an explicit `--max-depth` overrides), and a
+work-budget cap prints `… (truncated: N more)` at the cut:
+
+- **full** — expand every call edge; a symbol reached from two callers appears
+  under each. Revisiting an ancestor on the current branch prints
+  `↺ name (cycle)` and stops descending.
+- **spanning** — render each symbol once under its shortest-path parent, annotated
+  `(+N call sites)` when more than one call site within the bounded neighborhood
+  reaches it.
+
+```
+cgx_core::confidence::Confidence::weakest  crates/cgx-core/src/confidence.rs:40
+├─ cgx_query::engine::build_path_result::{closure@205:14}  …/engine.rs:205  [if]  [probable]
+│  └─ ts_sample::closures::nestedClosures::outer  …/closures.ts:58  [possible]  (+1 call sites)
+└─ cgx_query::engine::weakest_confidence_to  …/engine.rs:78  [loop]  [probable]
+   └─ cgx_query::engine::neighbor_walk  …/engine.rs:36
+```
+
+`reaches <from> <to>` (with a target) answers a single reachability question and
+keeps its **witness-path** rendering — it is not a forest.
 
 **When to choose which format:**
 

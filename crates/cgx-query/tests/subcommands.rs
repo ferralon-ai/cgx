@@ -5,8 +5,8 @@ mod common;
 
 use cgx_core::{Confidence, EdgeCondition, EntrypointKind, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
-    callees, callers, explain, paths, reaches, reaches_all, unused, Direction, EdgeFilter,
-    GraphView, PathWalker, TruncationReason,
+    callees, callers, explain, neighborhood, paths, reaches, reaches_all, unused, Direction,
+    EdgeFilter, GraphView, PathWalker, TruncationReason,
 };
 
 use common::{id_of, GraphBuilder};
@@ -825,4 +825,71 @@ fn explain_outgoing_edge_takes_site_from_the_explained_symbol() {
     let site = edge.site.as_ref().expect("call site span");
     assert_eq!(site.file, v.node(explained).file);
     assert_eq!(site.line, v.node(explained).line_start);
+}
+
+// --- neighborhood (induced sub-graph for the forest renderer) ----------------
+
+#[test]
+fn neighborhood_retains_induced_edges_not_just_discovery_edges() {
+    // root -> a, root -> b, a -> shared, b -> shared. The BFS records `shared`
+    // once (one discovery edge), but the induced sub-graph must keep BOTH
+    // a->shared and b->shared so a full forest can show shared under each.
+    let g = GraphBuilder::new()
+        .func("root")
+        .func("a")
+        .func("b")
+        .func("shared")
+        .calls("root", "a")
+        .calls("root", "b")
+        .calls("a", "shared")
+        .calls("b", "shared");
+    let v = view(g);
+    let root = id_of(v.nodes(), "root");
+    let sub = neighborhood(&v, root, &PathWalker::default(), Direction::Forward);
+
+    assert_eq!(sub.roots, vec![root], "anchor is the sole root");
+    assert_eq!(sub.nodes.len(), 4, "all reached nodes present");
+    let shared = id_of(v.nodes(), "shared");
+    let into_shared = sub.edges.iter().filter(|e| e.dst == shared).count();
+    assert_eq!(into_shared, 2, "both induced edges into shared retained");
+}
+
+#[test]
+fn neighborhood_orients_edges_toward_the_walk_for_callers() {
+    // a -> anchor, b -> anchor. A `callers` (Backward) neighborhood roots at
+    // `anchor` and expands to its callers, so the induced edges are anchor->a and
+    // anchor->b (traversal orientation), giving the anchor two children.
+    let g = GraphBuilder::new()
+        .func("anchor")
+        .func("a")
+        .func("b")
+        .calls("a", "anchor")
+        .calls("b", "anchor");
+    let v = view(g);
+    let anchor = id_of(v.nodes(), "anchor");
+    let sub = neighborhood(&v, anchor, &PathWalker::default(), Direction::Backward);
+
+    let from_anchor = sub.edges.iter().filter(|e| e.src == anchor).count();
+    assert_eq!(from_anchor, 2, "anchor expands to its two callers");
+}
+
+#[test]
+fn neighborhood_is_deterministic_in_node_and_edge_order() {
+    let g = GraphBuilder::new()
+        .func("root")
+        .func("a")
+        .func("b")
+        .calls("root", "a")
+        .calls("root", "b")
+        .calls("a", "b");
+    let v = view(g);
+    let root = id_of(v.nodes(), "root");
+    let s1 = neighborhood(&v, root, &PathWalker::default(), Direction::Forward);
+    let s2 = neighborhood(&v, root, &PathWalker::default(), Direction::Forward);
+    assert_eq!(s1, s2, "two neighborhood calls are identical");
+    // Nodes ascending by id; edges ascending by (src, dst, edge id).
+    let ids: Vec<u32> = s1.nodes.iter().map(|n| n.0).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "nodes in ascending id order");
 }

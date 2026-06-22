@@ -6,9 +6,8 @@ Run `cgx --version` before using this recipe. Features are gated by version; a
 capability marked `Since: v0.N` requires `MINOR >= N`. See `reference/versions.md`.
 
 **Step 0 — find the exact symbol name first.**
-cgx has no search, glob, or fuzzy match. An unknown symbol exits 2 with
-`no symbol matched '<x>'`. Grep/ripgrep the source for the fully-qualified name
-before running any cgx command.
+An unknown symbol exits 2 with `no symbol matched '<x>'`. Use `cgx search <pattern>` (Since: v0.2)
+to resolve a partial name to the exact FQN, or grep/ripgrep the source for older binaries.
 
 ---
 

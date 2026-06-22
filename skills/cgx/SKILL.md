@@ -22,13 +22,22 @@ reproducible. cgx tells you about *structure and reachability*; it does not run 
 cgx features are gated by version. **Run `cgx --version`** → `cgx 0.<MINOR>.<PATCH>`. A capability tagged
 `Since: v0.N` is available **iff `MINOR ≥ N`**. Everything in this skill carries a `Since:` tag. If a feature is
 above the running version, do not emit it — fall back to the highest available alternative or tell the user it
-needs `cgx ≥ 0.N`. The current shipped binary is **v0.1**. See `reference/versions.md` for the full ladder.
+needs `cgx ≥ 0.N`. The current shipped binary is **v0.2**. See `reference/versions.md` for the full ladder.
 
 ## STEP 1 — You need an exact symbol name
 
-cgx has **no search, glob, or fuzzy match**. Commands need the exact (usually fully-qualified) symbol name and
-fail with `no symbol matched '<x>'` (exit 2) otherwise. **Grep/ripgrep the source for the real name first**,
-then pass it to cgx. The index auto-builds on first query into `.cgx/`; force a rebuild with `cgx index .`.
+Commands need the exact (usually fully-qualified) symbol name and fail with `no symbol matched '<x>'` (exit 2)
+otherwise. **Use `cgx search <pattern>` (Since: v0.2) to resolve a partial or half-remembered name to exact
+FQNs**, then pass the result to `callers`/`callees`/`reaches`. Finding nothing exits 0 — it is not an error.
+For binaries older than v0.2, or when you need raw-text matching, grep/ripgrep the source instead.
+
+```bash
+cgx search Counter                     # case-insensitive substring over the whole FQN
+cgx search make --kind function        # narrow to functions
+cgx search 'derive_key' --regex        # regex over the full FQN
+```
+
+The index auto-builds on first query into `.cgx/`; force a rebuild with `cgx index .`.
 There is no `prune`/`clean`.
 
 ## Mental model — read before interpreting any result

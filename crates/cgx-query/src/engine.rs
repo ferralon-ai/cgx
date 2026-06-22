@@ -33,6 +33,21 @@ pub fn callees(view: &GraphView, source: NodeId, walker: &PathWalker) -> Vec<Nei
     neighbor_walk(view, source, walker, Direction::Forward)
 }
 
+/// The bounded directional neighborhood of `anchor` as an induced sub-graph (the
+/// reached nodes plus every admitted call edge among them, in `caller → callee`
+/// orientation). The single source of truth the CLI forest renderer consumes for
+/// `callers`/`callees`/`reaches <from>`. `dir` selects callee (`Forward`) or
+/// caller (`Backward`) expansion; the depth bound and confidence floor come from
+/// `walker`, exactly as `callees`/`callers` use it.
+pub fn neighborhood(
+    view: &GraphView,
+    anchor: NodeId,
+    walker: &PathWalker,
+    dir: Direction,
+) -> crate::walk::Subgraph {
+    walker.neighborhood(view, anchor, dir)
+}
+
 fn neighbor_walk(
     view: &GraphView,
     anchor: NodeId,

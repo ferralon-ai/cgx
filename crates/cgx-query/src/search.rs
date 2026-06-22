@@ -73,7 +73,7 @@ pub fn search_symbols(
     let mut hits: Vec<SymbolHit> = view
         .nodes()
         .iter()
-        .filter(|node| kind_filter.map_or(true, |k| node.kind == k))
+        .filter(|node| kind_filter.is_none_or(|k| node.kind == k))
         .filter(|node| match &re {
             Some(re) => re.is_match(&node.fqn),
             None => node.fqn.to_lowercase().contains(&needle),

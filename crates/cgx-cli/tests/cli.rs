@@ -632,3 +632,239 @@ fn mcp_tools_list_returns_tools() {
         "mcp tools/list response mentions tools: {stdout}"
     );
 }
+
+// --- `cgx search` (symbol search, Since: v0.2) -------------------------------
+
+/// A fixture with a known mix of symbol kinds and FQNs, so `search` assertions
+/// (substring, `--kind` narrowing, `--limit` truncation, sort order) are exact.
+/// `helper::Widget` is a `type`; the rest are `function`s. FQNs share the
+/// `search_target` substring so a single pattern hits a controlled set.
+const SEARCH_MAIN_RS: &str = "\
+mod helper;
+
+fn main() {
+    search_target_alpha();
+}
+
+fn search_target_alpha() {
+    helper::search_target_beta();
+}
+
+fn search_target_gamma() {
+    let _ = 1;
+}
+";
+
+const SEARCH_HELPER_RS: &str = "\
+pub struct SearchWidget {
+    pub n: i32,
+}
+
+pub fn search_target_beta() {
+    let _ = 1 + 1;
+}
+";
+
+fn search_fixture_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), SEARCH_MAIN_RS).unwrap();
+    std::fs::write(repo.join("src/helper.rs"), SEARCH_HELPER_RS).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+#[test]
+fn search_substring_returns_matching_fqns_exit_0() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "search_target"]);
+    assert_eq!(code, 0, "a search that matches still exits 0: {out}");
+    assert!(out.contains("fixture::search_target_alpha"), "alpha: {out}");
+    assert!(
+        out.contains("fixture::helper::search_target_beta"),
+        "beta: {out}"
+    );
+    assert!(out.contains("fixture::search_target_gamma"), "gamma: {out}");
+}
+
+#[test]
+fn search_is_case_insensitive_substring_anywhere() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // Upper-case query, mid-FQN substring: still matches the type SearchWidget.
+    let (out, code) = run_cgx(&repo, &["search", "WIDGET"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("fixture::helper::SearchWidget"),
+        "case-insensitive substring match anywhere in the FQN: {out}"
+    );
+}
+
+#[test]
+fn search_empty_result_exits_0_not_error() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "zzz_no_such_symbol"]);
+    assert_eq!(code, 0, "an empty search is NOT an error (unlike callers): {out}");
+    assert!(out.contains("(no results)"), "empty marker: {out}");
+}
+
+#[test]
+fn search_bad_regex_exits_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (_out, code) = run_cgx(&repo, &["search", "(unclosed", "--regex"]);
+    assert_eq!(code, 2, "an invalid regex is a usage error");
+}
+
+#[test]
+fn search_no_pattern_exits_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // A bare `cgx search` (no pattern) is a clap usage error, not "list all".
+    let (_out, code) = run_cgx(&repo, &["search"]);
+    assert_eq!(code, 2, "missing required pattern → usage exit 2");
+}
+
+#[test]
+fn search_kind_function_narrows() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // `search` matches both the type SearchWidget and the search_target_* fns;
+    // `--kind function` drops the type.
+    let (out, code) = run_cgx(&repo, &["search", "search", "--kind", "function"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("fixture::search_target_alpha"),
+        "function kept: {out}"
+    );
+    assert!(
+        !out.contains("SearchWidget"),
+        "type excluded by --kind function: {out}"
+    );
+}
+
+#[test]
+fn search_kind_type_excludes_functions() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "Search", "--kind", "type"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("fixture::helper::SearchWidget"), "type kept: {out}");
+    assert!(
+        !out.contains("search_target_alpha"),
+        "functions excluded by --kind type: {out}"
+    );
+}
+
+#[test]
+fn search_json_shape_is_array_of_objects() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "search_target", "--format", "json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().expect("search json is a bare array");
+    assert!(!arr.is_empty(), "array has hits: {out}");
+    let first = &arr[0];
+    for key in ["fqn", "file", "line", "kind"] {
+        assert!(first.get(key).is_some(), "object has `{key}`: {out}");
+    }
+    // FQNs are sorted ascending.
+    let fqns: Vec<&str> = arr
+        .iter()
+        .map(|o| o.get("fqn").unwrap().as_str().unwrap())
+        .collect();
+    let mut sorted = fqns.clone();
+    sorted.sort();
+    assert_eq!(fqns, sorted, "results sorted by FQN: {out}");
+}
+
+#[test]
+fn search_limit_truncates_with_footer() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // Three `search_target_*` functions exist; --limit 2 shows two + a footer.
+    let (out, code) = run_cgx(&repo, &["search", "search_target", "--kind", "function", "--limit", "2"]);
+    assert_eq!(code, 0);
+    let body_lines = out.lines().filter(|l| !l.starts_with('…')).count();
+    assert_eq!(body_lines, 2, "exactly --limit rows shown: {out}");
+    assert!(
+        out.contains("(1 more — raise --limit)"),
+        "footer reports the hidden count: {out}"
+    );
+}
+
+#[test]
+fn search_limit_zero_is_unlimited() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "search_target", "--kind", "function", "--limit", "0"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("more — raise"), "no footer when unlimited: {out}");
+    assert_eq!(
+        out.lines().count(),
+        3,
+        "all three functions shown with --limit 0: {out}"
+    );
+}
+
+#[test]
+fn search_empty_pattern_exits_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // An empty *provided* pattern would match everything — the "dump the table"
+    // path the spec keeps out of scope. It is a usage error, not a full dump.
+    let (_out, code) = run_cgx(&repo, &["search", ""]);
+    assert_eq!(code, 2, "empty pattern → usage exit 2");
+}
+
+#[test]
+fn search_unsupported_format_exits_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // `search`'s surface is human|json only; sarif/dot/mermaid/d2 are usage errors,
+    // not silently rendered as human.
+    for fmt in ["sarif", "dot", "mermaid", "d2"] {
+        let (_out, code) = run_cgx(&repo, &["search", "search_target", "--format", fmt]);
+        assert_eq!(code, 2, "--format {fmt} unsupported by search → exit 2");
+    }
+}
+
+#[test]
+fn search_output_is_byte_identical_across_runs() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (a, _) = run_cgx(&repo, &["search", "search_target"]);
+    let (b, _) = run_cgx(&repo, &["search", "search_target"]);
+    assert_eq!(a, b, "two search runs must be byte-identical");
+    let (ja, _) = run_cgx(&repo, &["search", "search_target", "--format", "json"]);
+    let (jb, _) = run_cgx(&repo, &["search", "search_target", "--format", "json"]);
+    assert_eq!(ja, jb, "two json search runs must be byte-identical");
+}

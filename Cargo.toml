@@ -12,6 +12,7 @@ rust-version = "1.96"
 cgx-core = { path = "crates/cgx-core" }
 cgx-frontend = { path = "crates/cgx-frontend" }
 cgx-scip = { path = "crates/cgx-scip" }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 smallvec = { version = "1", features = ["serde"] }

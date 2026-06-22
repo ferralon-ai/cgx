@@ -6,16 +6,16 @@ required check always on that path?
 **Version check first.** Run `cgx --version` and compare the minor version against each `Since:` tag
 below. See `reference/versions.md` for the full ladder.
 
-**Step 0 — find the exact symbol name.** cgx has no search, glob, or fuzzy match. Every command takes
-the exact (usually fully-qualified) symbol name. Grep/ripgrep the source first:
+**Step 0 — find the exact symbol name.** Every command takes the exact (usually fully-qualified)
+symbol name and exits 2 with `no symbol matched '<x>'` otherwise. Use `cgx search <pattern>` (Since:
+v0.2) to resolve a partial name to exact FQNs, or grep/ripgrep the source for older binaries:
 
 ```bash
-rg -n 'fn exec\b' src/
-rg -n 'fn derive_key\b' src/
+cgx search derive_key                  # Since: v0.2 — resolves partial name to exact FQN
+rg -n 'fn derive_key\b' src/          # fallback for cgx < v0.2
 ```
 
-Then pass the result (e.g. `crypto::derive_key`) to cgx. Unknown names exit with code 2 and the
-message `no symbol matched '<x>'`.
+Then pass the result (e.g. `crypto::derive_key`) to cgx.
 
 ---
 

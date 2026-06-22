@@ -19,14 +19,14 @@ use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
-    callees, callers, paths as query_paths, reaches, unused, EdgeFilter, GraphView, PathSet,
-    PathWalker,
+    callees, callers, paths as query_paths, reaches, search_symbols, unused, EdgeFilter, GraphView,
+    PathSet, PathWalker,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
-use cgx_cli::output::{render, render_explanation, Format, ResultSet, TableData};
+use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -107,6 +107,37 @@ enum Command {
         query: String,
         #[command(flatten)]
         query_args: QueryArgs,
+    },
+    /// Search the symbol table for definitions whose FQN matches `pattern`.
+    ///
+    /// A pure node-table scan (no graph walk): resolves a partial/half-remembered
+    /// name to exact FQNs to feed into `callers`/`callees`/`reaches`. Default match
+    /// is a case-insensitive substring against the whole FQN (matches anywhere);
+    /// `--regex` matches the whole FQN as a regex. Finding nothing exits 0 (search
+    /// is not the exact-symbol surface). `Since: v0.2`.
+    Search {
+        /// The pattern to match against each symbol's fully-qualified name.
+        pattern: String,
+        /// Treat `pattern` as a regular expression over the whole FQN (replaces the
+        /// default case-insensitive substring match). Invalid regex → exit 2.
+        #[arg(long)]
+        regex: bool,
+        /// Restrict to a symbol kind (e.g. `function`, `method`, `type`).
+        #[arg(long, value_enum)]
+        kind: Option<KindArg>,
+        /// Maximum number of results to print. Default 50; `--limit 0` = unlimited.
+        /// When results exceed the limit, the sorted top-N print with a footer.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format (human or json).
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+        /// Do not auto-index when the `.cgx/` store is missing or stale.
+        #[arg(long)]
+        no_auto_index: bool,
     },
     /// Symbols not reachable from any entrypoint.
     Unused {
@@ -265,6 +296,15 @@ fn run(command: Command) -> Result<(), CliError> {
             no_auto_index,
         } => run_explain(&symbol, repo, format, no_auto_index),
         Command::Query { query, query_args } => run_query(&query, query_args),
+        Command::Search {
+            pattern,
+            regex,
+            kind,
+            limit,
+            repo,
+            format,
+            no_auto_index,
+        } => run_search(&pattern, regex, kind, limit, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -670,6 +710,46 @@ fn run_explain(
         .ok_or_else(|| CliError::usage(format!("no symbol matched `{symbol}`")))?;
 
     print!("{}", render_explanation(format, &explanation));
+    Ok(())
+}
+
+/// `cgx search <pattern>` (Since: v0.2): a pure node-table scan that resolves a
+/// partial/half-remembered name to exact FQNs. Distinct from the exact-symbol
+/// surface in two ways the spec calls out: (1) an empty result set is **exit 0**,
+/// not a not-found error; (2) it carries no vacuity/assertion machinery, so it
+/// bypasses [`emit`]. Usage errors (all exit 2): an unsupported `--format`, an
+/// empty or invalid `--regex` pattern; a missing `--kind` value or a bare `cgx
+/// search` (no pattern) are rejected by clap before this runs.
+fn run_search(
+    pattern: &str,
+    regex: bool,
+    kind: Option<KindArg>,
+    limit: usize,
+    repo: Option<PathBuf>,
+    format: Format,
+    no_auto_index: bool,
+) -> Result<(), CliError> {
+    // `search`'s surface is `--format human|json` only. SARIF and the path-graph
+    // emitters (dot/mermaid/d2) are globally-defined enum values clap accepts, but
+    // they have no meaning for a flat symbol list — reject them rather than
+    // silently rendering human.
+    if !matches!(format, Format::Human | Format::Json) {
+        return Err(CliError::usage(format!(
+            "{format:?} format is not supported by `search` — use --format human|json"
+        )));
+    }
+
+    let repo_root = resolve_repo(repo)?;
+    if !no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    let view = load_view(&repo_root)?;
+
+    let kind_filter = kind.map(SymbolKind::from);
+    let hits = search_symbols(&view, pattern, regex, kind_filter)
+        .map_err(|e| CliError::usage(e.to_string()))?;
+
+    print!("{}", render_search(format, &hits, limit));
     Ok(())
 }
 

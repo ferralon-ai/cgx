@@ -926,6 +926,74 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
     })
 }
 
+/// The canonical lowercase string for a [`SymbolKind`] (`function`, `type`, …),
+/// reusing the serde `snake_case` representation so it matches the `kind` field
+/// every other JSON renderer emits.
+fn kind_str(kind: cgx_core::SymbolKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "symbol".into())
+}
+
+/// Render `cgx search` results (the `search` subcommand, Since: v0.2) as a human
+/// aligned list (default) or `--format json`. Hits arrive pre-sorted by FQN; this
+/// applies the `--limit` cap (`0` = unlimited) and, when results exceed it, prints
+/// the top-N then a `… (N more — raise --limit)` footer (never silently dropped).
+/// JSON mirrors the hit struct as a bare array: `[{ "fqn", "file", "line", "kind" }]`.
+pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize) -> String {
+    let shown = if limit == 0 {
+        hits.len()
+    } else {
+        limit.min(hits.len())
+    };
+    let visible = &hits[..shown];
+    let hidden = hits.len() - shown;
+
+    match format {
+        Format::Json => {
+            let items: Vec<Value> = visible
+                .iter()
+                .map(|h| {
+                    json!({
+                        "fqn": h.fqn,
+                        "file": h.file,
+                        "line": h.line,
+                        "kind": kind_str(h.kind),
+                    })
+                })
+                .collect();
+            let mut s =
+                serde_json::to_string_pretty(&items).expect("search results serialize");
+            s.push('\n');
+            s
+        }
+        _ => {
+            if hits.is_empty() {
+                return "(no results)\n".to_string();
+            }
+            // Align on the FQN column so `file:line` starts at a fixed offset.
+            let fqn_width = visible.iter().map(|h| h.fqn.chars().count()).max().unwrap_or(0);
+            let mut out = String::new();
+            for h in visible {
+                let pad = fqn_width.saturating_sub(h.fqn.chars().count());
+                out.push_str(&format!(
+                    "{}{}  {}:{}  [{}]\n",
+                    h.fqn,
+                    " ".repeat(pad),
+                    h.file,
+                    h.line,
+                    kind_str(h.kind)
+                ));
+            }
+            if hidden > 0 {
+                out.push_str(&format!("… ({hidden} more — raise --limit)\n"));
+            }
+            out
+        }
+    }
+}
+
 /// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text
 /// (default) or `--format json`. SARIF is not a meaningful shape for a single
 /// symbol's provenance, so `explain` supports only human/json (the dispatch scope).

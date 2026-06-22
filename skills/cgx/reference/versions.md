@@ -64,6 +64,7 @@ on the TypeScript frontend.
 | `query` | v0.1 | **CALLS-graph CQL subset only** — see "CQL clause gating" below |
 | `diff` | v0.1 | `<BASE> <HEAD>` are positional; `--newer-than` only; full filters at v0.4 |
 | `mcp` | v0.1 | STDIO server; 5 functional tools (callers/callees/paths/unused/explain) |
+| `search` | v0.2 | `--regex`, `--kind`, `--limit`, `--format human\|json`; empty result → exit 0 |
 | `prune --branches` | v0.4 *(planned)* | |
 | `policy check` | v0.5 *(planned)* | |
 
@@ -83,6 +84,7 @@ on the TypeScript frontend.
 | Cross-crate dependency edges (`scip-dep:`, from a supplied SCIP index) | v0.2 |
 | Confidence filtering discriminates (certain/probable/possible distinct) | v0.2 |
 | Syntactic own/transitive effects node attrs (heuristic; effect *queries* are v0.3 ²) | v0.2 |
+| `search` subcommand — FQN substring/regex scan; `--kind`/`--limit`/`--format`; empty → exit 0 | v0.2 |
 | `DATA_FLOW` edges + `CALL cgx.pedigree(...)` returning real rows | v0.3 *(planned)* |
 | Taint: source/sink/sanitizer classes, secret, nullability, narrowing; SARIF; `--taint` | v0.3 *(planned)* |
 | `MUST PASS THROUGH`/`AVOIDING` + path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 *(planned)* |

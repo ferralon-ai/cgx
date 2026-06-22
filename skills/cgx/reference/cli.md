@@ -3,7 +3,7 @@
 **Audience:** Engineers and AI agents driving cgx from the command line.
 
 Run `cgx --version` first. Parse the `0.<MINOR>.<PATCH>` after `cgx `. A capability tagged
-`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.1**.
+`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.2**.
 See `reference/versions.md` for the full ladder.
 
 > **Phantom flags — do not emit these.** They appear in upstream cookbook examples but cause
@@ -186,6 +186,44 @@ supported/unsupported clause list.
 
 ---
 
+### `search` — find symbols by partial name
+
+Since: v0.2
+
+```
+cgx search [OPTIONS] <PATTERN>
+```
+
+A pure node-table scan (no graph walk). Resolves a partial or half-remembered name to exact FQNs for use
+with `callers`/`callees`/`reaches`. Default match is a case-insensitive substring over the whole FQN;
+`--regex` switches to a full regex match.
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<PATTERN>` | required | Substring (default) or regex (`--regex`) matched against the full FQN |
+| `--regex` | off | Treat `<PATTERN>` as a regex over the whole FQN. Invalid regex → exit 2 |
+| `--kind <KIND>` | (all) | Restrict to a symbol kind: `function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint`. Unknown value → exit 2 |
+| `--limit <N>` | `50` | Max results to print. `0` = unlimited. Truncated output adds a footer `… (N more — raise --limit)` |
+| `--repo <PATH>` | CWD | Repository root |
+| `--format <FMT>` | `human` | `human` or `json`. JSON shape: `[{ "file", "fqn", "kind", "line" }]` |
+| `--no-auto-index` | off | Exit 3 if index missing instead of auto-building |
+
+**Exit codes:** empty result → exit 0 (unlike exact-symbol commands which exit 2 on `no symbol matched`).
+Bad regex or unknown `--kind` value → exit 2. Bare `cgx search` (no pattern) → exit 2.
+
+**Output columns (human):** FQN (left-aligned), `file:line`, `[kind]`. Sorted by FQN for deterministic output.
+
+**Examples:**
+```bash
+cgx search Counter                              # substring match, case-insensitive
+cgx search make --kind function                 # narrow to functions only
+cgx search 'derive_key' --regex                 # regex over the full FQN
+cgx search Counter --format json                # JSON array output
+cgx search auth --limit 0                       # unlimited results
+```
+
+---
+
 ### `unused` — find symbols not reachable from any entrypoint
 
 Since: v0.1
@@ -297,21 +335,24 @@ cgx mcp --root /path/to/repo
 
 ## Shared flags — subcommand applicability
 
-| Flag | callers | callees | reaches | paths | query | unused | explain | doctor | diff | mcp |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
-| `--format <FMT>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
-| `--at <REF>` | Y | Y | Y | Y | Y | Y* | — | — | — | — |
-| `--max-depth <N>` | Y | Y | Y | Y | Y | Y* | — | — | — | — |
-| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | Y | — | — | — | — |
-| `--assert-empty` | Y | Y | Y | Y | Y | Y | — | — | — | — |
-| `--allow-vacuous` | Y | Y | Y | Y | Y | Y | — | — | — | — |
-| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | — | — | — |
-| `--newer-than` | — | — | — | — | — | — | — | — | Y | — |
+| Flag | callers | callees | reaches | paths | query | search | unused | explain | doctor | diff | mcp |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
+| `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y | Y | Y | Y | — |
+| `--at <REF>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
+| `--max-depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
+| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
+| `--assert-empty` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
+| `--allow-vacuous` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
+| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | Y | — | — | — |
+| `--newer-than` | — | — | — | — | — | — | — | — | — | Y | — |
 
 **`--format` values:** `human` (default), `json`, `sarif`, `dot`, `mermaid`, `d2`.
 `dot`, `mermaid`, and `d2` are meaningful only for path-shaped results (`reaches`,
 `paths`, or `RETURN path` queries).
+
+**`†` (on `search`):** `search` accepts only `human` and `json`. `sarif`, `dot`, `mermaid`, and `d2` are not
+meaningful for a symbol-list result and are not accepted.
 
 **`*` (on `unused`):** the binary accepts `--at`, `--max-depth`, and `--confidence` on
 `unused` (exit 0); `--max-depth`/`--at` have no effect on the unused-symbol computation,

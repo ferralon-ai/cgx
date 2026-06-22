@@ -34,12 +34,14 @@ CLI `cgx query` covers arbitrary CALLS-graph CQL.
 
 ## Step 0 — Find the exact symbol name before every query
 
-cgx has no search, glob, or fuzzy match. A wrong symbol name produces exit 2
-(`no symbol matched '<x>'`). Grep or ripgrep the source for the exact (usually
-fully-qualified) symbol name first, then pass it to cgx.
+A wrong symbol name produces exit 2 (`no symbol matched '<x>'`). Use `cgx search <pattern>`
+(Since: v0.2) to resolve a partial name to the exact FQN; grep/ripgrep is the fallback for
+older binaries.
 
 ```bash
-# Find the fully-qualified name — do this before every cgx call
+# Since: v0.2 — resolves partial name to exact FQN(s) in one call
+cgx search process_payment
+# Fallback for cgx < v0.2
 rg --type rust -n "fn process_payment" .
 # → crates/payments/src/lib.rs:42:    pub fn process_payment(
 # Fully-qualified: payments::process_payment  (or the crate-path prefix)

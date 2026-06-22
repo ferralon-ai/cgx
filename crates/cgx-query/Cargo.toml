@@ -9,6 +9,7 @@ description = "cgx Layer-1 query engine: a GraphView over a linked graph plus th
 
 [dependencies]
 cgx-core.workspace = true
+regex = { workspace = true }
 
 [dev-dependencies]
 cgx-store = { path = "../cgx-store" }

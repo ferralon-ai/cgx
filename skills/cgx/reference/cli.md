@@ -7,7 +7,7 @@ Run `cgx --version` first. Parse the `0.<MINOR>.<PATCH>` after `cgx `. A capabil
 See `reference/versions.md` for the full ladder.
 
 > **Phantom flags — do not emit these.** They appear in upstream cookbook examples but cause
-> exit 2 in the real binary: `--depth`, `--base`, `--head`, `--from`, `--to`, `--from-class`,
+> exit 2 in the real binary: `--max-depth`, `--base`, `--head`, `--from`, `--to`, `--from-class`,
 > `--to-class`, `--avoiding`, `--only-edge-condition`, `--calls-to-sink-class`, `--kind fn`,
 > and a trailing `./` positional in place of `--repo ./`. The correct names are in the
 > signatures below. See ground truth §F for the complete list.
@@ -60,7 +60,7 @@ cgx callers [OPTIONS] <SYMBOL>
 | `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
 | `--tree <MODE>` | `full` | Human forest shape: `full` (expand every call edge) or `spanning` (each symbol once, `(+N call sites)` for extra callers). Human format only. |
 | `--at <REF>` | HEAD | Pin query to git ref |
-| `--max-depth <N>` | unlimited (forest: 3) | Traversal depth (use `--max-depth`, not `--depth`). The human forest applies a default depth of 3 when unset; an explicit value overrides it. |
+| `--depth <N>` | unlimited (forest: 2) | Traversal depth. The human forest applies a default depth of 2 when unset; an explicit value overrides it. |
 | `--confidence <LEVEL>` | `possible` | Minimum floor: `possible`, `probable`, `certain` |
 | `--assert-empty` | off | CI: exit 1 if results found |
 | `--allow-vacuous` | off | Suppress exit 4 vacuity guard |
@@ -72,7 +72,7 @@ anchor is the root; callers/callees hang off `├─ │ └─` box-drawing pre
 
 **Example:**
 ```bash
-cgx callers MyModule::my_fn --max-depth 3 --format json
+cgx callers MyModule::my_fn --depth 3 --format json
 cgx callees MyModule::my_fn --tree spanning
 ```
 
@@ -90,7 +90,7 @@ Accepts the same flags as `callers`.
 
 **Example:**
 ```bash
-cgx callees MyModule::my_fn --max-depth 2 --format sarif
+cgx callees MyModule::my_fn --depth 2 --format sarif
 ```
 
 ---
@@ -108,7 +108,7 @@ cgx reaches [OPTIONS] <FROM> [TO]
 | `<FROM>` | required | Source symbol (exact qualified name) |
 | `[TO]` | optional | Target symbol; omit to enumerate all reachable symbols |
 | `--tree <MODE>` | `full` | Forest shape for the `reaches <FROM>` (no `TO`) human view; see `callers`. Ignored for `reaches <FROM> <TO>`. |
-| `--repo`, `--format`, `--at`, `--max-depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+| `--repo`, `--format`, `--at`, `--depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
 
 `reaches <FROM>` (no `TO`) enumerates the reachable set and renders it as the
 human forest, like `callees`. `reaches <FROM> <TO>` answers a single
@@ -135,12 +135,12 @@ cgx paths [OPTIONS] <FROM> <TO>
 |---|---|---|
 | `<FROM>` | required | Source symbol |
 | `<TO>` | required | Target symbol |
-| `--max-depth <N>` | 6 | `0` = unlimited (work-budgeted) |
+| `--depth <N>` | 6 | `0` = unlimited (work-budgeted) |
 | `--repo`, `--format`, `--at`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
 
 **Example:**
 ```bash
-cgx paths FromFn ToFn --max-depth 0 --format mermaid
+cgx paths FromFn ToFn --depth 0 --format mermaid
 ```
 
 ---
@@ -180,7 +180,7 @@ cgx query [OPTIONS] <QUERY>
 | Argument / Flag | Default | Notes |
 |---|---|---|
 | `<QUERY>` | required | Inline CQL string or `@/path/to/file.cql` |
-| `--repo`, `--format`, `--at`, `--max-depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
+| `--repo`, `--format`, `--at`, `--depth`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
 
 **Shell quoting rule:** wrap the whole query in single quotes; use double quotes inside
 for string literals. Single-quoted strings cause a parse error (`unexpected character '\''`).
@@ -249,7 +249,7 @@ cgx unused [OPTIONS]
 |---|---|---|
 | `--kind <KIND>` | (all) | `function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint` — use the full word, not `fn` |
 | `--repo`, `--format`, `--confidence`, `--assert-empty`, `--allow-vacuous`, `--no-auto-index` | — | See shared-flags table |
-| `--max-depth`, `--at` | — | Accepted (exit 0) but inert for the whole-graph unused computation |
+| `--depth`, `--at` | — | Accepted (exit 0) but inert for the whole-graph unused computation |
 
 `unused` has **no name or pattern filter**. To find unused symbols matching a pattern,
 run `cgx unused` (optionally with `--kind`) then grep the output.
@@ -353,7 +353,7 @@ cgx mcp --root /path/to/repo
 | `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
 | `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y | Y | Y | Y | — |
 | `--at <REF>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
-| `--max-depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
+| `--depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
 | `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
 | `--assert-empty` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
 | `--allow-vacuous` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
@@ -367,8 +367,8 @@ cgx mcp --root /path/to/repo
 **`†` (on `search`):** `search` accepts only `human` and `json`. `sarif`, `dot`, `mermaid`, and `d2` are not
 meaningful for a symbol-list result and are not accepted.
 
-**`*` (on `unused`):** the binary accepts `--at`, `--max-depth`, and `--confidence` on
-`unused` (exit 0); `--max-depth`/`--at` have no effect on the unused-symbol computation,
+**`*` (on `unused`):** the binary accepts `--at`, `--depth`, and `--confidence` on
+`unused` (exit 0); `--depth`/`--at` have no effect on the unused-symbol computation,
 which is whole-graph. `--confidence` applies the edge-confidence floor when deciding
 whether an incoming edge counts as a caller.
 

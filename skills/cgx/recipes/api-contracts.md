@@ -59,17 +59,17 @@ caveats are defined in `reference/mental-model.md`.
 
 ```bash
 # Direct + transitive callees, human-readable
-cgx callees MyModule::my_public_fn --max-depth 10
+cgx callees MyModule::my_public_fn --depth 10
 
 # Cap depth; emit JSON for downstream processing
-cgx callees MyModule::my_public_fn --max-depth 6 --format json
+cgx callees MyModule::my_public_fn --depth 6 --format json
 
 # Footprint at a historical commit
-cgx callees MyModule::my_public_fn --max-depth 6 --at v1.0.0
+cgx callees MyModule::my_public_fn --depth 6 --at v1.0.0
 ```
 
 **Why this works:** `callees` performs a depth-first traversal of outgoing `CALLS` edges from the
-named symbol, up to `--max-depth` hops. Every node in the result is a function reachable from the
+named symbol, up to `--depth` hops. Every node in the result is a function reachable from the
 public method — the true scope of its call-contract.
 
 **Reading the result:** The footprint size (total reachable symbols) is a blast-radius proxy: a
@@ -121,14 +121,14 @@ cgx reaches MyModule::entry_point InternalModule::sink_fn
 cgx paths MyModule::entry_point InternalModule::sink_fn
 
 # Cap depth; default for paths is 6 (0 = unlimited, work-budgeted)
-cgx paths MyModule::entry_point InternalModule::sink_fn --max-depth 10
+cgx paths MyModule::entry_point InternalModule::sink_fn --depth 10
 
 # Mermaid diagram
 cgx paths MyModule::entry_point InternalModule::sink_fn --format mermaid
 ```
 
 **Why this works:** `reaches` answers the yes/no question and shows one witness path. `paths` finds
-all paths up to `--max-depth`. Both operate on the CALLS graph — they answer structural
+all paths up to `--depth`. Both operate on the CALLS graph — they answer structural
 reachability, not data flow. See the wrong-turns note below.
 
 **Reading the result:** A path with `exception` or `panic` edge labels means the call happens only

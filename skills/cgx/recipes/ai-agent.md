@@ -62,7 +62,7 @@ MCP tool defaults differ from the CLI. Set these explicitly to avoid over-fetchi
 | Set `max_results` explicitly | `callers(symbol, root, max_results=10)` |
 | Paginate on demand — check `has_more`; fetch the next page only if needed | pass `cursor` from the prior response |
 | Filter by edge condition to narrow result sets | `callers(symbol, root, edge_condition="exception")` |
-| Use `--format json` for CLI results that will be parsed | `cgx callers MyFn --max-depth 2 --format json` |
+| Use `--format json` for CLI results that will be parsed | `cgx callers MyFn --depth 2 --format json` |
 
 ---
 
@@ -124,13 +124,13 @@ Before adding a parameter to a function, find every call site so you know the re
 
 ```bash
 # CLI — all direct callers
-cgx callers Config::load --max-depth 1 --confidence probable --format json
+cgx callers Config::load --depth 1 --confidence probable --format json
 
 # MCP equivalent
 callers(symbol="Config::load", root="/workspace", depth=1, max_results=50)
 ```
 
-**Why this works:** `--max-depth 1` (CLI) / `depth=1` (MCP) returns direct call sites only —
+**Why this works:** `--depth 1` (CLI) / `depth=1` (MCP) returns direct call sites only —
 the ones that pass arguments and must be updated. `--confidence probable` / `confidence="probable"`
 includes callers reached via dynamic dispatch (trait objects), not just statically-certain callers.
 
@@ -160,7 +160,7 @@ loaded. Each remaining row is a callee in an unloaded file.
 
 **CLI form:**
 ```bash
-cgx callees OrderController::create --max-depth 1 --format json
+cgx callees OrderController::create --depth 1 --format json
 ```
 
 **Reading the result:** Each result row includes `file` and `line` for the callee's definition.
@@ -230,12 +230,12 @@ established pattern: what state is set up before the call, what arguments are pa
 callers(symbol="sendEmail", root="/workspace", depth=1, max_results=20)
 
 # CLI equivalent
-cgx callers sendEmail --max-depth 1 --format json
+cgx callers sendEmail --depth 1 --format json
 ```
 
 For two hops back (setup chain visible):
 ```bash
-cgx callers sendEmail --max-depth 2 --format json
+cgx callers sendEmail --depth 2 --format json
 ```
 
 **Reading the result:** Each caller row includes `file` and `line`. Load the top 2–3 call sites

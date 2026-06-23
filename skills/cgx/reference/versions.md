@@ -54,10 +54,10 @@ on the TypeScript frontend.
 | Subcommand | Since | Notes |
 |-----------|-------|-------|
 | `index` (auto-index) | v0.1 | Auto-builds into `.cgx/` on first query |
-| `callers` | v0.1 | `--max-depth`, `--confidence`, `--at`, `--format`, `--assert-empty` |
+| `callers` | v0.1 | `--depth`, `--confidence`, `--at`, `--format`, `--assert-empty` |
 | `callees` | v0.1 | Same flags as `callers` |
 | `reaches` | v0.1 | `TO` is optional; omit to enumerate all reachable symbols |
-| `paths` | v0.1 | `--max-depth` default 6; `0` = unlimited (work-budgeted); `--assert-empty` |
+| `paths` | v0.1 | `--depth` default 6; `0` = unlimited (work-budgeted); `--assert-empty` |
 | `explain` | v0.1 | Per-symbol provenance; flags limited to `--repo`, `--format`, `--no-auto-index` |
 | `unused` | v0.1 | `--kind function|method|type|field|variable|module|constant|macro|lambda|entrypoint` |
 | `doctor` | v0.1 | Index quality, unresolved-reference counts, `unexpanded-macro` counts |

@@ -184,8 +184,8 @@ Use `cgx paths` to check whether `commit` is reachable from `begin`:
 ```bash
 # Since: v0.1 — is there a path from transaction begin to commit?
 # Substitute your actual transaction-begin and commit symbol names
-cgx paths db::Connection::begin db::Connection::commit --max-depth 6
-cgx paths db::Connection::begin db::Connection::rollback --max-depth 6
+cgx paths db::Connection::begin db::Connection::commit --depth 6
+cgx paths db::Connection::begin db::Connection::rollback --depth 6
 ```
 
 Use `--assert-empty` in CI to assert no path exists (i.e., they are unreachable — inverts the check):
@@ -193,7 +193,7 @@ Use `--assert-empty` in CI to assert no path exists (i.e., they are unreachable 
 ```bash
 # Since: v0.1 — CI: fail if NO commit path exists would require the inverse pattern;
 # use paths to confirm reachability then audit missing-commit paths manually at v0.1
-cgx paths db::Connection::begin db::Connection::commit --format json --max-depth 6
+cgx paths db::Connection::begin db::Connection::commit --format json --depth 6
 ```
 
 For the full "all exit paths include commit-or-rollback" query (exception-path variant), use `cgx query`

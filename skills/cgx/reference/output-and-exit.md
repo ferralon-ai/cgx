@@ -39,8 +39,8 @@ Each child line is `fqn  file:line`, then non-default tags only:
   `always` is omitted.
 - confidence: `[probable]`, `[possible]`; `certain` is omitted.
 
-`--tree <full|spanning>` (default `full`). Both modes bound the walk to depth 3
-when `--max-depth` is unset (an explicit `--max-depth` overrides), and a
+`--tree <full|spanning>` (default `full`). Both modes bound the walk to depth 2
+when `--depth` is unset (an explicit `--depth` overrides), and a
 work-budget cap prints `… (truncated: N more)` at the cut:
 
 - **full** — expand every call edge; a symbol reached from two callers appears
@@ -138,7 +138,7 @@ reachable when `--no-auto-index` is passed explicitly.
 - Unknown or mistyped symbol name: `no symbol matched pattern '<x>'`
 - CQL parse error (e.g., single-quoted string, `NOT IN [...]`, node-only MATCH with no relationship)
 - CQL plan error (e.g., deferred node property such as `entrypoint_class`)
-- Phantom flag that does not exist (e.g., `--depth`, `--base`, `--avoiding`)
+- Phantom flag that does not exist (e.g., `--max-depth`, `--base`, `--avoiding`)
 
 Exit 2 is the signal to check the symbol name (grep source first), the CQL syntax, and the flag
 names against `reference/cli.md`. It is never "empty results."

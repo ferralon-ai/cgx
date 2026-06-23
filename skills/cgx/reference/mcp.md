@@ -73,7 +73,7 @@ defaults without adjusting them can produce narrower or different results than t
 
 | Parameter | MCP default | CLI equivalent | CLI default |
 |-----------|-------------|----------------|-------------|
-| `depth` (callers/callees) | **1** | `--max-depth` | unlimited |
+| `depth` (callers/callees) | **1** | `--depth` | 2 (forest) |
 | `include_dirty` | **true** | (no CLI flag) | false |
 | `max_results` (callers/callees/unused) | **20** | — | unlimited |
 | `max_results` (paths) | **10** | — | unlimited |

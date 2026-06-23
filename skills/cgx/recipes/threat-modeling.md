@@ -61,10 +61,10 @@ cgx reaches my_crate::http::handle_request libfoo::parse_header
 
 # Step 3: enumerate all call paths (bounded)
 # Since: v0.1
-cgx paths my_crate::http::handle_request libfoo::parse_header --max-depth 8 --format mermaid
+cgx paths my_crate::http::handle_request libfoo::parse_header --depth 8 --format mermaid
 ```
 
-**Why this works / breaking it down:** `reaches` returns a witness call path if one exists; `paths` enumerates all paths up to `--max-depth` hops. This confirms call reachability — not that data flows to the vulnerable call, and not that a sanitizer is absent. Those require v0.3 taint analysis (see `recipes/taint.md`).
+**Why this works / breaking it down:** `reaches` returns a witness call path if one exists; `paths` enumerates all paths up to `--depth` hops. This confirms call reachability — not that data flows to the vulnerable call, and not that a sanitizer is absent. Those require v0.3 taint analysis (see `recipes/taint.md`).
 
 **Reading the result:** Empty output from `reaches` (exit 0) means no call path exists — a strong negative. Non-empty output names the path and its edge-condition labels (`always`/`conditional`/`exception`/`loop`/`panic`) and per-edge confidence (`certain`/`probable`/`possible`). A `possible`-confidence edge on the path may be a false positive from unresolved dynamic dispatch. The reachability answer does not confirm whether a sanitizer or auth check stands between the caller and the sink — that requires the v0.3 taint form.
 
@@ -230,7 +230,7 @@ For a visual attack tree, pipe to a graph format:
 ```bash
 # Since: v0.1
 cgx paths my_crate::http::public_handler my_crate::db::execute_write \
-  --max-depth 6 --format mermaid
+  --depth 6 --format mermaid
 ```
 
 **Why this works / breaking it down:** The `NONE` quantifier on nodes excludes paths that pass through auth functions — a call-reachability proxy for "unauthenticated path". The second `NONE` on relationships restricts to non-exception edges (structural paths, not error paths). The `*6` bound must cover the realistic depth in your codebase. `paths --format mermaid` renders a visual call tree directly.

@@ -337,6 +337,7 @@ prop_compose! {
                 established_by: None,
                 cfg_condition: None,
                 macro_origin: None,
+                transform: None,
             })
             .collect();
         LinkedGraph::new(nodes, edges, vec![])

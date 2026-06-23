@@ -23,14 +23,23 @@
 /// v2 (GM-12 Phase 1): adds the `nodes.own_effects` denormalized column. The
 /// authoritative effect data rides in the `data` blob (postcard of `NodeRecord`);
 /// the column is a `--sql`-visible projection of the canonical effect-label list.
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// v3 (v0.3 DATA_FLOW SC2): adds the `edges.transform` denormalized column (NULL
+/// for non-dataflow edges). The authoritative value rides in the `data` blob
+/// (postcard of `EdgeRecord.transform`, `#[serde(default)]`-additive). A v2 store
+/// opened by a v3 binary is forward-migrated by clear-and-reindex (the Layer-1
+/// `blob_facts` cache is preserved — see [`crate::store`]).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// View-schema version (ADR-05), surfaced via the `cgx_meta` view. Bumped only on
 /// view-breaking changes (renamed/removed columns or views), independently of the
 /// physical `SCHEMA_VERSION`.
 ///
 /// v2 (GM-12 Phase 1): `v_symbols` gains an additive `own_effects` column.
-pub const VIEW_SCHEMA_VERSION: i64 = 2;
+///
+/// v3 (v0.3 DATA_FLOW SC2): adds the dedicated `v_data_flow_edges` view (and a
+/// `transform` column on it); the `v_call_edges` contract is unchanged.
+pub const VIEW_SCHEMA_VERSION: i64 = 3;
 
 /// `cgx_meta_kv` key under which the physical schema version is stored.
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -42,6 +51,7 @@ pub const META_VIEW_SCHEMA_VERSION: &str = "view_schema_version";
 pub const VIEW_SET: &[&str] = &[
     "v_symbols",
     "v_call_edges",
+    "v_data_flow_edges",
     "v_call_sites",
     "v_provenance",
     "cgx_meta",
@@ -94,6 +104,7 @@ CREATE TABLE IF NOT EXISTS edges (
     confidence      TEXT NOT NULL,
     tier            INTEGER NOT NULL,
     rule            TEXT NOT NULL,
+    transform       TEXT,                -- v3: DerivesFrom transform tag; NULL otherwise
     site_id         INTEGER,
     candidate_group INTEGER,
     data            BLOB NOT NULL,       -- canonical postcard of the EdgeRecord
@@ -127,6 +138,12 @@ CREATE VIEW IF NOT EXISTS v_call_edges AS
     SELECT graph_id, edge_id, src AS caller, dst AS callee, edge_kind,
            edge_condition, confidence, tier, rule, site_id, candidate_group
     FROM edges;
+
+CREATE VIEW IF NOT EXISTS v_data_flow_edges AS
+    SELECT graph_id, edge_id, src AS derived, dst AS source, edge_kind,
+           edge_condition, confidence, tier, rule, transform
+    FROM edges
+    WHERE edge_kind = 'derives-from';
 
 CREATE VIEW IF NOT EXISTS v_call_sites AS
     SELECT e.graph_id, e.site_id, e.src AS caller, e.edge_id,

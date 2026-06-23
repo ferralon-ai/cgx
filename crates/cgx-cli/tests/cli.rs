@@ -1008,3 +1008,24 @@ fn search_output_is_byte_identical_across_runs() {
     let (jb, _) = run_cgx(&repo, &["search", "search_target", "--format", "json"]);
     assert_eq!(ja, jb, "two json search runs must be byte-identical");
 }
+
+#[test]
+fn index_accepts_dataflow_flag_and_succeeds() {
+    // v0.3 DATA_FLOW SC2: `cgx index --dataflow` is accepted and indexes cleanly.
+    let (_tmp, repo) = fixture_repo();
+    let (out, code) = run_cgx(&repo, &["index", "--dataflow"]);
+    assert_eq!(code, 0, "index --dataflow should succeed: {out}");
+    assert!(out.contains("nodes"), "stats printed: {out}");
+    assert!(repo.join(".cgx/index.db").exists(), "store written");
+}
+
+#[test]
+fn dataflow_index_then_query_call_graph_still_works() {
+    // The base call-graph surface is unaffected by building the dataflow layer.
+    let (_tmp, repo) = fixture_repo();
+    let (_o, code) = run_cgx(&repo, &["index", "--dataflow"]);
+    assert_eq!(code, 0);
+    let (out, code) = run_cgx(&repo, &["callees", "main", "--no-auto-index"]);
+    assert_eq!(code, 0, "callees over a dataflow index works: {out}");
+    assert!(out.contains("fixture::alpha"), "alpha still reached: {out}");
+}

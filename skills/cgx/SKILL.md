@@ -77,7 +77,7 @@ answer means.
 - **Never emit unbounded `CALLS*` — it hangs.** Always bound the hops: `CALLS*2`.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
-- **Real flags, not the cookbook's:** `--max-depth` (not `--depth`); `--repo ./` (not a trailing `./`);
+- **Real flags, not the cookbook's:** `--repo ./` (not a trailing `./`);
   `--kind function` (not `--kind fn`); `cgx diff <BASE> <HEAD>` positional (not `--base/--head`). Flags like
   `--from-class`, `--avoiding`, `--only-edge-condition` **do not exist**.
 - **cgx answers reachability (call paths), not data flow.** `reaches A B` means "a call path exists", not

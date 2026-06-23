@@ -125,13 +125,13 @@ Find all call paths between a source and a sink, with optional edge-condition fi
 cgx paths --from <symbol> --to <symbol> <path>
           [--exclude-edge-condition exception|conditional|loop]
           [--only-edge-condition exception]
-          [--max-depth N] [--max-paths N]
+          [--depth N] [--max-paths N]
           [--max-fanout N] [--through-sentinels]
           [--at <ref>] [--format <fmt>]
 ```
 
 `--max-fanout` and `--through-sentinels` bound per-node breadth (orthogonally to
-the `--max-depth` / `--max-paths` bounds, which limit path length and path
+the `--depth` / `--max-paths` bounds, which limit path length and path
 count); see Q-13.
 
 **Examples:**
@@ -144,7 +144,7 @@ cgx paths --from main::foo --to vulnerable::bar ./ --exclude-edge-condition exce
 cgx paths --from main::foo --to vulnerable::bar ./ --only-edge-condition exception
 
 # Paths with depth limit to keep output manageable
-cgx paths --from '**' --to crypto::decrypt ./ --max-depth 8
+cgx paths --from '**' --to crypto::decrypt ./ --depth 8
 ```
 
 ### Q-4: unused
@@ -704,7 +704,7 @@ cgx query --at HEAD~1 '
 ## Q-13: Depth and Fan-Out Limits
 
 Transitive traversals are bounded in two orthogonal dimensions. **Depth** is
-bounded by the simple-path guarantee and the explicit `--depth` / `--max-depth`
+bounded by the simple-path guarantee and the explicit `--depth` / `--depth`
 flags (and `[:CALLS*min..max]` in the query language — see the `CALLS*`
 semantics above). **Fan-out** — the per-node breadth of the traversal — is
 bounded by `--max-fanout` and the sentinel mechanism. The two are independent: a

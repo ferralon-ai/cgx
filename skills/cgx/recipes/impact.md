@@ -25,11 +25,11 @@ The questions below run against the v0.1 binary using `callers`, `callees`,
 ```bash
 # Replace MyModule::my_fn with the exact symbol name from grep
 cgx callers MyModule::my_fn
-cgx callers MyModule::my_fn --max-depth 3 --format json
+cgx callers MyModule::my_fn --depth 3 --format json
 ```
 
 **Why this works:** `callers` walks the CALLS graph in reverse, returning every
-node that can reach the target within `--max-depth` hops (default: unlimited,
+node that can reach the target within `--depth` hops (default: unlimited,
 work-budgeted). The result is the set of callers that will be affected if the
 function's signature or behavior changes.
 
@@ -50,8 +50,8 @@ Before editing function `F`, retrieve callers (who will be affected) and callees
 (what `F` depends on):
 
 ```bash
-cgx callers OrderService::submit --max-depth 2 --format json
-cgx callees OrderService::submit --max-depth 3 --format json
+cgx callers OrderService::submit --depth 2 --format json
+cgx callees OrderService::submit --depth 3 --format json
 ```
 
 Or as a single bounded CQL query:
@@ -70,7 +70,7 @@ programmatic consumption.
 **Reading the result:** The caller set defines the API contract that must be
 preserved; the callee set defines the behavior the edit must not regress.
 Bound `CALLS*N` explicitly — unbounded `CALLS*` hangs. See `reference/cli.md`
-for `--max-depth` defaults.
+for `--depth` defaults.
 
 ---
 
@@ -84,7 +84,7 @@ separately:
 
 ```bash
 # Step 1 — get all callers of the target function
-cgx callers OrderService::submit --max-depth 5 --format json > callers.json
+cgx callers OrderService::submit --depth 5 --format json > callers.json
 
 # Step 2 — identify test modules from the caller list by file path convention
 # (e.g. grep for paths containing /tests/, _test.rs, test_, etc.)
@@ -104,7 +104,7 @@ represent uncovered production code — regression risk if the signature changes
 **Status:** runnable today   **Since:** v0.1
 
 ```bash
-cgx callers panic_handler --max-depth 20 --format json
+cgx callers panic_handler --depth 20 --format json
 ```
 
 Or with CQL to include edge-condition detail:
@@ -118,7 +118,7 @@ cgx query 'MATCH (caller)-[:CALLS*10]->(ph)
 
 **Why this works:** `callers` in reverse gives every function that can reach the
 panic handler — the set that could be on the call stack at crash time.
-`--max-depth 20` accommodates deep call chains; adjust as needed.
+`--depth 20` accommodates deep call chains; adjust as needed.
 
 **Reading the result:** The result is the blast radius from the panic — every
 function that could be interrupted. Edge conditions on individual hops
@@ -162,7 +162,7 @@ it." Real data-flow analysis is v0.3 (see `reference/versions.md`).
 
 ```bash
 # Direct callers of a known deprecated symbol
-cgx callers DeprecatedModule::old_function --max-depth 1 --format json
+cgx callers DeprecatedModule::old_function --depth 1 --format json
 ```
 
 For a graph-wide scan, use CQL with a name predicate (the `deprecated` node
@@ -176,9 +176,9 @@ cgx query 'MATCH (caller)-[:CALLS]->(fn)
            ORDER BY caller.file'
 ```
 
-**Why this works:** `--max-depth 1` returns only direct call sites — the actual
+**Why this works:** `--depth 1` returns only direct call sites — the actual
 migration touch points. Transitive callers (callers of callers) are a separate
-`--max-depth N` query if you need the broader blast radius.
+`--depth N` query if you need the broader blast radius.
 
 **Reading the result:** Each row is a file and line that calls the deprecated
 symbol directly. This is your migration checklist. Running with `--format sarif`
@@ -192,7 +192,7 @@ emits SARIF 2.1.0 suitable for IDE annotation or CI reporting.
 
 ```bash
 # All callers, then filter by test file path convention
-cgx callers OrderService::submit --max-depth 5 --format json
+cgx callers OrderService::submit --depth 5 --format json
 ```
 
 The CQL form using `entrypoint_class:"test"` node property does not run in
@@ -213,8 +213,8 @@ A middleware that wraps `authenticate` must honor all existing call sites (the
 caller contract) and preserve all existing behavior (the callee contract):
 
 ```bash
-cgx callers authenticate --max-depth 2 --format json
-cgx callees authenticate --max-depth 3 --format json
+cgx callers authenticate --depth 2 --format json
+cgx callees authenticate --depth 3 --format json
 ```
 
 **Why this works:** Callers within 2 hops define the API the middleware must
@@ -255,7 +255,7 @@ for sink proximity. See `recipes/vcs-diffs.md`.
 
 | Correct flag | Wrong form (do not use) | Notes |
 |---|---|---|
-| `--max-depth N` | `--depth N` | Phantom flag — exits 2 |
+| `--depth N` | `--max-depth N` | Renamed to `--depth` — `--max-depth` exits 2 |
 | `cgx diff BASE HEAD` (positional) | `--base REF --head REF` | Phantom flags — exits 2 |
 | `--kind function` | `--kind fn` | Phantom value — exits 2 |
 | `--repo /path/to/repo` | trailing `./` positional | Phantom positional — exits 2 |

@@ -47,7 +47,7 @@ cgx query '
 ```
 
 **Why this works.** `reaches` returns a witness path or nothing. `paths` returns every call chain up to
-`--max-depth` (default 6). The CQL form scans backwards from named sinks and can cover several sinks
+`--depth` (default 6). The CQL form scans backwards from named sinks and can cover several sinks
 in one query; bound the hops (`*4`) — unbounded `CALLS*` hangs.
 
 **Reading the result.** Each result row is a confirmed reachable call chain, not a guarantee of
@@ -121,10 +121,10 @@ authorizes correctly. Restrict to non-exception paths by adding:
 cgx reaches MyApp::main libfoo::deserialize
 
 # All paths, bounded
-cgx paths MyApp::main libfoo::deserialize --max-depth 10 --format json
+cgx paths MyApp::main libfoo::deserialize --depth 10 --format json
 
 # Who calls the vulnerable function? (scan backwards)
-cgx callers libfoo::deserialize --max-depth 5 --format json
+cgx callers libfoo::deserialize --depth 5 --format json
 
 # Structured report with edge conditions and confidence
 cgx query '
@@ -234,10 +234,10 @@ hop. Any result is a privilege escalation candidate. v0.1 has no string-prefix o
 
 ```bash
 # What does the new handler reach?
-cgx callees new_route::handler --max-depth 5 --format json
+cgx callees new_route::handler --depth 5 --format json
 
 # What does an authenticated handler reach?
-cgx callees auth::authenticated_handler --max-depth 5 --format json
+cgx callees auth::authenticated_handler --depth 5 --format json
 
 # CQL dual-MATCH for shared nodes — anchor EACH MATCH with a WHERE before the next clause
 cgx query '
@@ -353,8 +353,8 @@ quotes for the shell.
 | Pattern | Runnable form | Since |
 |---|---|---|
 | Reachability witness | `cgx reaches A B` | v0.1 |
-| All call paths | `cgx paths A B --max-depth N` | v0.1 |
-| Callers of a sink (depth N) | `cgx callers sink --max-depth N` | v0.1 |
+| All call paths | `cgx paths A B --depth N` | v0.1 |
+| Callers of a sink (depth N) | `cgx callers sink --depth N` | v0.1 |
 | Path must avoid node by name | `NONE(n IN nodes(path) WHERE n.name = "check")` | v0.1 |
 | Path has at least one exception edge | `ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | v0.1 |
 | Path is exception-only | `NONE(r IN relationships(path) WHERE r.condition <> "exception" AND r.condition <> "panic")` | v0.1 |
@@ -365,6 +365,6 @@ quotes for the shell.
 | Must-pass-through | `MATCH ALL … MUST PASS THROUGH` | v0.3 |
 | Dependency attributes | `dep_fn.package`, `dep_fn.version` | v0.4 |
 
-For flag reference (`--max-depth`, `--confidence`, `--format`, `--assert-empty`, `--repo`) see
+For flag reference (`--depth`, `--confidence`, `--format`, `--assert-empty`, `--repo`) see
 `reference/cli.md`. For output format shapes and exit-code meanings see `reference/output-and-exit.md`.
 For edge-condition labels and the confidence ladder see `reference/mental-model.md`.

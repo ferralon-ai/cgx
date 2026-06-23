@@ -41,7 +41,7 @@ rg --type rust "fn lock\b" path/to/repo/src
 Step 1: list callers of the acquire function.
 
 ```bash
-cgx callers 'MyMutex::lock' --max-depth 3 --format json
+cgx callers 'MyMutex::lock' --depth 3 --format json
 ```
 
 This tells you which functions call `MyMutex::lock` within 3 hops. It cannot tell

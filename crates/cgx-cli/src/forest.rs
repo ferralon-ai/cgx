@@ -36,9 +36,9 @@ pub enum TreeMode {
     Spanning,
 }
 
-/// The depth bound applied to a full-expansion forest when `--max-depth` is unset.
-/// An explicit `--max-depth` overrides this; the work budget is the hard backstop.
-pub const DEFAULT_TREE_DEPTH: u32 = 3;
+/// The depth bound applied to a full-expansion forest when `--depth` is unset.
+/// An explicit `--depth` overrides this; the work budget is the hard backstop.
+pub const DEFAULT_TREE_DEPTH: u32 = 2;
 
 /// The work-budget backstop on rendered tree rows. Bounds output on a dense graph
 /// regardless of depth; when hit, a `… (truncated: N more)` marker is emitted.

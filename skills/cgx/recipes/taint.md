@@ -51,14 +51,14 @@ cgx reaches MyModule::handle_request MyModule::log_info
 cgx paths MyModule::handle_request MyModule::log_info
 
 # Unlimited depth (work-budgeted) — use with caution on large graphs
-cgx paths MyModule::handle_request MyModule::log_info --max-depth 0
+cgx paths MyModule::handle_request MyModule::log_info --depth 0
 
 # JSON output for programmatic use
 cgx reaches MyModule::handle_request MyModule::log_info --format json
 ```
 
 **Why this works / breaking it down:** `reaches` performs a graph reachability check in the CALLS graph
-and returns a witness path if one exists. `paths` enumerates all call paths up to `--max-depth` (default 6).
+and returns a witness path if one exists. `paths` enumerates all call paths up to `--depth` (default 6).
 
 **Reading the result:**
 - A result means a call path exists; it does **not** mean tainted data flows on that path.
@@ -76,10 +76,10 @@ and returns a witness path if one exists. `paths` enumerates all call paths up t
 
 ```bash
 # Who calls the SQL execution function?
-cgx callers MyDb::execute --max-depth 3 --format json
+cgx callers MyDb::execute --depth 3 --format json
 
 # Who calls the log sink?
-cgx callers Logger::log_raw --max-depth 5
+cgx callers Logger::log_raw --depth 5
 
 # Who calls eval or reflect dispatch?
 cgx callers Evaluator::eval --confidence possible
@@ -92,7 +92,7 @@ knowledge of which callers handle user input to identify risk.
 **Reading the result:**
 - This is a reverse-reachability query, not a taint query. Every caller is returned regardless of
   whether it carries user-controlled data.
-- Use `--max-depth` to bound the traversal; the default is unlimited and can be slow on large graphs.
+- Use `--depth` to bound the traversal; the default is unlimited and can be slow on large graphs.
 - Filter for `--confidence certain` to restrict to calls the graph resolved without ambiguity.
 
 ### CQL reachability approximation via `cgx query`

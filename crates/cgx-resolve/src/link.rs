@@ -5,9 +5,12 @@ use cgx_core::confidence::{Confidence, Tier};
 use cgx_core::cut::{CutMarker, CutMarkers};
 use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
-use cgx_core::node::{EntrypointKind, NodeRecord, NodeWithProvenance, SymbolKind};
+use cgx_core::node::{EntrypointKind, NodeRecord, NodeWithProvenance, SymbolKind, Visibility};
 use cgx_core::provenance::{Provenance, Span};
-use cgx_frontend::facts::{ImplRelation, RawRef, RefKind, RelationKind, ScopeId, ScopeTree, SymbolDef};
+use cgx_core::transform::Transform;
+use cgx_frontend::facts::{
+    DataFlowFact, ImplRelation, RawRef, RefKind, RelationKind, ScopeId, ScopeTree, SymbolDef,
+};
 
 use crate::graph::{ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
@@ -23,7 +26,7 @@ use crate::symtab::{
 /// tier → confidence mapping.
 pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // --- Pass 0: materialize nodes and assign dense ids by canonical sort. ---
-    let (nodes, def_to_node) = build_nodes(inputs);
+    let (mut nodes, def_to_node) = build_nodes(inputs);
     let files: Vec<(String, &cgx_frontend::facts::FileFacts)> = inputs
         .iter()
         .map(|f| (module_segment(f), f.facts))
@@ -78,6 +81,13 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // --- Structural edges from imports (GM-2.2 Imports). ---
     // (Phase 1: only the call/structural edges the goldens exercise; the import
     // edge set is derivable but not required by WP-08's contract, so kept minimal.)
+
+    // --- v0.3 DATA_FLOW SC2 (opt-in): materialize SSA value nodes + DerivesFrom
+    // edges from each file's `data_flows`. A no-op when `opts.dataflow` is off, so
+    // the base index keeps zero value nodes / zero DerivesFrom edges. ---
+    if opts.dataflow {
+        resolve_data_flows(inputs, &def_to_node, &mut nodes, &mut edges);
+    }
 
     finalize(nodes, edges, candidates, unresolved)
 }
@@ -455,6 +465,252 @@ fn resolve_impl_relation(
     push_structural_edge(edges, src, dst, kind, &span);
 }
 
+/// v0.3 DATA_FLOW SC2: materialize SSA value nodes and intraprocedural
+/// `DerivesFrom` edges from every file's `data_flows`.
+///
+/// Value nodes are minted as `NodeRecord`s (kind `Variable`, `Value` flavor in
+/// the model) with a content-derived synthetic FQN `<fn>::<local>#<version>`, so
+/// re-assignment yields distinct nodes (flow-sensitivity) and two indexings of an
+/// unchanged blob mint identical FQNs (determinism). They are **appended** after
+/// the symbol nodes — symbol node ids are left untouched, so a base index (this
+/// pass not run) is byte-identical.
+///
+/// Source/derived name-paths resolve via the same intraprocedural scoping
+/// `RawRef` uses: the resolver replays each function's facts in span order,
+/// tracking the current SSA version of each local, so a `source` use binds to the
+/// value node of the version live at that point (or version 0 = the parameter /
+/// initial binding). Endpoints that resolve cleanly get `Certain`/`Probable` per
+/// the transform (design §1.3); a fact carrying an `OpaqueCall` cut has no source
+/// and emits no edge (SC4 resolves it through a summary).
+fn resolve_data_flows(
+    inputs: &[FileInput<'_>],
+    def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    nodes: &mut Vec<NodeWithProvenance>,
+    edges: &mut Vec<EdgeWithProvenance>,
+) {
+    // Intern value nodes by synthetic FQN so repeated references to the same SSA
+    // def share one node. A `BTreeMap` keeps minting order deterministic.
+    let mut value_nodes: std::collections::BTreeMap<String, ValueNodeStage> =
+        std::collections::BTreeMap::new();
+    let mut pending_edges: Vec<PendingDataFlowEdge> = Vec::new();
+
+    for file in inputs {
+        // Group this file's facts by owning function so SSA versions are tracked
+        // per function. The function of a fact is the scope's enclosing def.
+        let facts = file.facts;
+        // Per-function current version of each source name (0 = param / initial).
+        // Facts are already span-sorted by canonicalize(), so a single forward
+        // pass reconstructs def-use order deterministically.
+        let mut current: std::collections::HashMap<(String, String), u32> =
+            std::collections::HashMap::new();
+
+        for df in &facts.data_flows {
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope) else {
+                continue;
+            };
+            let fn_fqn = caller.fqn.as_str();
+
+            // The derived endpoint: a fresh value node for this SSA def.
+            let derived_local = df.derived.last().cloned().unwrap_or_default();
+            let derived_fqn = value_fqn(fn_fqn, &derived_local, df.derived_version);
+            intern_value_node(&mut value_nodes, &derived_fqn, file, df);
+
+            // Resolve the source endpoint at its currently-live version BEFORE
+            // recording the derived def. Def-use order: `b = b + 1` reads the old
+            // `b` (the version live on entry, or 0 = param) and writes a new one,
+            // so a self-named source binds to the prior value node, never itself.
+            let source_node_fqn = if df.source.is_empty() {
+                None
+            } else {
+                let source_local = df.source.last().cloned().unwrap_or_default();
+                let source_version = *current
+                    .get(&(fn_fqn.to_string(), source_local.clone()))
+                    .unwrap_or(&0);
+                let source_fqn = value_fqn(fn_fqn, &source_local, source_version);
+                intern_value_node(&mut value_nodes, &source_fqn, file, df);
+                Some(source_fqn)
+            };
+
+            // Record that `derived_local` is now at `derived_version` for later
+            // uses (after the source above was resolved against the prior version).
+            current.insert(
+                (fn_fqn.to_string(), derived_local.clone()),
+                df.derived_version,
+            );
+
+            // An opaque-call fact (empty source) mints the derived node but emits
+            // no edge — SC4 resolves it through the callee summary.
+            let Some(source_fqn) = source_node_fqn else {
+                continue;
+            };
+
+            pending_edges.push(PendingDataFlowEdge {
+                derived_fqn,
+                source_fqn,
+                transform: df.transform,
+                condition: df.edge_condition,
+                cut_markers: df.cut_markers.iter().copied().collect(),
+                span: Span::new(file.path.clone(), df.span.line, df.span.col),
+            });
+        }
+    }
+
+    // Assign dense ids to value nodes, appended after the existing symbol nodes,
+    // in canonical (file, line, fqn) order. Symbol node ids are unchanged.
+    let mut staged: Vec<ValueNodeStage> = value_nodes.into_values().collect();
+    staged.sort_by(|a, b| {
+        (a.file.as_str(), a.line, a.fqn.as_str()).cmp(&(b.file.as_str(), b.line, b.fqn.as_str()))
+    });
+    let mut value_fqn_to_node: std::collections::BTreeMap<String, NodeId> =
+        std::collections::BTreeMap::new();
+    let base = nodes.len() as u32;
+    for (offset, stage) in staged.into_iter().enumerate() {
+        let id = NodeId(base + offset as u32);
+        value_fqn_to_node.insert(stage.fqn.clone(), id);
+        nodes.push(stage.into_node(id));
+    }
+
+    // Resolve and push the DerivesFrom edges now that every value node has an id.
+    // A source name path may also reference a function-boundary symbol (e.g. a
+    // parameter that is itself a def) — fall back to the symbol node map.
+    for pe in pending_edges {
+        let Some(derived) = value_fqn_to_node.get(&pe.derived_fqn).copied() else {
+            continue;
+        };
+        let source = value_fqn_to_node
+            .get(&pe.source_fqn)
+            .copied()
+            .or_else(|| def_to_node.get(&pe.source_fqn).copied());
+        let Some(source) = source else {
+            continue;
+        };
+        push_data_flow_edge(edges, derived, source, &pe);
+    }
+}
+
+/// A value node staged before id assignment.
+///
+/// Identity is the content-derived [`ValueId`] (design §A.1); it is rendered into
+/// the deterministic synthetic `fqn` (`<fn>::<local>#<version>`) under which the
+/// node is persisted, so two indexings of an unchanged blob mint the same node.
+struct ValueNodeStage {
+    fqn: String,
+    file: String,
+    line: u32,
+    span: Span,
+    blob_oid: String,
+}
+
+impl ValueNodeStage {
+    fn into_node(self, id: NodeId) -> NodeWithProvenance {
+        let record = NodeRecord {
+            id,
+            kind: SymbolKind::Variable,
+            fqn: self.fqn,
+            file: self.file,
+            line_start: self.line,
+            line_end: self.line,
+            lang: String::new(),
+            visibility: Visibility::Private,
+            is_abstract: false,
+            entrypoint_kind: None,
+            signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
+        };
+        let prov = Provenance::new(self.span, "ssa-value", Tier::ScopeGraph, self.blob_oid);
+        NodeWithProvenance {
+            node: record,
+            provenance: prov,
+        }
+    }
+}
+
+/// A DerivesFrom edge whose endpoints are resolved after value-node ids exist.
+struct PendingDataFlowEdge {
+    derived_fqn: String,
+    source_fqn: String,
+    transform: Transform,
+    condition: cgx_core::condition::EdgeCondition,
+    cut_markers: Vec<CutMarker>,
+    span: Span,
+}
+
+/// The deterministic synthetic FQN of an SSA value node:
+/// `<fn_fqn>::<local>#<version>`. Version 0 is the parameter / initial binding.
+fn value_fqn(fn_fqn: &str, local: &str, version: u32) -> String {
+    format!("{fn_fqn}::{local}#{version}")
+}
+
+/// Intern (or refresh) a staged value node under its synthetic FQN. The first
+/// definition site (the fact whose span we see first) anchors the node's span; a
+/// later use of the same SSA version reuses it.
+fn intern_value_node(
+    value_nodes: &mut std::collections::BTreeMap<String, ValueNodeStage>,
+    fqn: &str,
+    file: &FileInput<'_>,
+    df: &DataFlowFact,
+) {
+    value_nodes.entry(fqn.to_string()).or_insert_with(|| ValueNodeStage {
+        fqn: fqn.to_string(),
+        file: file.path.clone(),
+        line: df.span.line,
+        span: Span::new(file.path.clone(), df.span.line, df.span.col),
+        blob_oid: file.blob_oid.clone(),
+    });
+}
+
+/// Push one resolved `DerivesFrom` edge: directed derived → source (docs/04
+/// DF-3.1), tagged with the transform and a confidence per design §1.3.
+fn push_data_flow_edge(
+    edges: &mut Vec<EdgeWithProvenance>,
+    derived: NodeId,
+    source: NodeId,
+    pe: &PendingDataFlowEdge,
+) {
+    // Confidence ladder (design §1.3): a direct copy/projection/return with both
+    // endpoints resolved is `certain`; a derivation through a recognized transform
+    // (arith/composed/branched) is `probable`; a truncated access path drops to
+    // `possible`.
+    let truncated = pe.cut_markers.contains(&CutMarker::TruncatedAccessPath);
+    let confidence = if truncated {
+        Confidence::Possible
+    } else {
+        match pe.transform {
+            Transform::Copy | Transform::Projection => Confidence::Certain,
+            _ => Confidence::Probable,
+        }
+    };
+    let mut cut_markers = CutMarkers::new();
+    for m in &pe.cut_markers {
+        cut_markers.insert(*m);
+    }
+    let record = EdgeRecord {
+        id: EdgeId(0),
+        src: derived,
+        dst: source,
+        kind: EdgeKind::DerivesFrom,
+        condition: pe.condition,
+        confidence,
+        tier: Tier::ScopeGraph,
+        rule: "derives-from".to_owned(),
+        site_id: None,
+        stmt_index: None,
+        cut_markers,
+        implicit: None,
+        candidate_group: None,
+        established_by: None,
+        cfg_condition: None,
+        macro_origin: None,
+        transform: Some(pe.transform),
+    };
+    let prov = Provenance::new(pe.span.clone(), "derives-from", Tier::ScopeGraph, String::new());
+    edges.push(EdgeWithProvenance {
+        edge: record,
+        provenance: prov,
+    });
+}
+
 /// Resolve a type/trait name path to a unique `Type` node id. Prefers an exact
 /// FQN match; falls back to a unique `Type` def with the matching short name.
 fn resolve_type_node(table: &SymbolTable, name_path: &[String]) -> Option<NodeId> {
@@ -538,6 +794,7 @@ fn push_structural_edge(
         established_by: None,
         cfg_condition: None,
         macro_origin: None,
+        transform: None,
     };
     let prov = Provenance::new(span.clone(), rule, Tier::ScopeGraph, String::new());
     edges.push(EdgeWithProvenance {
@@ -684,6 +941,7 @@ fn push_edge(edges: &mut Vec<EdgeWithProvenance>, b: EdgeBuild<'_>) {
         established_by: None,
         cfg_condition: None,
         macro_origin: None,
+        transform: None,
     };
     let prov = Provenance::new(b.span.clone(), b.rule, b.tier, String::new());
     edges.push(EdgeWithProvenance {

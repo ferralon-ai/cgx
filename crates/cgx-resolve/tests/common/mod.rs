@@ -227,6 +227,38 @@ impl FileBuilder {
         self
     }
 
+    /// Add an intraprocedural dataflow fact (v0.3 DATA_FLOW SC2):
+    /// `derived#version --derives-from(transform)--> source`, in `scope`.
+    pub fn data_flow(
+        &mut self,
+        derived: &[&str],
+        derived_version: u32,
+        source: &[&str],
+        scope: ScopeId,
+        transform: cgx_core::transform::Transform,
+        line: u32,
+    ) -> &mut Self {
+        self.facts.data_flows.push(cgx_frontend::DataFlowFact {
+            derived: derived.iter().map(|s| s.to_string()).collect(),
+            source: source.iter().map(|s| s.to_string()).collect(),
+            derived_version,
+            scope,
+            transform,
+            edge_condition: EdgeCondition::Always,
+            cut_markers: smallvec![],
+            span: Span::new("f", line, Some(1)),
+        });
+        self
+    }
+
+    /// Mark the last-added dataflow fact with a frontend cut marker.
+    pub fn last_data_flow_cut(&mut self, marker: CutMarker) -> &mut Self {
+        if let Some(df) = self.facts.data_flows.last_mut() {
+            df.cut_markers.push(marker);
+        }
+        self
+    }
+
     /// Finish, returning canonicalized facts.
     pub fn build(mut self) -> FileFacts {
         self.facts.canonicalize();

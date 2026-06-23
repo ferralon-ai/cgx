@@ -46,6 +46,7 @@ pub mod pattern;
 pub mod provenance;
 pub mod signature;
 pub mod sort;
+pub mod transform;
 
 // --- Curated flat re-exports for downstream ergonomics ---
 
@@ -54,11 +55,13 @@ pub use confidence::{Confidence, Tier};
 pub use cut::{CutMarker, CutMarkers};
 pub use edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance, EstablishedBy, ImplicitKind};
 pub use effect::{Effect, EffectSet};
-pub use id::{EdgeId, NodeId, NodeSortKey, SiteId};
+pub use id::{EdgeId, NodeId, NodeSortKey, SiteId, ValueId};
 pub use node::{
-    CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, Visibility,
+    CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, ValueNode,
+    Visibility,
 };
 pub use pattern::{PatternKind, SymbolPattern};
 pub use provenance::{Provenance, Span};
 pub use signature::{Param, Signature};
 pub use sort::EdgeIdentity;
+pub use transform::Transform;

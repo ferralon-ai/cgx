@@ -51,6 +51,11 @@ pub struct LinkOpts {
     /// When matching the Tier-0 fallback, require the callee arity to match a
     /// candidate's signature arity if both are known. Reduces false candidates.
     pub arity_filter: bool,
+    /// Build the v0.3 DATA_FLOW layer: materialize SSA value nodes and
+    /// `DerivesFrom` edges from each file's `data_flows`. Off by default so the
+    /// base index is byte-identical to pre-SC2 (zero value nodes, zero
+    /// `DerivesFrom` edges). Set by `cgx index --dataflow`.
+    pub dataflow: bool,
 }
 
 impl Default for LinkOpts {
@@ -58,6 +63,7 @@ impl Default for LinkOpts {
         LinkOpts {
             name_arity_fallback: true,
             arity_filter: true,
+            dataflow: false,
         }
     }
 }

@@ -257,6 +257,7 @@ fn build_sig_edge(
         established_by: None,
         cfg_condition: None,
         macro_origin: None,
+        transform: None,
     };
     let prov = Provenance::new(
         proto.provenance.span.clone(),

@@ -74,6 +74,7 @@ fn call_edge(
             established_by: None,
             cfg_condition: None,
             macro_origin: None,
+            transform: None,
         },
         provenance: Provenance::new(span, rule, tier, String::new()),
     }

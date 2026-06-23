@@ -53,6 +53,7 @@ fn call_edge(id: u32, src: u32, dst: u32) -> EdgeRecord {
         established_by: None,
         cfg_condition: None,
         macro_origin: None,
+        transform: None,
     }
 }
 

@@ -20,6 +20,7 @@ use cgx_core::effect::EffectSet;
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::Signature;
+use cgx_core::transform::Transform;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -296,6 +297,39 @@ pub struct EffectFact {
     pub effects: EffectSet,
 }
 
+/// A single intraprocedural dataflow fact (design §2.1, v0.3 DATA_FLOW): the
+/// value bound at `derived` was produced, in whole or in part, from the value at
+/// `source`. The resolver maps both name-paths to SSA value nodes (the same
+/// intraprocedural scope resolution `RawRef` uses) and emits a `DerivesFrom`
+/// [`EdgeKind`](cgx_core::edge::EdgeKind) tagged with `transform`.
+///
+/// Both endpoints share a scope subtree (intraprocedural — SC2 emits no
+/// cross-function facts; a call result records an `opaque-call` cut hint
+/// instead). `derived`/`source` are depth-≤1 access paths (`["u","name"]`);
+/// deeper paths truncate to the base with a `truncated-access-path` cut.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DataFlowFact {
+    /// Access-path of the derived binding (the SSA def being written).
+    pub derived: SmallVec<[Name; 2]>,
+    /// Access-path of the source binding (a use feeding the derived value).
+    pub source: SmallVec<[Name; 2]>,
+    /// The SSA version of `derived` at this definition. Re-assignment
+    /// (`x = a; x = b;`) increments it, so the resolver mints distinct value
+    /// nodes (criterion 2, flow-sensitivity).
+    pub derived_version: u32,
+    /// Lexical scope of the function body both endpoints live in.
+    pub scope: ScopeId,
+    /// Structural transform tag (design §1.5).
+    pub transform: Transform,
+    /// Edge condition lowered by the frontend, exactly like [`RawRef`].
+    pub edge_condition: EdgeCondition,
+    /// Cut markers the frontend already knows apply (e.g. `OpaqueCall` for a flow
+    /// through a call result, `TruncatedAccessPath` for a depth-2+ field access).
+    pub cut_markers: SmallVec<[CutMarker; 1]>,
+    /// Source span of the assignment.
+    pub span: Span,
+}
+
 /// A hint that some call edges are structurally invisible at this site
 /// (architecture §5 `CutHint`, GM-5.3 / ADR-07). The frontend records the cut
 /// so the edge is never silently dropped; the resolver stamps the marker on the
@@ -334,6 +368,10 @@ pub struct FileFacts {
     /// Syntactic own-effect facts (GM-12 Phase 1), one per symbol with any
     /// detected effect.
     pub effects: Vec<EffectFact>,
+    /// Intraprocedural dataflow facts (v0.3 DATA_FLOW SC2). Empty for frontends
+    /// that emit no dataflow (TS in the MVP) and for the base index path.
+    #[serde(default)]
+    pub data_flows: Vec<DataFlowFact>,
 }
 
 impl FileFacts {
@@ -362,9 +400,14 @@ impl FileFacts {
         self.entrypoint_hints.sort();
         self.cut_hints.sort();
         self.effects.sort();
+        self.data_flows.sort();
         for r in &mut self.refs {
             r.cut_markers.sort_unstable();
             r.cut_markers.dedup();
+        }
+        for df in &mut self.data_flows {
+            df.cut_markers.sort_unstable();
+            df.cut_markers.dedup();
         }
     }
 
@@ -380,5 +423,6 @@ impl FileFacts {
             && self.entrypoint_hints.is_empty()
             && self.cut_hints.is_empty()
             && self.effects.is_empty()
+            && self.data_flows.is_empty()
     }
 }

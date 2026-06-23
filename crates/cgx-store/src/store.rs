@@ -104,7 +104,24 @@ impl SqliteStore {
 
     /// Create tables/views (idempotent), then read-or-write the version rows and
     /// enforce the gate.
+    ///
+    /// ## Forward-compat migration (v0.3 DATA_FLOW SC2)
+    ///
+    /// An *older* on-disk schema (`found < SCHEMA_VERSION`) is migrated by
+    /// **clear-and-reindex**: the disposable Layer-2 tables (`graphs`, `nodes`,
+    /// `edges`, `candidates`) are dropped and recreated at the current schema, and
+    /// the version rows are rewritten. The Layer-1 `blob_facts` cache is preserved
+    /// — it is content-addressed and expensive to re-extract, and is decoded
+    /// through the additive (`#[serde(default)]`) record fields, so old fragments
+    /// stay valid. The next index run repopulates Layer 2 from that cache. A
+    /// *newer* on-disk schema (`found > SCHEMA_VERSION`) is still a hard error
+    /// (forward-incompatible: this binary cannot read it).
     fn init_schema(&self) -> Result<()> {
+        // Run the DDL first so every table (incl. `cgx_meta_kv` and `blob_facts`)
+        // exists before we read the version. On a fresh or current store this is
+        // the only step; on an *older* store the version read below triggers the
+        // clear-and-reindex migration, which recreates the Layer-2 tables at the
+        // current column layout.
         self.conn.execute_batch(SCHEMA_DDL)?;
 
         match self.read_meta(META_SCHEMA_VERSION)? {
@@ -116,13 +133,41 @@ impl SqliteStore {
                 // Keep the recorded view version current with this binary.
                 self.write_meta(META_VIEW_SCHEMA_VERSION, VIEW_SCHEMA_VERSION)?;
             }
+            Some(found) if found < SCHEMA_VERSION => {
+                self.migrate_to_current()?;
+            }
             Some(found) => {
+                // Newer on-disk schema: this binary cannot read it.
                 return Err(StoreError::SchemaVersion {
                     found,
                     expected: SCHEMA_VERSION,
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Clear-and-reindex an older store to the current schema: drop the disposable
+    /// Layer-2 tables and views, recreate them via the DDL, and rewrite the version
+    /// rows. `blob_facts` (the Layer-1 cache) is never touched.
+    fn migrate_to_current(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DROP VIEW IF EXISTS v_data_flow_edges;
+             DROP VIEW IF EXISTS v_call_edges;
+             DROP VIEW IF EXISTS v_call_sites;
+             DROP VIEW IF EXISTS v_provenance;
+             DROP VIEW IF EXISTS v_symbols;
+             DROP VIEW IF EXISTS cgx_meta;
+             DROP TABLE IF EXISTS candidates;
+             DROP TABLE IF EXISTS edges;
+             DROP TABLE IF EXISTS nodes;
+             DROP TABLE IF EXISTS graphs;",
+        )?;
+        // Recreate every table/view at the current schema (blob_facts/cgx_meta_kv
+        // are `IF NOT EXISTS`, so the preserved ones are left intact).
+        self.conn.execute_batch(SCHEMA_DDL)?;
+        self.write_meta(META_SCHEMA_VERSION, SCHEMA_VERSION)?;
+        self.write_meta(META_VIEW_SCHEMA_VERSION, VIEW_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -340,8 +385,8 @@ impl FactStore for SqliteStore {
 
             let mut edge_stmt = tx.prepare(
                 "INSERT INTO edges(graph_id, edge_id, src, dst, edge_kind, edge_condition,
-                                   confidence, tier, rule, site_id, candidate_group, data)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                                   confidence, tier, rule, transform, site_id, candidate_group, data)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
             for e in &g.edges {
                 edge_stmt.execute(params![
@@ -354,6 +399,7 @@ impl FactStore for SqliteStore {
                     enum_token(e.confidence),
                     e.tier.level() as i64,
                     e.rule,
+                    e.transform.map(enum_token),
                     e.site_id.map(|s| s.0 as i64),
                     e.candidate_group.map(|c| c as i64),
                     encode(e)?,

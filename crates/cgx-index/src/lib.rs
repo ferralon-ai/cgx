@@ -101,7 +101,7 @@ pub fn index_path(
     let repo = Repo::discover(repo_path)?;
     let tree_oid = repo.head_tree_oid()?;
     let sources = repo.enumerate_tree()?;
-    let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store)?;
+    let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
     pipeline::apply_scip(&mut graph, &mut stats, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
@@ -134,7 +134,7 @@ pub fn index_workdir(
     let repo = Repo::discover(repo_path)?;
     let sources = repo.enumerate_workdir(dir)?;
     let key = workdir_key(&sources);
-    let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store)?;
+    let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
     pipeline::apply_scip(&mut graph, &mut stats, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);

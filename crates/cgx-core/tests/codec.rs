@@ -54,6 +54,7 @@ fn sample_edge() -> EdgeRecord {
         established_by: Some(EstablishedBy::Annotation),
         cfg_condition: Some("feature = \"legacy\"".into()),
         macro_origin: None,
+        transform: None,
     }
 }
 
@@ -149,6 +150,7 @@ prop_compose! {
             established_by: None,
             cfg_condition: None,
             macro_origin: None,
+            transform: None,
         }
     }
 }

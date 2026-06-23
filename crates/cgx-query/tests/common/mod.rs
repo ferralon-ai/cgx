@@ -244,6 +244,7 @@ impl GraphBuilder {
                 established_by: None,
                 cfg_condition: None,
                 macro_origin: None,
+                transform: None,
             })
             .collect();
         cgx_core::sort::sort_edges(&mut edges);

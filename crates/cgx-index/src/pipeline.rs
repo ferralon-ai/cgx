@@ -44,6 +44,11 @@ pub struct IndexOpts {
     /// Path to a `.scip` index to ingest for the SCIP upgrade-only re-label pass
     /// (design §3.5). `None` ⇒ no SCIP pass; the graph is stored as linked.
     pub scip: Option<PathBuf>,
+    /// Build the v0.3 DATA_FLOW layer (SC2): SSA value nodes + `DerivesFrom`
+    /// edges. Off by default — the base index is byte-identical to pre-SC2 (zero
+    /// value nodes, zero dataflow edges, unchanged latency). Set by
+    /// `cgx index --dataflow`.
+    pub dataflow: bool,
 }
 
 /// Counters describing what an index run did. The incremental win is observable
@@ -98,6 +103,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
     sources: &[SourceFile],
     registry: &FrontendRegistry,
     store: &mut S,
+    opts: &IndexOpts,
 ) -> Result<(ResolvedGraph, IndexStats)> {
     use rayon::prelude::*;
 
@@ -199,7 +205,11 @@ pub(crate) fn extract_and_link<S: FactStore>(
             )
         })
         .collect();
-    let graph = link(&inputs, &LinkOpts::default());
+    let link_opts = LinkOpts {
+        dataflow: opts.dataflow,
+        ..LinkOpts::default()
+    };
+    let graph = link(&inputs, &link_opts);
     stats.nodes = graph.nodes.len();
     stats.edges = graph.edges.len();
     stats.unresolved = graph.unresolved.len();

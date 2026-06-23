@@ -93,6 +93,7 @@ pub fn sample_graph() -> LinkedGraph {
             established_by: None,
             cfg_condition: None,
             macro_origin: None,
+            transform: None,
         },
         EdgeRecord {
             id: EdgeId(1),
@@ -111,6 +112,7 @@ pub fn sample_graph() -> LinkedGraph {
             established_by: None,
             cfg_condition: None,
             macro_origin: None,
+            transform: None,
         },
     ];
 

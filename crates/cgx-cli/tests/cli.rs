@@ -182,7 +182,7 @@ fn tree_spanning_flag_switches_mode() {
 }
 
 /// A deeper fixture: a linear call chain `c0 → c1 → c2 → c3 → c4 → c5` (depth 5),
-/// so the depth-3 default has something to clip. Returns (tempdir, repo path).
+/// so the depth-2 default has something to clip. Returns (tempdir, repo path).
 fn deep_chain_repo() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
@@ -227,13 +227,13 @@ fn main() { c0(); }
     (tmp, repo)
 }
 
-/// SPANNING mode must inherit the depth-3 default when `--max-depth` is unset:
-/// on a depth-5 chain from `c0`, the walk stops at depth 3 (c1,c2,c3 present;
-/// c4,c5 absent) for BOTH spanning and full. This is the criterion-4 regression:
+/// SPANNING mode must inherit the depth-2 default when `--depth` is unset:
+/// on a depth-5 chain from `c0`, the walk stops at depth 2 (c1,c2 present;
+/// c3,c4,c5 absent) for BOTH spanning and full. This is the criterion-4 regression:
 /// before the walker-level default, spanning collected an unbounded subgraph and
 /// rendered all the way to c5.
 #[test]
-fn spanning_honors_default_depth_three_when_unset() {
+fn spanning_honors_default_depth_two_when_unset() {
     let (_tmp, repo) = deep_chain_repo();
     index(&repo);
 
@@ -241,33 +241,33 @@ fn spanning_honors_default_depth_three_when_unset() {
     assert_eq!(cs, 0, "spanning exits 0: {spanning}");
     assert!(spanning.contains("fixture::c1"), "c1 (depth1) present: {spanning}");
     assert!(spanning.contains("fixture::c2"), "c2 (depth2) present: {spanning}");
-    assert!(spanning.contains("fixture::c3"), "c3 (depth3) present: {spanning}");
-    assert!(!spanning.contains("fixture::c4"), "c4 (depth4) clipped at default depth 3: {spanning}");
-    assert!(!spanning.contains("fixture::c5"), "c5 (depth5) clipped at default depth 3: {spanning}");
+    assert!(!spanning.contains("fixture::c3"), "c3 (depth3) clipped at default depth 2: {spanning}");
+    assert!(!spanning.contains("fixture::c4"), "c4 (depth4) clipped at default depth 2: {spanning}");
+    assert!(!spanning.contains("fixture::c5"), "c5 (depth5) clipped at default depth 2: {spanning}");
 
     // Full mode bounds identically at the default.
     let (full, cf) = run_cgx(&repo, &["callees", "c0", "--tree", "full"]);
     assert_eq!(cf, 0, "full exits 0: {full}");
-    assert!(full.contains("fixture::c3"), "c3 present in full: {full}");
-    assert!(!full.contains("fixture::c4"), "c4 clipped in full: {full}");
+    assert!(full.contains("fixture::c2"), "c2 present in full: {full}");
+    assert!(!full.contains("fixture::c3"), "c3 clipped in full: {full}");
 }
 
-/// An explicit `--max-depth` overrides the depth-3 default for BOTH modes: on the
-/// same depth-5 chain `--max-depth 5` reaches c5; `--max-depth 1` stops at c1.
+/// An explicit `--depth` overrides the depth-2 default for BOTH modes: on the
+/// same depth-5 chain `--depth 5` reaches c5; `--depth 1` stops at c1.
 #[test]
-fn explicit_max_depth_overrides_default_for_both_modes() {
+fn explicit_depth_overrides_default_for_both_modes() {
     let (_tmp, repo) = deep_chain_repo();
     index(&repo);
 
     for mode in ["full", "spanning"] {
-        let (deep, c) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--max-depth", "5"]);
-        assert_eq!(c, 0, "{mode} --max-depth 5 exits 0: {deep}");
-        assert!(deep.contains("fixture::c5"), "{mode} --max-depth 5 reaches c5: {deep}");
+        let (deep, c) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--depth", "5"]);
+        assert_eq!(c, 0, "{mode} --depth 5 exits 0: {deep}");
+        assert!(deep.contains("fixture::c5"), "{mode} --depth 5 reaches c5: {deep}");
 
-        let (shallow, c2) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--max-depth", "1"]);
-        assert_eq!(c2, 0, "{mode} --max-depth 1 exits 0: {shallow}");
-        assert!(shallow.contains("fixture::c1"), "{mode} --max-depth 1 has c1: {shallow}");
-        assert!(!shallow.contains("fixture::c2"), "{mode} --max-depth 1 stops before c2: {shallow}");
+        let (shallow, c2) = run_cgx(&repo, &["callees", "c0", "--tree", mode, "--depth", "1"]);
+        assert_eq!(c2, 0, "{mode} --depth 1 exits 0: {shallow}");
+        assert!(shallow.contains("fixture::c1"), "{mode} --depth 1 has c1: {shallow}");
+        assert!(!shallow.contains("fixture::c2"), "{mode} --depth 1 stops before c2: {shallow}");
     }
 }
 

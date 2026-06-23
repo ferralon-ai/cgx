@@ -123,9 +123,9 @@ fn full_forest_expands_every_call_edge_under_each_parent() {
 }
 
 #[test]
-fn full_forest_honors_default_depth_three_when_unset() {
-    // A linear chain 0->1->2->3->4. Default depth 3 stops after three levels:
-    // d1, d2, d3 render; d4 (the 5th node) does not.
+fn full_forest_honors_default_depth_two_when_unset() {
+    // A linear chain 0->1->2->3->4. Default depth 2 stops after two levels:
+    // d1, d2 render; d3 (the 4th node) does not.
     let v = view(
         (0..5).map(|i| node(i, &format!("f{i}"))).collect(),
         (0..4).map(|i| call_edge(i, i, i + 1)).collect(),
@@ -138,8 +138,8 @@ fn full_forest_honors_default_depth_three_when_unset() {
     let out = render(&v, sub, TreeMode::Full, None);
     assert!(out.contains("f1"), "depth1 present: {out}");
     assert!(out.contains("f2"), "depth2 present: {out}");
-    assert!(out.contains("f3"), "depth3 present: {out}");
-    assert!(!out.contains("f4"), "depth4 omitted at default depth 3: {out}");
+    assert!(!out.contains("f3"), "depth3 omitted at default depth 2: {out}");
+    assert!(!out.contains("f4"), "depth4 omitted at default depth 2: {out}");
 }
 
 // --- cycle marker -------------------------------------------------------------

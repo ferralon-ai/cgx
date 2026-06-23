@@ -701,7 +701,7 @@ fn render_table_json(t: &TableData, vacuous: bool) -> String {
 fn truncation_marker(reason: TruncationReason) -> String {
     match reason {
         TruncationReason::StepBudget => {
-            "[truncated: search budget exhausted; narrow with --max-depth]".to_string()
+            "[truncated: search budget exhausted; narrow with --depth]".to_string()
         }
         TruncationReason::PathCap => {
             "[truncated: path limit reached; more paths exist]".to_string()

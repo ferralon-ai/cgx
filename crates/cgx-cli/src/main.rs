@@ -80,7 +80,7 @@ enum Command {
         query: QueryArgs,
     },
     /// Enumerate the call paths from `from` to `to`. Bounded to depth 6 by default
-    /// (`--max-depth 0` lifts the depth limit; the search stays work-budgeted and
+    /// (`--depth 0` lifts the depth limit; the search stays work-budgeted and
     /// may report `[truncated]`).
     Paths {
         from: String,
@@ -233,11 +233,12 @@ struct QueryArgs {
     /// (Q-17). Shared across every subcommand that takes these query flags.
     #[arg(long)]
     at: Option<String>,
-    /// Maximum traversal depth. For `paths`, omitting it applies a default depth
-    /// of 6 (the common case is bounded and fast); pass `--max-depth 0` for
-    /// unlimited depth, which stays protected by an internal work budget and may
-    /// report `[truncated]` on a dense graph.
-    #[arg(long)]
+    /// Maximum traversal depth. The human forest (`callers`/`callees`/`reaches`)
+    /// applies a default depth of 2 when unset; for `paths`, omitting it applies a
+    /// default depth of 6 (the common case is bounded and fast); pass `--depth 0`
+    /// for unlimited depth, which stays protected by an internal work budget and
+    /// may report `[truncated]` on a dense graph.
+    #[arg(long = "depth", value_name = "DEPTH")]
     max_depth: Option<u32>,
     /// Forest shape for the human view of `callers`/`callees`/`reaches <from>`:
     /// `full` (default) expands every call edge, so a callee reached from two
@@ -511,7 +512,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
     };
     match to {
         // `from → *`: every reachable symbol (callees machinery), as a forest. Uses
-        // the forest walker so the depth-3 default bounds the neighborhood walk.
+        // the forest walker so the depth-2 default bounds the neighborhood walk.
         None => {
             let walker = build_forest_walker(&args);
             let results = callees(&view, from_id, &walker);
@@ -1097,10 +1098,10 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
 }
 
 /// Resolve the effective neighborhood depth for the forest human view: an explicit
-/// `--max-depth` is honored as given; when unset it defaults to
+/// `--depth` is honored as given; when unset it defaults to
 /// [`DEFAULT_TREE_DEPTH`] so the induced subgraph the walk collects — and thus both
 /// the `full` and `spanning` renders that consume it — is bounded by default. This
-/// is the single place the depth-3 default is applied, so the walk itself is
+/// is the single place the depth-2 default is applied, so the walk itself is
 /// bounded (no unbounded collection) and both tree modes inherit the same bound.
 fn forest_max_depth(max_depth: Option<u32>) -> Option<u32> {
     Some(max_depth.unwrap_or(DEFAULT_TREE_DEPTH))
@@ -1108,7 +1109,7 @@ fn forest_max_depth(max_depth: Option<u32>) -> Option<u32> {
 
 /// Build the neighborhood walker for the forest human path. Identical to
 /// [`build_walker`] except the depth is resolved via [`forest_max_depth`] so the
-/// depth-3 default bounds the walk when `--max-depth` is unset.
+/// depth-2 default bounds the walk when `--depth` is unset.
 fn build_forest_walker(args: &QueryArgs) -> PathWalker {
     PathWalker {
         max_depth: forest_max_depth(args.max_depth),
@@ -1116,13 +1117,13 @@ fn build_forest_walker(args: &QueryArgs) -> PathWalker {
     }
 }
 
-/// Default `--max-depth` for `paths` when the user passes none. An unbounded DFS
+/// Default `--depth` for `paths` when the user passes none. An unbounded DFS
 /// over a dense graph never terminates, so the common `cgx paths a b` invocation
-/// is bounded by default; the user can widen it explicitly (or pass `--max-depth 0`
+/// is bounded by default; the user can widen it explicitly (or pass `--depth 0`
 /// for unlimited depth, which stays protected by the walker's step budget).
 const PATHS_DEFAULT_MAX_DEPTH: u32 = 6;
 
-/// Resolve the effective `paths` depth from `--max-depth`:
+/// Resolve the effective `paths` depth from `--depth`:
 /// - omitted → [`PATHS_DEFAULT_MAX_DEPTH`] (the bounded common case);
 /// - `0`     → `None` (unlimited depth, still capped by the work budget);
 /// - `n`     → `Some(n)` (honored as given).

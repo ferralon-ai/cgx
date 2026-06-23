@@ -53,6 +53,11 @@ enum Command {
         /// Phase-1 syntactic graph, unchanged.
         #[arg(long, value_name = "SCIP_INDEX")]
         scip: Option<PathBuf>,
+        /// Build the v0.3 DATA_FLOW layer: SSA value nodes and `derives-from`
+        /// edges (intraprocedural, Rust-only in this release). Off by default; the
+        /// base index is byte-identical without it. Surfaces in `:DATA_FLOW`/`--sql`.
+        #[arg(long)]
+        dataflow: bool,
     },
     /// Symbols that (transitively) call `symbol`.
     Callers {
@@ -292,7 +297,7 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path, scip } => run_index(path, scip),
+        Command::Index { path, scip, dataflow } => run_index(path, scip, dataflow),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::Reaches { from, to, query } => run_reaches(&from, to.as_deref(), query),
@@ -328,9 +333,9 @@ fn run(command: Command) -> Result<(), CliError> {
     }
 }
 
-fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>) -> Result<(), CliError> {
+fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>, dataflow: bool) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
-    let outcome = index_repo(&repo_root, &IndexOpts { scip })?;
+    let outcome = index_repo(&repo_root, &IndexOpts { scip, dataflow })?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);

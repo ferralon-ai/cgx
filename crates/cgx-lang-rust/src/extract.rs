@@ -22,6 +22,7 @@ use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::{Param, Signature};
+use cgx_core::transform::Transform;
 use cgx_frontend::{
     CutHint, EffectFact, EntrypointHint, EntrypointKind, ExportFact, FileCtx, FileFacts,
     FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, RawRef, RefKind,
@@ -164,6 +165,10 @@ struct Builder<'a> {
     /// definition's local FQN. Flushed into `facts.effects` in [`Builder::finish`].
     /// A `BTreeMap` keeps the flush order deterministic.
     effects: std::collections::BTreeMap<String, EffectSet>,
+    /// Accumulated intraprocedural dataflow facts (v0.3 DATA_FLOW SC2), keyed by
+    /// the owning function's local FQN for a stable, per-function flush order.
+    /// Flushed into `facts.data_flows` in [`Builder::finish`].
+    data_flows: std::collections::BTreeMap<String, Vec<cgx_frontend::DataFlowFact>>,
 }
 
 impl<'a> Builder<'a> {
@@ -174,6 +179,7 @@ impl<'a> Builder<'a> {
             facts: FileFacts::empty(),
             extern_fns: Vec::new(),
             effects: std::collections::BTreeMap::new(),
+            data_flows: std::collections::BTreeMap::new(),
         }
     }
 
@@ -182,6 +188,9 @@ impl<'a> Builder<'a> {
             if !set.is_empty() {
                 self.facts.effects.push(EffectFact { fqn, effects: set });
             }
+        }
+        for (_fqn, facts) in self.data_flows {
+            self.facts.data_flows.extend(facts);
         }
         self.facts
     }
@@ -314,9 +323,14 @@ impl<'a> Builder<'a> {
         self.record_fn_entrypoints(node, &name, &fqn);
 
         if let Some(body) = node.child_by_field_name("body") {
-            let body_ctx = ctx.enter_body(fqn, scope);
+            let body_ctx = ctx.enter_body(fqn.clone(), scope);
             let mut inner = 0u32;
             self.walk(body, &body_ctx, &mut inner);
+            // v0.3 DATA_FLOW SC2: a second, dataflow-only traversal of the same
+            // body that versions assignments into SSA value defs and emits
+            // intraprocedural `DataFlowFact`s. Reuses the same scope + condition
+            // lowering as the call walk above.
+            self.walk_function_ssa(body, &body_ctx, &fqn);
         }
     }
 
@@ -1299,6 +1313,415 @@ impl<'a> Builder<'a> {
             }
         }
         Some(sig)
+    }
+
+    // --- v0.3 DATA_FLOW SC2: intraprocedural SSA pass ---
+
+    /// Walk one function body a second time, dataflow-only: version each
+    /// assignment into an SSA value def and emit an intraprocedural
+    /// [`DataFlowFact`](cgx_frontend::DataFlowFact) for the production sites in
+    /// design §1.1 (let/assign → copy/arith/projection/composed/branched; return
+    /// → copy to `<fn>::return`). Re-assignment (`x = a; x = b;`) increments the
+    /// per-name version so the resolver mints two distinct value nodes
+    /// (flow-sensitivity, criterion 2). Call results record an `opaque-call` cut
+    /// and emit no cross-function source (SC4's job).
+    fn walk_function_ssa(&mut self, body: Node<'_>, ctx: &Ctx, fn_fqn: &str) {
+        let mut versions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        self.ssa_walk(body, ctx, fn_fqn, &mut versions);
+    }
+
+    fn ssa_walk(
+        &mut self,
+        node: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        match node.kind() {
+            "let_declaration" => {
+                let cond = ctx.condition();
+                if let Some(name) = node
+                    .child_by_field_name("pattern")
+                    .and_then(|p| self.binding_name(p))
+                {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        self.ssa_assignment(&name, value, ctx, fn_fqn, cond, versions);
+                    }
+                }
+                // Recurse into the RHS so nested assignments/blocks are versioned.
+                if let Some(value) = node.child_by_field_name("value") {
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
+            "assignment_expression" => {
+                let cond = ctx.condition();
+                if let Some(name) = node
+                    .child_by_field_name("left")
+                    .and_then(|p| self.binding_name(p))
+                {
+                    if let Some(value) = node.child_by_field_name("right") {
+                        self.ssa_assignment(&name, value, ctx, fn_fqn, cond, versions);
+                    }
+                }
+                if let Some(value) = node.child_by_field_name("right") {
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
+            "return_expression" => {
+                let cond = ctx.condition();
+                if let Some(value) = node.named_child(0) {
+                    self.ssa_return(value, ctx, fn_fqn, cond, versions);
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
+            // Control-flow constructs lower an edge condition exactly like the call
+            // walk, so a flow inside an `if`/`match`-arm / loop body is conditional
+            // / exception / loop, matching `RawRef.edge_condition`.
+            "if_expression" | "if_let_expression" => {
+                if let Some(c) = node.child_by_field_name("condition") {
+                    self.ssa_walk(c, ctx, fn_fqn, versions);
+                }
+                let inner = ctx.with_condition(EdgeCondition::Conditional);
+                if let Some(c) = node.child_by_field_name("consequence") {
+                    self.ssa_walk(c, &inner, fn_fqn, versions);
+                }
+                if let Some(a) = node.child_by_field_name("alternative") {
+                    self.ssa_walk(a, &inner, fn_fqn, versions);
+                }
+            }
+            "match_expression" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+                if let Some(mbody) = node.child_by_field_name("body") {
+                    let mut cursor = mbody.walk();
+                    for arm in mbody.children(&mut cursor) {
+                        if arm.kind() != "match_arm" {
+                            continue;
+                        }
+                        let is_err = arm
+                            .child_by_field_name("pattern")
+                            .map(|p| self.pattern_is_err(p))
+                            .unwrap_or(false);
+                        let arm_cond = if is_err {
+                            EdgeCondition::Exception
+                        } else {
+                            EdgeCondition::Conditional
+                        };
+                        let inner = ctx.with_condition(arm_cond);
+                        if let Some(value) = arm.child_by_field_name("value") {
+                            self.ssa_walk(value, &inner, fn_fqn, versions);
+                        }
+                    }
+                }
+            }
+            "for_expression" | "while_expression" | "loop_expression" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let inner = ctx.with_condition(EdgeCondition::Loop);
+                    self.ssa_walk(body, &inner, fn_fqn, versions);
+                }
+            }
+            // A closure opens a new scope/binding world; SC2 does not descend into
+            // closure bodies for SSA (closure-capture dataflow is deferred, DF-18).
+            "closure_expression" => {}
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.ssa_walk(child, ctx, fn_fqn, versions);
+                }
+            }
+        }
+    }
+
+    /// Emit the `DataFlowFact`(s) for `name = <value>`: bump the SSA version of
+    /// `name`, classify the RHS shape into a [`Transform`], and emit one fact per
+    /// source operand (`derived --derives-from(transform)--> source`).
+    fn ssa_assignment(
+        &mut self,
+        name: &str,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = {
+            let v = versions.entry(name.to_string()).or_insert(0);
+            *v += 1;
+            *v
+        };
+        let derived: SmallVec<[String; 2]> = smallvec_one(name.to_string());
+        let span = self.span(value);
+        let (transform, sources, cut) = self.classify_rhs(value);
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                span.clone(),
+            );
+        }
+    }
+
+    /// Emit the return dataflow fact: `<fn>::return --derives-from(copy)--> <expr>`
+    /// for the syntactic operand of a `return` (or a tail expression).
+    fn ssa_return(
+        &mut self,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = {
+            let v = versions.entry("return".to_string()).or_insert(0);
+            *v += 1;
+            *v
+        };
+        let derived: SmallVec<[String; 2]> = {
+            let mut v = SmallVec::new();
+            v.push(fn_fqn.to_string());
+            v.push("return".to_string());
+            v
+        };
+        let span = self.span(value);
+        let (_t, sources, cut) = self.classify_rhs(value);
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                span.clone(),
+            );
+        }
+    }
+
+    /// Classify a RHS expression into `(transform, source access-paths, cut)`.
+    ///
+    /// Returns the structural [`Transform`], the list of source bindings the value
+    /// derives from (a copy/projection has one; arith/composed several), and an
+    /// optional cut marker (`OpaqueCall` for a call result — empty sources;
+    /// `TruncatedAccessPath` for a depth-2+ field access — base source kept).
+    fn classify_rhs(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        match value.kind() {
+            "identifier" => (Transform::Copy, vec![smallvec_one(self.text(value))], None),
+            "field_expression" => self.classify_field(value),
+            "binary_expression" => {
+                let mut sources = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = value.child_by_field_name(field) {
+                        sources.extend(self.operand_sources(n));
+                    }
+                }
+                (Transform::Arith, sources, None)
+            }
+            "unary_expression" => {
+                let sources = value
+                    .named_child(0)
+                    .map(|n| self.operand_sources(n))
+                    .unwrap_or_default();
+                (Transform::Arith, sources, None)
+            }
+            "struct_expression" | "tuple_expression" | "array_expression" => {
+                let sources = self.composed_sources(value);
+                (Transform::Composed, sources, None)
+            }
+            "if_expression" | "if_let_expression" | "match_expression" => {
+                let sources = self.branch_sources(value);
+                (Transform::Branched, sources, None)
+            }
+            "call_expression" | "macro_invocation" | "await_expression" | "try_expression" => {
+                // SC2: a call result is opaque — no cross-function edge (SC4).
+                (Transform::Other, Vec::new(), Some(CutMarker::OpaqueCall))
+            }
+            "reference_expression" | "parenthesized_expression" => value
+                .named_child(0)
+                .map(|n| self.classify_rhs(n))
+                .unwrap_or((Transform::Other, Vec::new(), None)),
+            _ => (Transform::Other, Vec::new(), None),
+        }
+    }
+
+    /// Classify a `field_expression` RHS: depth-1 (`u.name`) is a clean
+    /// `Projection`; depth-2+ (`u.cfg.timeout`) truncates to the base value with a
+    /// `TruncatedAccessPath` cut.
+    fn classify_field(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        let Some(base) = value.child_by_field_name("value") else {
+            return (Transform::Projection, Vec::new(), None);
+        };
+        let field = value
+            .child_by_field_name("field")
+            .map(|f| self.text(f))
+            .unwrap_or_default();
+        if base.kind() == "identifier" {
+            // Depth-1: `base.field`.
+            let mut path: SmallVec<[String; 2]> = SmallVec::new();
+            path.push(self.text(base));
+            path.push(field);
+            (Transform::Projection, vec![path], None)
+        } else {
+            // Depth-2+: truncate to the deepest nameable base identifier.
+            let base_id = self.deepest_base_ident(base);
+            let sources = base_id.map(|b| vec![smallvec_one(b)]).unwrap_or_default();
+            (
+                Transform::Projection,
+                sources,
+                Some(CutMarker::TruncatedAccessPath),
+            )
+        }
+    }
+
+    /// The deepest base identifier of a (possibly nested) field/projection chain:
+    /// `u.cfg.timeout` → `u`. Returns `None` if the base is not a plain name.
+    fn deepest_base_ident(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "identifier" => Some(self.text(node)),
+            "field_expression" => node
+                .child_by_field_name("value")
+                .and_then(|v| self.deepest_base_ident(v)),
+            _ => None,
+        }
+    }
+
+    /// The source bindings of one operand of an arith/composed expression: a bare
+    /// identifier contributes itself, a depth-1 field its base.field path, a
+    /// nested expression recurses. Literals/calls contribute nothing.
+    fn operand_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        match node.kind() {
+            "identifier" => vec![smallvec_one(self.text(node))],
+            "field_expression" => {
+                let (_t, sources, _c) = self.classify_field(node);
+                sources
+            }
+            "binary_expression" => {
+                let mut out = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = node.child_by_field_name(field) {
+                        out.extend(self.operand_sources(n));
+                    }
+                }
+                out
+            }
+            "parenthesized_expression" | "reference_expression" | "unary_expression" => node
+                .named_child(0)
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Source bindings assembled by a struct/tuple/array literal: every named
+    /// identifier operand. `Point { x: a, y: b }` → `[a, b]`.
+    fn composed_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        self.descendant_idents_in(node)
+            .into_iter()
+            .map(smallvec_one)
+            .collect()
+    }
+
+    /// Source bindings of a conditional-select / φ join: the identifier operands
+    /// of each arm/branch. `if c { a } else { b }` → `[a, b]`.
+    fn branch_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        self.descendant_idents_in(node)
+            .into_iter()
+            .map(smallvec_one)
+            .collect()
+    }
+
+    /// Collect the text of every `identifier` descendant of `node` in source
+    /// order, deduplicated, not descending into nested closure/call internals. A
+    /// small structural approximation good enough for composed/branched operand
+    /// discovery in SC2. Struct field *names* (the `x:` in `x: a`) are
+    /// `field_identifier` nodes, not `identifier`, so they are excluded.
+    fn descendant_idents_in(&self, node: Node<'_>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        self.collect_idents(node, true, &mut out);
+        out
+    }
+
+    fn collect_idents(&self, node: Node<'_>, is_root: bool, out: &mut Vec<String>) {
+        if !is_root && matches!(node.kind(), "closure_expression" | "call_expression") {
+            return;
+        }
+        if node.kind() == "identifier" {
+            let t = self.text(node);
+            if !out.contains(&t) {
+                out.push(t);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_idents(child, false, out);
+        }
+    }
+
+    /// The bound name of a `let` pattern or assignment LHS, when it is a plain
+    /// identifier (`let x = ...`, `x = ...`). Tuple/struct destructuring and
+    /// `mut`-pattern wrappers resolve to their inner identifier; anything else is
+    /// `None` (not versioned in SC2).
+    fn binding_name(&self, pattern: Node<'_>) -> Option<String> {
+        match pattern.kind() {
+            "identifier" => Some(self.text(pattern)),
+            "mut_pattern" | "ref_pattern" => pattern
+                .named_child(0)
+                .and_then(|inner| self.binding_name(inner)),
+            _ => None,
+        }
+    }
+
+    /// Push one `DataFlowFact` into the per-function accumulator (flushed sorted in
+    /// [`Builder::finish`]).
+    #[allow(clippy::too_many_arguments)]
+    fn push_data_flow(
+        &mut self,
+        fn_fqn: &str,
+        derived: SmallVec<[String; 2]>,
+        derived_version: u32,
+        source: SmallVec<[String; 2]>,
+        scope: ScopeId,
+        transform: Transform,
+        edge_condition: EdgeCondition,
+        cut_markers: SmallVec<[CutMarker; 1]>,
+        span: Span,
+    ) {
+        self.data_flows
+            .entry(fn_fqn.to_string())
+            .or_default()
+            .push(cgx_frontend::DataFlowFact {
+                derived,
+                source,
+                derived_version,
+                scope,
+                transform,
+                edge_condition,
+                cut_markers,
+                span,
+            });
     }
 
     /// Signature of a `closure_expression` (`|x: T| body` / `move |x| body`).

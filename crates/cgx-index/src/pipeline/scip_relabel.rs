@@ -289,6 +289,7 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             established_by: None,
             cfg_condition: None,
             macro_origin: None,
+            transform: None,
         };
         let prov = Provenance::new(span, rule, Tier::Scip, String::new());
         self.new_edges.push(EdgeWithProvenance {

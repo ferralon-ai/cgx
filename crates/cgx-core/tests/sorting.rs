@@ -21,6 +21,7 @@ fn edge(id: u32, src: u32, dst: u32, kind: EdgeKind) -> EdgeRecord {
         established_by: None,
         cfg_condition: None,
         macro_origin: None,
+        transform: None,
     }
 }
 

@@ -212,6 +212,73 @@ fn call_family_includes_spawns_and_excludes_structural() {
     assert!(!EdgeKind::Contains.is_call());
     assert!(!EdgeKind::Implements.is_call());
     assert!(!EdgeKind::Throws.is_call());
+    // v0.3 DATA_FLOW: DerivesFrom is a structural edge, never a call.
+    assert!(!EdgeKind::DerivesFrom.is_call());
+}
+
+#[test]
+fn transform_round_trips_through_canonical_codec() {
+    use cgx_core::codec::{decode, encode};
+    use cgx_core::Transform;
+    for t in [
+        Transform::Copy,
+        Transform::Projection,
+        Transform::Arith,
+        Transform::Composed,
+        Transform::Branched,
+        Transform::Other,
+    ] {
+        let bytes = encode(&t).unwrap();
+        let back: Transform = decode(&bytes).unwrap();
+        assert_eq!(t, back, "Transform must postcard round-trip");
+    }
+}
+
+#[test]
+fn value_id_is_flow_sensitive_and_deterministic() {
+    use cgx_core::ValueId;
+    // Re-assignment (distinct ssa_version) yields distinct ids; same inputs are
+    // stable across calls (determinism §A.1).
+    let v1 = ValueId::derive("m::g", "x", 1, 2, 4);
+    let v2 = ValueId::derive("m::g", "x", 2, 3, 4);
+    assert_ne!(v1, v2, "distinct ssa versions must hash distinctly");
+    assert_eq!(v1, ValueId::derive("m::g", "x", 1, 2, 4), "derive is pure");
+}
+
+#[test]
+fn edge_record_transform_defaults_to_none_on_old_rows() {
+    use cgx_core::codec::{decode, encode};
+    // An EdgeRecord encoded without a transform (the common non-dataflow case)
+    // decodes with transform == None — the `#[serde(default)]` forward-compat
+    // guarantee for pre-v3 postcard rows.
+    let mut e = sample_edge();
+    e.transform = None;
+    let bytes = encode(&e).unwrap();
+    let back: EdgeRecord = decode(&bytes).unwrap();
+    assert_eq!(back.transform, None);
+}
+
+/// A minimal non-dataflow edge for the codec assertions above.
+fn sample_edge() -> EdgeRecord {
+    EdgeRecord {
+        id: EdgeId(0),
+        src: NodeId(0),
+        dst: NodeId(1),
+        kind: EdgeKind::Calls,
+        condition: EdgeCondition::Always,
+        confidence: Confidence::Certain,
+        tier: Tier::ScopeGraph,
+        rule: "scope-ref".into(),
+        site_id: None,
+        stmt_index: None,
+        cut_markers: CutMarkers::new(),
+        implicit: None,
+        candidate_group: None,
+        established_by: None,
+        cfg_condition: None,
+        macro_origin: None,
+        transform: None,
+    }
 }
 
 #[test]

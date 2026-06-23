@@ -5,6 +5,7 @@ use crate::confidence::{Confidence, Tier};
 use crate::cut::CutMarkers;
 use crate::id::{EdgeId, NodeId, SiteId};
 use crate::provenance::Provenance;
+use crate::transform::Transform;
 use serde::{Deserialize, Serialize};
 
 /// Edge kinds (GM-2.1 call edges, GM-2.2 structural/dataflow, GM-9 `spawns`).
@@ -150,6 +151,11 @@ pub struct EdgeRecord {
     pub cfg_condition: Option<String>,
     /// Macro/codegen origin (GM-14.5); `None` if developer-written.
     pub macro_origin: Option<String>,
+    /// Structural transform tag on a `DerivesFrom` dataflow edge (design §1.5);
+    /// `None` on every non-dataflow edge. `#[serde(default)]` so existing
+    /// postcard rows (which predate this field) decode as `None`.
+    #[serde(default)]
+    pub transform: Option<Transform>,
 }
 
 /// An edge record paired with its provenance (GM-6).

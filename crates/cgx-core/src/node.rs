@@ -1,8 +1,8 @@
 //! Node taxonomy (GM-1) and the call-site node kind reserved by ADR-01.
 
 use crate::effect::EffectSet;
-use crate::id::{NodeId, SiteId};
-use crate::provenance::Provenance;
+use crate::id::{NodeId, SiteId, ValueId};
+use crate::provenance::{Provenance, Span};
 use crate::signature::Signature;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,11 @@ pub enum NodeFlavor {
     /// A call-site node (GM-1.4 / ADR-01). Discriminant 1 (reserved). Populated
     /// cheaply at index time (identity + ordinal + `suspends` only in Phase 1).
     CallSite = 1,
+    /// An SSA value node (design §A.1, v0.3 DATA_FLOW). One per SSA definition of
+    /// a local binding within a function body; the flow-sensitive endpoint of a
+    /// `DerivesFrom` edge. Discriminant 2. Materialized only when dataflow is
+    /// built for a function; a base index has zero value nodes.
+    Value = 2,
 }
 
 /// Language-mapped visibility (GM-1.3).
@@ -173,6 +178,53 @@ impl CallSite {
             col,
             ordinal,
             suspends,
+        }
+    }
+}
+
+/// An SSA value node (design §A.1). The flow-sensitive endpoint of a
+/// `DerivesFrom` edge: one per SSA definition of a local binding, parameter
+/// formal-in, or join (φ) point within a function body.
+///
+/// Identity is the content-derived [`ValueId`] over `(fn_fqn, ssa_local,
+/// ssa_version, def_span)`, so re-assignment yields distinct nodes and identity
+/// is stable across re-indexing of the same blob. Value nodes are **local to a
+/// function** and are not part of the base (non-dataflow) node set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ValueNode {
+    /// Deterministic content-addressed identity (design §A.1).
+    pub value_id: ValueId,
+    /// FQN of the function whose body defines this value (the scope the value is
+    /// local to).
+    pub fn_fqn: String,
+    /// The source-level local name this SSA definition versions (`x`), or a
+    /// synthetic name for a φ/return value.
+    pub ssa_local: String,
+    /// Per-binding SSA definition counter, assigned in source order. `x = a;
+    /// x = b;` produces versions 1 and 2 of `x`.
+    pub ssa_version: u32,
+    /// Source span of the definition site.
+    pub def_span: Span,
+}
+
+impl ValueNode {
+    /// Construct a value node, deriving its [`ValueId`] from the identity tuple.
+    pub fn new(fn_fqn: impl Into<String>, ssa_local: impl Into<String>, ssa_version: u32, def_span: Span) -> Self {
+        let fn_fqn = fn_fqn.into();
+        let ssa_local = ssa_local.into();
+        let value_id = ValueId::derive(
+            &fn_fqn,
+            &ssa_local,
+            ssa_version,
+            def_span.line,
+            def_span.col.unwrap_or(0),
+        );
+        ValueNode {
+            value_id,
+            fn_fqn,
+            ssa_local,
+            ssa_version,
+            def_span,
         }
     }
 }

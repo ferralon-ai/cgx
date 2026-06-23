@@ -66,6 +66,39 @@ impl SiteId {
     }
 }
 
+/// Deterministic, content-addressed identity of an SSA value node (design §A.1).
+///
+/// Identity is `(fn_fqn, ssa_local, ssa_version, def_span_line, def_span_col)` —
+/// the function-local SSA definition coordinates. Like [`SiteId`] it is a 64-bit
+/// FNV-1a hash of a length-prefixed encoding of those fields, so it is stable
+/// across re-indexes of an unchanged blob, independent of insertion order, and
+/// **local to a function** (so a per-function recompute never perturbs another
+/// function's value-node ids). `ssa_version` makes re-assignment flow-sensitive:
+/// `x = a; x = b;` hashes to two distinct `ValueId`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ValueId(pub u64);
+
+impl ValueId {
+    /// Derive the deterministic value id from its SSA identity tuple. Pure
+    /// function of its inputs: no randomness, no time.
+    pub fn derive(
+        fn_fqn: &str,
+        ssa_local: &str,
+        ssa_version: u32,
+        def_span_line: u32,
+        def_span_col: u32,
+    ) -> ValueId {
+        let mut hash = FNV_OFFSET;
+        fold_str(&mut hash, fn_fqn);
+        fold_str(&mut hash, ssa_local);
+        fold_u32(&mut hash, ssa_version);
+        fold_u32(&mut hash, def_span_line);
+        fold_u32(&mut hash, def_span_col);
+        ValueId(hash)
+    }
+}
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 

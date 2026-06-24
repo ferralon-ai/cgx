@@ -56,6 +56,12 @@ pub struct LinkOpts {
     /// base index is byte-identical to pre-SC2 (zero value nodes, zero
     /// `DerivesFrom` edges). Set by `cgx index --dataflow`.
     pub dataflow: bool,
+    /// v0.3 SC3 incremental-dataflow prior cache: `(blob_oid, fn_fqn) →
+    /// facts_hash` loaded from the store before this link. A function whose
+    /// recomputed hash matches its entry counts as *reused*; a miss as
+    /// *recomputed*. Empty on a cold build (everything recomputes). Ignored when
+    /// `dataflow` is off.
+    pub prior_fn_cache: std::collections::HashMap<(String, String), String>,
 }
 
 impl Default for LinkOpts {
@@ -64,6 +70,7 @@ impl Default for LinkOpts {
             name_arity_fallback: true,
             arity_filter: true,
             dataflow: false,
+            prior_fn_cache: std::collections::HashMap::new(),
         }
     }
 }

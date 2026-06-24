@@ -12,7 +12,7 @@ use cgx_frontend::facts::{
     DataFlowFact, ImplRelation, RawRef, RefKind, RelationKind, ScopeId, ScopeTree, SymbolDef,
 };
 
-use crate::graph::{ResolvedGraph, UnresolvedRef};
+use crate::graph::{DataflowOutput, ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
 use crate::symtab::{
     collect_import_bindings, short_name, DefEntry, ImportBinding, ResolveOutcome, SymbolTable,
@@ -85,11 +85,22 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // --- v0.3 DATA_FLOW SC2 (opt-in): materialize SSA value nodes + DerivesFrom
     // edges from each file's `data_flows`. A no-op when `opts.dataflow` is off, so
     // the base index keeps zero value nodes / zero DerivesFrom edges. ---
-    if opts.dataflow {
-        resolve_data_flows(inputs, &def_to_node, &mut nodes, &mut edges);
-    }
+    let dataflow = if opts.dataflow {
+        resolve_data_flows(
+            inputs,
+            &def_to_node,
+            &table,
+            &mut nodes,
+            &mut edges,
+            &opts.prior_fn_cache,
+        )
+    } else {
+        DataflowOutput::default()
+    };
 
-    finalize(nodes, edges, candidates, unresolved)
+    let mut graph = finalize(nodes, edges, candidates, unresolved);
+    graph.dataflow = dataflow;
+    graph
 }
 
 /// Build node records from every file's defs, then sort canonically and assign
@@ -485,9 +496,13 @@ fn resolve_impl_relation(
 fn resolve_data_flows(
     inputs: &[FileInput<'_>],
     def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    table: &SymbolTable,
     nodes: &mut Vec<NodeWithProvenance>,
     edges: &mut Vec<EdgeWithProvenance>,
-) {
+    prior_cache: &std::collections::HashMap<(String, String), String>,
+) -> DataflowOutput {
+    let mut output = build_incremental_substrate(inputs, table, prior_cache);
+
     // Intern value nodes by synthetic FQN so repeated references to the same SSA
     // def share one node. A `BTreeMap` keeps minting order deterministic.
     let mut value_nodes: std::collections::BTreeMap<String, ValueNodeStage> =
@@ -585,6 +600,112 @@ fn resolve_data_flows(
             continue;
         };
         push_data_flow_edge(edges, derived, source, &pe);
+    }
+
+    output.stats.functions_recomputed = output.changed_fns.len();
+    output.stats.functions_reused =
+        output.fn_intraproc_cache.len() - output.changed_fns.len();
+    output
+}
+
+/// Build the v0.3 SC3 incremental-dataflow substrate: per-function content
+/// hashes, the `summary_deps` relation, and the own-dirty set, by partitioning
+/// every file's `data_flows` by owning function.
+///
+/// A function's cache key is `(blob_oid, fn_fqn)`; its value is the FNV-1a hash
+/// of the canonical postcard bytes of its (already span-sorted) `DataFlowFact`
+/// subset. A function whose hash differs from `prior_cache` (or is absent) is
+/// *changed* (a recompute); a match is a reuse. Each `OpaqueCall` fact records a
+/// `summary_deps` row: its `callee_fqn` grounded against the symbol table to a
+/// real FQN when uniquely resolvable, else the `"*"` wildcard (conservative
+/// fallback — over-invalidate rather than miss a staleness).
+fn build_incremental_substrate(
+    inputs: &[FileInput<'_>],
+    table: &SymbolTable,
+    prior_cache: &std::collections::HashMap<(String, String), String>,
+) -> DataflowOutput {
+    // Partition facts by (blob_oid, fn_fqn). A BTreeMap keeps the persisted cache
+    // and summary_deps rows in a deterministic order.
+    let mut per_fn: std::collections::BTreeMap<(String, String), Vec<&DataFlowFact>> =
+        std::collections::BTreeMap::new();
+    for file in inputs {
+        let facts = file.facts;
+        for df in &facts.data_flows {
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope) else {
+                continue;
+            };
+            per_fn
+                .entry((file.blob_oid.clone(), caller.fqn.clone()))
+                .or_default()
+                .push(df);
+        }
+    }
+
+    // Reuse is detected by `fn_fqn`, not by the full `(blob_oid, fn_fqn)` key:
+    // editing one function in a file changes the WHOLE file's blob OID, so every
+    // function in it would otherwise miss. A function is reused iff its recomputed
+    // `facts_hash` matches the hash recorded for that `fn_fqn` in the prior run.
+    let prior_by_fqn: std::collections::HashMap<&str, &str> = prior_cache
+        .iter()
+        .map(|((_blob, fqn), hash)| (fqn.as_str(), hash.as_str()))
+        .collect();
+
+    let mut output = DataflowOutput::default();
+    // summary_deps deduped per function: a fn may call the same callee twice.
+    let mut deps: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+
+    for ((blob_oid, fn_fqn), fn_facts) in &per_fn {
+        // Content hash of the function's canonical fact subset. `data_flows` is
+        // already span-sorted by `canonicalize()`, so the encoding is stable.
+        let bytes = cgx_core::codec::encode(fn_facts).unwrap_or_default();
+        let facts_hash = cgx_core::id::content_hash_hex(&bytes);
+
+        let key = (blob_oid.clone(), fn_fqn.clone());
+        let unchanged = prior_by_fqn
+            .get(fn_fqn.as_str())
+            .is_some_and(|h| *h == facts_hash);
+        if !unchanged {
+            output.changed_fns.push(fn_fqn.clone());
+        }
+        output.fn_intraproc_cache.push((key, facts_hash));
+
+        // Record summary deps for every opaque-call fact in this function.
+        for df in fn_facts {
+            if !df.cut_markers.contains(&CutMarker::OpaqueCall) {
+                continue;
+            }
+            let callee = ground_callee(table, df.callee_fqn.as_deref());
+            deps.insert((fn_fqn.clone(), callee));
+        }
+    }
+
+    output.summary_deps = deps.into_iter().collect();
+    output
+}
+
+/// Ground an opaque call's syntactic callee name to a `summary_deps` callee key:
+/// the unique resolved FQN when the name binds to exactly one callable def, else
+/// the `"*"` wildcard. A missing callee name (a method call on a receiver
+/// expression — virtual / duck-typed) is also a wildcard (conservative).
+fn ground_callee(table: &SymbolTable, callee_fqn: Option<&str>) -> String {
+    const WILDCARD: &str = "*";
+    let Some(name) = callee_fqn else {
+        return WILDCARD.to_string();
+    };
+    if let Some(def) = table.def_by_fqn(name) {
+        if def.kind.is_callable() {
+            return def.fqn.clone();
+        }
+    }
+    let last = name.rsplit("::").next().unwrap_or(name);
+    let callables: Vec<&DefEntry> = table
+        .defs_by_short(last)
+        .iter()
+        .filter(|d| d.kind.is_callable())
+        .collect();
+    match callables.as_slice() {
+        [only] => only.fqn.clone(),
+        _ => WILDCARD.to_string(),
     }
 }
 
@@ -1038,6 +1159,7 @@ fn finalize(
         edges,
         candidates,
         unresolved,
+        dataflow: DataflowOutput::default(),
     };
     canonicalize(&mut graph);
     graph

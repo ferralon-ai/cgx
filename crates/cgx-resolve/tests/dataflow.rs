@@ -12,7 +12,7 @@ use cgx_core::edge::EdgeKind;
 use cgx_core::node::SymbolKind;
 use cgx_core::transform::Transform;
 use cgx_frontend::facts::{FileFacts, ScopeId};
-use cgx_resolve::{link, FileInput, LinkOpts};
+use cgx_resolve::{link, propagate_dirty, FileInput, LinkOpts};
 
 use common::FileBuilder;
 
@@ -183,4 +183,142 @@ fn link_with_dataflow_is_byte_identical_across_runs() {
     let nodes1: Vec<&str> = g1.node_records().map(|n| n.fqn.as_str()).collect();
     let nodes2: Vec<&str> = g2.node_records().map(|n| n.fqn.as_str()).collect();
     assert_eq!(nodes1, nodes2, "node ids/fqns must be identical across runs");
+}
+
+// --- v0.3 SC3 incremental substrate (resolver-level) -------------------------
+
+/// A file with caller `m::g` (whose body holds the supplied facts) and a leaf
+/// callee `m::h`, so an opaque call to `h` grounds to a real FQN.
+fn fn_g_calling_h<F: FnOnce(&mut FileBuilder, ScopeId)>(f: F) -> FileFacts {
+    let mut b = FileBuilder::new();
+    let body = b.scope(ScopeId::ROOT, Some("m::g"));
+    b.def(
+        "m::g",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        cgx_core::node::Visibility::Public,
+        false,
+        Some(1),
+    );
+    b.def(
+        "m::h",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        10,
+        cgx_core::node::Visibility::Public,
+        false,
+        Some(1),
+    );
+    f(&mut b, body);
+    b.build()
+}
+
+#[test]
+fn opaque_call_records_resolved_summary_dep() {
+    // An opaque call `let r = h(a)` carrying callee `h` grounds to the real FQN
+    // `m::h` in summary_deps.
+    let facts = fn_g_calling_h(|b, body| {
+        b.data_flow(&["r"], 1, &[], body, Transform::Other, 2);
+        b.last_data_flow_cut(cgx_core::cut::CutMarker::OpaqueCall);
+        b.last_data_flow_callee("h");
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+    assert!(
+        g.dataflow
+            .summary_deps
+            .contains(&("m::g".to_string(), "m::h".to_string())),
+        "expected a resolved (m::g -> m::h) dep, got {:?}",
+        g.dataflow.summary_deps
+    );
+}
+
+#[test]
+fn opaque_call_with_unknown_callee_records_wildcard_dep() {
+    // Criterion 6 (substrate): an opaque call whose callee carries no name (a
+    // virtual/duck-typed receiver call) records the conservative `*` wildcard.
+    let facts = fn_g_calling_h(|b, body| {
+        b.data_flow(&["r"], 1, &[], body, Transform::Other, 2);
+        b.last_data_flow_cut(cgx_core::cut::CutMarker::OpaqueCall);
+        // No callee name set → wildcard.
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+    assert!(
+        g.dataflow
+            .summary_deps
+            .contains(&("m::g".to_string(), "*".to_string())),
+        "expected a wildcard dep, got {:?}",
+        g.dataflow.summary_deps
+    );
+}
+
+#[test]
+fn cold_link_recomputes_every_function() {
+    // An empty prior cache (cold build) marks every function as recomputed.
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["b"], 1, &["a"], body, Transform::Copy, 2);
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+    assert_eq!(g.dataflow.stats.functions_recomputed, 1);
+    assert_eq!(g.dataflow.stats.functions_reused, 0);
+    assert_eq!(g.dataflow.changed_fns, vec!["m::g".to_string()]);
+}
+
+#[test]
+fn unchanged_function_with_matching_prior_cache_is_reused() {
+    // Criterion 1 (substrate): a function whose facts_hash matches the prior
+    // cache is reused, not recomputed.
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["b"], 1, &["a"], body, Transform::Copy, 2);
+    });
+    // First (cold) link to learn the hash the resolver computes.
+    let cold = link(&[input(&facts)], &dataflow_opts());
+    let prior: std::collections::HashMap<(String, String), String> =
+        cold.dataflow.fn_intraproc_cache.iter().cloned().collect();
+
+    let warm_opts = LinkOpts {
+        dataflow: true,
+        prior_fn_cache: prior,
+        ..LinkOpts::default()
+    };
+    let warm = link(&[input(&facts)], &warm_opts);
+    assert_eq!(warm.dataflow.stats.functions_recomputed, 0);
+    assert_eq!(warm.dataflow.stats.functions_reused, 1);
+    assert!(warm.dataflow.changed_fns.is_empty());
+}
+
+#[test]
+fn propagate_dirty_reaches_transitive_callers() {
+    // Criterion 3: B calls A, C calls B, D is independent. A dirty → B, C dirty;
+    // D stays clean.
+    let deps = vec![
+        ("B".to_string(), "A".to_string()),
+        ("C".to_string(), "B".to_string()),
+    ];
+    let mut closed = propagate_dirty(&["A".to_string()], &deps);
+    closed.sort();
+    assert_eq!(closed, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+}
+
+#[test]
+fn propagate_dirty_terminates_on_mutual_recursion_cycle() {
+    // The visited set makes a cycle A<->B terminate rather than loop forever.
+    let deps = vec![
+        ("A".to_string(), "B".to_string()),
+        ("B".to_string(), "A".to_string()),
+    ];
+    let mut closed = propagate_dirty(&["A".to_string()], &deps);
+    closed.sort();
+    assert_eq!(closed, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn propagate_dirty_wildcard_dependent_recomputes_on_any_change() {
+    // Criterion 6: a function with a `*` dep recomputes when ANY function changed.
+    let deps = vec![("W".to_string(), "*".to_string())];
+    let closed = propagate_dirty(&["X".to_string()], &deps);
+    assert!(closed.contains(&"W".to_string()), "wildcard dependent must be dirty");
+    // No change → wildcard dependent stays clean.
+    let none = propagate_dirty(&[], &deps);
+    assert!(none.is_empty(), "no seed change must leave the wildcard clean");
 }

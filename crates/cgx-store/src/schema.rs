@@ -124,6 +124,28 @@ CREATE TABLE IF NOT EXISTS cgx_meta_kv (
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
+-- ---- v0.3 DATA_FLOW SC3: incremental dataflow substrate (additive-to-v3) ------
+-- Per-function intraproc cache: a content hash of the function's DataFlowFact
+-- subset, keyed by (blob_oid, fn_fqn). A re-index recomputes a function's
+-- dataflow only when its hash changed (or a callee's summary changed — see
+-- summary_deps). Disposable Layer-2 derivative: dropped on migration.
+CREATE TABLE IF NOT EXISTS fn_intraproc_cache (
+    blob_oid   TEXT NOT NULL,
+    fn_fqn     TEXT NOT NULL,
+    facts_hash TEXT NOT NULL,
+    PRIMARY KEY (blob_oid, fn_fqn)
+) WITHOUT ROWID;
+
+-- summary_deps: fn_fqn -> a callee whose summary it consumes. `callee_fqn = '*'`
+-- is the conservative wildcard (virtual / unresolved callee): any external
+-- change forces the dependent to recompute. Used for dirty-set transitive
+-- propagation. Disposable Layer-2 derivative: dropped on migration.
+CREATE TABLE IF NOT EXISTS summary_deps (
+    fn_fqn     TEXT NOT NULL,
+    callee_fqn TEXT NOT NULL,
+    PRIMARY KEY (fn_fqn, callee_fqn)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(graph_id, fqn);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(graph_id, dst);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(graph_id, src);

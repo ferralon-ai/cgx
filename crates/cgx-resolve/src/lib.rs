@@ -76,7 +76,9 @@ mod symtab;
 
 pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
 pub use effects::{run_effect_closure, EffectStats};
-pub use graph::{ResolvedGraph, UnresolvedRef};
+pub use graph::{
+    propagate_dirty, DataflowOutput, DataflowStats, ResolvedGraph, UnresolvedRef,
+};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};
 pub use rta::{run_rta, RtaStats};

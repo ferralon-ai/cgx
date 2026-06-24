@@ -47,6 +47,19 @@ pub trait FactStore {
     /// graphs whose tree is no longer referenced (IX-5). With `aggressive`, also
     /// `VACUUM`s to reclaim disk.
     fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats>;
+
+    /// Load the entire per-function intraproc cache (v0.3 SC3): a map from
+    /// `(blob_oid, fn_fqn)` to the function's `DataFlowFact`-subset content hash.
+    /// Consulted before a dataflow re-link to decide which functions changed.
+    fn load_fn_intraproc_cache(&self) -> Result<Vec<((String, String), String)>>;
+
+    /// Replace the per-function intraproc cache with `rows` (v0.3 SC3). Each row
+    /// is `((blob_oid, fn_fqn), facts_hash)`. Idempotent for an unchanged tree.
+    fn put_fn_intraproc_cache(&mut self, rows: &[((String, String), String)]) -> Result<()>;
+
+    /// Replace the `summary_deps` relation with `rows` (v0.3 SC3): each row is
+    /// `(fn_fqn, callee_fqn)`, where `callee_fqn == "*"` is the wildcard.
+    fn put_summary_deps(&mut self, rows: &[(String, String)]) -> Result<()>;
 }
 
 /// One fragment to store: the content-addressed key plus the canonical bytes.
@@ -161,7 +174,9 @@ impl SqliteStore {
              DROP TABLE IF EXISTS candidates;
              DROP TABLE IF EXISTS edges;
              DROP TABLE IF EXISTS nodes;
-             DROP TABLE IF EXISTS graphs;",
+             DROP TABLE IF EXISTS graphs;
+             DROP TABLE IF EXISTS fn_intraproc_cache;
+             DROP TABLE IF EXISTS summary_deps;",
         )?;
         // Recreate every table/view at the current schema (blob_facts/cgx_meta_kv
         // are `IF NOT EXISTS`, so the preserved ones are left intact).
@@ -505,6 +520,49 @@ impl FactStore for SqliteStore {
             stats.compacted = true;
         }
         Ok(stats)
+    }
+
+    fn load_fn_intraproc_cache(&self) -> Result<Vec<((String, String), String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT blob_oid, fn_fqn, facts_hash FROM fn_intraproc_cache")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn put_fn_intraproc_cache(&mut self, rows: &[((String, String), String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            tx.execute("DELETE FROM fn_intraproc_cache", [])?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO fn_intraproc_cache(blob_oid, fn_fqn, facts_hash) VALUES(?1, ?2, ?3)",
+            )?;
+            for ((blob_oid, fn_fqn), facts_hash) in rows {
+                stmt.execute(params![blob_oid, fn_fqn, facts_hash])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn put_summary_deps(&mut self, rows: &[(String, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            tx.execute("DELETE FROM summary_deps", [])?;
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO summary_deps(fn_fqn, callee_fqn) VALUES(?1, ?2)",
+            )?;
+            for (fn_fqn, callee_fqn) in rows {
+                stmt.execute(params![fn_fqn, callee_fqn])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 

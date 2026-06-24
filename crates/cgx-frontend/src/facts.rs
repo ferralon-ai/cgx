@@ -326,6 +326,13 @@ pub struct DataFlowFact {
     /// Cut markers the frontend already knows apply (e.g. `OpaqueCall` for a flow
     /// through a call result, `TruncatedAccessPath` for a depth-2+ field access).
     pub cut_markers: SmallVec<[CutMarker; 1]>,
+    /// The syntactic callee name path of an `OpaqueCall` fact, `::`-joined
+    /// (`helper`, `Foo::method`). `None` for non-call facts. The resolver grounds
+    /// this against the symbol table to record a `summary_deps` row (v0.3 SC3): a
+    /// resolved name yields the callee's real FQN, an unresolved/virtual one a
+    /// `'*'` wildcard. Additive (`#[serde(default)]`) — no fragment-version bump.
+    #[serde(default)]
+    pub callee_fqn: Option<String>,
     /// Source span of the assignment.
     pub span: Span,
 }

@@ -333,6 +333,17 @@ pub struct DataFlowFact {
     /// `'*'` wildcard. Additive (`#[serde(default)]`) — no fragment-version bump.
     #[serde(default)]
     pub callee_fqn: Option<String>,
+    /// Per-argument source access-paths of an `OpaqueCall` fact (v0.3 SC4): the
+    /// `i`th entry is the access-path(s) the `i`th positional argument reads
+    /// (`g(a, b.x)` → `[["a"], ["b","x"]]`). Empty for non-call facts. The IFDS
+    /// summary-application pass maps a callee's `formal_in_i` to `args[i]` in the
+    /// caller's value-node space, so a `r = g(a)` site can materialize the
+    /// interprocedural `DerivesFrom` edge `r ⇝ a`. An argument that is not a plain
+    /// name/field (a literal, a nested call) contributes an empty inner vec, so
+    /// positional indices stay aligned with the callee's parameter order.
+    /// Additive (`#[serde(default)]`) — no fragment-version bump.
+    #[serde(default)]
+    pub args: SmallVec<[SmallVec<[Name; 2]>; 4]>,
     /// Source span of the assignment.
     pub span: Span,
 }

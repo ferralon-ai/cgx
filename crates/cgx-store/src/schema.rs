@@ -146,6 +146,19 @@ CREATE TABLE IF NOT EXISTS summary_deps (
     PRIMARY KEY (fn_fqn, callee_fqn)
 ) WITHOUT ROWID;
 
+-- ---- v0.3 DATA_FLOW SC4: per-function IFDS summaries (additive-to-v3) ---------
+-- fn_summaries: the content-addressed interprocedural summary of one function,
+-- keyed by (blob_oid, fn_fqn). `summary_bytes` is a postcard-encoded
+-- `Vec<SummaryFact>` (formal_in_idx -> formal_out, transform, condition). Applied
+-- at each `r = g(a)` call site to materialize the caller's interproc DerivesFrom
+-- edges. Disposable Layer-2 derivative: dropped on migration.
+CREATE TABLE IF NOT EXISTS fn_summaries (
+    blob_oid      TEXT NOT NULL,
+    fn_fqn        TEXT NOT NULL,
+    summary_bytes BLOB NOT NULL,
+    PRIMARY KEY (blob_oid, fn_fqn)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(graph_id, fqn);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(graph_id, dst);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(graph_id, src);

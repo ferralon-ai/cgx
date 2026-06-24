@@ -332,6 +332,7 @@ dependencies = [
  "cgx-core",
  "cgx-frontend",
  "proptest",
+ "serde",
  "smallvec",
 ]
 

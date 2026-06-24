@@ -62,6 +62,13 @@ pub struct LinkOpts {
     /// *recomputed*. Empty on a cold build (everything recomputes). Ignored when
     /// `dataflow` is off.
     pub prior_fn_cache: std::collections::HashMap<(String, String), String>,
+    /// v0.3 SC4 IFDS work-budget cap (decision D): the total interprocedural-
+    /// edge / SCC-iteration work the summary worklist may do before recording a
+    /// `SummaryBudgetExceeded` cut marker instead of continuing. `None` =
+    /// [`crate::DEFAULT_MAX_SUMMARY_EDGES`] (the production default; mirrors
+    /// `cgx-query`'s `max_steps`/`DEFAULT_MAX_STEPS`). Tests set a small value to
+    /// exercise the backstop on a bounded input. Ignored when `dataflow` is off.
+    pub max_summary_edges: Option<u64>,
 }
 
 impl Default for LinkOpts {
@@ -71,6 +78,7 @@ impl Default for LinkOpts {
             arity_filter: true,
             dataflow: false,
             prior_fn_cache: std::collections::HashMap::new(),
+            max_summary_edges: None,
         }
     }
 }

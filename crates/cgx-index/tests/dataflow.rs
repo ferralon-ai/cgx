@@ -147,22 +147,42 @@ fn dataflow_reindex_is_byte_identical() {
 }
 
 #[test]
-fn opaque_call_emits_no_cross_function_derives_from() {
-    // opaque-call: `let r = helper(a)` in through_call records the cut but emits
-    // NO DerivesFrom edge from r into helper's body / a.
+fn opaque_call_resolves_through_summary_in_sc4() {
+    // SC4 supersedes the SC2 "no cross-function edge" behavior: `let r = helper(a)`
+    // in `through_call` now resolves through helper's IFDS summary
+    // (`formal_in_0 ⇝ return`), materializing an interprocedural DerivesFrom edge
+    // `r ⇝ a` tagged `interprocedural` + confidence `probable` (criterion 1).
+    use cgx_core::confidence::Confidence;
     let (_t, store, id) = index_with(true);
     let g = read_graph(&store, id);
-    // No DerivesFrom edge should have a `helper`-internal or `a` source for `r`.
+
     let r_node = g
         .nodes
         .iter()
-        .find(|n| n.fqn.contains("::through_call::r#"));
-    if let Some(r) = r_node {
-        let leaks = g
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::DerivesFrom && e.src == r.id)
-            .count();
-        assert_eq!(leaks, 0, "opaque call result must have no source edge in SC2");
-    }
+        .find(|n| n.fqn.contains("::through_call::r#"))
+        .expect("through_call::r value node exists");
+    let interproc: Vec<_> = g
+        .edges
+        .iter()
+        .filter(|e| {
+            e.kind == EdgeKind::DerivesFrom && e.src == r_node.id && e.rule == "interprocedural"
+        })
+        .collect();
+    assert_eq!(
+        interproc.len(),
+        1,
+        "r must derive from a through helper's summary (one interproc edge)"
+    );
+    assert_eq!(interproc[0].confidence, Confidence::Probable);
+    // The edge targets through_call's own parameter `a` (formal-in #0).
+    let dst_fqn = &g
+        .nodes
+        .iter()
+        .find(|n| n.id == interproc[0].dst)
+        .unwrap()
+        .fqn;
+    assert!(
+        dst_fqn.contains("::through_call::a#0"),
+        "interproc edge sources the caller's arg `a`, got {dst_fqn}"
+    );
 }

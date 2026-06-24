@@ -12,6 +12,11 @@ use cgx_core::{EdgeRecord, NodeRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
+/// One persisted IFDS summary row (v0.3 SC4): `((blob_oid, fn_fqn),
+/// postcard(Vec<SummaryFact>))`. Aliased to keep the [`FactStore`] signatures
+/// readable (clippy type-complexity).
+pub type FnSummaryRow = ((String, String), Vec<u8>);
+
 /// The Phase-1 persistence contract (architecture §3 interface sketch). WP-08
 /// (index) and WP-09 (query) build on exactly this surface.
 pub trait FactStore {
@@ -60,6 +65,17 @@ pub trait FactStore {
     /// Replace the `summary_deps` relation with `rows` (v0.3 SC3): each row is
     /// `(fn_fqn, callee_fqn)`, where `callee_fqn == "*"` is the wildcard.
     fn put_summary_deps(&mut self, rows: &[(String, String)]) -> Result<()>;
+
+    /// Load the entire per-function IFDS summary cache (v0.3 SC4): a map from
+    /// `(blob_oid, fn_fqn)` to the function's postcard-encoded `Vec<SummaryFact>`
+    /// bytes. Consulted before a dataflow re-link so callees whose facts are
+    /// unchanged need not be re-summarized.
+    fn load_fn_summaries(&self) -> Result<Vec<FnSummaryRow>>;
+
+    /// Replace the per-function IFDS summary cache with `rows` (v0.3 SC4). Each
+    /// row is `((blob_oid, fn_fqn), summary_bytes)`. Replace semantics, matching
+    /// [`Self::put_fn_intraproc_cache`]; idempotent for an unchanged tree.
+    fn put_fn_summaries(&mut self, rows: &[FnSummaryRow]) -> Result<()>;
 }
 
 /// One fragment to store: the content-addressed key plus the canonical bytes.
@@ -176,7 +192,8 @@ impl SqliteStore {
              DROP TABLE IF EXISTS nodes;
              DROP TABLE IF EXISTS graphs;
              DROP TABLE IF EXISTS fn_intraproc_cache;
-             DROP TABLE IF EXISTS summary_deps;",
+             DROP TABLE IF EXISTS summary_deps;
+             DROP TABLE IF EXISTS fn_summaries;",
         )?;
         // Recreate every table/view at the current schema (blob_facts/cgx_meta_kv
         // are `IF NOT EXISTS`, so the preserved ones are left intact).
@@ -559,6 +576,34 @@ impl FactStore for SqliteStore {
             )?;
             for (fn_fqn, callee_fqn) in rows {
                 stmt.execute(params![fn_fqn, callee_fqn])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn load_fn_summaries(&self) -> Result<Vec<FnSummaryRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT blob_oid, fn_fqn, summary_bytes FROM fn_summaries")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn put_fn_summaries(&mut self, rows: &[FnSummaryRow]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            tx.execute("DELETE FROM fn_summaries", [])?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO fn_summaries(blob_oid, fn_fqn, summary_bytes) VALUES(?1, ?2, ?3)",
+            )?;
+            for ((blob_oid, fn_fqn), summary_bytes) in rows {
+                stmt.execute(params![blob_oid, fn_fqn, summary_bytes])?;
             }
         }
         tx.commit()?;

@@ -247,6 +247,7 @@ impl FileBuilder {
             edge_condition: EdgeCondition::Always,
             cut_markers: smallvec![],
             callee_fqn: None,
+            args: smallvec![],
             span: Span::new("f", line, Some(1)),
         });
         self
@@ -264,6 +265,19 @@ impl FileBuilder {
     pub fn last_data_flow_callee(&mut self, callee: &str) -> &mut Self {
         if let Some(df) = self.facts.data_flows.last_mut() {
             df.callee_fqn = Some(callee.to_string());
+        }
+        self
+    }
+
+    /// Set the per-argument source access-paths on the last-added dataflow fact
+    /// (v0.3 SC4): `args[i]` is the access-path the `i`th positional argument
+    /// reads (`g(a, b.x)` → `&[&["a"], &["b","x"]]`).
+    pub fn last_data_flow_args(&mut self, args: &[&[&str]]) -> &mut Self {
+        if let Some(df) = self.facts.data_flows.last_mut() {
+            df.args = args
+                .iter()
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .collect();
         }
         self
     }

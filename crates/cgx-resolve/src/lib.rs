@@ -68,21 +68,27 @@
 mod cha;
 mod effects;
 mod graph;
+mod graph_alg;
+mod ifds;
 mod input;
 mod link;
 mod rta;
 mod sig;
+mod summary;
 mod symtab;
 
 pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
 pub use effects::{run_effect_closure, EffectStats};
 pub use graph::{
-    propagate_dirty, DataflowOutput, DataflowStats, ResolvedGraph, UnresolvedRef,
+    propagate_dirty, DataflowOutput, DataflowStats, IfdsDataflowStats, ResolvedGraph,
+    UnresolvedRef,
 };
+pub use ifds::{IfdsStats, DEFAULT_MAX_SUMMARY_EDGES};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};
 pub use rta::{run_rta, RtaStats};
 pub use sig::{run_sig, SigStats};
+pub use summary::{FormalOut, SummaryFact};
 
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.

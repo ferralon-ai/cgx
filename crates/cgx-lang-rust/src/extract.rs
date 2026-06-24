@@ -1328,6 +1328,40 @@ impl<'a> Builder<'a> {
     fn walk_function_ssa(&mut self, body: Node<'_>, ctx: &Ctx, fn_fqn: &str) {
         let mut versions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         self.ssa_walk(body, ctx, fn_fqn, &mut versions);
+        // A Rust function body's trailing expression is an implicit return
+        // (`fn f() -> T { ...; expr }`). The statement walk above versions the
+        // assignments; lower the tail expression to a `<fn>::return` fact too so
+        // the IFDS pass (SC4) can summarize the param ⇝ return flow on idiomatic
+        // tail-return code, not just explicit `return`s.
+        if body.kind() == "block" {
+            if let Some(tail) = self.block_tail_expression(body) {
+                let cond = ctx.condition();
+                self.ssa_return(tail, ctx, fn_fqn, cond, &mut versions);
+            }
+        }
+    }
+
+    /// The trailing expression of a `{ … }` block, when the block ends in a bare
+    /// expression (an implicit return / block value) rather than a statement. A
+    /// `block`'s last named child that is *not* an `expression_statement` /
+    /// `let_declaration` / item is the tail value (tree-sitter-rust models the
+    /// implicit-return expression as a direct child of the block). Returns `None`
+    /// for a block ending in `;` or a statement.
+    fn block_tail_expression<'t>(&self, block: Node<'t>) -> Option<Node<'t>> {
+        let mut cursor = block.walk();
+        let last = block.children(&mut cursor).filter(|c| c.is_named()).last()?;
+        match last.kind() {
+            // Statements / declarations / items are not block-value expressions.
+            "expression_statement"
+            | "let_declaration"
+            | "line_comment"
+            | "block_comment"
+            | "empty_statement"
+            | "attribute_item" => None,
+            // An explicit `return` is already lowered by the statement walk.
+            "return_expression" => None,
+            _ => Some(last),
+        }
     }
 
     fn ssa_walk(
@@ -1456,10 +1490,18 @@ impl<'a> Builder<'a> {
         // An opaque-call RHS (`let r = helper(a)`) has no syntactic source, but
         // SC3 still records one fact so the resolver can ground the callee into a
         // `summary_deps` row. Carry the callee name on it.
-        let callee = (cut == Some(CutMarker::OpaqueCall))
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
             .then(|| self.opaque_callee_name(value))
             .flatten();
-        if sources.is_empty() && cut == Some(CutMarker::OpaqueCall) {
+        // SC4: carry per-argument access-paths on the opaque-call fact so the IFDS
+        // pass can map the callee's formal-ins to the caller's argument nodes.
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
             let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
             cut_markers.push(CutMarker::OpaqueCall);
             self.push_data_flow(
@@ -1472,6 +1514,7 @@ impl<'a> Builder<'a> {
                 cond,
                 cut_markers,
                 callee,
+                args,
                 span,
             );
             return;
@@ -1491,6 +1534,7 @@ impl<'a> Builder<'a> {
                 cond,
                 cut_markers,
                 callee.clone(),
+                SmallVec::new(),
                 span.clone(),
             );
         }
@@ -1519,10 +1563,16 @@ impl<'a> Builder<'a> {
         };
         let span = self.span(value);
         let (_t, sources, cut) = self.classify_rhs(value);
-        let callee = (cut == Some(CutMarker::OpaqueCall))
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
             .then(|| self.opaque_callee_name(value))
             .flatten();
-        if sources.is_empty() && cut == Some(CutMarker::OpaqueCall) {
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
             let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
             cut_markers.push(CutMarker::OpaqueCall);
             self.push_data_flow(
@@ -1535,6 +1585,7 @@ impl<'a> Builder<'a> {
                 cond,
                 cut_markers,
                 callee,
+                args,
                 span,
             );
             return;
@@ -1554,6 +1605,7 @@ impl<'a> Builder<'a> {
                 cond,
                 cut_markers,
                 callee.clone(),
+                SmallVec::new(),
                 span.clone(),
             );
         }
@@ -1753,6 +1805,7 @@ impl<'a> Builder<'a> {
         edge_condition: EdgeCondition,
         cut_markers: SmallVec<[CutMarker; 1]>,
         callee_fqn: Option<String>,
+        args: SmallVec<[SmallVec<[String; 2]>; 4]>,
         span: Span,
     ) {
         self.data_flows
@@ -1767,8 +1820,51 @@ impl<'a> Builder<'a> {
                 edge_condition,
                 cut_markers,
                 callee_fqn,
+                args,
                 span,
             });
+    }
+
+    /// The per-positional-argument source access-paths of an opaque-call RHS
+    /// (v0.3 SC4). `g(a, b.x, 1, h())` → `[["a"], ["b","x"], [], []]`: each named
+    /// argument is reduced through the same `operand_sources` logic the intraproc
+    /// pass uses, taking the *first* access-path the argument yields. An argument
+    /// that names no binding (a literal, a nested call) contributes an empty inner
+    /// vec so positional indices stay aligned with the callee's parameter order.
+    /// Empty when the RHS is not a call. The IFDS pass maps `formal_in_i ⇝
+    /// args[i]` to materialize the caller's interproc edges.
+    fn opaque_call_arg_paths(&self, value: Node<'_>) -> SmallVec<[SmallVec<[String; 2]>; 4]> {
+        let call = match value.kind() {
+            "await_expression" | "try_expression" | "parenthesized_expression"
+            | "reference_expression" => {
+                return value
+                    .named_child(0)
+                    .map(|n| self.opaque_call_arg_paths(n))
+                    .unwrap_or_default();
+            }
+            "call_expression" => value,
+            _ => return SmallVec::new(),
+        };
+        let Some(args) = call.child_by_field_name("arguments") else {
+            return SmallVec::new();
+        };
+        let mut out: SmallVec<[SmallVec<[String; 2]>; 4]> = SmallVec::new();
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if !arg.is_named() {
+                continue; // skip `(`, `,`, `)` punctuation.
+            }
+            // The first access-path the argument resolves to is its formal-in
+            // source; a literal / nested call yields none → empty (kept for
+            // positional alignment).
+            let path = self
+                .operand_sources(arg)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            out.push(path);
+        }
+        out
     }
 
     /// The syntactic callee name path of a call-result RHS, `::`-joined

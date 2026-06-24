@@ -205,7 +205,9 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
                 CutMarker::ViaDi => cut_markers.via_di += 1,
                 // Dataflow-only cut markers (v0.3 DATA_FLOW): not part of the
                 // call-resolution quality breakdown this report summarizes.
-                CutMarker::OpaqueCall | CutMarker::TruncatedAccessPath => {}
+                CutMarker::OpaqueCall
+                | CutMarker::TruncatedAccessPath
+                | CutMarker::SummaryBudgetExceeded => {}
             }
         }
     }

@@ -32,10 +32,18 @@ pub enum CutMarker {
     /// base value node (design §1.2). The flow to the base is recorded; the
     /// deeper path component is the cut.
     TruncatedAccessPath = 7,
+    /// The IFDS interprocedural-summary pass hit its per-SCC or per-index
+    /// work-budget cap (`DEFAULT_MAX_SUMMARY_EDGES`, v0.3 SC4) before reaching a
+    /// summary fixpoint. The materialized `DerivesFrom` edge set is sound but
+    /// possibly incomplete past this point — recorded honestly rather than
+    /// hanging on an adversarial dense/deep call graph (design §C, mirroring the
+    /// bounded-DFS backstop in cgx-query). No further interproc edges are minted
+    /// once the cap fires.
+    SummaryBudgetExceeded = 8,
 }
 
 impl CutMarker {
-    pub const ALL: [CutMarker; 8] = [
+    pub const ALL: [CutMarker; 9] = [
         CutMarker::Reflective,
         CutMarker::Dynamic,
         CutMarker::ViaDi,
@@ -44,6 +52,7 @@ impl CutMarker {
         CutMarker::UnexpandedMacro,
         CutMarker::OpaqueCall,
         CutMarker::TruncatedAccessPath,
+        CutMarker::SummaryBudgetExceeded,
     ];
 }
 

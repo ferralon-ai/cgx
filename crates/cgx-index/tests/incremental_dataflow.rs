@@ -212,6 +212,78 @@ pub fn mutator(a: i32, x: i32) -> i32 { let b = x; b }
 ";
 
 #[test]
+fn interproc_summary_edge_materialized_end_to_end() {
+    // Criterion 1 (end-to-end): the real Rust extractor + IFDS pass materialize an
+    // interprocedural DerivesFrom edge in `middle` (which calls `leaf(a, a)`),
+    // tagged `interprocedural` + confidence `probable`.
+    use cgx_core::confidence::Confidence;
+    use cgx_core::edge::EdgeKind;
+
+    let (_tmp, repo) = init_empty_repo();
+    let registry = default_registry();
+    let mut store = mem_store();
+    write_file(&repo, "src/chain.rs", CHAIN_V1);
+    commit_all(&repo, "v1");
+    let out = index_path(&repo, &registry, &mut store, &dataflow_opts()).unwrap();
+
+    assert!(
+        out.stats.ifds.summary_edges_materialized >= 1,
+        "the chain must materialize at least one interproc edge: {:?}",
+        out.stats.ifds
+    );
+    assert_eq!(out.stats.ifds.budget_exceeded_sccs, 0, "no budget trip on the small chain");
+
+    let g = read_graph(&store, out.graph_id);
+    let interproc: Vec<_> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::DerivesFrom && e.rule == "interprocedural")
+        .collect();
+    assert!(
+        !interproc.is_empty(),
+        "an interprocedural DerivesFrom edge must be stored"
+    );
+    assert!(
+        interproc.iter().all(|e| e.confidence == Confidence::Probable),
+        "every summary edge is probable"
+    );
+}
+
+#[test]
+fn summary_edges_consumed_by_existing_walk_no_second_path() {
+    // Criterion 5: summaries materialize as DerivesFrom edges (read by the EXISTING
+    // walk over the `edges` table) — there is no second execution path. The
+    // `v_data_flow_edges` view surfaces them; a count query over the store sees the
+    // interproc rows like any other DerivesFrom edge.
+    use cgx_core::edge::EdgeKind;
+
+    let (_tmp, repo) = init_empty_repo();
+    let registry = default_registry();
+    let mut store = mem_store();
+    write_file(&repo, "src/chain.rs", CHAIN_V1);
+    commit_all(&repo, "v1");
+    let out = index_path(&repo, &registry, &mut store, &dataflow_opts()).unwrap();
+
+    // The store's read path reconstructs the interproc edges from the same `edges`
+    // table as every other edge — proving they live on the one execution path.
+    let g = read_graph(&store, out.graph_id);
+    let interproc = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::DerivesFrom && e.rule == "interprocedural")
+        .count();
+    assert!(interproc >= 1, "summary edges must be queryable via the edges table");
+
+    // The `v_data_flow_edges` ADR-05 view (unchanged contract) counts all
+    // derives-from edges including the interproc ones — the query surface needs no
+    // new code path.
+    let n: i64 = store
+        .query_count("SELECT COUNT(*) FROM v_data_flow_edges WHERE rule = 'interprocedural'")
+        .unwrap();
+    assert!(n >= 1, "the interproc edges are visible through the existing v_data_flow_edges view");
+}
+
+#[test]
 fn wildcard_dependent_recomputes_when_any_candidate_changes() {
     // Criterion 6: caller_v has an unresolved (virtual) callee → wildcard dep. An
     // edit to ANY function (mutator) forces caller_v to recompute too, so the

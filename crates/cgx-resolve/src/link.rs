@@ -93,6 +93,8 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
             &mut nodes,
             &mut edges,
             &opts.prior_fn_cache,
+            opts.max_summary_edges
+                .unwrap_or(crate::ifds::DEFAULT_MAX_SUMMARY_EDGES),
         )
     } else {
         DataflowOutput::default()
@@ -500,6 +502,7 @@ fn resolve_data_flows(
     nodes: &mut Vec<NodeWithProvenance>,
     edges: &mut Vec<EdgeWithProvenance>,
     prior_cache: &std::collections::HashMap<(String, String), String>,
+    summary_budget: u64,
 ) -> DataflowOutput {
     let mut output = build_incremental_substrate(inputs, table, prior_cache);
 
@@ -508,6 +511,36 @@ fn resolve_data_flows(
     let mut value_nodes: std::collections::BTreeMap<String, ValueNodeStage> =
         std::collections::BTreeMap::new();
     let mut pending_edges: Vec<PendingDataFlowEdge> = Vec::new();
+
+    // v0.3 SC4 IFDS inputs, accumulated per function as we walk the facts.
+    let mut fn_dataflow: std::collections::BTreeMap<String, crate::ifds::FnDataflow> =
+        std::collections::BTreeMap::new();
+    // The owning file blob OID per function (for persisting summaries keyed by
+    // (blob_oid, fn_fqn), matching the SC3 cache keying).
+    let mut fn_blob: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    // Decision C: explicitly mint every parameter's formal-in value node
+    // `<fn>::<param>#0` BEFORE the IFDS pass, so a param that is never read as an
+    // intraproc source still has a node and can be a summary source.
+    for file in inputs {
+        let facts = file.facts;
+        for def in &facts.defs {
+            let Some(sig) = def.signature.as_ref() else {
+                continue;
+            };
+            if !def.kind.is_callable() {
+                continue;
+            }
+            let entry = fn_dataflow.entry(def.fqn.clone()).or_default();
+            fn_blob.entry(def.fqn.clone()).or_insert_with(|| file.blob_oid.clone());
+            for p in &sig.params {
+                let fqn = value_fqn(&def.fqn, &p.name, 0);
+                intern_param_node(&mut value_nodes, &fqn, file, def);
+                entry.formal_ins.push(fqn);
+            }
+        }
+    }
 
     for file in inputs {
         // Group this file's facts by owning function so SSA versions are tracked
@@ -524,11 +557,26 @@ fn resolve_data_flows(
                 continue;
             };
             let fn_fqn = caller.fqn.as_str();
+            fn_blob
+                .entry(fn_fqn.to_string())
+                .or_insert_with(|| file.blob_oid.clone());
 
             // The derived endpoint: a fresh value node for this SSA def.
             let derived_local = df.derived.last().cloned().unwrap_or_default();
             let derived_fqn = value_fqn(fn_fqn, &derived_local, df.derived_version);
             intern_value_node(&mut value_nodes, &derived_fqn, file, df);
+
+            // A return fact's derived local is "return" (the derived path is
+            // `[fn, "return"]`). Record the return value node so IFDS can search
+            // backward from it to the formal-ins.
+            let is_return = derived_local == "return";
+            if is_return {
+                fn_dataflow
+                    .entry(fn_fqn.to_string())
+                    .or_default()
+                    .returns
+                    .insert(derived_fqn.clone());
+            }
 
             // Resolve the source endpoint at its currently-live version BEFORE
             // recording the derived def. Def-use order: `b = b + 1` reads the old
@@ -546,6 +594,36 @@ fn resolve_data_flows(
                 Some(source_fqn)
             };
 
+            // An opaque-call fact records an IFDS call site (decision F): resolve
+            // each argument access-path to the live value-node FQN at this point,
+            // so the summary maps `formal_in_i ⇝ arg_i`.
+            if df.cut_markers.contains(&CutMarker::OpaqueCall) {
+                let args: Vec<Option<String>> = df
+                    .args
+                    .iter()
+                    .map(|path| {
+                        let base = path.last()?;
+                        let version = *current
+                            .get(&(fn_fqn.to_string(), base.clone()))
+                            .unwrap_or(&0);
+                        let fqn = value_fqn(fn_fqn, base, version);
+                        intern_value_node(&mut value_nodes, &fqn, file, df);
+                        Some(fqn)
+                    })
+                    .collect();
+                fn_dataflow
+                    .entry(fn_fqn.to_string())
+                    .or_default()
+                    .calls
+                    .push(crate::ifds::CallSite {
+                        result_fqn: derived_fqn.clone(),
+                        callee_fqn: ground_summary_callee(table, df.callee_fqn.as_deref()),
+                        args,
+                        condition: df.edge_condition,
+                        span: Span::new(file.path.clone(), df.span.line, df.span.col),
+                    });
+            }
+
             // Record that `derived_local` is now at `derived_version` for later
             // uses (after the source above was resolved against the prior version).
             current.insert(
@@ -554,10 +632,22 @@ fn resolve_data_flows(
             );
 
             // An opaque-call fact (empty source) mints the derived node but emits
-            // no edge — SC4 resolves it through the callee summary.
+            // no intraproc edge — SC4 resolves it through the callee summary.
             let Some(source_fqn) = source_node_fqn else {
                 continue;
             };
+
+            // Record the intraproc hop for IFDS reachability composition.
+            fn_dataflow
+                .entry(fn_fqn.to_string())
+                .or_default()
+                .intra
+                .push(crate::ifds::IntraEdge {
+                    derived_fqn: derived_fqn.clone(),
+                    source_fqn: source_fqn.clone(),
+                    transform: df.transform,
+                    condition: df.edge_condition,
+                });
 
             pending_edges.push(PendingDataFlowEdge {
                 derived_fqn,
@@ -602,10 +692,59 @@ fn resolve_data_flows(
         push_data_flow_edge(edges, derived, source, &pe);
     }
 
+    // v0.3 SC4: run the IFDS interprocedural-summary worklist and materialize the
+    // interproc edges into the SAME `edges` vector (no second execution path,
+    // criterion 5). The summary edges are appended fresh for all functions every
+    // run (matching SC3's edge-always-rebuilt invariant — never substitute cached
+    // interproc edges).
+    let resolve = |fqn: &str| value_fqn_to_node.get(fqn).copied();
+    let ifds = crate::ifds::run_ifds_summaries(&fn_dataflow, &resolve, summary_budget);
+    edges.extend(ifds.edges);
+
+    // Persist the computed summaries keyed by (blob_oid, fn_fqn).
+    for (fn_fqn, facts) in &ifds.summaries {
+        if facts.is_empty() {
+            continue;
+        }
+        let blob = fn_blob.get(fn_fqn).cloned().unwrap_or_default();
+        let bytes = cgx_core::codec::encode(facts).unwrap_or_default();
+        output.fn_summaries.push(((blob, fn_fqn.clone()), bytes));
+    }
+    output.fn_summaries.sort();
+    output.ifds_stats = crate::graph::IfdsDataflowStats {
+        summaries_computed: ifds.stats.summaries_computed,
+        summary_edges_materialized: ifds.stats.summary_edges_materialized,
+        budget_exceeded_sccs: ifds.stats.budget_exceeded_sccs,
+    };
+
     output.stats.functions_recomputed = output.changed_fns.len();
     output.stats.functions_reused =
         output.fn_intraproc_cache.len() - output.changed_fns.len();
     output
+}
+
+/// Ground an opaque call's syntactic callee name to a resolved FQN for IFDS
+/// summary application. Unlike [`ground_callee`] (which falls back to the `"*"`
+/// wildcard for `summary_deps` over-invalidation), this returns `None` when the
+/// callee is not a single uniquely-resolvable callable — a virtual/unknown callee
+/// has no single summary to apply, so it stays an opaque cut.
+fn ground_summary_callee(table: &SymbolTable, callee_fqn: Option<&str>) -> Option<String> {
+    let name = callee_fqn?;
+    if let Some(def) = table.def_by_fqn(name) {
+        if def.kind.is_callable() {
+            return Some(def.fqn.clone());
+        }
+    }
+    let last = name.rsplit("::").next().unwrap_or(name);
+    let callables: Vec<&DefEntry> = table
+        .defs_by_short(last)
+        .iter()
+        .filter(|d| d.kind.is_callable())
+        .collect();
+    match callables.as_slice() {
+        [only] => Some(only.fqn.clone()),
+        _ => None,
+    }
 }
 
 /// Build the v0.3 SC3 incremental-dataflow substrate: per-function content
@@ -777,6 +916,24 @@ fn intern_value_node(
         file: file.path.clone(),
         line: df.span.line,
         span: Span::new(file.path.clone(), df.span.line, df.span.col),
+        blob_oid: file.blob_oid.clone(),
+    });
+}
+
+/// Intern a parameter's formal-in value node `<fn>::<param>#0` (decision C). Its
+/// span anchors to the function definition (a param has no statement of its own);
+/// a later intraproc *use* of the same `#0` version reuses this entry.
+fn intern_param_node(
+    value_nodes: &mut std::collections::BTreeMap<String, ValueNodeStage>,
+    fqn: &str,
+    file: &FileInput<'_>,
+    def: &SymbolDef,
+) {
+    value_nodes.entry(fqn.to_string()).or_insert_with(|| ValueNodeStage {
+        fqn: fqn.to_string(),
+        file: file.path.clone(),
+        line: def.span.line,
+        span: Span::new(file.path.clone(), def.span.line, def.span.col),
         blob_oid: file.blob_oid.clone(),
     });
 }

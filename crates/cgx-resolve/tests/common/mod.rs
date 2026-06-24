@@ -246,6 +246,7 @@ impl FileBuilder {
             transform,
             edge_condition: EdgeCondition::Always,
             cut_markers: smallvec![],
+            callee_fqn: None,
             span: Span::new("f", line, Some(1)),
         });
         self
@@ -255,6 +256,14 @@ impl FileBuilder {
     pub fn last_data_flow_cut(&mut self, marker: CutMarker) -> &mut Self {
         if let Some(df) = self.facts.data_flows.last_mut() {
             df.cut_markers.push(marker);
+        }
+        self
+    }
+
+    /// Set the opaque-call callee FQN on the last-added dataflow fact (v0.3 SC3).
+    pub fn last_data_flow_callee(&mut self, callee: &str) -> &mut Self {
+        if let Some(df) = self.facts.data_flows.last_mut() {
+            df.callee_fqn = Some(callee.to_string());
         }
         self
     }

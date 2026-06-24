@@ -103,6 +103,7 @@ fn e1_free_fn_direct_call_upgrades_to_certain() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 5, 9, Confidence::Probable, Tier::ScopeGraph, "import-ref")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 
@@ -148,6 +149,7 @@ fn e2_trait_member_call_caps_at_probable_not_certain() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 6, 11, Confidence::Possible, Tier::ScopeGraph, "name-method")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 
@@ -201,6 +203,7 @@ fn existing_certain_scope_graph_edge_is_never_downgraded() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 6, 11, Confidence::Certain, Tier::ScopeGraph, "scope-ref")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 
@@ -236,6 +239,7 @@ fn double_def_site_collision_18772_caps_at_probable() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 10, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 
@@ -283,6 +287,7 @@ fn cross_crate_ref_emits_scip_dep_edge() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 6, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 
@@ -331,6 +336,7 @@ fn dst_redirect_and_group_collapse_recanonicalizes() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 10, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     graph.edges[0].edge.candidate_group = Some(0);
     canonicalize(&mut graph);
@@ -369,6 +375,7 @@ fn no_scip_occurrence_leaves_edge_untouched() {
         edges: vec![call_edge(0, 1, "src/lib.rs", 5, 9, Confidence::Probable, Tier::ScopeGraph, "import-ref")],
         candidates: vec![],
         unresolved: vec![],
+        ..Default::default()
     };
     canonicalize(&mut graph);
 

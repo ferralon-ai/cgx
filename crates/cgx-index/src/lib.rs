@@ -64,7 +64,7 @@ mod registry;
 pub use error::{IndexError, Result};
 pub use git::{compute_blob_oid, Repo, SourceFile};
 pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
-pub use cgx_resolve::{ChaStats, RtaStats, SigStats};
+pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
 pub use pipeline::{IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 

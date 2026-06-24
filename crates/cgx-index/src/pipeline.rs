@@ -29,8 +29,8 @@ use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{
-    link, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, EffectStats, FileInput,
-    LinkOpts, ResolvedGraph, RtaStats, SigStats,
+    link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
+    EffectStats, FileInput, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
@@ -84,6 +84,10 @@ pub struct IndexStats {
     /// GM-12 transitive effect-closure counters. Pure graph analysis that always
     /// runs last (after confidence settles), so these are always present.
     pub effects: EffectStats,
+    /// v0.3 SC3 incremental-dataflow counters: functions recomputed vs. reused.
+    /// Zeroed unless the run used `--dataflow` (the only path that builds the
+    /// per-function cache).
+    pub dataflow: DataflowStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -205,14 +209,42 @@ pub(crate) fn extract_and_link<S: FactStore>(
             )
         })
         .collect();
+    // v0.3 SC3 pre-pass: load the per-function intraproc cache so the link can
+    // classify each function as recomputed (hash changed / absent) or reused
+    // (hash unchanged). Empty/absent for a non-dataflow run (the cache is only
+    // built under `--dataflow`).
+    let prior_fn_cache: std::collections::HashMap<(String, String), String> = if opts.dataflow {
+        store.load_fn_intraproc_cache()?.into_iter().collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let link_opts = LinkOpts {
         dataflow: opts.dataflow,
+        prior_fn_cache,
         ..LinkOpts::default()
     };
     let graph = link(&inputs, &link_opts);
     stats.nodes = graph.nodes.len();
     stats.edges = graph.edges.len();
     stats.unresolved = graph.unresolved.len();
+
+    // v0.3 SC3 post-pass: persist the new per-function cache + summary_deps, and
+    // fold transitive callers (over `summary_deps`, conservative wildcard) into
+    // the recompute set so the telemetry reflects the true dirty closure.
+    if opts.dataflow {
+        let df = &graph.dataflow;
+        store.put_fn_intraproc_cache(&df.fn_intraproc_cache)?;
+        store.put_summary_deps(&df.summary_deps)?;
+
+        let closed = propagate_dirty(&df.changed_fns, &df.summary_deps);
+        let total = df.fn_intraproc_cache.len();
+        let recomputed = closed.len().min(total);
+        stats.dataflow = DataflowStats {
+            functions_recomputed: recomputed,
+            functions_reused: total - recomputed,
+        };
+    }
 
     Ok((graph, stats))
 }

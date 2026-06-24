@@ -99,6 +99,19 @@ impl ValueId {
     }
 }
 
+/// A deterministic 64-bit FNV-1a content hash of `bytes`, rendered as 16 lowercase
+/// hex digits. Stable across runs and machines (no `std::hash` randomization), so
+/// it is safe to persist for content-change detection — e.g. the v0.3 SC3
+/// per-function intraproc cache key over a function's canonical `DataFlowFact`
+/// bytes. Not cryptographic; collision-resistant enough for cache invalidation.
+pub fn content_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = FNV_OFFSET;
+    for b in bytes {
+        fold_byte(&mut hash, *b);
+    }
+    format!("{hash:016x}")
+}
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 

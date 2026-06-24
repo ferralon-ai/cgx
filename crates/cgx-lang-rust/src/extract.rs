@@ -1453,6 +1453,29 @@ impl<'a> Builder<'a> {
         let derived: SmallVec<[String; 2]> = smallvec_one(name.to_string());
         let span = self.span(value);
         let (transform, sources, cut) = self.classify_rhs(value);
+        // An opaque-call RHS (`let r = helper(a)`) has no syntactic source, but
+        // SC3 still records one fact so the resolver can ground the callee into a
+        // `summary_deps` row. Carry the callee name on it.
+        let callee = (cut == Some(CutMarker::OpaqueCall))
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        if sources.is_empty() && cut == Some(CutMarker::OpaqueCall) {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                callee,
+                span,
+            );
+            return;
+        }
         for source in sources {
             let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
             if let Some(c) = cut {
@@ -1467,6 +1490,7 @@ impl<'a> Builder<'a> {
                 transform,
                 cond,
                 cut_markers,
+                callee.clone(),
                 span.clone(),
             );
         }
@@ -1495,6 +1519,26 @@ impl<'a> Builder<'a> {
         };
         let span = self.span(value);
         let (_t, sources, cut) = self.classify_rhs(value);
+        let callee = (cut == Some(CutMarker::OpaqueCall))
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        if sources.is_empty() && cut == Some(CutMarker::OpaqueCall) {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                ctx.scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                callee,
+                span,
+            );
+            return;
+        }
         for source in sources {
             let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
             if let Some(c) = cut {
@@ -1509,6 +1553,7 @@ impl<'a> Builder<'a> {
                 Transform::Copy,
                 cond,
                 cut_markers,
+                callee.clone(),
                 span.clone(),
             );
         }
@@ -1707,6 +1752,7 @@ impl<'a> Builder<'a> {
         transform: Transform,
         edge_condition: EdgeCondition,
         cut_markers: SmallVec<[CutMarker; 1]>,
+        callee_fqn: Option<String>,
         span: Span,
     ) {
         self.data_flows
@@ -1720,8 +1766,35 @@ impl<'a> Builder<'a> {
                 transform,
                 edge_condition,
                 cut_markers,
+                callee_fqn,
                 span,
             });
+    }
+
+    /// The syntactic callee name path of a call-result RHS, `::`-joined
+    /// (`helper`, `Foo::bar`). Recorded on an `OpaqueCall` `DataFlowFact` so the
+    /// resolver can ground a `summary_deps` row (v0.3 SC3). `None` when the callee
+    /// is not a plain/scoped name (e.g. a method call on a receiver expression,
+    /// recorded as a wildcard dep instead).
+    fn opaque_callee_name(&self, value: Node<'_>) -> Option<String> {
+        let call = match value.kind() {
+            "await_expression" | "try_expression" | "parenthesized_expression"
+            | "reference_expression" => return value
+                .named_child(0)
+                .and_then(|n| self.opaque_callee_name(n)),
+            "call_expression" => value,
+            _ => return None,
+        };
+        let func = call.child_by_field_name("function")?;
+        let (name_path, kind) = self.classify_callee(func);
+        // A method call on a receiver (`w.poke()`) is virtual dispatch: the real
+        // callee depends on the receiver's type, so it is recorded as a wildcard
+        // summary dep (None here), never a single resolved FQN.
+        if name_path.is_empty() || kind == RefKind::CallVirtualReceiver {
+            None
+        } else {
+            Some(name_path.join("::"))
+        }
     }
 
     /// Signature of a `closure_expression` (`|x: T| body` / `move |x| body`).

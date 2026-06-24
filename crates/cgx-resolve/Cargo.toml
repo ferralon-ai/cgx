@@ -10,6 +10,7 @@ description = "cgx shared cross-file resolution: builds a symbol table from per-
 [dependencies]
 cgx-core.workspace = true
 cgx-frontend = { path = "../cgx-frontend" }
+serde.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]

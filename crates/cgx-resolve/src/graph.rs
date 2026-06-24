@@ -65,6 +65,26 @@ pub struct DataflowOutput {
     /// Recompute/reuse telemetry. `functions_recomputed` is the own-dirty count at
     /// link time; the indexer raises it to include transitive callers.
     pub stats: DataflowStats,
+    /// v0.3 SC4 IFDS per-function summaries to persist in `fn_summaries`:
+    /// `((blob_oid, fn_fqn), postcard(Vec<SummaryFact>))`. Empty when no callee
+    /// produced a summary. The blob_oid is the function's owning file blob.
+    pub fn_summaries: Vec<((String, String), Vec<u8>)>,
+    /// v0.3 SC4 IFDS telemetry: summaries computed, interproc edges materialized,
+    /// SCCs that hit the work-budget cap.
+    pub ifds_stats: IfdsDataflowStats,
+}
+
+/// v0.3 SC4 IFDS counters, surfaced through `DataflowOutput` + `IndexStats`
+/// (decision E.3). A `Copy`/`Default` mirror of the resolver-internal `IfdsStats`
+/// so the public surface needs no re-export of internal types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IfdsDataflowStats {
+    /// Functions for which at least one summary fact was computed.
+    pub summaries_computed: usize,
+    /// Interprocedural `DerivesFrom` edges materialized this run.
+    pub summary_edges_materialized: usize,
+    /// SCCs that hit the work-budget cap before reaching fixpoint.
+    pub budget_exceeded_sccs: usize,
 }
 
 /// Recompute/reuse counters for one dataflow link (v0.3 SC3 telemetry).

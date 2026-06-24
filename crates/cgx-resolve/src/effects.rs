@@ -103,7 +103,10 @@ pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
         }
     }
 
-    let sccs = tarjan_sccs(&own, &succ);
+    // SCCs over the effect-propagating call graph, reverse-topological. The node
+    // set is every node with an own-effects entry (i.e. every graph node).
+    let node_set: BTreeSet<NodeId> = own.keys().copied().collect();
+    let sccs = crate::graph_alg::tarjan_sccs(&node_set, &succ);
 
     // Map each node to its SCC index (SCCs are in reverse-topological order: a
     // component appears before any component it points into is *false* — Tarjan
@@ -160,103 +163,4 @@ pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
     }
 
     stats
-}
-
-/// Iterative Tarjan strongly-connected-components over the node set `own.keys()`
-/// with forward adjacency `succ`. Returns the SCCs in **reverse-topological order**
-/// (every component is emitted before the components that point *into* it, i.e.
-/// successors are emitted first), which is exactly the order the effect closure
-/// consumes. Iterative (explicit stack) to avoid recursion-depth limits on deep
-/// call chains. Deterministic: roots and successors are visited in ascending
-/// `NodeId` order.
-fn tarjan_sccs(
-    own: &BTreeMap<NodeId, EffectSet>,
-    succ: &BTreeMap<NodeId, BTreeSet<NodeId>>,
-) -> Vec<Vec<NodeId>> {
-    // Stable dense indexing of nodes by ascending NodeId.
-    let nodes: Vec<NodeId> = own.keys().copied().collect();
-    let index_of: BTreeMap<NodeId, usize> =
-        nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-    // Adjacency as index lists in ascending NodeId order.
-    let adj: Vec<Vec<usize>> = nodes
-        .iter()
-        .map(|n| {
-            succ.get(n)
-                .map(|ts| {
-                    ts.iter()
-                        .filter_map(|t| index_of.get(t).copied())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-
-    let n = nodes.len();
-    const UNVISITED: usize = usize::MAX;
-    let mut idx = vec![UNVISITED; n];
-    let mut low = vec![0usize; n];
-    let mut on_stack = vec![false; n];
-    let mut tarjan_stack: Vec<usize> = Vec::new();
-    let mut next_index = 0usize;
-    let mut sccs: Vec<Vec<NodeId>> = Vec::new();
-
-    // Explicit DFS frame: the node, and a cursor into its adjacency list.
-    struct Frame {
-        v: usize,
-        child: usize,
-    }
-
-    for start in 0..n {
-        if idx[start] != UNVISITED {
-            continue;
-        }
-        let mut call_stack: Vec<Frame> = vec![Frame { v: start, child: 0 }];
-        idx[start] = next_index;
-        low[start] = next_index;
-        next_index += 1;
-        tarjan_stack.push(start);
-        on_stack[start] = true;
-
-        while let Some(frame) = call_stack.last_mut() {
-            let v = frame.v;
-            if frame.child < adj[v].len() {
-                let w = adj[v][frame.child];
-                frame.child += 1;
-                if idx[w] == UNVISITED {
-                    // Descend into w.
-                    idx[w] = next_index;
-                    low[w] = next_index;
-                    next_index += 1;
-                    tarjan_stack.push(w);
-                    on_stack[w] = true;
-                    call_stack.push(Frame { v: w, child: 0 });
-                } else if on_stack[w] {
-                    low[v] = low[v].min(idx[w]);
-                }
-            } else {
-                // Done with v's children: if v is a root, pop its SCC.
-                if low[v] == idx[v] {
-                    let mut comp: Vec<NodeId> = Vec::new();
-                    loop {
-                        let w = tarjan_stack.pop().unwrap();
-                        on_stack[w] = false;
-                        comp.push(nodes[w]);
-                        if w == v {
-                            break;
-                        }
-                    }
-                    comp.sort_unstable();
-                    sccs.push(comp);
-                }
-                call_stack.pop();
-                // Relax the parent's low-link with v's.
-                if let Some(parent) = call_stack.last() {
-                    let p = parent.v;
-                    low[p] = low[p].min(low[v]);
-                }
-            }
-        }
-    }
-
-    sccs
 }

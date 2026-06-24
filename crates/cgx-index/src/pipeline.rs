@@ -30,7 +30,7 @@ use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{
     link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
-    EffectStats, FileInput, LinkOpts, ResolvedGraph, RtaStats, SigStats,
+    EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
@@ -88,6 +88,10 @@ pub struct IndexStats {
     /// Zeroed unless the run used `--dataflow` (the only path that builds the
     /// per-function cache).
     pub dataflow: DataflowStats,
+    /// v0.3 SC4 IFDS interprocedural-summary counters: summaries computed,
+    /// interproc edges materialized, SCCs that hit the work-budget cap. Zeroed
+    /// unless the run used `--dataflow`.
+    pub ifds: IfdsDataflowStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -236,6 +240,9 @@ pub(crate) fn extract_and_link<S: FactStore>(
         let df = &graph.dataflow;
         store.put_fn_intraproc_cache(&df.fn_intraproc_cache)?;
         store.put_summary_deps(&df.summary_deps)?;
+        // SC4: persist the IFDS per-function summaries (content-addressed, keyed
+        // by (blob_oid, fn_fqn)) so they survive incremental re-index.
+        store.put_fn_summaries(&df.fn_summaries)?;
 
         let closed = propagate_dirty(&df.changed_fns, &df.summary_deps);
         let total = df.fn_intraproc_cache.len();
@@ -244,6 +251,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
             functions_recomputed: recomputed,
             functions_reused: total - recomputed,
         };
+        stats.ifds = df.ifds_stats;
     }
 
     Ok((graph, stats))

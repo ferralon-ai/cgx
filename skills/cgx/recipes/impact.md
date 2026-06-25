@@ -13,8 +13,11 @@ to resolve a partial name to the exact FQN, or grep/ripgrep the source for older
 
 ## Runnable today (Since: v0.1)
 
-The questions below run against the v0.1 binary using `callers`, `callees`,
-`reaches`, and `cgx query` (CALLS-graph CQL only).
+The questions below run on v0.3.0 using `callers`, `callees`,
+`reaches`, and `cgx query`. CALLS-graph CQL and `:DATA_FLOW` edges work out
+of the box; security-typed taint properties (`source_class`, `sink_class`,
+`sanitizer_class`, `taint_label`) and `MUST PASS THROUGH`/`AVOIDING` are
+deferred (exit 2).
 
 ---
 
@@ -29,16 +32,16 @@ cgx callers MyModule::my_fn --depth 3 --format json
 ```
 
 **Why this works:** `callers` walks the CALLS graph in reverse, returning every
-node that can reach the target within `--depth` hops (default: unlimited,
-work-budgeted). The result is the set of callers that will be affected if the
+node that can reach the target within `--depth` hops (default: 2; pass
+`--depth 0` for unlimited, work-budgeted). The result is the set of callers that will be affected if the
 function's signature or behavior changes.
 
 **Reading the result:** Each row carries `file:line` evidence and a confidence
-label (`certain`/`probable`/`possible`). At v0.1, `probable` and `possible`
-edges reflect syntactic analysis without CHA/RTA disambiguation — read them
-as "may call", not "definitely calls." Confidence filtering discriminates at
-v0.2 (see `reference/versions.md`). See `reference/mental-model.md` for the
-full confidence ladder and edge-condition meanings.
+label (`certain`/`probable`/`possible`). `probable` and `possible` edges
+reflect syntactic analysis; SCIP-enriched indexes (v0.2+) can resolve some to
+`certain`. Use `--confidence probable` to exclude `possible` edges. See
+`reference/mental-model.md` for the full confidence ladder and
+edge-condition meanings.
 
 ---
 
@@ -69,7 +72,8 @@ programmatic consumption.
 
 **Reading the result:** The caller set defines the API contract that must be
 preserved; the callee set defines the behavior the edit must not regress.
-Bound `CALLS*N` explicitly — unbounded `CALLS*` hangs. See `reference/cli.md`
+Bind `CALLS*N` explicitly in deep traversals to control scope; unbounded `CALLS*`
+is work-budgeted (may report `[truncated]`). See `reference/cli.md`
 for `--depth` defaults.
 
 ---
@@ -78,9 +82,8 @@ for `--depth` defaults.
 
 **Status:** runnable today (partial)   **Since:** v0.1
 
-The general `entrypoint_class:"test"` node property is not supported in v0.1
-CQL (plan error, exit 2). Use the subcommand approach and cross-reference
-separately:
+The `entrypoint_class:"test"` node property is deferred past v0.3 (plan error,
+exit 2 in v0.3.0). Use the subcommand approach and cross-reference separately:
 
 ```bash
 # Step 1 — get all callers of the target function
@@ -90,8 +93,8 @@ cgx callers OrderService::submit --depth 5 --format json > callers.json
 # (e.g. grep for paths containing /tests/, _test.rs, test_, etc.)
 ```
 
-A first-class "callers scoped to test entrypoints only" query is planned for a
-future version when `entrypoint_class` node properties are supported.
+A first-class "callers scoped to test entrypoints only" query requires
+`entrypoint_class` node properties, which are deferred past v0.3.
 
 **Reading the result:** Callers whose file paths match your test naming
 convention are likely test coverage. Callers without any test-path ancestor
@@ -152,7 +155,8 @@ Bound each traversal (`*5`) to prevent hangs; increase for deeper graphs.
 shared functions are candidates for concurrency bugs or divergent assumptions
 about caller state. Note: cgx answers call-graph reachability, not data flow —
 "shared" means "both paths call it," not "both paths pass the same data through
-it." Real data-flow analysis is v0.3 (see `reference/versions.md`).
+it." For structural data flow, use `flows-to`/`flows-from` or `[:DATA_FLOW*]`
+CQL (v0.3, on by default). See `recipes/taint.md`.
 
 ---
 
@@ -195,8 +199,8 @@ emits SARIF 2.1.0 suitable for IDE annotation or CI reporting.
 cgx callers OrderService::submit --depth 5 --format json
 ```
 
-The CQL form using `entrypoint_class:"test"` node property does not run in
-v0.1 (plan error, exit 2). Use the file-path filter approach above.
+The CQL form using `entrypoint_class:"test"` node property is deferred past
+v0.3 (plan error, exit 2). Use the file-path filter approach above.
 
 **Reading the result:** From the caller list, tests that directly call the
 function (depth 1) will fail to compile on rename. Tests that reach it through
@@ -229,21 +233,21 @@ whether a callee edge represents a definite or possible dependency.
 
 ---
 
-## Spec-only forms (not runnable in v0.1)
+## Spec-only forms (not runnable in v0.3)
 
-The following cookbook question types from Theme 2 are documented but require a
-future version. Do not emit them as runnable commands.
+The following cookbook question types from Theme 2 are documented but deferred
+past v0.3.0. Do not emit them as runnable commands.
 
 | Question | Why gated | Since |
 |----------|-----------|-------|
 | Diff-scoped impact: "show new call edges introduced by this commit that reach dangerous sinks" (`cgx diff HEAD~1 HEAD --calls-to-sink-class sql`) | `--calls-to-sink-class` does not exist; positional `<BASE> <HEAD>` works but sink-class filter is v0.4 | **v0.4** |
-| Filter diff by `--base`/`--head` flags | Phantom flags — diff uses positional args: `cgx diff HEAD~1 HEAD` | v0.1 (use positional) |
-| CQL `r.introducing_commit` edge property | Not in v0.1 graph schema | **v0.4** |
-| `MEMBER_OF` edge type for module-membership queries | Not populated in v0.1; arrives with the object-model phase | **v0.3** |
-| `entrypoint_class:"test"` / `entrypoint_class` node property in CQL WHERE | Plan error, exit 2 in v0.1 | **v0.3** |
-| Test-coverage boolean via CQL `EXISTS { … }` subquery | `EXISTS` subquery not confirmed as supported CQL | **v0.3+** |
-| Public-API scope partitioning via `visibility:"public"`, `OPTIONAL MATCH`, `WITH`, `CASE WHEN` | None of these CQL constructs are confirmed in v0.1 ground truth | unscheduled |
-| Confidence-discriminating results (true `certain` vs `probable` distinction) | Requires SCIP enrichment | **v0.2** |
+| Filter diff by `--base`/`--head` flags | Phantom flags — never existed; diff uses positional args: `cgx diff HEAD~1 HEAD` | n/a (use positional) |
+| CQL `r.introducing_commit` edge property | Not in v0.3 graph schema | **v0.4** |
+| `MEMBER_OF` edge type for module-membership queries | Edge type is accepted by the parser but returns 0 rows in v0.3 — the object-model phase is deferred past v0.3 | **deferred past v0.3** |
+| `entrypoint_class:"test"` / `entrypoint_class` node property in CQL WHERE | Plan error, exit 2 in v0.3 — deferred past v0.3 | **deferred past v0.3** |
+| Test-coverage boolean via CQL `EXISTS { … }` subquery | `EXISTS` subquery is a parse error (exit 2) in v0.3 | **deferred past v0.3** |
+| Public-API scope partitioning via `visibility:"public"`, `OPTIONAL MATCH`, `WITH`, `CASE WHEN` | `visibility` is an unknown node property (plan error exit 2) in v0.3; `OPTIONAL MATCH`/`WITH`/`CASE WHEN` not confirmed in v0.3 ground truth | unscheduled |
+| `certain` edges in results (true `certain` vs `probable` distinction) | `--confidence certain` works in v0.3; producing `certain` edges requires a SCIP-enriched index (`cgx index --scip <path>`, since v0.2). Plain indexes produce only `probable`/`possible` edges. | **v0.2** (SCIP enrichment) |
 
 For diff-based impact today, use `cgx diff HEAD~1 HEAD` (positional) with
 `--newer-than` to filter to newly added edges, then manually inspect the result
@@ -255,7 +259,7 @@ for sink proximity. See `recipes/vcs-diffs.md`.
 
 | Correct flag | Wrong form (do not use) | Notes |
 |---|---|---|
-| `--depth N` | `--max-depth N` | Renamed to `--depth` — `--max-depth` exits 2 |
+| `--depth N` | `--max-depth N` | Phantom flag — never existed; `--max-depth` exits 2 |
 | `cgx diff BASE HEAD` (positional) | `--base REF --head REF` | Phantom flags — exits 2 |
 | `--kind function` | `--kind fn` | Phantom value — exits 2 |
 | `--repo /path/to/repo` | trailing `./` positional | Phantom positional — exits 2 |

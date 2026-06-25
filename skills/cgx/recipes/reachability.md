@@ -51,12 +51,12 @@ cgx query '
 in one query; bound the hops (`*4`) — unbounded `CALLS*` hangs.
 
 **Reading the result.** Each result row is a confirmed reachable call chain, not a guarantee of
-exploitability. Check edge conditions: an `exception`-only path (`r.condition = "exception"`) means
-the shell sink is only reachable during error handling. Use `--confidence certain` to suppress
+exploitability. Check edge conditions: an `[exc]`-only path (every edge has `condition = "exception"`)
+means the shell sink is only reachable during error handling. Use `--confidence certain` to suppress
 over-approximate dynamic-dispatch edges. See `reference/mental-model.md` for the confidence ladder.
 
-**Cookbook note.** Q1 shows `--from-class http` and `entrypoint_class:"http"` — neither exists in
-v0.1. Replace with the exact handler symbol.
+**Cookbook note.** Q1 shows `--from-class http` and `entrypoint_class:"http"` — neither exists.
+Replace with the exact handler symbol.
 
 ---
 
@@ -108,7 +108,8 @@ authorizes correctly. Restrict to non-exception paths by adding:
 `AND NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])`.
 
 **Cookbook note.** Q87 shows `--avoiding require_admin` — that flag does not exist. Use the CQL
-`NONE` form above. Q88 shows `MATCH ALL … MUST PASS THROUGH` — that is v0.3 (see below).
+`NONE` form above. Q88 shows `MATCH ALL … MUST PASS THROUGH` — that syntax is a plan error today;
+use the `NONE` form (see the Deferred section below).
 
 ---
 
@@ -149,8 +150,8 @@ over-approximation from dynamic dispatch; treat it as "may be reachable." A path
 edges is confirmed.
 
 **Cookbook note.** Q3 also has a CQL form with `dep_fn.package` and `dep_fn.version` attributes —
-those require dependency edges (v0.4). Q10 extends this to a full SBOM triage loop; the same basic
-`cgx paths`/`callers` approach works per-function in v0.1.
+those require dependency edges (v0.4, not yet available). Q10 extends this to a full SBOM triage loop;
+the same basic `cgx paths`/`callers` approach works per-function today.
 
 ---
 
@@ -185,7 +186,7 @@ cgx query '
 
 **Why this works.** `NONE(r … WHERE r.condition <> "exception" AND r.condition <> "panic")` keeps only
 paths where every edge is in the exceptional class — i.e., the KDF is exclusively reachable through error
-handling. (`NOT IN [...]` is a parse error in v0.1; use the `<>` + `AND` form.)
+handling. (`<expr> NOT IN [...]` is a parse error (exit 2); use `NOT <expr> IN [...]` or the `<>` + `AND` form.)
 
 **Reading the result.** Results here warrant review: is a cryptographic primitive being invoked only
 when something has already gone wrong? See `reference/mental-model.md` for the full edge-condition
@@ -219,12 +220,12 @@ cgx query '
 ```
 
 **Why this works.** The `NONE` node filter checks that the scheduler gating code is absent from every
-hop. Any result is a privilege escalation candidate. v0.1 has no string-prefix operator (`STARTS WITH`,
-`CONTAINS`, and `=~` all parse-error at exit 2), so enumerate the admin function names explicitly with
-`IN [...]`.
+hop. Any result is a privilege escalation candidate. String-prefix and pattern operators (`STARTS WITH`,
+`CONTAINS`, `=~`) are not supported (parse error, exit 2) — enumerate the admin function names
+explicitly with `IN [...]`.
 
 **Cookbook note.** Q6 shows `--from-class http`, `--avoiding scheduler::dispatch`, and
-`entrypoint_class:"http"` — none of those exist in v0.1. Use exact symbol names and the `NONE` form.
+`entrypoint_class:"http"` — none of those exist. Use exact symbol names and the `NONE` form.
 
 ---
 
@@ -253,16 +254,17 @@ cgx query '
 ```
 
 **Why this works.** The dual-MATCH finds nodes reachable from both handlers — the intersection of
-their call sets. **Clause order matters in v0.1:** put a `WHERE` that anchors the first `MATCH` by name
-*before* the second `MATCH`. If both `MATCH` clauses appear first and all filters are deferred to a single
-trailing `WHERE`, v0.1 materializes the cartesian product of both traversals and the query is killed (OOM)
-on any real repo. The anchored-first form above stays bounded and returns at exit 0.
+their call sets. **Clause order matters:** put a `WHERE` that anchors the first `MATCH` by name
+*before* the second `MATCH`. If both `MATCH` clauses appear first and all filters are deferred to a
+single trailing `WHERE`, the planner materializes the cartesian product of both traversals and the
+query is killed (OOM) on any real repo. The anchored-first form above stays bounded and returns at
+exit 0.
 
 **Reading the result.** Functions appearing in both call sets mean the new public handler exercises the
 same code as an authenticated handler. Pay attention to shared functions that touch global state or
 sensitive resources.
 
-**Cookbook note.** Q11 uses `ep.authenticated = true` — that property is not indexed by cgx in v0.1.
+**Cookbook note.** Q11 uses `ep.authenticated = true` — that property is not indexed by cgx.
 Substitute the exact handler symbol names.
 
 ---
@@ -294,31 +296,31 @@ exception-conditioned hop. To find sinks reachable *only* through exception path
 `NONE` as in the Q4 pattern above.
 
 **Reading the result.** Sinks reached only in error handlers are candidates for sensitive data leakage
-in error conditions. Enumerating the sink function names manually is required in v0.1; there is no
-`sink_class` property to filter by.
+in error conditions. Enumerating the sink function names manually is required; `sink_class` is a
+deferred node property (plan error, exit 2) and cannot be used to filter by category today.
 
 **Cookbook note.** Q12 uses `sink.sink_class IN ["path","net-request","shell"]` and
-`NOT EXISTS { … }` — neither works in v0.1. Use explicit name lists and the `ANY`/`NONE` edge-condition
-pattern.
+`NOT EXISTS { … }` — neither works today (`sink_class` is deferred; `NOT EXISTS` is unsupported syntax).
+Use explicit name lists and the `ANY`/`NONE` edge-condition pattern.
 
 ---
 
-## Spec-only in v0.1 — documented, not yet runnable
+## Deferred or version-gated — not fully runnable today
 
-The following questions from the cookbook are **not runnable in v0.1**. The CQL forms are documented
-design for the version shown; do not emit them without verifying `cgx --version` meets the requirement.
+### Taint-reachable forms — structural `:DATA_FLOW` edges (Since: v0.3, runnable); security-typed properties (deferred)
 
-### Taint-reachable forms — Since: v0.3
+**Since: v0.3**, a plain `cgx index .` builds SSA value nodes and `derives-from` edges.
+`MATCH (a)-[:DATA_FLOW]->(b)` CQL returns rows (exit 0). The `flows-to`/`flows-from` CLI
+subcommands traverse those edges directly. Dataflow is on by default; `cgx index --no-dataflow`
+skips it.
 
-Questions Q2 (sql-sink bypass via exact path filter), Q5 (user input to template renderer), Q9 (file
-I/O without path sanitizer), Q13 (user input to JWT functions), Q92 (SSRF / open redirect without
-sanitizer), Q93 (deserialization gadget chains), Q100 (mass assignment to SQL sinks) all require
-`DATA_FLOW` edges, `source_class`/`sink_class`/`sanitizer_class` node properties, or taint labels.
-These properties and edges return a CQL plan error (exit 2) in v0.1.
+Questions Q2, Q5, Q9, Q13, Q92, Q93, Q100 additionally require `source_class`/`sink_class`/
+`sanitizer_class` node properties or `taint_label`. Those properties are **not yet implemented**:
+any query referencing them exits 2 (plan error) today, regardless of version.
 
-The general form when v0.3 ships:
+The full security-typed form (deferred):
 ```cypher
--- Since: v0.3
+-- DEFERRED: source_class and sanitizer_class are plan errors in v0.3
 MATCH path = (src)-[:DATA_FLOW*]->(sink)
 WHERE src.source_class = "network"
   AND sink.name = "template::render"
@@ -326,29 +328,30 @@ WHERE src.source_class = "network"
 RETURN src.name, src.file, sink.name, sink.file, length(path) AS hops
 ```
 
-Until v0.3: approximate these as call-graph reachability questions using `cgx reaches`/`paths` with
-exact symbol names, then manually audit whether user-controlled data actually flows through the
-identified call path.
+Until security-typed taint lands: approximate with call-graph reachability using
+`cgx reaches`/`paths` with exact symbol names, then manually audit whether user-controlled
+data flows through the identified call path.
 
-### ∀-path `MUST PASS THROUGH` form — Since: v0.3
+### ∀-path `MUST PASS THROUGH` form — deferred
 
-Q88 shows `MATCH ALL path … MUST PASS THROUGH (check)`. This syntax is rejected in v0.1 with
-`not supported in this release (deferred)`. Use the equivalent `NONE` form (shown in the Q87 recipe
-above) which is v0.1-runnable and has the same semantics.
+Q88 shows `MATCH ALL path … MUST PASS THROUGH (check)`. This syntax is a plan error (exit 2)
+today: `MATCH ALL … MUST PASS THROUGH/AVOIDING (Q-20 guarded-cut) is not supported in this
+release (deferred)`. Use the equivalent `NONE` form (shown in the Q87 recipe above), which is
+runnable today and has the same semantics.
 
 ### CVE dependency-edge attributes — Since: v0.4
 
 Q3 (weakest-confidence per path), Q7 (dependency package/version attributes), and Q10 (SBOM triage
 loop with `entrypoint_class` grouping) require `dep_fn.package`/`dep_fn.version` node properties and
-cross-crate dependency edges. These are v0.4. In v0.1 use `cgx callers <vulnerable_fn>` to check
+cross-crate dependency edges. These are v0.4. Use `cgx callers <vulnerable_fn>` to check
 whether the function is called at all, then inspect the result manually.
 
 ---
 
 ## CQL quick-reference for this theme
 
-All examples use v0.1-supported CQL. String literals use double quotes; wrap the whole query in single
-quotes for the shell.
+String literals use double quotes; wrap the whole query in single quotes for the shell. The `Since`
+column shows the minimum version for each pattern; `deferred` means the pattern exits 2 today.
 
 | Pattern | Runnable form | Since |
 |---|---|---|
@@ -361,8 +364,9 @@ quotes for the shell.
 | Collect per-hop conditions | `[e IN relationships(path) \| e.condition] AS conditions` | v0.1 |
 | CI assertion gate | `--assert-empty` (exit 1 if results) | v0.1 |
 | Bounded multi-hop | `[:CALLS*N]` — always provide N; bare `*` hangs | v0.1 |
-| Taint path | `[:DATA_FLOW*]`, `source_class`, `sink_class`, `sanitizer_class` | v0.3 |
-| Must-pass-through | `MATCH ALL … MUST PASS THROUGH` | v0.3 |
+| Structural dataflow (forward/backward) | `[:DATA_FLOW]`, `flows-to`/`flows-from` CLI | v0.3 |
+| Security-typed taint (source/sink/sanitizer class) | `source_class`, `sink_class`, `sanitizer_class`, `taint_label` — plan error (exit 2) today | deferred |
+| Must-pass-through | `MATCH ALL … MUST PASS THROUGH` — plan error (exit 2) today | deferred |
 | Dependency attributes | `dep_fn.package`, `dep_fn.version` | v0.4 |
 
 For flag reference (`--depth`, `--confidence`, `--format`, `--assert-empty`, `--repo`) see

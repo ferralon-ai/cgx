@@ -91,6 +91,7 @@ answer means.
 
 ## Note on the question cookbook
 
-`docs/questions/` (the upstream cookbook) is a rich source of phrasings, but several entries tagged
-"answerable-today" use flags or analysis that the v0.1 binary does not implement. This skill is tagged against
-what actually runs (`reference/versions.md`). When they disagree, trust the version tags here.
+`docs/questions/` (the upstream cookbook) is a rich source of phrasings, but some entries tagged
+"answerable-today" use features deferred past v0.3 (taint properties, `MUST PASS THROUGH`/`AVOIDING`,
+`own_effects`, `is_return_site`, and other v0.3+ predicates). This skill is tagged against what actually
+runs on the current binary (`reference/versions.md`). When they disagree, trust the version tags here.

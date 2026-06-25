@@ -7,10 +7,10 @@ See `reference/versions.md` for the full capability ladder and `reference/cli.md
 
 ---
 
-## Runnable today (v0.1)
+## Runnable today (v0.3)
 
 `cgx diff` takes two **positional** arguments — `<BASE>` and `<HEAD>` — not `--base`/`--head` flags.
-The only diff-specific filter available at v0.1 is `--newer-than` (only edges added at HEAD).
+The only diff-specific filter is `--newer-than` (only edges added at HEAD).
 Use `--at <REF>` on `cgx query` to pin any query to a historical graph snapshot.
 
 ---
@@ -28,12 +28,14 @@ cgx diff v2.3 v2.4
 **Why this works:** `diff` computes the symmetric edge-set difference between the graph at `<BASE>` and the
 graph at `<HEAD>`. cgx uses a content-addressed index keyed by git blob OIDs, so only changed files are
 re-parsed. Added edges appear in the `+` section; removed edges in the `-` section, each with
-`(caller, callee, edge-condition, confidence, file:line)`.
+`(caller, callee, kind, file:line)`.
 
-**Reading the result:** Edge-condition labels on new edges (`always`, `exception`, `conditional`) indicate
-whether the new call is on the happy path or an error path. `possible` confidence on added edges means the
-call was found syntactically but without type resolution — treat it as a lead, not a confirmed path.
-Confidence discrimination between `certain`/`probable` sharpens at v0.2 (SCIP enrichment).
+**Reading the result:** Each `+ edge` line shows `src → dst (file)`. The `kind` field (in `--format json`)
+records the relationship type: e.g. `Calls`, `CallsAsync`, `CallsClosure`, `CallsVirtual`, `Overrides`, `Inherits`, `Implements` (the set grows with the language model; do not treat any enumeration as exhaustive).
+`diff` does not emit per-edge confidence or edge-condition labels; use `cgx callers`/`cgx paths` to
+inspect those attributes on a specific edge. `possible` confidence on a caller means the call was found
+syntactically but without type resolution — use `cgx explain` to see the full edge record.
+SCIP-enriched confidence (`certain`/`probable`) is available from v0.2+.
 
 ---
 
@@ -91,9 +93,8 @@ cgx callers AuthService::validate --at v2.4 --format json > callers-v2.4.json
 # Then: diff / jq set-difference as needed
 ```
 
-**Why this works:** `cgx diff` in v0.1 does not filter to a specific callee — it outputs the full edge-set
-difference. The two-query method gives the same information for a targeted symbol without the noise of the
-full diff.
+**Why this works:** `cgx diff` outputs the full edge-set difference with no per-callee filter. The two-query
+method gives the same information for a targeted symbol without the noise of the full diff.
 
 **Reading the result:** Symbols in `callers-v2.4.json` but absent from `callers-v2.3.json` are new callers.
 Each new caller warrants a review: verify it is using the function's contract correctly.

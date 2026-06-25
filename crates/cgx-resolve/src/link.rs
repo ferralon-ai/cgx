@@ -547,12 +547,23 @@ fn resolve_data_flows(
         // per function. The function of a fact is the scope's enclosing def.
         let facts = file.facts;
         // Per-function current version of each source name (0 = param / initial).
-        // Facts are already span-sorted by canonicalize(), so a single forward
-        // pass reconstructs def-use order deterministically.
+        // The forward pass below reconstructs def-use order, so it must iterate in
+        // true PROGRAM order. `canonicalize()` stores `data_flows` sorted by the
+        // derived NAME (for byte-identical postcard encoding), NOT by span — a
+        // binding whose name sorts before its source's def would otherwise resolve
+        // the source to a dead phantom version `#0` (Gap A). Resolve over a
+        // span-ordered view so source-version reconstruction is independent of the
+        // canonical storage order; storage stays name-sorted (determinism intact).
         let mut current: std::collections::HashMap<(String, String), u32> =
             std::collections::HashMap::new();
 
-        for df in &facts.data_flows {
+        let mut ordered: Vec<&DataFlowFact> = facts.data_flows.iter().collect();
+        ordered.sort_by(|a, b| {
+            (&a.span, &a.derived, a.derived_version)
+                .cmp(&(&b.span, &b.derived, b.derived_version))
+        });
+
+        for df in ordered {
             let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope) else {
                 continue;
             };
@@ -585,7 +596,14 @@ fn resolve_data_flows(
             let source_node_fqn = if df.source.is_empty() {
                 None
             } else {
-                let source_local = df.source.last().cloned().unwrap_or_default();
+                // Resolve the BASE local of the access path, not the field tail:
+                // `let x = p.lo;` emits source path `["p","lo"]` and must flow from
+                // `p` (the local), with `lo` carried as the `Projection` transform
+                // (depth-1 field sensitivity, design §B). Taking `.last()` here bound
+                // `x` to a phantom local named after the field (Gap 2). Depth-2+
+                // paths are already truncated to their base by the frontend, so
+                // `.first()` is correct for them too.
+                let source_local = df.source.first().cloned().unwrap_or_default();
                 let source_version = *current
                     .get(&(fn_fqn.to_string(), source_local.clone()))
                     .unwrap_or(&0);
@@ -602,7 +620,9 @@ fn resolve_data_flows(
                     .args
                     .iter()
                     .map(|path| {
-                        let base = path.last()?;
+                        // Base local of the arg access-path (`g(b.x)` flows the arg
+                        // from `b`, not the field `x`). Mirrors the Gap-2 fix above.
+                        let base = path.first()?;
                         let version = *current
                             .get(&(fn_fqn.to_string(), base.clone()))
                             .unwrap_or(&0);

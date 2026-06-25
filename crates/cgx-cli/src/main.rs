@@ -14,7 +14,7 @@ use std::process::ExitCode as ProcExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use cgx_core::{NodeId, SymbolKind, SymbolPattern};
+use cgx_core::{EdgeKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
@@ -67,6 +67,28 @@ enum Command {
     },
     /// Symbols that `symbol` (transitively) calls.
     Callees {
+        symbol: String,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// Values that `symbol` flows into (forward data-flow slice over
+    /// `derives-from` edges). `Since: v0.3`. Operates on **value nodes**, not
+    /// function symbols — a function FQN has no `derives-from` edges and returns
+    /// empty. Discover the exact value-node FQNs (e.g. `fn::local#1`) with
+    /// `cgx search <name>`. Requires an index built with `cgx index --dataflow`;
+    /// without it, value nodes are absent so the symbol does not resolve (exit 2).
+    FlowsTo {
+        symbol: String,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// Values that `symbol` derives from (backward data-flow pedigree over
+    /// `derives-from` edges). `Since: v0.3`. Operates on **value nodes**, not
+    /// function symbols — a function FQN has no `derives-from` edges and returns
+    /// empty. Discover the exact value-node FQNs (e.g. `fn::local#1`) with
+    /// `cgx search <name>`. Requires an index built with `cgx index --dataflow`;
+    /// without it, value nodes are absent so the symbol does not resolve (exit 2).
+    FlowsFrom {
         symbol: String,
         #[command(flatten)]
         query: QueryArgs,
@@ -301,6 +323,8 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Index { path, scip, dataflow } => run_index(path, scip, dataflow),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
+        Command::FlowsTo { symbol, query } => run_flow(&symbol, query, FlowDir::Forward),
+        Command::FlowsFrom { symbol, query } => run_flow(&symbol, query, FlowDir::Backward),
         Command::Reaches { from, to, query } => run_reaches(&from, to.as_deref(), query),
         Command::Paths { from, to, query } => run_paths(&from, &to, query),
         Command::Explain {
@@ -463,6 +487,90 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
     let unfiltered = match dir {
         NeighborDir::Callers => callers(&view, anchor, &unfiltered_walker),
         NeighborDir::Callees => callees(&view, anchor, &unfiltered_walker),
+    };
+
+    emit(
+        subcommand,
+        &args,
+        neighbors_with_forest(&view, &args, results, subgraph),
+        true,
+        unfiltered.len(),
+    )
+}
+
+/// Direction selector for the shared data-flow path (`flows-to`/`flows-from`).
+///
+/// A `DerivesFrom` edge points from a value to the value it was derived from
+/// (`src` derives from `dst`; e.g. `r → a` for `let r = helper(a)`). So:
+/// - `flows-from` (pedigree — what a value derives from) walks edges **forward**
+///   (src→dst), reaching the inputs.
+/// - `flows-to` (forward slice — what flows into a value's consumers) walks edges
+///   **backward** (dst→src), reaching the consumers.
+///
+/// This mirrors `callers`/`callees` over the DerivesFrom edge set rather than the
+/// call family.
+enum FlowDir {
+    /// `flows-to`: the forward slice, reached by walking DerivesFrom backward.
+    Forward,
+    /// `flows-from`: the pedigree, reached by walking DerivesFrom forward.
+    Backward,
+}
+
+/// Build the data-flow walker: the same forest walker as `callers`/`callees`
+/// (depth-2 default via [`forest_max_depth`], `--confidence` floor) but scoped to
+/// `DerivesFrom` edges instead of the call family. This is the *only* edge-set
+/// difference between `flows-to`/`flows-from` and `callers`/`callees`; everything
+/// downstream (the `PathWalker`, `neighborhood`, the forest renderer) is shared.
+fn build_flow_walker(args: &QueryArgs) -> PathWalker {
+    let mut filter = EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]);
+    if let Some(c) = args.confidence {
+        filter = filter.with_min_confidence(c.into());
+    }
+    PathWalker {
+        filter,
+        max_depth: forest_max_depth(args.max_depth),
+        max_paths: None,
+        max_steps: None,
+    }
+}
+
+/// `cgx flows-to`/`flows-from`: a thin wrapper over the existing
+/// `callers`/`callees`/`neighborhood` walk with the edge filter swapped from the
+/// call family to `DerivesFrom`. No second execution path: same `PathWalker`, same
+/// forest rendering, same exit-code contract as the call-graph neighbor commands.
+fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError> {
+    let subcommand = match dir {
+        FlowDir::Forward => "flows-to",
+        FlowDir::Backward => "flows-from",
+    };
+    let view = prepare_view(&args)?;
+    let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
+        Some(id) => id,
+        None => return emit(subcommand, &args, empty_neighbors(&args), false, 0),
+    };
+
+    let walker = build_flow_walker(&args);
+    // `flows-from` (pedigree) walks DerivesFrom forward (src→dst) via `callees`;
+    // `flows-to` (forward slice) walks it backward (dst→src) via `callers`.
+    let (walk_dir, results) = match dir {
+        FlowDir::Backward => (Direction::Forward, callees(&view, anchor, &walker)),
+        FlowDir::Forward => (Direction::Backward, callers(&view, anchor, &walker)),
+    };
+    let subgraph = neighborhood(&view, anchor, &walker, walk_dir);
+
+    // Vacuity clause (b): re-run with the confidence/condition filters stripped to
+    // learn the unfiltered count. Unlike `run_neighbors` this re-run keeps the
+    // DerivesFrom edge scope — comparing a DerivesFrom result against a
+    // call-family "unfiltered" count would be meaningless and emit false vacuity.
+    let unfiltered_walker = PathWalker {
+        filter: EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]),
+        max_depth: forest_max_depth(args.max_depth),
+        max_paths: None,
+        max_steps: None,
+    };
+    let unfiltered = match dir {
+        FlowDir::Backward => callees(&view, anchor, &unfiltered_walker),
+        FlowDir::Forward => callers(&view, anchor, &unfiltered_walker),
     };
 
     emit(

@@ -20,8 +20,11 @@ cgx 0.3.0
 
 The current shipped binary is **v0.3** (`cgx 0.3.0`).
 
-When a deferred CQL clause is attempted, the binary reports:
-`… is not supported in this release (deferred)`. Treat that error as authoritative.
+When a deferred CQL clause is attempted, the binary exits 2 with a plan error. The exact
+suffix varies: path-set algebra (`MUST PASS THROUGH`/`AVOIDING`) reports `(deferred)`;
+taint node props (`source_class` etc.) report `(no backing field on a symbol node)`;
+unknown props (`taint_label`) report `unknown node property`. Treat the exit-2 plan error as
+authoritative regardless of the exact wording.
 
 ---
 
@@ -33,7 +36,7 @@ When a deferred CQL clause is attempted, the binary reports:
 | **v0.2** | Semantic precision | SCIP enrichment (`index --scip`, requires a supplied SCIP index ¹); CHA/RTA `dyn Trait` resolution (`possible`→`probable`, automatic); confidence filtering now discriminates; cross-crate `scip-dep:` edges; `--explain` provenance (tier/rule/resolution_source/site); MCP `confidence` param; syntactic own/transitive effects (heuristic ²) |
 | **v0.3** | Dataflow query surface (on by default) | SSA value nodes + intraprocedural `DerivesFrom` edges (SC2); incremental per-function invalidation (SC3); IFDS interprocedural `DerivesFrom` summaries (SC4); `flows-to`/`flows-from` CLI subcommands + real `:DATA_FLOW` CQL rows (SC5); **on by default as of SC6** — a plain `cgx index` now builds dataflow; use `cgx index --no-dataflow` or `[index] data_flow = false` in `cgx.toml` to disable. Taint labels/classes, `MUST PASS THROUGH`/`AVOIDING`, lock-set, framework packs, MRO, `--assert-count`/`--assert-max` remain planned. |
 | v0.4 *(planned)* | Branch / VCS | Full `diff <BASE> <HEAD>` with `--calls-to`/`--edge-condition`/`--taint-class`; edge age + author; `query --cve`; worktree-native indexing; `prune --branches`; reachability matrix |
-| v0.5 *(planned)* | Agent + CI hardening | MCP token-efficiency (resource_link, caps, lazy schema); `graph_query` MCP tool + prompts + subscriptions; policy mode (`.cgx/policy.cql`, `cgx policy check`, incremental) |
+| v0.5 *(planned)* | Agent + CI hardening | MCP token-efficiency (resource_link, caps, lazy schema); `graph_query` full implementation (prompts + subscriptions; the tool is already registered in v0.3 but always errors); policy mode (`.cgx/policy.cql`, `cgx policy check`, incremental) |
 
 ¹ **SCIP enrichment is upgrade-only and requires the user to supply a `.scip` index** (e.g.
 `rust-analyzer --emit=scip`). cgx does not generate the index itself. The pass is validated on
@@ -63,7 +66,7 @@ on the TypeScript frontend.
 | `doctor` | v0.1 | Index quality, unresolved-reference counts, `unexpanded-macro` counts |
 | `query` | v0.1 | **CALLS-graph CQL subset only** — see "CQL clause gating" below |
 | `diff` | v0.1 | `<BASE> <HEAD>` are positional; `--newer-than` only; full filters at v0.4 |
-| `mcp` | v0.1 | STDIO server; 5 functional tools (callers/callees/paths/unused/explain) |
+| `mcp` | v0.1 | STDIO server; 6 tools registered (callers/callees/paths/unused/explain + graph_query); `graph_query` is registered in the tool list but always returns an error on call — use the other 5 tools |
 | `search` | v0.2 | `--regex`, `--kind`, `--limit`, `--format human\|json`; empty result → exit 0 |
 | `flows-to` | v0.3 | Forward `DerivesFrom` walk from a value node. On by default (SC6); disable with `cgx index --no-dataflow`. Accepts `--confidence`, `--depth`, `--tree`, `--at`, `--repo`, `--format`. |
 | `flows-from` | v0.3 | Backward `DerivesFrom` walk (pedigree) from a value node. On by default (SC6); disable with `cgx index --no-dataflow`. Same flags as `flows-to`. |
@@ -103,7 +106,7 @@ on the TypeScript frontend.
 | Graph diff (full) + edge age/author | v0.4 *(planned)* |
 | CVE reachability (`query --cve`) | v0.4 *(planned)* |
 | Worktree-native indexing; reachability matrix | v0.4 *(planned)* |
-| MCP token-efficiency + `graph_query` MCP tool + prompts + subscriptions | v0.5 *(planned)* |
+| MCP token-efficiency + `graph_query` full implementation (prompts + subscriptions; registered but unimplemented at v0.3) | v0.5 *(planned)* |
 | Policy mode (`.cgx/policy.cql`) | v0.5 *(planned)* |
 
 ---

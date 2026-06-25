@@ -2,15 +2,15 @@
 
 **Audience:** AI agents and engineers writing or debugging `cgx query` expressions.
 
-Run `cgx --version` first. The `query` subcommand ships in **v0.1**, but the
-language is split across versions. Gate per clause, not per subcommand. See
-`reference/versions.md` for the full version ladder.
+Run `cgx --version` first. The `query` subcommand is available in all versions
+(v0.1+) and the language is split across versions. Gate per clause, not per
+subcommand. See `reference/versions.md` for the full version ladder.
 
 ---
 
 ## Verdict
 
-`cgx query` **runs in v0.1** and dispatches CQL to the live graph. The
+`cgx query` is available in all versions (v0.1+) and dispatches CQL to the live graph. The
 **CALLS-graph subset** of CQL produces results in v0.1. `DATA_FLOW` edges
 return real rows at v0.3 and are **on by default as of SC6** — a plain
 `cgx index` suffices; use `cgx index --no-dataflow` or `[index] data_flow = false`
@@ -24,7 +24,7 @@ is the gate:
 | Node props: `name`, `kind`, `file`, `line` | v0.1 | **runs** |
 | Edge props: `condition`, `confidence` | v0.1 | **runs** |
 | `IN […]`, `<>` comparisons | v0.1 | **runs** |
-| `ANY` / `NONE` quantifiers with **bounded** `*N` | v0.1 | **runs** |
+| `ANY` / `NONE` quantifiers with **bounded** `*N` (anchor required; see note) | v0.1 | **runs** |
 | `@file.cql` query files | v0.1 | **runs** |
 | `--at <REF>` historical graph pin | v0.1 | **runs** |
 | `--format human\|json\|sarif\|dot\|mermaid\|d2` | v0.1 | **runs** |
@@ -39,10 +39,10 @@ is the gate:
 
 ---
 
-## Part 1 — Runs today (v0.1): the CALLS-graph subset
+## Part 1 — Runs today (v0.1+): the CALLS-graph subset
 
 `[:CALLS]` is the only **fully-populated** edge in v0.1 — almost every runnable query
-traverses it. Two adjacent facts, both verified against the binary:
+traverses it. Three adjacent facts, all verified against the binary:
 
 - **Node labels parse and run:** `MATCH (m:method)-[:CALLS]->(b) …` is accepted (a label
   is fine as long as the pattern still contains a relationship).
@@ -51,6 +51,10 @@ traverses it. Two adjacent facts, both verified against the binary:
   override syntax (empty otherwise). Treat them as runnable-but-thin, not as full analysis.
 - **The `CALLS:<subtype>` qualifier is NOT supported** (`[:CALLS:super]`, `[:CALLS:virtual]`
   → exit 2, "deferred, Theme-13"). Match the family with plain `[:CALLS]`.
+- **`path = (a)-[:CALLS*N]->(b)` requires an anchor when N > 1.** The `path = ` form
+  materializes every matched path in memory. On a large index, `CALLS*2` or higher without
+  a `WHERE a.fqn = "…"` (or `WHERE b.fqn = "…"`) anchor hangs. Always anchor at least one
+  endpoint when using path-variable quantifiers with `*2` or higher.
 
 ### Shell quoting rule
 
@@ -119,16 +123,20 @@ cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "my_module::my_fn" RETURN a.na
 cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE a.kind = "function" AND r.condition = "exception" RETURN a.name, b.name LIMIT 10'
 ```
 
-**Example 3 — Multi-hop bounded traversal with ANY quantifier**
+**Example 3 — Bounded path traversal with ANY quantifier (anchored)**
 
 ```bash
-cgx query 'MATCH path = (a)-[:CALLS*3]->(b) WHERE ANY(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 5'
+cgx query 'MATCH path = (a)-[:CALLS*1]->(b) WHERE a.fqn = "rust_sample::errors::handle_with_match" AND ANY(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 5' --repo /path/to/rust-sample
 ```
 
-**Example 4 — NONE quantifier to exclude exception-path callers; historical graph**
+The anchor on `a.fqn` is required: `path = (a)-[:CALLS*N]->(b)` for N ≥ 2 materializes
+all paths on a large graph and hangs. Anchor at least one endpoint when using path-variable
+quantifiers with `*2` or higher.
+
+**Example 4 — NONE quantifier to exclude exception-path edges; historical graph**
 
 ```bash
-cgx query 'MATCH path = (a)-[:CALLS*2]->(b) WHERE b.name = "db::write" AND NONE(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name LIMIT 10' --at HEAD~1
+cgx query 'MATCH path = (a)-[:CALLS*1]->(b) WHERE a.fqn = "rust_sample::conditions::dispatch" AND NONE(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 10' --at HEAD --repo /path/to/rust-sample
 ```
 
 **Example 5 — Query from file**
@@ -156,9 +164,10 @@ WHERE a.kind NOT IN ["method", "function"]
 -- correct
 WHERE NOT a.kind = "method" AND NOT a.kind = "function"
 
--- also correct inside NONE
-MATCH path = (a)-[:CALLS*2]->(b)
-WHERE NONE(r IN relationships(path) WHERE NOT r.condition = "exception")
+-- also correct inside NONE (anchor required for N ≥ 2; use CALLS*1 for unanchored)
+MATCH path = (a)-[:CALLS*1]->(b)
+WHERE a.fqn = "rust_sample::conditions::dispatch"
+  AND NONE(r IN relationships(path) WHERE NOT r.condition = "exception")
 RETURN a.name LIMIT 5
 ```
 
@@ -168,7 +177,10 @@ RETURN a.name LIMIT 5
 |---|---|---|
 | `--repo <PATH>` | CWD | Repository root |
 | `--at <REF>` | HEAD | Pin query to git ref |
+| `--depth <N>` | 6 | Maximum traversal depth; `0` = unlimited (work-budgeted, may show `[truncated]`) |
 | `--format <FMT>` | human | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+| `--confidence <TIER>` | — | Floor filter: `possible`, `probable`, or `certain` |
+| `--tree <SHAPE>` | full | `full` or `spanning`; only affects human-format forest results (e.g. when a query returns callers-shaped output); ignored by `--format json/sarif/dot/mermaid/d2` |
 | `--assert-empty` | off | CI: exit 1 if results found |
 | `--allow-vacuous` | off | Suppress exit 4 vacuity guard |
 | `--no-auto-index` | off | Error (exit 3) if index missing |
@@ -247,6 +259,7 @@ error exit 2). The example above omits them intentionally.
 | Trap | Effect | Fix |
 |---|---|---|
 | Unbounded `CALLS*` | Hangs — no termination | Always bound: `CALLS*3` or `CALLS*1..5` |
+| `path = (a)-[:CALLS*N]->(b)` with N ≥ 2, no endpoint anchor | Hangs — materializes all paths | Anchor one endpoint: add `WHERE a.fqn = "…"` or use `CALLS*1` |
 | Single-quoted strings inside query | Parse error exit 2 | Use double quotes inside; wrap query in single quotes |
 | `NOT IN […]` | Parse error exit 2 | Use `NOT x = …` or repeated `AND NOT x = …` |
 | Node-only MATCH (no relationship) | Plan error exit 2 | Add `[:CALLS]->` or any valid relationship |

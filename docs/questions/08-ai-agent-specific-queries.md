@@ -13,8 +13,8 @@ Before editing a function, an agent needs the minimal subgraph that reveals the 
 **The query**
 
 ```cgx
-cgx callers processPayment ./ --depth 2 --format json > callers.json
-cgx callees processPayment ./ --depth 3 --format json > callees.json
+cgx callers processPayment --repo ./ --depth 2 --format json > callers.json
+cgx callees processPayment --repo ./ --depth 3 --format json > callees.json
 ```
 
 Or as a single subgraph query (specified in docs/05 depth-limited blast radius example):
@@ -27,15 +27,15 @@ cgx query '
          d.name, d.file, d.line,
          [r IN relationships((c)-[:CALLS*1..2]->(fn)) | r.condition] AS caller_edge_conditions,
          [r IN relationships((fn)-[:CALLS*1..3]->(d)) | r.condition] AS callee_edge_conditions
-' ./
+' --repo ./
 ```
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `cgx callers processPayment ./ --depth 2` | Walk 2 hops backward from `processPayment`; returns the functions that can reach it. |
-| `cgx callees processPayment ./ --depth 3` | Walk 3 hops forward; returns the functions it can reach. |
+| `cgx callers processPayment --repo ./ --depth 2` | Walk 2 hops backward from `processPayment`; returns the functions that can reach it. |
+| `cgx callees processPayment --repo ./ --depth 3` | Walk 3 hops forward; returns the functions it can reach. |
 | `CALLS*1..2` / `CALLS*1..3` | Transitive edge traversal bounded by the hop counts. Combining both directions in one query gives the minimal context subgraph. |
 | `[r IN relationships(...) | r.condition]` | Project the edge-condition label on each edge in the path — tells the agent which edges are `always`, `conditional`, `exception`, etc. |
 
@@ -52,19 +52,26 @@ An agent that has already loaded some files into its context window needs to kno
 **The query**
 
 ```cgx
-cgx callees OrderController::create ./ --depth 1 --format json
+cgx callees OrderController::create --repo ./ --depth 1 --format json
 ```
 
-The agent then filters the result against its already-loaded file list:
+The agent then filters the result against its already-loaded file list. Because `cgx query` does not support query parameters (`--param` does not exist), build the IN-list by inlining the file paths as a literal array in the query string, or filter the JSON output from `callees` in a shell post-processing step:
+
+```cgx
+cgx callees OrderController::create --repo ./ --depth 1 --format json \
+  | jq '[.results[] | select(.file as $f | ["src/lib.rs","src/main.rs"] | index($f) | not)]'
+```
+
+The equivalent CQL form (with a hardcoded file list in the query string) is:
 
 ```cgx
 cgx query '
   MATCH (fn {name:"OrderController::create"})-[:CALLS]->(callee)
-  WHERE NOT callee.file IN $loaded_files
+  WHERE NOT callee.file IN ["src/lib.rs","src/main.rs"]
   RETURN callee.name, callee.file, callee.line,
          callee.kind
   ORDER BY callee.file, callee.name
-' ./ --param loaded_files=$(jq -c '[.[] | .file]' context-files.json)
+' --repo ./
 ```
 
 **Breaking it down**
@@ -72,7 +79,7 @@ cgx query '
 | Fragment | What it means |
 |---|---|
 | `CALLS` (no `*`) | Direct callees only — one hop. The agent can expand depth as needed. |
-| `NOT callee.file IN $loaded_files` | Filter out callees whose definition file is already in the agent's context. Only new files are returned. |
+| `NOT callee.file IN [...]` | Filter out callees whose definition file is already in the agent's context. The list must be inlined as a CQL literal array — `cgx query` has no `--param` flag. |
 | `callee.kind` | Tells the agent whether each new callee is a function, method, or trait implementation — helps decide whether to load the file. |
 
 **Reading the result** — Each returned row is a callee in a file the agent has not loaded. The agent can then decide which files to load based on relevance (e.g., load only callees in the same crate, skip stdlib). This is a one-call answer to "what do I still need to read?"
@@ -81,81 +88,83 @@ cgx query '
 
 ### Q70 — Is there any function I'm about to call that is only safe to call from the happy path and would fail if called from an error handler?
 
-**Personas:** ACA · **Status:** answerable-today
+**Personas:** ACA · **Status:** partial — edge-condition filtering on callers is answerable-today via CQL; `own_effects` and `edge_condition_assumption` node properties are not yet supported (exit 2, plan error)
 
 Some functions assume they are called on the happy path: they may panic on invalid state, assume a database transaction is active, or require a lock to be held. An agent about to call such a function from an error handler risks introducing a panic or inconsistent state.
 
 **The query**
 
+To check what condition each caller uses to reach the target function, inspect the edge `condition` field on incoming CALLS edges:
+
 ```cgx
 cgx query '
-  MATCH (fn {name:$target_fn})
-  WHERE fn.own_effects IS NOT NULL
-     OR fn.edge_condition_assumption = "always"
-  RETURN fn.name, fn.file, fn.line,
-         fn.own_effects,
-         fn.edge_condition_assumption
-' ./ --param target_fn=my_module::process_record
+  MATCH (caller)-[e:CALLS]->(fn {name:"my_module::process_record"})
+  RETURN caller.name, caller.file, caller.line,
+         e.condition
+  ORDER BY e.condition, caller.file
+' --repo ./
 ```
 
-To check whether a function is ever called only from exception paths (and therefore designed for error-path use):
+To narrow to callers that reach the function only via exception-conditioned edges:
 
 ```cgx
-cgx callers my_module::process_record ./ --depth 5 --edge-condition exception
+cgx query '
+  MATCH (caller)-[e:CALLS]->(fn {name:"my_module::process_record"})
+  WHERE e.condition = "exception"
+  RETURN caller.name, caller.file, caller.line,
+         e.condition
+' --repo ./
 ```
+
+Note: `fn.own_effects` and `fn.edge_condition_assumption` are not supported node properties in v0.3.0 (plan error, exit 2). The `--edge-condition` flag does not exist on `cgx callers`. Use `cgx query` with `e.condition` on the relationship to filter by edge condition.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `fn.edge_condition_assumption = "always"` | The function carries an annotation or inferred property indicating it expects to be called on always-condition edges only. |
-| `fn.own_effects` | The function's declared effects (GM-12), such as `panics-if-invalid-state`. If non-null, the agent should check what conditions the function requires. |
-| `--edge-condition exception` on `callers` | Find callers that only reach this function via exception-conditioned edges — if all callers are exception-path callers, the function is designed for error-path use and is probably safe to call from a handler. |
+| `[e:CALLS]` | Capture the edge as variable `e` so its `condition` property can be projected. |
+| `e.condition = "exception"` | Find callers that only reach this function via exception-conditioned edges — if all callers are exception-path callers, the function is designed for error-path use and is probably safe to call from a handler. |
+| Result grouped by `e.condition` | Lets the agent see whether the target function has a mix of happy-path and exception-path callers, or exclusively one type. |
 
-**Reading the result** — If `edge_condition_assumption = "always"` is set, the function was designed for happy-path use and calling it from an error handler is risky. If all of its existing callers reach it via exception edges, it is error-path-compatible. An empty result from the `--edge-condition exception` callers query means the function has no exception-path callers in the codebase — treat it as happy-path-only until confirmed otherwise.
+**Reading the result** — If every caller row shows `condition = "always"`, the function is called exclusively on the happy path and is likely unsafe to call from an error handler. If all callers show `condition = "exception"`, the function is error-path-compatible. A mix signals shared use; inspect the individual callers to determine whether calling from a handler is safe.
 
 ---
 
 ### Q71 — Scan the entire codebase: for every function that takes a `String` from an HTTP request parameter, determine if it reaches a shell command function without a sanitizer on the path.
 
-**Personas:** ASA · **Status:** answerable-today
+**Personas:** ASA · **Status:** deferred — security-typed taint (`source_class`, `sink_class`, `sanitizer_class` node properties and typed-taint subcommand flags) is not supported in v0.3.0; these properties exit 2 with a plan error. Track the taint-annotation milestone for a fully automated scan. Structural dataflow (`DATA_FLOW` edges) is available; manual name-based identification of sources and sinks is the workaround.
 
-This is a codebase-wide command-injection scan: find all HTTP parameter sources, trace them forward, and report any path that reaches a shell execution sink without a sanitizer. Running this as a structured query produces a report an ASA can include in its CI output.
+This is a codebase-wide command-injection scan: find all HTTP parameter sources, trace them forward, and report any path that reaches a shell execution sink without a sanitizer. In v0.3.0, source and sink symbols must be identified by name; there is no automatic class-based annotation.
 
 **The query**
 
+Identify the known HTTP-parameter entry functions and known shell-execution functions by name, then trace DATA_FLOW edges between them:
+
 ```cgx
 cgx query '
-  MATCH path = (src)-[:DATA_FLOW*]->(sink {sink_class:"shell"})
-  WHERE src.source_class = "network"
-    AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "shell")
+  MATCH path = (src)-[:DATA_FLOW*]->(sink)
+  WHERE src.name IN ["axum::extract::Query::into_inner","actix_web::web::Query::into_inner"]
+    AND sink.name IN ["std::process::Command::new","libc::system"]
   RETURN src.name, src.file, src.line,
          sink.name, sink.file, sink.line,
          length(path) AS hops,
-         [e IN relationships(path) | e.transformation_kind] AS transforms
+         [e IN relationships(path) | e.condition] AS conditions
   ORDER BY src.file, src.line
-' ./
+' --repo ./
 ```
 
-Or using the typed-taint subcommand:
-
-```cgx
-cgx paths --from-class network --to-class shell \
-          --require-sanitizer-class shell \
-          --negate-sanitizer \
-          --format sarif > command-injection.sarif
-```
+Note: `source_class`, `sink_class`, and `sanitizer_class` node properties are not supported in v0.3.0 (plan error, exit 2). The flags `--from-class`, `--to-class`, `--require-sanitizer-class`, and `--negate-sanitizer` do not exist on `cgx paths`. A fully class-annotated taint scan requires a future release that supports these properties.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `src.source_class = "network"` | The source is classified as a network input (HTTP parameters, headers, body). |
-| `sink.sink_class = "shell"` | The sink is a shell-execution function (`Command::new`, `exec`, `system`, etc.). |
-| `NONE(n IN nodes(path) WHERE n.sanitizer_class = "shell")` | No node on the path is a sanitizer declared for the `shell` class. |
-| `[e IN relationships(path) | e.transformation_kind] AS transforms` | The transformation chain shows how the value was processed along the path — useful for triage (e.g., a `parsed` transformation may indicate structured extraction). |
+| `src.name IN [...]` | Enumerate the known HTTP-input functions by FQN. Replace with the actual entry functions in your codebase. |
+| `sink.name IN [...]` | Enumerate the known shell-execution functions by FQN. |
+| `[:DATA_FLOW*]` | Transitive data-flow edges (v0.3, on by default). |
+| `[e IN relationships(path) \| e.condition] AS conditions` | The condition chain along the path; exception-only paths are lower immediate risk. |
 
-**Reading the result** — Each row is a confirmed injection path from a network source to a shell sink. The `transforms` column shows the data processing chain between source and sink; a path with no transformations is a direct injection candidate. Use `--format sarif` for SARIF output that uploads to GitHub Advanced Security.
+**Reading the result** — Each row is a structural data-flow path from a named HTTP input to a named shell sink. There is no sanitizer filtering in v0.3.0; review the path manually to determine whether any intermediate node performs input validation. Use `--format sarif` on `cgx query` to produce SARIF output for upload to GitHub Advanced Security.
 
 ---
 
@@ -168,7 +177,7 @@ Before calling a function for the first time, an agent should look at existing c
 **The query**
 
 ```cgx
-cgx callers sendEmail ./ --depth 1 --format json
+cgx callers sendEmail --repo ./ --depth 1 --format json
 ```
 
 For richer context (2 hops back to see the setup functions):
@@ -177,67 +186,63 @@ For richer context (2 hops back to see the setup functions):
 cgx query '
   MATCH path = (setup)-[:CALLS*1..2]->(fn {name:"sendEmail"})
   RETURN fn.name,
-         collect(distinct setup.name) AS calling_context,
-         collect(distinct {name: setup.name, file: setup.file, line: setup.line})
-           AS call_sites
+         collect(setup.name) AS calling_context,
+         collect(setup.file) AS call_site_files
   ORDER BY fn.name
-' ./
+' --repo ./
 ```
+
+Note: `collect(distinct ...)` is not supported in v0.3.0 (parse error, exit 2). Use plain `collect(...)` as shown above.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `cgx callers sendEmail ./ --depth 1` | List all functions that directly call `sendEmail`. |
+| `cgx callers sendEmail --repo ./ --depth 1` | List all functions that directly call `sendEmail`. |
 | `CALLS*1..2` | Walk 2 hops backward to see not just direct callers but also what calls those callers — the setup chain. |
-| `collect(distinct setup.name) AS calling_context` | Aggregate all upstream context functions into a list, showing the established calling pattern. |
+| `collect(setup.name) AS calling_context` | Aggregate all upstream context functions into a list, showing the established calling pattern. `collect(distinct ...)` is not supported; deduplicate in the consuming layer if needed. |
 
-**Reading the result** — The `calling_context` list shows the functions that set up the call to `sendEmail`. If all existing callers first call `validate_email_address`, the agent knows it should do the same. If the callers span multiple modules, the `call_sites` list lets the agent inspect the most representative examples.
+**Reading the result** — The `calling_context` list shows the functions that set up the call to `sendEmail`. If all existing callers first call `validate_email_address`, the agent knows it should do the same. If the callers span multiple modules, the `call_site_files` list lets the agent identify which files to inspect.
 
 ---
 
 ### Q73 — Generate a SARIF report of all taint paths from HTTP input to SQL sinks, including the full call chain for each path.
 
-**Personas:** ASA · **Status:** answerable-today
+**Personas:** ASA · **Status:** deferred — security-typed taint (`source_class`, `sink_class`, `sanitizer_class` node properties; `--from-class`, `--to-class`, `--require-sanitizer-class`, `--negate-sanitizer` flags) is not supported in v0.3.0 (plan error, exit 2 for properties; argument errors for flags). Structural dataflow (`DATA_FLOW` edges) and `--format sarif` on `cgx query` are available; use name-based identification of sources and sinks as a workaround.
 
 An automated security agent needs to produce a structured, machine-readable report of SQL injection candidates. SARIF is the standard format accepted by GitHub Advanced Security and other CI security tools.
 
 **The query**
 
-```cgx
-cgx paths --from-class network --to-class sql \
-          --require-sanitizer-class sql \
-          --negate-sanitizer \
-          --confidence probable \
-          --format sarif > sql-injection.sarif
-```
-
-The full query form (to include call chain detail in each result):
+In v0.3.0, identify source and sink symbols by name and trace DATA_FLOW edges between them:
 
 ```cgx
 cgx query '
-  MATCH path = (src)-[:DATA_FLOW*]->(sink {sink_class:"sql"})
-  WHERE src.source_class = "network"
-    AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "sql")
+  MATCH path = (src)-[:DATA_FLOW*]->(sink)
+  WHERE src.name IN ["axum::extract::Query::into_inner","actix_web::web::Query::into_inner"]
+    AND sink.name IN ["sqlx::query","diesel::sql_query","rusqlite::Connection::execute"]
   RETURN src.name, src.file, src.line,
          sink.name, sink.file, sink.line,
-         [n IN nodes(path) | {name: n.name, file: n.file, line: n.line}] AS call_chain,
+         [n IN nodes(path) | n.name] AS call_chain_names,
          length(path) AS hops,
          MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence
   ORDER BY weakest_confidence DESC, hops
-' ./ --format sarif > sql-injection.sarif
+' --repo ./ --format sarif > sql-injection.sarif
 ```
+
+Note: `--from-class`, `--to-class`, `--require-sanitizer-class`, and `--negate-sanitizer` do not exist on `cgx paths`. The properties `source_class`, `sink_class`, and `sanitizer_class` are not supported in v0.3.0. Additionally, map-literal expressions in list comprehensions (e.g. `[n IN nodes(path) | {name: n.name, ...}]`) cause a parse error (exit 2) in v0.3.0; project individual properties as separate expressions instead, as shown above. The `MIN(...)` confidence ordering above uses `MIN` on string values as a proxy — in v0.3.0 confidence values are strings (`possible`, `probable`, `certain`); sort by `e.confidence` directly if lexicographic order is sufficient for triage.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `--require-sanitizer-class sql --negate-sanitizer` | Find paths where a `sql`-class sanitizer is absent — i.e., unsanitized paths only. |
-| `--confidence probable` | Include probable-confidence edges (e.g., through dynamically-dispatched calls) but exclude `possible` over-approximations. |
-| `[n IN nodes(path) | {name: n.name, file: n.file, line: n.line}] AS call_chain` | Include every node on the path as a list of `{name, file, line}` objects — the full call chain in each SARIF result. |
-| `MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence` | The weakest-link confidence on the path; a path with all-`certain` edges is a confirmed injection candidate. |
+| `src.name IN [...]` | Enumerate known HTTP-input functions by FQN. Replace with the actual entry functions in your codebase. |
+| `sink.name IN [...]` | Enumerate known SQL-execution functions by FQN. |
+| `[:DATA_FLOW*]` | Transitive data-flow edges (v0.3, on by default). |
+| `[n IN nodes(path) \| n.name] AS call_chain_names` | Every node name on the path as a list — the full chain in each SARIF result. Map-literal projections (`{name: n.name, ...}`) are not supported in v0.3.0. |
+| `--format sarif` on `cgx query` | Produces SARIF 2.1.0 output for upload to GitHub Advanced Security. |
 
-**Reading the result** — The SARIF output contains one result per path. `call_chain` in the result properties gives the full intermediate call sequence, enabling developers to see exactly how the tainted data travels from input to SQL sink. `weakest_confidence` helps triage: `certain` paths first, then `probable`.
+**Reading the result** — The SARIF output contains one result per path. `call_chain_names` in the result properties gives the full intermediate call sequence as a name list, enabling developers to see exactly how the data travels from input to SQL sink. Review the chain manually to determine whether any intermediate node performs sanitization — per-path sanitizer detection requires a future release with `sanitizer_class` support.
 
 ---
 
@@ -250,13 +255,13 @@ Adding a parameter to a function requires updating every call site. The call gra
 **The query**
 
 ```cgx
-cgx callers Config::load ./ --depth 10 --format json
+cgx callers Config::load --repo ./ --depth 10 --format json
 ```
 
 For the direct call sites only (the ones that must change):
 
 ```cgx
-cgx callers Config::load ./ --depth 1 --confidence probable --format json
+cgx callers Config::load --repo ./ --depth 1 --confidence probable --format json
 ```
 
 **Breaking it down**
@@ -269,12 +274,12 @@ cgx query '
   RETURN caller.name, caller.file, caller.line,
          caller.kind
   ORDER BY caller.file, caller.line
-' ./
+' --repo ./
 ```
 
 | Fragment | What it means |
 |---|---|
-| `cgx callers Config::load ./ --depth 1` | Direct callers only — the call sites that pass arguments and must be updated. |
+| `cgx callers Config::load --repo ./ --depth 1` | Direct callers only — the call sites that pass arguments and must be updated. |
 | `--confidence probable` | Include callers reached via dynamic dispatch or trait objects, not just statically-certain callers. |
 | `caller.kind` | Tells the agent whether each caller is a function, a test function, or a generated item — helps prioritize the update order. |
 
@@ -290,29 +295,29 @@ cgx query '
 
 **The query**
 
-Per advisory, in a loop:
+Per advisory, use `cgx reaches` to check reachability from any entrypoint, or `cgx paths` with positional FROM and TO arguments:
 
 ```cgx
-cgx paths --from '**' \
-          --to 'serde_json::de::from_str' \
-          --to-package 'serde_json@>=1.0.0,<1.0.96' \
-          --confidence probable \
-          --format sarif >> advisory-findings.sarif
+cgx reaches 'serde_json::de::from_str' \
+            --repo ./ \
+            --confidence probable \
+            --format sarif >> advisory-findings.sarif
 ```
 
-For a combined reachability + sanitizer check:
+For a combined reachability check with path detail (inline the vulnerable symbol in the query string — `cgx query` has no `--param` flag):
 
 ```cgx
 cgx query '
-  MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:$vuln_symbol})
+  MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"serde_json::de::from_str"})
   RETURN ep.name, ep.file, ep.line,
          length(path) AS hops,
          [e IN relationships(path) | e.condition] AS conditions,
-         ANY(n IN nodes(path) WHERE n.sanitizer_class IS NOT NULL) AS has_sanitizer,
          MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence
   ORDER BY hops, ep.name
-' ./ --param vuln_symbol="serde_json::de::from_str"
+' --repo ./ --format sarif >> advisory-findings.sarif
 ```
+
+Note: `paths --from '**' --to <sym> --to-package <range>` does not exist in v0.3.0. `cgx paths` takes two positional symbol arguments (`<FROM> <TO>`); there is no `--from`, `--to`, or `--to-package` flag. `n.sanitizer_class IS NOT NULL` exits 2 (unsupported property + unsupported IS NOT NULL predicate); drop it and inspect paths manually. The `--param` flag does not exist on `cgx query`; inline query parameters as literals.
 
 Specified in docs/05 Worked Example 5 (CVE reachability triage).
 
@@ -321,12 +326,11 @@ Specified in docs/05 Worked Example 5 (CVE reachability triage).
 | Fragment | What it means |
 |---|---|
 | `ep {kind:"entrypoint"}` | Start from declared entrypoints (HTTP handlers, CLI entry points, etc.). |
-| `--to 'serde_json::de::from_str'` | The specific vulnerable symbol named in the advisory. |
-| `--to-package 'serde_json@>=1.0.0,<1.0.96'` | Match any symbol in the advisory's affected version range, even if the exact symbol name is not known. |
-| `ANY(n IN nodes(path) WHERE n.sanitizer_class IS NOT NULL) AS has_sanitizer` | Whether any node on the path is a sanitizer — a sanitizer does not make the function unreachable, but it may reduce exploitability. |
-| `MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence` | A path where all edges are `certain` is a confirmed reachable path; a `possible` weakest edge may be a false positive from dynamic dispatch. |
+| `vuln {name:"serde_json::de::from_str"}` | The specific vulnerable symbol named in the advisory, inlined as a literal. |
+| `[e IN relationships(path) \| e.condition] AS conditions` | Whether the path is exception-only (lower immediate risk) or always-condition (high risk). |
+| `MIN([e IN relationships(path) \| e.confidence]) AS weakest_confidence` | A path where all edges are `certain` is a confirmed reachable path; a `possible` weakest edge may be a false positive from dynamic dispatch. |
 
-**Reading the result** — For each entrypoint row: (a) the vulnerability is reachable if any row is returned; (b) `ep.name` lists the entrypoints that reach it; (c) `has_sanitizer` tells the ASA whether any sanitizer is on the path. `conditions` shows whether the path is exception-only (lower immediate risk) or always-condition (high risk). Use `weakest_confidence` to triage: report `certain`/`probable` findings first.
+**Reading the result** — For each entrypoint row: (a) the vulnerability is reachable if any row is returned; (b) `ep.name` lists the entrypoints that reach it; (c) inspect `conditions` to see whether the path is exception-only. Sanitizer detection on the path is not automated in v0.3.0; review intermediate nodes manually. Use `weakest_confidence` to triage: report `certain`/`probable` findings first.
 
 ---
 
@@ -340,18 +344,30 @@ The CIE benchmark measures how many tool calls an agent needs to gather call-cha
 
 Three calls: one to find the path, one to get signatures, one to explain edge conditions.
 
-Call 1 — find the path:
+Call 1 — find paths from any entrypoint to the target (use `cgx query` for flexible FROM; `cgx paths` requires a concrete FROM symbol):
 ```cgx
-cgx paths --from '**' --to my_module::process_record ./ \
-          --max-paths 5 --format json
+cgx query '
+  MATCH path = (ep {kind:"entrypoint"})-[:CALLS*1..10]->(fn {name:"my_module::process_record"})
+  RETURN ep.name, ep.file, ep.line,
+         [n IN nodes(path) | n.name] AS chain_names,
+         [r IN relationships(path) | r.condition] AS edge_conditions,
+         length(path) AS hops
+  ORDER BY hops
+  LIMIT 5
+' --repo ./ --format json
 ```
 
-Call 2 — get signatures for every intermediate node:
+Call 2 — get provenance for the target symbol:
 ```cgx
-cgx explain my_module::process_record ./ --format json
+cgx explain my_module::process_record --repo ./ --format json
 ```
 
-Call 3 — check edge conditions on the paths returned by call 1 (via MCP `paths` tool with the `--explain` flag, or inline in call 1 with `--format tree`).
+Call 3 — check callers one hop deep to confirm all call sites:
+```cgx
+cgx callers my_module::process_record --repo ./ --depth 1 --format json
+```
+
+Note: `cgx paths` takes two positional symbol arguments (`<FROM> <TO>`); there is no `--from`, `--to`, or `--max-paths` flag. Use `cgx query` with `ep {kind:"entrypoint"}` to find paths from any entrypoint. `cgx explain` does not accept a trailing positional path argument; use `--repo PATH` instead. Map-literal expressions in list comprehensions (e.g. `[n IN nodes(path) | {name: n.name, ...}]`) cause a parse error (exit 2) in v0.3.0; project individual scalar properties instead.
 
 Or as a single Layer-2 query (one MCP tool call):
 
@@ -359,13 +375,12 @@ Or as a single Layer-2 query (one MCP tool call):
 cgx query '
   MATCH path = (ep {kind:"entrypoint"})-[:CALLS*1..10]->(fn {name:"my_module::process_record"})
   RETURN ep.name, ep.file, ep.line,
-         [n IN nodes(path) |
-           {name: n.name, file: n.file, line: n.line, kind: n.kind}] AS chain,
+         [n IN nodes(path) | n.name] AS chain_names,
          [r IN relationships(path) | r.condition] AS edge_conditions,
          length(path) AS hops
   ORDER BY hops
   LIMIT 3
-' ./ --format json
+' --repo ./ --format json
 ```
 
 **Breaking it down**
@@ -373,7 +388,7 @@ cgx query '
 | Fragment | What it means |
 |---|---|
 | `CALLS*1..10` | Traverse up to 10 hops — adjust to the known depth of the call chain. |
-| `[n IN nodes(path) | {name, file, line, kind}]` | Return all intermediate nodes as a structured list in a single result, eliminating the need for follow-up file reads. |
+| `[n IN nodes(path) \| n.name] AS chain_names` | Return all intermediate node names as a list. Map-literal projections (`{name: n.name, ...}`) cause a parse error in v0.3.0; use scalar property expressions. |
 | `[r IN relationships(path) | r.condition]` | Edge-condition labels on every hop — the critical context for exception-path-aware editing. |
 | `LIMIT 3` | Return at most 3 distinct paths to keep the context window usage bounded. |
 
@@ -389,23 +404,26 @@ An agent that has loaded a set of files knows all the symbols defined in those f
 
 **The query**
 
-```cgx
-cgx query '
+Because `cgx query` has no `--param` flag, inline the file list as a CQL literal array in the query string. Build the array from the agent's loaded file list using shell substitution:
+
+```sh
+LOADED=$(jq -c '[.[] | .file]' context-files.json)  # e.g. ["src/lib.rs","src/main.rs"]
+cgx query "
   MATCH (caller)-[:CALLS]->(fn)
-  WHERE fn.file IN $loaded_files
-    AND NOT caller.file IN $loaded_files
+  WHERE fn.file IN ${LOADED}
+    AND NOT caller.file IN ${LOADED}
   RETURN fn.name, fn.file, fn.line,
          caller.name, caller.file, caller.line
   ORDER BY fn.name, caller.file
-' ./ --param loaded_files=$(jq -c '[.[] | .file]' context-files.json)
+" --repo ./
 ```
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `fn.file IN $loaded_files` | The callee is defined in a file the agent has already loaded. |
-| `NOT caller.file IN $loaded_files` | The caller is in a file the agent has not loaded. |
+| `fn.file IN [...]` | The callee is defined in a file the agent has already loaded. The list is inlined as a CQL literal; `cgx query` has no `--param` flag. |
+| `NOT caller.file IN [...]` | The caller is in a file the agent has not loaded. |
 | Result grouped by `fn.name` | Shows which of the agent's known symbols have callers outside its context. |
 
 **Reading the result** — Each returned pair is a `(known symbol, unknown caller)` relationship. The `caller.file` column tells the agent which files it should consider loading next. A symbol with many unknown callers carries higher risk when modified — the agent may not have a complete picture of the call contract.
@@ -422,23 +440,26 @@ Before writing a new function, an agent should look at sibling functions: other 
 
 Find all functions that call the same set of dependencies as the target:
 
+Because `cgx query` has no `--param` flag, inline the target function name as a literal in the query string:
+
 ```cgx
 cgx query '
-  MATCH (target_fn {name:$my_fn})-[:CALLS]->(dep)
+  MATCH (target_fn {name:"my_module::my_new_function"})-[:CALLS]->(dep)
   WITH collect(dep.name) AS my_deps
   MATCH (sibling_fn)-[:CALLS]->(shared_dep)
   WHERE shared_dep.name IN my_deps
-    AND sibling_fn.name <> $my_fn
-  WITH sibling_fn,
-       collect(distinct shared_dep.name) AS shared_deps,
-       size(collect(distinct shared_dep.name)) AS overlap
+    AND sibling_fn.name <> "my_module::my_new_function"
+  WITH sibling_fn.name AS sib, sibling_fn.file AS sib_file, sibling_fn.line AS sib_line,
+       collect(shared_dep.name) AS shared_deps
+  WITH sib, sib_file, sib_line, shared_deps, size(shared_deps) AS overlap
   WHERE overlap >= 2
-  RETURN sibling_fn.name, sibling_fn.file, sibling_fn.line,
-         shared_deps, overlap
+  RETURN sib, sib_file, sib_line, shared_deps, overlap
   ORDER BY overlap DESC
   LIMIT 10
-' ./ --param my_fn=my_module::my_new_function
+' --repo ./
 ```
+
+Note: `collect(distinct ...)` is not supported in v0.3.0. Use a two-step `WITH` to compute and filter by `size(shared_deps)` as shown above.
 
 **Breaking it down**
 

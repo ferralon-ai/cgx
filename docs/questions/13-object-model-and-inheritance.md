@@ -113,7 +113,7 @@ RETURN sub.name, sub.file, sub.line
 | `MATCH ALL (sub)-[:CALLS*]->(sink {sink_class:"db-write"}) AVOIDING (g)` | Find cases where the override reaches the same sink class on a path that avoids that guard. An `AVOIDING` match produces results only when such a bypass path exists. |
 | `RETURN sub.name, sub.file, sub.line` | Return overrides where a bypass path was found. |
 
-**Reading the result** — Each row is an override that has silently removed an authorisation check the base enforced. The `MUST PASS THROUGH` / `AVOIDING` semantics use guarded-cut reachability (corrected Q-20); until Phase 3 dominance facts are populated, findings carry `guard_analysis: "cut-only"` and are capped at `probable` confidence.
+**Reading the result** — This query is illustrative only; it exits 2 today. `MUST PASS THROUGH` and `AVOIDING` are parse errors in v0.3 (not recognised keywords), and `sink_class` / `guard_class` are plan errors (unsupported node properties). When Q-32 is implemented each returned row will be an override that has silently removed an authorisation check the base enforced.
 
 ---
 
@@ -257,13 +257,14 @@ RETURN acc.name, parent_field.name, acc.file, acc.line
 
 ### Q136 — For this polymorphic call, what is the full set of bodies it could resolve to across instantiated subtypes?
 
-**Personas:** PSE, SSE · **Status:** answerable-today
+**Personas:** PSE, SSE · **Status:** needs-schema-room-feature (GM-2.1)
 
-Before a virtual call is analysed for security or correctness, the reviewer needs the complete set of possible runtime targets. `calls:virtual` edges carry a `candidate_set` attribute listing all possible targets, narrowed by CHA/RTA at tier 3.
+Before a virtual call is analysed for security or correctness, the reviewer needs the complete set of possible runtime targets. The `CALLS:virtual` subtype qualifier and the `candidate_set` edge attribute that would carry the CHA/RTA-narrowed target set are recognised by the parser but deferred to v0.3 — using them today produces a plan error (exit 2). The query below is illustrative of the intended form; run it as-is and cgx returns exit 2.
 
 **The query**
 
 ```cgx
+-- illustrative: requires GM-2.1 (virtual dispatch edge kind + candidate_set attribute, deferred)
 MATCH (site)-[c:CALLS:virtual]->(target {name:"Codec::decode"})
 RETURN site.name, site.candidate_set, site.file, site.line
 ```
@@ -273,12 +274,12 @@ RETURN site.name, site.candidate_set, site.file, site.line
 | Fragment | What it means |
 |---|---|
 | `(site)` | The call site where the virtual call originates. |
-| `[c:CALLS:virtual]` | The virtual dispatch edge kind (GM-2.1). Unlike `CALLS`, this edge represents dispatch through a virtual, interface, or trait method. |
+| `[c:CALLS:virtual]` | The virtual dispatch edge kind (GM-2.1). Unlike `CALLS`, this edge represents dispatch through a virtual, interface, or trait method. Deferred: exits 2 in v0.3. |
 | `(target {name:"Codec::decode"})` | The declared target of the virtual call, matched by its declared type and method name. |
-| `site.candidate_set` | The attribute on the edge carrying all possible runtime targets, ordered by probability. Populated from CHA/RTA narrowing. |
+| `site.candidate_set` | The GM-2.1 attribute on the edge carrying all possible runtime targets, ordered by probability. Absent until GM-2.1 is populated. |
 | `RETURN site.name, site.candidate_set, site.file, site.line` | Return the call site and the full set of bodies it may invoke. |
 
-**Reading the result** — `candidate_set` lists possible runtime implementations in probability order. Entries with `certain` or `probable` confidence from CHA/RTA narrowing are the high-priority candidates; `possible`-confidence entries are over-approximation from unresolved dispatch. A short candidate set means the virtual call is nearly-monomorphic; a large set suggests wide polymorphism that complicates analysis.
+**Reading the result** — Until GM-2.1 is populated, use Q128 to enumerate which subclasses override the method, then use `cgx callers` to find call sites that reach those overrides. `candidate_set` will list possible runtime implementations in probability order once the virtual dispatch edge kind is active; entries with `certain` or `probable` confidence from CHA/RTA narrowing are high-priority candidates.
 
 ---
 

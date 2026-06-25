@@ -59,8 +59,16 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     let mut store = SqliteStore::open_in_memory()
         .map_err(|e| ToolError::index(format!("opening in-memory store: {e}")))?;
 
+    // v0.3 SC6: dataflow is part of the standard index (on by default), so MCP
+    // tools answer `:DATA_FLOW`/`flows-*` against a fresh auto-index. The
+    // `[index] data_flow = false` cgx.toml key opts back out (mirrors the CLI).
+    let opts = IndexOpts {
+        dataflow: dataflow_default(root),
+        ..IndexOpts::default()
+    };
+
     if !include_dirty {
-        let outcome = index_path(root, &registry, &mut store, &IndexOpts::default())
+        let outcome = index_path(root, &registry, &mut store, &opts)
             .map_err(|e| ToolError::index(format!("indexing committed tree: {e}")))?;
         let view = load_view(&store, outcome.graph_id)?;
         return Ok(GraphSession {
@@ -89,7 +97,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .map_err(|e| ToolError::index(e.to_string()))?;
     let dirty_oids = dirty_synthetic_oids(&committed, &working);
 
-    let outcome = index_workdir(root, &workdir, &registry, &mut store, &IndexOpts::default())
+    let outcome = index_workdir(root, &workdir, &registry, &mut store, &opts)
         .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
     let view = load_view(&store, outcome.graph_id)?;
 
@@ -113,6 +121,33 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
             dirty_files_analyzed: dirty_oids.len(),
         })
     }
+}
+
+/// The effective on-by-default dataflow setting for `root` (v0.3 SC6). Dataflow
+/// ships ON; only a `[index] data_flow = false` key in a `cgx.toml` at the repo
+/// root disables it. Minimal section-scoped line scan — cgx carries no `toml`
+/// dependency by design.
+fn dataflow_default(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("cgx.toml")) else {
+        return true;
+    };
+    let mut in_index = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_index = line == "[index]";
+            continue;
+        }
+        if !in_index {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "data_flow" {
+                return value.trim() != "false";
+            }
+        }
+    }
+    true
 }
 
 /// Read a stored graph back into a queryable [`GraphView`].

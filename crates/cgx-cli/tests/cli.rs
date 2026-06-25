@@ -1010,20 +1010,22 @@ fn search_output_is_byte_identical_across_runs() {
 }
 
 #[test]
-fn index_accepts_dataflow_flag_and_succeeds() {
-    // v0.3 DATA_FLOW SC2: `cgx index --dataflow` is accepted and indexes cleanly.
+fn index_accepts_no_dataflow_flag_and_succeeds() {
+    // v0.3 SC6: dataflow is ON by default; `--no-dataflow` is the escape hatch and
+    // is accepted, indexing cleanly to the leaner base graph.
     let (_tmp, repo) = fixture_repo();
-    let (out, code) = run_cgx(&repo, &["index", "--dataflow"]);
-    assert_eq!(code, 0, "index --dataflow should succeed: {out}");
+    let (out, code) = run_cgx(&repo, &["index", "--no-dataflow"]);
+    assert_eq!(code, 0, "index --no-dataflow should succeed: {out}");
     assert!(out.contains("nodes"), "stats printed: {out}");
     assert!(repo.join(".cgx/index.db").exists(), "store written");
 }
 
 #[test]
 fn dataflow_index_then_query_call_graph_still_works() {
-    // The base call-graph surface is unaffected by building the dataflow layer.
+    // The base call-graph surface is unaffected by building the dataflow layer
+    // (which the default `cgx index` now does, SC6 on-by-default).
     let (_tmp, repo) = fixture_repo();
-    let (_o, code) = run_cgx(&repo, &["index", "--dataflow"]);
+    let (_o, code) = run_cgx(&repo, &["index"]);
     assert_eq!(code, 0);
     let (out, code) = run_cgx(&repo, &["callees", "main", "--no-auto-index"]);
     assert_eq!(code, 0, "callees over a dataflow index works: {out}");

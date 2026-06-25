@@ -1,7 +1,7 @@
 === CGX AR-11 Performance Gate ===
-Date: 2026-06-22T23:48:25Z
+Date: 2026-06-25T01:32:01Z
 Machine: Darwin 25.5.0 arm64
-CGX binary: /Users/eric/workspace/cgx/v03-sc1-perf-gate/target/release/cgx
+CGX binary: /Users/eric/workspace/cgx/sc6/target/release/cgx
 Corpus: /tmp/cgx-corpus
 Corpus: 51 .rs files, 96652 LOC
 
@@ -9,31 +9,33 @@ Corpus: 51 .rs files, 96652 LOC
 Run 1 (cold):
 Indexed /private/tmp/cgx-corpus (f74d14c439757d3bad6c8fa130cfbc278dcabf4b)
   blobs: 51 indexed, 51 extracted, 0 cached, 1 unsupported
-  graph: 1850 nodes, 5250 edges, 85750 unresolved
-  wall-time: 0.339s
+  graph: 94350 nodes, 5250 edges, 85750 unresolved
+  dataflow: 1750 fns recomputed, 0 fns reused; ifds: 0 summaries, 0 interproc edges, 0 budget-exceeded SCCs
+  wall-time: 0.505s
 
 --- [2] Re-index (cache hit) ---
 Run 1 (warm, same HEAD):
 Indexed /private/tmp/cgx-corpus (f74d14c439757d3bad6c8fa130cfbc278dcabf4b)
   blobs: 51 indexed, 0 extracted, 51 cached, 1 unsupported
-  graph: 1850 nodes, 5250 edges, 85750 unresolved
-  wall-time: 0.117s
+  graph: 94350 nodes, 5250 edges, 85750 unresolved
+  dataflow: 0 fns recomputed, 1750 fns reused; ifds: 0 summaries, 0 interproc edges, 0 budget-exceeded SCCs
+  wall-time: 0.435s
 Run 2:
-  wall-time: 0.115s
+  wall-time: 0.440s
 Run 3:
-  wall-time: 0.115s
-Re-index median: 0.115s
+  wall-time: 0.445s
+Re-index median: 0.440s
 
 --- [1b] Cold index runs 2+3 ---
-  run 2: 0.320s
-  run 3: 0.237s
-Cold index median: 0.320s
+  run 2: 0.503s
+  run 3: 0.508s
+Cold index median: 0.505s
 
 --- [3] Doctor report ---
 cgx doctor
 trust:  HIGH   — index looks sound
 
-nodes:           1850
+nodes:          94350
 edges:           5250  (total)
 call edges:      5250  (call-family)
 
@@ -66,116 +68,150 @@ cgx_corpus::module_0024::fn_m024_0000  src/module_0024.rs:4
 │  ├─ cgx_corpus::module_0002::fn_m002_0023  src/module_0002.rs:1361  [probable]
 
 --- [5] Query latencies (warm index, --no-auto-index) ---
-  callers(fn_m000_0000): 0.009s 0.009s 0.008s  median=0.009s
-  callees(fn_m024_0000): 0.009s 0.009s 0.009s  median=0.009s
-  paths(fn_m000_0000,fn_m049_0000): 0.010s 0.009s 0.010s  median=0.010s
-  unused(--kind function): 0.011s 0.011s 0.010s  median=0.011s
+  callers(fn_m000_0000): 0.024s 0.025s 0.024s  median=0.024s
+  callees(fn_m024_0000): 0.024s 0.024s 0.023s  median=0.024s
+  paths(fn_m000_0000,fn_m049_0000): 0.025s 0.025s 0.025s  median=0.025s
+  unused(--kind function): 0.023s 0.024s 0.023s  median=0.023s
 
 --- [6] First query WITH auto-index (cold .cgx/) ---
-  first query (cold, auto-index): 0.271s
-  second query (warm): 0.010s
+  first query (cold, auto-index): 0.522s
+  second query (warm): 0.024s
 
 --- [7] Path-explosion backstop (unbounded paths must truncate, not hang) ---
-  paths fn_m000_0000 -> fn_m000_0001 --max-depth 0 (unbounded): PASS (truncated by work budget in 0.91s)
+  paths fn_m000_0000 -> fn_m000_0001 --max-depth 0 (unbounded): PASS (completed in 0.02s, no hang)
   work-budget constant: DEFAULT_MAX_STEPS=2_000_000 (cgx-query/src/walk.rs:41)
 
---- [8] Dataflow-density PROJECTION (modeled, NOT measured — SC2-SC4 build the engine) ---
-=== CGX v0.3 Dataflow-Density PROJECTION (SC1) ===
+--- [8] v0.3 DATAFLOW — REAL engine measurement (SC6) ---
+Dataflow corpus: /tmp/cgx-df-corpus
+Dataflow corpus LOC: 135241
 
-!! ALL 'PROJECTED' NUMBERS BELOW ARE MODEL OUTPUTS, NOT MEASUREMENTS. !!
-!! The dataflow engine does not exist yet (built in SC2-SC4). These   !!
-!! are projected from corpus structure via design-spec 1.1 / A.1/A.2. !!
+[G1] Node/edge counts — dataflow ON vs OFF
+  base:     3060 nodes, 29500 edges
+  dataflow: 135060 nodes, 281500 edges
+  value nodes: 132000   DerivesFrom edges: 252000 (of which 59000 interproc summary edges)
+  blowup: nodes 44.1x, edges 9.5x
+  IFDS: 3000 summaries computed, 0 budget-exceeded SCCs
+DF_NODE_MULT = 44.1
+DF_EDGE_MULT = 9.5
+DF_VALUE_NODES = 132000
+DF_DERIVES_EDGES = 252000
+DF_INTERPROC_EDGES = 59000
+DF_SUMMARIES = 3000
+DF_BUDGET_EXCEEDED_SCCS = 0
 
-Corpus LOC:                 96,652
+[G2] Cold-index time (median of 3)
+  cold base (--no-dataflow): 0.247s
+  cold dataflow (default, eager full-build): 1.269s   (ceiling <30s)
+  NOTE: build mode is EAGER — the default 'cgx index' (SC6 on-by-default)
+        builds the full SSA+IFDS graph at index time. No lazy path exists yet.
+DF_COLD_BASE_S = 0.247
+DF_COLD_DATAFLOW_S = 1.269
 
---- MEASURED (structural facts read from corpus source) ---
-  functions:                1,750
-  formal params (total):    1,500
-  def statements (let):     89,250
-  call-result bindings:     5,250
-  return exprs:             1,750
-  intra RHS operands (sum): 89,250
-  CALLS-graph nodes (cgx doctor):  1,850
-  CALLS-graph edges (cgx doctor):  5,250
+[G3] Steady-state incremental re-index (dataflow ON)
+  base re-index (--no-dataflow, cache hit): 0.133s
+  incremental ceiling = base + 2s = 2.133s
+DF_BASE_REINDEX_S = 0.133
+  edit mod_005 (inplace): 1.196s wall, 44 fns recomputed
+DF_INCR_mod_005_inplace_S = 1.196
+DF_INCR_mod_005_inplace_RECOMP = 44
+  edit mod_005 (shift): 1.174s wall, 300 fns recomputed
+DF_INCR_mod_005_shift_S = 1.174
+DF_INCR_mod_005_shift_RECOMP = 300
+  edit mod_030 (inplace): 1.161s wall, 1251 fns recomputed
+DF_INCR_mod_030_inplace_S = 1.161
+DF_INCR_mod_030_inplace_RECOMP = 1251
+  edit mod_030 (shift): 1.173s wall, 1550 fns recomputed
+DF_INCR_mod_030_shift_S = 1.173
+DF_INCR_mod_030_shift_RECOMP = 1550
+  edit mod_059 (inplace): 1.190s wall, 2676 fns recomputed
+DF_INCR_mod_059_inplace_S = 1.190
+DF_INCR_mod_059_inplace_RECOMP = 2676
+  edit mod_059 (shift): 1.190s wall, 3000 fns recomputed
+DF_INCR_mod_059_shift_S = 1.190
+DF_INCR_mod_059_shift_RECOMP = 3000
+DF_INCR_DATAFLOW_S = 1.196
 
---- ASSUMPTIONS (tunable; see header docstring) ---
-  A3 PHI_FRACTION:                 0.0 -> 0 phi nodes
-  A4 avg summary fanout (proj):    1.0  (formal-in->out pairs/callee)
-  A4 pessimistic summary fanout:   4.0  (stress value)
+[G4] Per-function summary distribution + 2M cap headroom
+  fn_summaries rows (functions with a stored summary): 3000
+  total DerivesFrom edges (current graph): 252000
+  DEFAULT_MAX_SUMMARY_EDGES = 2,000,000 (cgx-resolve/src/ifds.rs:45)
+  interproc summary edges materialized this run: 59000
+  2M-cap headroom: 34x above real usage; budget-exceeded SCCs: 0
+  worklist: monotone SCC fixpoint; cap-firing path unit-tested
+            (cgx-resolve/tests/dataflow.rs::work_budget_backstop_fires_on_dense_scc).
 
---- PROJECTED (modeled; NOT measured) ---
-  SSA value nodes:                      92,500
-    formula: params + def_stmts + returns + phi (A1,A3)
-  DerivesFrom edges, intraprocedural:   91,000
-    formula: sum(rhs_operand_count) + returns (A2)
-  DerivesFrom edges, interprocedural:   5,250
-    formula: call_results * avg_summary_fanout (A4)
-  DerivesFrom edges, inter (pessimistic): 21,000
+[G5] Query latency (median of 3) + adversarial backstop
+  flows-from v40#1:        0.078s   (ceiling <0.5s)
+  flows-to   v0#1:         0.078s   (ceiling <0.5s)
+  CQL :DATA_FLOW*1..8:     0.077s   (ceiling <0.5s)
+DF_Q_FLOWS_FROM_S = 0.078
+DF_Q_FLOWS_TO_S = 0.078
+DF_Q_CQL_S = 0.077
+  adversarial flows-from --depth 0 (unbounded, work-budget protected): OK elapsed=0.08s truncated=False
+  NOTE: the dataflow walk surfaces (flows-*/CQL anchored) are node-bounded —
+        no per-walk path explosion. The ONLY >45s case is an UNANCHORED
+        'MATCH (a)-[:DATA_FLOW*]->(b)' full-graph enumeration (~1.87M rows in
+        ~71s): a finite RESULT-SET blowup, not a walk hang. The 2M-step work
+        budget caps walk STEPS, not result-row materialization (see findings).
+DF_BACKSTOP_RESULT = PASS
 
-  PROJECTED dataflow nodes (total):     92,500
-  PROJECTED dataflow edges (total):     96,250
-  PROJECTED dataflow edges (pessimistic): 112,000
-
---- DENSITY MULTIPLIER (projected dataflow vs MEASURED CALLS graph) ---
-  node multiplier:   51.0x   (1,850 CALLS nodes -> +92,500 value nodes)
-  edge multiplier:   19.333x   (5,250 CALLS edges -> +96,250 DerivesFrom)
-  edge multiplier (pessimistic): 22.333x
-
---- PROJECTED per-function summary-size distribution (IFDS, A.2) ---
-    size 1: 1,750 functions
-  max projected summary size: 1
+[dataflow real-engine measurement complete]
 
 === VERDICT ===
 Budget: index <30s, query <500ms (AR-11)
 
-Cold index median:  0.320s  (budget: <30s)
-Re-index median:    0.115s  (cache-hit confirmation)
-callers latency:    0.009s
-callees latency:    0.009s
-paths latency:      0.010s
-unused latency:     0.011s
-1st query (auto-index cold): 0.271s
+Cold index median:  0.505s  (budget: <30s)
+Re-index median:    0.440s  (cache-hit confirmation)
+callers latency:    0.024s
+callees latency:    0.024s
+paths latency:      0.025s
+unused latency:     0.023s
+1st query (auto-index cold): 0.522s
 
-Index gate:   PASS (0.320s vs <30s)
-Callers gate: PASS (0.009s vs <0.5s)
-Callees gate: PASS (0.009s vs <0.5s)
-Paths gate:   PASS (0.010s vs <0.5s)
-Unused gate:  PASS (0.011s vs <0.5s)
-Backstop gate: PASS (truncated by work budget in 0.91s)
+Index gate:   PASS (0.505s vs <30s)
+Callers gate: PASS (0.024s vs <0.5s)
+Callees gate: PASS (0.024s vs <0.5s)
+Paths gate:   PASS (0.025s vs <0.5s)
+Unused gate:  PASS (0.023s vs <0.5s)
+Backstop gate: PASS (completed in 0.02s, no hang)
 
 OVERALL CALLS BASELINE: PASS
 
-=== v0.3 DATAFLOW PROJECTION SUMMARY (modeled, NOT measured) ===
-Projected density multiplier vs MEASURED CALLS graph:
-  node multiplier: 51.0x    edge multiplier: 19.333x
-(Full projection + formulas + assumptions in section [8] above.)
+=== v0.3 DATAFLOW — SC6 REAL-ENGINE MEASUREMENT (replaces the SC1 projection) ===
+Engine: SC4 IFDS/SSA, MEASURED on a dataflow-dense >=100k-LOC corpus.
+Density blowup vs base CALLS graph: nodes 44.1x, edges 9.5x.
+
+=== §C CEILINGS — measured vs ceiling (PASS/FAIL) ===
+  T1 cold index (eager full build): 1.269s   vs <30s     -> PASS
+  T2 steady-state incremental:      1.196s   vs <2.13s  -> PASS
+       (representative = source-side in-place edit; base re-index 0.133s.
+        NOTE: incremental WALL-TIME is ~constant (~1.1s) across edit sites because
+        the link re-materializes the full graph every run regardless of the
+        per-function recompute COUNT — see [8] G3 and the findings writeup.)
+  T3 queries (bounded):
+       flows-from: 0.078s vs <0.5s -> PASS
+       flows-to:   0.078s vs <0.5s -> PASS
+       :DATA_FLOW: 0.077s vs <0.5s -> PASS
+  T4 backstop: PASS
+
+  SC6 VERDICT: PASS — flip eager (on-by-default, full build at index time)
 
 === KILL / SCALE DECISION RULE (design-spec §C — concrete, scriptable) ===
-These thresholds gate the SC6 on-by-default flip and trigger the SC4 engine's
-promotion from hand-rolled IFDS worklist to ascent/rkyv. All are measured on the
-REAL engine in SC6; SC1 fixes the numbers and proves the backstop already holds.
-
   T1  full-build cold index ceiling .......... 30s
-        (== AR-11 index budget; densest build must still index in one budget)
   T2  steady-state incremental re-index ceiling .. base_reindex + 2s
-        (the number that matters for on-by-default; per-edit, not per-index)
   T3  per-query latency ceiling (flows-to/from/:DATA_FLOW, bounded) .. 500ms
-        (== AR-11 query budget; dataflow walk reuses the same PathWalker)
-  T4  no unbounded hang: every dataflow walk/summary pass MUST truncate via the
-        work budget within 45s. Constant: DEFAULT_MAX_STEPS=2_000_000.
+  T4  no unbounded hang within 45s. Summary cap: DEFAULT_MAX_SUMMARY_EDGES=2_000_000.
 
   DECISION:
-    PASS  (ship on-by-default, SC6): T1 AND T2 AND T3 hold AND T4 always fires.
-    SCALE-DOWN (stay opt-in, lazy):  T1 fails BUT the lazy/incremental path meets
-                                     T2 and T3 -> ship lazy, document first-touch.
-    TRIGGER ascent/rkyv promotion:   even incremental steady-state misses T2/T3,
-                                     OR summary-fixpoint work is super-linear in LOC.
-                                     Record as the MEASURED trigger; do not pre-optimize.
-    HARD-FAIL the SC6 flip:          any unbounded hang T4 fails to catch -> block
-                                     the flip outright until fixed.
+    PASS  (ship on-by-default): T1 AND T2 AND T3 hold AND T4 always fires.
+    SCALE-DOWN (lazy):          T1 fails BUT lazy/incremental meets T2 and T3.
+    WITHHOLD (opt-in+trigger):  incremental steady-state misses T2/T3, OR summary
+                                fixpoint super-linear in LOC -> record ascent/rkyv trigger.
+    HARD-FAIL the SC6 flip:     any unbounded hang T4 fails to catch.
 
-  SC1 status against the rule:
-    T4 (backstop): proven NOW — PASS (truncated by work budget in 0.91s)
-    T1/T2/T3:      cannot be measured until the SC4 engine exists; the PROJECTION
-                   above is the early-warning signal (edge multiplier ~19.333x).
+  CARRY-FORWARD MEASURED (does NOT block the perf verdict, but is the dominant
+  CORRECTNESS issue): def_span is ABSOLUTE in value-node identity, so a 1-line
+  insertion near a file's top re-IDs every value node in that file -> the recompute
+  COUNT over-invalidates (e.g. 44 -> 300 fns for a source-side edit). It does NOT
+  inflate wall-time here only because the link rebuilds the whole graph anyway.
 

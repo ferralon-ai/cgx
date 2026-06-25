@@ -12,8 +12,9 @@ language is split across versions. Gate per clause, not per subcommand. See
 
 `cgx query` **runs in v0.1** and dispatches CQL to the live graph. The
 **CALLS-graph subset** of CQL produces results in v0.1. `DATA_FLOW` edges
-return real rows at v0.3 when the index is built with `cgx index --dataflow`
-(opt-in; on-by-default in SC6). Most other deferred clauses in
+return real rows at v0.3 and are **on by default as of SC6** — a plain
+`cgx index` suffices; use `cgx index --no-dataflow` or `[index] data_flow = false`
+in `cgx.toml` to produce a base/CALLS-only index. Most other deferred clauses in
 `docs/05-queries.md` still error with exit 2 or return empty. The table below
 is the gate:
 
@@ -28,7 +29,7 @@ is the gate:
 | `--at <REF>` historical graph pin | v0.1 | **runs** |
 | `--format human\|json\|sarif\|dot\|mermaid\|d2` | v0.1 | **runs** |
 | `--confidence possible\|probable\|certain` discriminates | v0.2 | **runs** |
-| `DATA_FLOW` edge type | v0.3 | **runs** with `cgx index --dataflow` (opt-in); returns empty against a base index |
+| `DATA_FLOW` edge type | v0.3 | **runs** (on by default as of SC6); use `cgx index --no-dataflow` to build a base index that returns empty for this edge type |
 | `MUST PASS THROUGH` / `AVOIDING` | v0.3 | deferred — error |
 | Path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 | deferred |
 | `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` | v0.3 | deferred — error |
@@ -178,7 +179,7 @@ output format samples.
 
 ---
 
-## Part 2 — Deferred or opt-in clauses (v0.3+)
+## Part 2 — Deferred clauses (v0.3+)
 
 The following clauses and properties appear in `docs/05-queries.md` and the
 cookbook. Most produce exit 2 or empty results unless gated correctly. Check
@@ -186,11 +187,11 @@ cookbook. Most produce exit 2 or empty results unless gated correctly. Check
 using any of them. When the binary rejects a deferred clause it returns exit 2
 with a message ending in `(deferred)`.
 
-### Edge types — shipped opt-in or still deferred
+### Edge types — shipped or still deferred
 
 | Edge type | Since | Notes |
 |---|---|---|
-| `DATA_FLOW` | v0.3 | Returns real rows when indexed with `cgx index --dataflow`; returns empty against a base index (additive, opt-in until SC6 on-by-default flip) |
+| `DATA_FLOW` | v0.3 | Returns real rows (on by default as of SC6); use `cgx index --no-dataflow` or `[index] data_flow = false` in `cgx.toml` to produce a base index that returns empty for this edge type |
 | `CALLS:super` | v0.3 | Object-model frontend not yet shipped |
 | `RESOLVES_TO` | v0.3 | Same |
 | `PROVIDES_BODY` | v0.3 | Same |
@@ -220,14 +221,16 @@ with a message ending in `(deferred)`.
 
 ### Version gate pattern
 
-`DATA_FLOW` requires v0.3 **and** a `--dataflow` index. The opt-in index flag
-is `cgx index --dataflow`. On-by-default is SC6 (not yet shipped).
+`DATA_FLOW` requires v0.3. As of SC6 the dataflow index is **on by default** — a plain
+`cgx index` is sufficient. To opt out of dataflow indexing, run `cgx index --no-dataflow`
+or set `[index] data_flow = false` in `cgx.toml`; a base/CALLS-only index returns empty
+for `DATA_FLOW` queries.
 
 ```bash
 VERSION=$(cgx --version | awk '{print $2}' | cut -d. -f2)
 if [ "$VERSION" -ge 3 ]; then
-  # Ensure a --dataflow index exists first:
-  #   cgx index --dataflow .
+  # A plain 'cgx index' now includes dataflow (on by default since SC6).
+  # To disable: cgx index --no-dataflow .
   cgx query 'MATCH (s)-[:DATA_FLOW*1..5]->(t) RETURN s.name, t.name LIMIT 10'
 else
   echo "DATA_FLOW requires cgx >= 0.3; current: 0.$VERSION"

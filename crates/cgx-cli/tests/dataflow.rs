@@ -104,16 +104,17 @@ fn run_cgx(repo: &Path, args: &[&str]) -> (String, String, i32) {
     (stdout, stderr, out.status.code().unwrap_or(-1))
 }
 
-/// Index the repo with the v0.3 dataflow layer (`cgx index --dataflow`).
+/// Index the repo with the v0.3 dataflow layer. SC6: dataflow is ON by default,
+/// so a bare `cgx index` builds it — no flag needed.
 fn index_dataflow(repo: &Path) {
-    let (_o, _e, code) = run_cgx(repo, &["index", "--dataflow"]);
-    assert_eq!(code, 0, "index --dataflow should succeed");
+    let (_o, _e, code) = run_cgx(repo, &["index"]);
+    assert_eq!(code, 0, "default index (dataflow on) should succeed");
 }
 
-/// Index the repo with the base (no-dataflow) layer.
+/// Index the repo with the base (no-dataflow) layer via the SC6 escape hatch.
 fn index_base(repo: &Path) {
-    let (_o, _e, code) = run_cgx(repo, &["index"]);
-    assert_eq!(code, 0, "base index should succeed");
+    let (_o, _e, code) = run_cgx(repo, &["index", "--no-dataflow"]);
+    assert_eq!(code, 0, "base index (--no-dataflow) should succeed");
 }
 
 /// The set of result FQNs from a `flows-to`/`flows-from` JSON run.
@@ -360,6 +361,116 @@ fn flows_function_fqn_with_no_dataflow_edges_is_empty_exit_0() {
     assert_eq!(
         parsed["count"], 0,
         "a function FQN has no DerivesFrom edges → empty slice: {out}"
+    );
+}
+
+// ── SC6 flip: dataflow on-by-default + escape hatches ────────────────────────
+
+#[test]
+fn fresh_index_no_flags_answers_data_flow() {
+    // SC6 flip: a bare `cgx index` (no `--dataflow`) now builds the dataflow layer,
+    // so `:DATA_FLOW` returns real value-node rows with no opt-in flag.
+    let (_tmp, repo) = fixture_repo();
+    let (_o, _e, code) = run_cgx(&repo, &["index"]);
+    assert_eq!(code, 0, "default index should succeed");
+    let (out, _e, code) = run_cgx(
+        &repo,
+        &[
+            "query",
+            "MATCH (a)-[:DATA_FLOW*1..8]->(b) RETURN a.name, b.name LIMIT 10",
+            "--no-auto-index",
+        ],
+    );
+    assert_eq!(code, 0, ":DATA_FLOW exits 0 on a default index: {out}");
+    assert!(
+        out.contains('#'),
+        "a default (no-flag) index must answer :DATA_FLOW with value-node rows: {out}"
+    );
+}
+
+#[test]
+fn no_dataflow_flag_produces_base_index_with_no_dataflow_edges() {
+    // SC6 escape hatch: `--no-dataflow` produces the leaner base index — zero
+    // DerivesFrom edges, zero value nodes — matching the pre-flip default.
+    let (_tmp, repo) = fixture_repo();
+    let (_o, _e, code) = run_cgx(&repo, &["index", "--no-dataflow"]);
+    assert_eq!(code, 0, "--no-dataflow index should succeed");
+    let (out, _e, code) = run_cgx(
+        &repo,
+        &[
+            "query",
+            "MATCH (a)-[:DATA_FLOW*1..8]->(b) RETURN a.name, b.name LIMIT 10",
+            "--no-auto-index",
+        ],
+    );
+    assert_eq!(code, 0, ":DATA_FLOW over a --no-dataflow index exits 0: {out}");
+    assert!(
+        !out.contains("through_call") && !out.contains("dataflow::"),
+        "--no-dataflow must produce a base index (no DerivesFrom edges): {out}"
+    );
+}
+
+#[test]
+fn cgx_toml_data_flow_false_disables_dataflow_on_default_index() {
+    // SC6 config escape hatch: `[index] data_flow = false` in cgx.toml turns the
+    // on-by-default flip back off, so a bare `cgx index` builds the base graph.
+    let (_tmp, repo) = fixture_repo();
+    std::fs::write(repo.join("cgx.toml"), "[index]\ndata_flow = false\n").unwrap();
+    let (_o, _e, code) = run_cgx(&repo, &["index"]);
+    assert_eq!(code, 0, "default index with toml opt-out should succeed");
+    let (out, _e, code) = run_cgx(
+        &repo,
+        &[
+            "query",
+            "MATCH (a)-[:DATA_FLOW*1..8]->(b) RETURN a.name, b.name LIMIT 10",
+            "--no-auto-index",
+        ],
+    );
+    assert_eq!(code, 0, ":DATA_FLOW exits 0: {out}");
+    assert!(
+        !out.contains("through_call") && !out.contains("dataflow::"),
+        "[index] data_flow = false must disable the on-by-default dataflow build: {out}"
+    );
+}
+
+// ── SC6 regressions: end-to-end recall after the Gap-A / Gap-2 fixes ─────────
+
+const REORDER_P: &str = "rust_sample::dataflow::reorder::p#0";
+const REORDER_RETURN: &str = "rust_sample::dataflow::reorder::return#1";
+const FIELD_BASE_PT: &str = "rust_sample::dataflow::field_base::pt#0";
+const FIELD_BASE_R: &str = "rust_sample::dataflow::field_base::r#1";
+
+#[test]
+fn tail_return_reaches_param_through_reordered_bindings() {
+    // Gap A (cycle 2026-06-24_1831_cgx-v0.3-sc6-on-by-default): `reorder(p)` is
+    // `let z = p; let a = z; a`. The derived names a < z, so the canonical
+    // sort-by-name stored `a = z` before z's def. Pre-fix, `a` resolved `z` to a
+    // dead phantom `z#0` and `flows-from return` did NOT reach `p`. Resolution now
+    // uses program order, so the full chain return ⇝ a ⇝ z ⇝ p is connected.
+    let (_tmp, repo) = fixture_repo();
+    index_dataflow(&repo);
+    let fqns = flow_fqns(&repo, "flows-from", REORDER_RETURN);
+    assert!(
+        fqns.iter().any(|f| f == REORDER_P),
+        "flows-from reorder::return must reach the param p through z then a, got {fqns:?}"
+    );
+}
+
+#[test]
+fn depth1_field_projection_flows_from_base_local_end_to_end() {
+    // Gap 2: `field_base(pt)` is `let r = pt.x; r`. The projection source must be
+    // the base local `pt`, not a phantom local named after the field `x`. Pre-fix
+    // the edge bound `r` to `x#0`, so `flows-from r` never reached `pt`.
+    let (_tmp, repo) = fixture_repo();
+    index_dataflow(&repo);
+    let fqns = flow_fqns(&repo, "flows-from", FIELD_BASE_R);
+    assert!(
+        fqns.iter().any(|f| f == FIELD_BASE_PT),
+        "flows-from field_base::r must reach the base local pt, got {fqns:?}"
+    );
+    assert!(
+        !fqns.iter().any(|f| f.contains("::x#")),
+        "no phantom value node named after the field `x` may appear, got {fqns:?}"
     );
 }
 

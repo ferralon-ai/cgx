@@ -53,11 +53,12 @@ enum Command {
         /// Phase-1 syntactic graph, unchanged.
         #[arg(long, value_name = "SCIP_INDEX")]
         scip: Option<PathBuf>,
-        /// Build the v0.3 DATA_FLOW layer: SSA value nodes and `derives-from`
-        /// edges (intraprocedural, Rust-only in this release). Off by default; the
-        /// base index is byte-identical without it. Surfaces in `:DATA_FLOW`/`--sql`.
-        #[arg(long)]
-        dataflow: bool,
+        /// Skip the v0.3 DATA_FLOW layer (SSA value nodes + `derives-from` edges,
+        /// intraprocedural, Rust-only). Dataflow is built BY DEFAULT (v0.3 SC6);
+        /// pass `--no-dataflow` (or set `[index] data_flow = false` in `cgx.toml`)
+        /// for the leaner base index — byte-identical to the pre-dataflow graph.
+        #[arg(long = "no-dataflow")]
+        no_dataflow: bool,
     },
     /// Symbols that (transitively) call `symbol`.
     Callers {
@@ -75,8 +76,9 @@ enum Command {
     /// `derives-from` edges). `Since: v0.3`. Operates on **value nodes**, not
     /// function symbols — a function FQN has no `derives-from` edges and returns
     /// empty. Discover the exact value-node FQNs (e.g. `fn::local#1`) with
-    /// `cgx search <name>`. Requires an index built with `cgx index --dataflow`;
-    /// without it, value nodes are absent so the symbol does not resolve (exit 2).
+    /// `cgx search <name>`. Dataflow is built by default; on an index built with
+    /// `cgx index --no-dataflow` value nodes are absent and the symbol does not
+    /// resolve (exit 2).
     FlowsTo {
         symbol: String,
         #[command(flatten)]
@@ -86,8 +88,9 @@ enum Command {
     /// `derives-from` edges). `Since: v0.3`. Operates on **value nodes**, not
     /// function symbols — a function FQN has no `derives-from` edges and returns
     /// empty. Discover the exact value-node FQNs (e.g. `fn::local#1`) with
-    /// `cgx search <name>`. Requires an index built with `cgx index --dataflow`;
-    /// without it, value nodes are absent so the symbol does not resolve (exit 2).
+    /// `cgx search <name>`. Dataflow is built by default; on an index built with
+    /// `cgx index --no-dataflow` value nodes are absent and the symbol does not
+    /// resolve (exit 2).
     FlowsFrom {
         symbol: String,
         #[command(flatten)]
@@ -320,7 +323,7 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path, scip, dataflow } => run_index(path, scip, dataflow),
+        Command::Index { path, scip, no_dataflow } => run_index(path, scip, no_dataflow),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::FlowsTo { symbol, query } => run_flow(&symbol, query, FlowDir::Forward),
@@ -358,8 +361,17 @@ fn run(command: Command) -> Result<(), CliError> {
     }
 }
 
-fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>, dataflow: bool) -> Result<(), CliError> {
+fn run_index(
+    path: Option<PathBuf>,
+    scip: Option<PathBuf>,
+    no_dataflow: bool,
+) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
+    // v0.3 SC6: dataflow is ON by default. The CLI flag `--no-dataflow` and the
+    // `[index] data_flow = false` cgx.toml key are escape hatches; either one
+    // disables it. The library `IndexOpts::default()` stays base (dataflow off) —
+    // the on-by-default decision lives here at the application boundary.
+    let dataflow = resolve_dataflow_default(&repo_root) && !no_dataflow;
     let outcome = index_repo(&repo_root, &IndexOpts { scip, dataflow })?;
 
     let s = &outcome.stats;
@@ -394,6 +406,22 @@ fn run_index(path: Option<PathBuf>, scip: Option<PathBuf>, dataflow: bool) -> Re
         println!(
             "  sig: {} indirect sites resolved, {} unmatched, {} supernode (cut-marked)",
             s.sig.sites_resolved, s.sig.sites_unmatched, s.sig.supernode_sites
+        );
+    }
+    // v0.3 SC6 perf-gate telemetry: surface the per-function recompute/reuse
+    // split (SC3) and the IFDS summary counters (SC4) so the perf gate can
+    // measure the real engine (over-invalidation, summary-edge cap headroom).
+    // Printed whenever dataflow ran (on by default); on a `--no-dataflow` base
+    // index the counters are all zero and this line is suppressed, leaving the
+    // base-index output byte-identical.
+    if dataflow {
+        println!(
+            "  dataflow: {} fns recomputed, {} fns reused; ifds: {} summaries, {} interproc edges, {} budget-exceeded SCCs",
+            s.dataflow.functions_recomputed,
+            s.dataflow.functions_reused,
+            s.ifds.summaries_computed,
+            s.ifds.summary_edges_materialized,
+            s.ifds.budget_exceeded_sccs
         );
     }
     Ok(())
@@ -436,16 +464,60 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         .and_then(|r| r.head_tree_oid())
         .ok();
 
+    // v0.3 SC6: an auto-built index is a STANDARD index — dataflow ON by default,
+    // so a fresh `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`.
+    // The `[index] data_flow = false` cgx.toml key opts back out.
+    let opts = IndexOpts {
+        dataflow: resolve_dataflow_default(repo_root),
+        ..IndexOpts::default()
+    };
     match read_pointer(repo_root) {
         Ok(ptr) => match &current_tree {
             // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
-            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &IndexOpts::default()).map(|_| ()),
+            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &opts).map(|_| ()),
             // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
             _ => Ok(()),
         },
         // No index yet: build one.
-        Err(_) => index_repo(repo_root, &IndexOpts::default()).map(|_| ()),
+        Err(_) => index_repo(repo_root, &opts).map(|_| ()),
     }
+}
+
+/// The effective on-by-default dataflow setting for `repo_root` (v0.3 SC6).
+/// Dataflow ships ON; the only off-switch at config level is the
+/// `[index] data_flow = false` key in a `cgx.toml` at the repo root. Any other
+/// value (or a missing key/file) leaves dataflow enabled. Parsed with a minimal
+/// line scan — cgx carries no `toml` dependency by design (cf. `cargo_pkg.rs`).
+fn resolve_dataflow_default(repo_root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("cgx.toml")) else {
+        return true;
+    };
+    !cgx_toml_data_flow_is_false(&text)
+}
+
+/// Whether a `cgx.toml`'s `[index]` table sets `data_flow = false`. A minimal
+/// scanner: find the `[index]` section header, then the first `data_flow = …`
+/// assignment within it, and test for a literal `false`. Section-scoped so a
+/// `data_flow` key under another table is ignored.
+fn cgx_toml_data_flow_is_false(text: &str) -> bool {
+    let mut in_index = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_index = line == "[index]";
+            continue;
+        }
+        if !in_index {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "data_flow" {
+            return value.trim() == "false";
+        }
+    }
+    false
 }
 
 /// Direction selector for the shared callers/callees path.

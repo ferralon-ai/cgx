@@ -55,7 +55,7 @@ answer means.
 | Assess impact / blast radius of changing a symbol; what could break | `recipes/impact.md` |
 | Find dead / unused / unreachable code | `recipes/dead-code.md` |
 | Reason about exception / panic / failure paths; ∀-path "must pass through" | `recipes/failure-paths.md` |
-| Trace data provenance; forward/backward value flows (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) *(v0.3, `--dataflow`)* | `recipes/taint.md` |
+| Trace data provenance; forward/backward value flows (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) *(v0.3, on by default)* | `recipes/taint.md` |
 | Map the public API surface / contracts | `recipes/api-contracts.md` |
 | See what changed in the call graph between commits/branches | `recipes/vcs-diffs.md` |
 | Drive cgx as an AI agent (MCP tools, token-efficient queries) | `recipes/ai-agent.md` + `reference/mcp.md` |
@@ -72,9 +72,10 @@ answer means.
 ## Common wrong turns (pre-empt these)
 
 - **`cgx query` runs, but CQL is gated per-clause.** In v0.1 only the **CALLS-graph** subset works
-  (`MATCH (a)-[:CALLS]->(b) … RETURN …`). At v0.3 with `cgx index --dataflow`, `DATA_FLOW` edges
-  return real rows. Taint props (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) and
-  `MUST PASS THROUGH`/`AVOIDING` remain deferred — plan error exit 2. See `reference/query-language.md`.
+  (`MATCH (a)-[:CALLS]->(b) … RETURN …`). At v0.3 (SC6+), `DATA_FLOW` edges return real rows out of
+  the box — a plain `cgx index .` is sufficient; use `cgx index --no-dataflow` to opt out. Taint props
+  (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) and `MUST PASS THROUGH`/`AVOIDING`
+  remain deferred — plan error exit 2. See `reference/query-language.md`.
 - **Never emit unbounded `CALLS*` — it hangs.** Always bound the hops: `CALLS*2`.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
@@ -83,7 +84,8 @@ answer means.
   `--from-class`, `--avoiding`, `--only-edge-condition` **do not exist**.
 - **cgx answers reachability (call paths), not taint.** `reaches A B` means "a call path exists", not
   "tainted data flows A→B". Structural data flow (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) is v0.3
-  with `--dataflow` index. Security-typed taint (classes, sanitizers) is deferred past v0.3.
+  and **on by default** (SC6) — no `--dataflow` flag needed; disable with `cgx index --no-dataflow`.
+  Security-typed taint (classes, sanitizers) is deferred past v0.3.
 - **Exit codes:** `0` = success *including empty results*; `2` = bad symbol / CQL parse-or-plan error / bad arg
   (not "empty"); `1`/`4` = `--assert-empty` outcomes. See `reference/output-and-exit.md`.
 

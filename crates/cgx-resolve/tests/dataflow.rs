@@ -536,3 +536,219 @@ fn unread_param_is_minted_as_formal_in() {
         "every param must be minted as a formal-in node"
     );
 }
+
+// --- v0.3 SC6 regression: order-independent source resolution + field base ----
+//
+// These guard the Gap-A (canonicalize sorts by derived NAME but resolution must
+// use PROGRAM order) and Gap-2 (depth-1 field projection must flow from the BASE
+// local, not the field tail) fixes verified in the cycle
+// `2026-06-24_1831_cgx-v0.3-sc6-on-by-default` (execution/verify-ssa-recall.md).
+
+/// Whether a backward DerivesFrom walk from the value node `from_fqn` reaches
+/// `to_fqn` (the source the chain should bottom out at). Follows edges by
+/// node FQN so it is independent of dense id assignment.
+fn derives_from_reaches(g: &cgx_resolve::ResolvedGraph, from_fqn: &str, to_fqn: &str) -> bool {
+    let id_of = |fqn: &str| g.node_records().find(|n| n.fqn == fqn).map(|n| n.id);
+    let fqn_of = |id: cgx_core::id::NodeId| {
+        g.node_records().find(|n| n.id == id).map(|n| n.fqn.clone())
+    };
+    let Some(start) = id_of(from_fqn) else {
+        return false;
+    };
+    let mut stack = vec![start];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        if fqn_of(cur).as_deref() == Some(to_fqn) {
+            return true;
+        }
+        for e in g.edge_records() {
+            if e.kind == EdgeKind::DerivesFrom && e.src == cur {
+                stack.push(e.dst);
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn tail_return_reaches_source_through_reordered_bindings() {
+    // Gap A: `fn order_test(p) { let z = p; let a = z; a }`. The derived names
+    // a < return < z, so canonicalize() stores them in an order where the binding
+    // `a = z` precedes z's def — yet resolution must use program order so the
+    // chain return ⇝ a ⇝ z ⇝ p stays connected (pre-fix `a#1 -> z#0` was a dead
+    // phantom and return did NOT reach p).
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["z"], 1, &["p0"], body, Transform::Copy, 2);
+        b.data_flow(&["a"], 1, &["z"], body, Transform::Copy, 3);
+        b.data_flow(&["m::g", "return"], 1, &["a"], body, Transform::Copy, 4);
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+
+    // No source resolves to a phantom #0 of a local that is actually re-defined.
+    assert!(
+        g.node_records().any(|n| n.fqn == "m::g::z#1"),
+        "z's real def z#1 must exist as a node"
+    );
+    assert!(
+        !g.edge_records().any(|e| {
+            e.kind == EdgeKind::DerivesFrom
+                && g.node_records().any(|n| n.id == e.dst && n.fqn == "m::g::z#0")
+        }),
+        "no edge may resolve z to the dead phantom z#0"
+    );
+    // End-to-end: the tail return reaches the parameter through the full chain.
+    assert!(
+        derives_from_reaches(&g, "m::g::return#1", "m::g::p0#0"),
+        "return ⇝ p0 must be connected through z#1 and a#1"
+    );
+}
+
+#[test]
+fn interproc_tail_return_reaches_caller_arg_across_call() {
+    // Gap A across a call boundary: the callee's tail-return summary plus the
+    // caller's reordered bindings must compose so the caller's downstream value
+    // reaches its own param. `caller_callee_fixture` builds g(a){ r=h(a); b=r }
+    // and h(p0){ return p0 }; b ⇝ p0 must hold via the interproc edge r ⇝ p0.
+    let facts = caller_callee_fixture(Transform::Copy);
+    let g = link(&[input(&facts)], &dataflow_opts());
+    assert!(
+        derives_from_reaches(&g, "m::g::b#1", "m::g::p0#0"),
+        "b ⇝ p0 must be connected through the interproc summary edge r ⇝ p0"
+    );
+}
+
+#[test]
+fn depth1_field_projection_flows_from_base_local() {
+    // Gap 2: `let x = p.lo;` emits source path ["p","lo"]. The resolver must bind
+    // x to the BASE local p (with a Projection transform), not to a phantom local
+    // named after the field `lo` (pre-fix edge was `x#1 -> lo#0`).
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["x"], 1, &["p0", "lo"], body, Transform::Projection, 2);
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+
+    let proj = g
+        .edge_records()
+        .find(|e| e.kind == EdgeKind::DerivesFrom && e.transform == Some(Transform::Projection))
+        .expect("a Projection DerivesFrom edge");
+    let dst_fqn = g.node_records().find(|n| n.id == proj.dst).map(|n| n.fqn.clone());
+    assert_eq!(
+        dst_fqn.as_deref(),
+        Some("m::g::p0#0"),
+        "x must flow from the base local p0, not the field tail `lo`"
+    );
+    assert!(
+        !g.node_records().any(|n| n.fqn.contains("::lo#")),
+        "no phantom value node named after the field `lo` may be minted"
+    );
+    assert!(
+        derives_from_reaches(&g, "m::g::x#1", "m::g::p0#0"),
+        "flows-from x must reach p0 through the projection"
+    );
+}
+
+#[test]
+fn if_select_captures_both_arms_and_condition() {
+    // Gap 3 (REFUTED as a bug — guard it stays correct): a φ-join
+    // `let y = if cond { a } else { b }` captures both arms. Modelled as three
+    // Branched facts at the same site (one per source), and the tail return
+    // reaches each arm. The over-capture of `cond` is by current design.
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["a"], 1, &["p0"], body, Transform::Copy, 2);
+        b.data_flow(&["bb"], 1, &["p0"], body, Transform::Copy, 3);
+        b.data_flow(&["y"], 1, &["a"], body, Transform::Branched, 4);
+        b.data_flow(&["y"], 1, &["bb"], body, Transform::Branched, 4);
+        b.data_flow(&["m::g", "return"], 1, &["y"], body, Transform::Copy, 5);
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+    let branched: Vec<_> = g
+        .edge_records()
+        .filter(|e| e.kind == EdgeKind::DerivesFrom && e.transform == Some(Transform::Branched))
+        .collect();
+    assert_eq!(branched.len(), 2, "both if-arms must produce a Branched edge");
+    assert!(
+        derives_from_reaches(&g, "m::g::return#1", "m::g::a#1"),
+        "return ⇝ y ⇝ a (then-arm) must be connected"
+    );
+    assert!(
+        derives_from_reaches(&g, "m::g::return#1", "m::g::bb#1"),
+        "return ⇝ y ⇝ bb (else-arm) must be connected"
+    );
+}
+
+#[test]
+fn binary_arith_links_both_operands_to_return() {
+    // Gap 4 (REFUTED as a bug — guard it stays correct): `let c = a + b` links
+    // BOTH operands at their live versions, and the tail return reaches both
+    // through the full chain c ⇝ {a,b} ⇝ {p,q}.
+    let facts = fn_g_with(|b, body| {
+        b.data_flow(&["a"], 1, &["p0"], body, Transform::Copy, 2);
+        b.data_flow(&["bb"], 1, &["q0"], body, Transform::Copy, 3);
+        b.data_flow(&["c"], 1, &["a"], body, Transform::Arith, 4);
+        b.data_flow(&["c"], 1, &["bb"], body, Transform::Arith, 4);
+        b.data_flow(&["m::g", "return"], 1, &["c"], body, Transform::Copy, 5);
+    });
+    let g = link(&[input(&facts)], &dataflow_opts());
+    assert!(
+        derives_from_reaches(&g, "m::g::return#1", "m::g::p0#0"),
+        "return ⇝ c ⇝ a ⇝ p0 (first operand) must be connected"
+    );
+    assert!(
+        derives_from_reaches(&g, "m::g::return#1", "m::g::q0#0"),
+        "return ⇝ c ⇝ bb ⇝ q0 (second operand) must be connected — no phantom #0"
+    );
+}
+
+// KNOWN LIMIT (Gap 1, deferred by design — do NOT try to fix here): arithmetic
+// THROUGH a builtin/opaque method call, e.g. `let c = a.wrapping_add(b)`, yields
+// NO DerivesFrom edge. The call is classified OpaqueCall with no grounded callee
+// summary (a builtin), and a method call's receiver `a` is not captured as an
+// arg, so IFDS materializes zero edges. This is the documented OpaqueCall
+// deferral (design 04 DF lattice), not a regression — see verify-ssa-recall.md
+// Gap 1. There is intentionally no passing-reachability test for this shape.
+
+#[test]
+fn resolution_is_independent_of_canonical_fact_order() {
+    // Gap A invariant: the resolved value-node + edge set must be identical no
+    // matter what order the facts arrive in, because resolution uses program
+    // (span) order, not the canonical derived-name storage order. Feed the same
+    // facts twice — once name-sorted (via build()) and once reversed — and assert
+    // the resolved edge FQN set is byte-identical.
+    let mut forward = FB::new();
+    let f_body = forward.scope(ScopeId::ROOT, Some("m::g"));
+    forward.def("m::g", SymbolKind::Function, ScopeId::ROOT, 1,
+        cgx_core::node::Visibility::Public, false, Some(1));
+    forward.data_flow(&["z"], 1, &["p0"], f_body, Transform::Copy, 2);
+    forward.data_flow(&["a"], 1, &["z"], f_body, Transform::Copy, 3);
+    forward.data_flow(&["m::g", "return"], 1, &["a"], f_body, Transform::Copy, 4);
+    let facts_a = forward.build(); // canonicalize() sorts by derived name.
+
+    // Same facts, but reverse the data_flows after build to prove the resolver
+    // re-derives program order from spans regardless of vec order.
+    let mut facts_b = facts_a.clone();
+    facts_b.data_flows.reverse();
+
+    let g_a = link(&[input(&facts_a)], &dataflow_opts());
+    let g_b = link(&[input(&facts_b)], &dataflow_opts());
+
+    let edge_fqns = |g: &cgx_resolve::ResolvedGraph| -> Vec<(String, String)> {
+        let fqn = |id: cgx_core::id::NodeId| {
+            g.node_records().find(|n| n.id == id).map(|n| n.fqn.clone()).unwrap_or_default()
+        };
+        let mut v: Vec<(String, String)> = g
+            .edge_records()
+            .filter(|e| e.kind == EdgeKind::DerivesFrom)
+            .map(|e| (fqn(e.src), fqn(e.dst)))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        edge_fqns(&g_a),
+        edge_fqns(&g_b),
+        "resolved DerivesFrom edge set must not depend on canonical fact order"
+    );
+}

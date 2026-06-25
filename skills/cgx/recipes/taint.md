@@ -13,13 +13,29 @@ Run `cgx --version` first. A capability tagged `Since: v0.N` requires `MINOR ≥
 `cgx reaches SourceFn SinkFn` tells you a call path exists between two functions.
 It does **not** tell you that tainted data flows from one to the other.
 
-`DATA_FLOW` edges ship at v0.3 behind `cgx index --dataflow` (opt-in). The structural
-`DerivesFrom` walk is available via `flows-to`/`flows-from` subcommands and
-`MATCH (a)-[:DATA_FLOW*1..8]->(b)` CQL.
+**As of v0.3 SC6, structural dataflow is on by default.** A plain `cgx index .`
+now builds SSA value nodes and `DerivesFrom` edges. The structural `DerivesFrom` walk
+is available immediately via `flows-to`/`flows-from` subcommands and
+`MATCH (a)-[:DATA_FLOW*1..8]->(b)` CQL — no extra flag needed.
+
+To build a base/CALLS-only index without dataflow, use `cgx index --no-dataflow .`
+or set `[index] data_flow = false` in `cgx.toml`.
 
 The full taint engine — `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node
 and edge properties, `CALL cgx.pedigree(...)`, and `MUST PASS THROUGH`/`AVOIDING`
 path-set algebra — remains deferred past v0.3 and errors with exit 2 today.
+
+### Known limitations (v0.3 SC6)
+
+Two narrow edge cases produce incomplete results in the current engine:
+
+1. **Method-call arithmetic** (e.g. `a.wrapping_add(b)`): built-in method calls are
+   treated as opaque — arguments do not flow through them. `DerivesFrom` edges for
+   arithmetic/bitwise builtins are absent. Deferred.
+2. **Trailing `//` comment on a tail-expression line**: a `//` comment immediately
+   following the final expression of a function can mask that function's return fact,
+   causing `flows-to` to miss the return edge from that function. Narrow frontend edge
+   case; deferred.
 
 The questions in this theme (Q26–Q36, Q86, Q91, Q94–Q96, Q102) are documented in
 `docs/questions/03-provenance-and-taint.md`. That file tags them `answerable-today`; **that tag is wrong
@@ -137,11 +153,12 @@ invisible to the CALLS graph.
 
 > Check `cgx --version`. These queries require `MINOR ≥ 3`. On v0.1 they return empty or exit 2.
 
-**v0.3 status (SC5):** `DATA_FLOW` edges are live at v0.3 behind `cgx index --dataflow`
-(opt-in; on-by-default is SC6, not yet shipped). The `flows-to <value-node>` and
-`flows-from <value-node>` CLI subcommands surface the forward and backward `DerivesFrom`
-walks. Value-node names have the synthetic FQN form `<fn>::<local>#<ver>`; use
-`cgx search <pattern>` to locate them. `flows-to`/`flows-from` accept `--confidence`, `--depth`, `--tree`, `--at`, `--repo`, `--format`.
+**v0.3 status (SC6):** `DATA_FLOW` edges are live at v0.3 and **on by default** — a plain
+`cgx index .` suffices. The `flows-to <value-node>` and `flows-from <value-node>` CLI
+subcommands surface the forward and backward `DerivesFrom` walks out of the box.
+Value-node names have the synthetic FQN form `<fn>::<local>#<ver>`; use
+`cgx search <pattern>` to locate them. `flows-to`/`flows-from` accept `--confidence`,
+`--depth`, `--tree`, `--at`, `--repo`, `--format`.
 
 Taint source/sink/sanitizer classes (`source_class`, `sink_class`, `sanitizer_class`,
 `taint_label`), `MUST PASS THROUGH`/`AVOIDING` path constraints, and the `pedigree`

@@ -10,10 +10,12 @@ language is split across versions. Gate per clause, not per subcommand. See
 
 ## Verdict
 
-`cgx query` **runs in v0.1** and dispatches CQL to the live graph. Only the
-**CALLS-graph subset** of CQL produces results today. Every other clause in
-`docs/05-queries.md` either errors with exit 2 or returns empty until v0.3. The
-table below is the gate:
+`cgx query` **runs in v0.1** and dispatches CQL to the live graph. The
+**CALLS-graph subset** of CQL produces results in v0.1. `DATA_FLOW` edges
+return real rows at v0.3 when the index is built with `cgx index --dataflow`
+(opt-in; on-by-default in SC6). Most other deferred clauses in
+`docs/05-queries.md` still error with exit 2 or return empty. The table below
+is the gate:
 
 | CQL surface | Since | Status |
 |---|---|---|
@@ -26,12 +28,12 @@ table below is the gate:
 | `--at <REF>` historical graph pin | v0.1 | **runs** |
 | `--format human\|json\|sarif\|dot\|mermaid\|d2` | v0.1 | **runs** |
 | `--confidence possible\|probable\|certain` discriminates | v0.2 | **runs** |
-| `DATA_FLOW` edge type | v0.3 | deferred — empty or error |
+| `DATA_FLOW` edge type | v0.3 | **runs** with `cgx index --dataflow` (opt-in); returns empty against a base index |
 | `MUST PASS THROUGH` / `AVOIDING` | v0.3 | deferred — error |
 | Path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 | deferred |
 | `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` | v0.3 | deferred — error |
-| `CALL cgx.pedigree(…)` / `cgx.mutation_fanout(…)` real rows | v0.3 | stub only |
-| `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `taint_label` props | v0.3 | plan error exit 2 |
+| `CALL cgx.pedigree(…)` / `cgx.mutation_fanout(…)` real rows | v0.3 | deferred — stub only |
+| `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `taint_label` props | v0.3 | deferred — plan error exit 2 |
 | `NOT IN […]` | v0.3 | parse error exit 2 — use `NOT x = …` |
 
 ---
@@ -176,19 +178,19 @@ output format samples.
 
 ---
 
-## Part 2 — Documented but not yet runnable (Since: v0.3 unless noted)
+## Part 2 — Deferred or opt-in clauses (v0.3+)
 
 The following clauses and properties appear in `docs/05-queries.md` and the
-cookbook. None produce real results in v0.1. Check `cgx --version` and compare
-against the "Since" column in `reference/versions.md` before using any of them.
-When the binary rejects a deferred clause it returns exit 2 with a message
-ending in `(deferred)`.
+cookbook. Most produce exit 2 or empty results unless gated correctly. Check
+`cgx --version` and the "Since" column in `reference/versions.md` before
+using any of them. When the binary rejects a deferred clause it returns exit 2
+with a message ending in `(deferred)`.
 
-### Deferred edge types
+### Edge types — shipped opt-in or still deferred
 
 | Edge type | Since | Notes |
 |---|---|---|
-| `DATA_FLOW` | v0.3 | Pattern parses but returns empty; real rows need Phase 3 index |
+| `DATA_FLOW` | v0.3 | Returns real rows when indexed with `cgx index --dataflow`; returns empty against a base index (additive, opt-in until SC6 on-by-default flip) |
 | `CALLS:super` | v0.3 | Object-model frontend not yet shipped |
 | `RESOLVES_TO` | v0.3 | Same |
 | `PROVIDES_BODY` | v0.3 | Same |
@@ -218,14 +220,22 @@ ending in `(deferred)`.
 
 ### Version gate pattern
 
+`DATA_FLOW` requires v0.3 **and** a `--dataflow` index. The opt-in index flag
+is `cgx index --dataflow`. On-by-default is SC6 (not yet shipped).
+
 ```bash
 VERSION=$(cgx --version | awk '{print $2}' | cut -d. -f2)
 if [ "$VERSION" -ge 3 ]; then
-  cgx query 'MATCH (s)-[:DATA_FLOW*1..5]->(t) WHERE t.sink_class = "sql" RETURN s.name, t.name LIMIT 10'
+  # Ensure a --dataflow index exists first:
+  #   cgx index --dataflow .
+  cgx query 'MATCH (s)-[:DATA_FLOW*1..5]->(t) RETURN s.name, t.name LIMIT 10'
 else
   echo "DATA_FLOW requires cgx >= 0.3; current: 0.$VERSION"
 fi
 ```
+
+Note: `sink_class`, `source_class`, and `taint_label` are still deferred (plan
+error exit 2). The example above omits them intentionally.
 
 ---
 
@@ -237,7 +247,7 @@ fi
 | Single-quoted strings inside query | Parse error exit 2 | Use double quotes inside; wrap query in single quotes |
 | `NOT IN […]` | Parse error exit 2 | Use `NOT x = …` or repeated `AND NOT x = …` |
 | Node-only MATCH (no relationship) | Plan error exit 2 | Add `[:CALLS]->` or any valid relationship |
-| Deferred props (`entrypoint_class`, `taint_label`, …) | Plan error exit 2 | Gate on `cgx --version >= 0.3` |
+| Deferred props (`entrypoint_class`, `taint_label`, …) | Plan error exit 2 | Still deferred at v0.3; gate on a later taint cycle |
 | `graph_query` MCP tool | Always ToolError | Use CLI `cgx query` instead; see `reference/mcp.md` |
 
 Cross-references: `reference/output-and-exit.md` (exit codes, format samples),

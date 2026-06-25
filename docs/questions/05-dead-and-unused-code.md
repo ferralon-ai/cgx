@@ -13,19 +13,10 @@ A public method that no entrypoint ever calls is dead to the application even if
 **The query**
 
 ```cgx
-cgx unused ./ --kind method --type UserService
+cgx unused --repo PATH --kind method
 ```
 
-The Layer-2 form also exists:
-
-```cgx
-cgx query '
-  MATCH (m:method)-[:MEMBER_OF]->(t {name:"UserService"})
-  WHERE NOT (m)<-[:CALLS]-()
-  RETURN m.name, m.file, m.line
-  ORDER BY m.name
-' ./
-```
+`cgx unused` has no `--type` filter flag; use `--kind method` to restrict to methods. There is no Layer-2 CQL equivalent: CQL v0.3 requires a relationship in every `MATCH` clause, so a standalone "find nodes with no callers" pattern is not expressible without `NOT EXISTS` (deferred). Use `cgx unused --kind method` for the bulk scan.
 
 Specified in docs/05 Canonical Example 3.
 
@@ -34,10 +25,8 @@ Specified in docs/05 Canonical Example 3.
 | Fragment | What it means |
 |---|---|
 | `--kind method` | Restrict the unused search to methods (not standalone functions or fields). |
-| `--type UserService` | Scope to methods that belong to the type `UserService`. |
-| `NOT (m)<-[:CALLS]-()` | In the query form, exclude any method that has at least one incoming call edge from anywhere in the graph. |
 
-**Reading the result** — Each row is a method on `UserService` with no caller anywhere in the indexed codebase. Because the unreachability check is relative to the full indexed graph (not just declared entrypoints by default), add `--entrypoint main` to the subcommand if you want to restrict to "unreachable from a specific root." Results are `certain` confidence when no call edge exists; `probable` when dynamic dispatch is possible.
+**Reading the result** — Each row is a method with no caller anywhere in the indexed codebase. `cgx unused` does not accept an `--entrypoint` filter flag; it reports all symbols not reachable from any declared entrypoint in the graph. Results are `certain` confidence when no call edge exists; `probable` when dynamic dispatch is possible.
 
 ---
 
@@ -50,32 +39,29 @@ Authentication functions that are not reachable from any declared entrypoint are
 **The query**
 
 ```cgx
-cgx unused ./ --kind fn --path-filter '**/auth*'
+cgx unused --repo PATH --kind function
 ```
 
-Or with a name-pattern filter in the query language:
+`cgx unused` has no `--path-filter` flag. To filter by name pattern, use `cgx search` to identify auth-related function FQNs, then check reachability with `cgx callers`:
 
 ```cgx
-cgx query '
-  MATCH (fn {kind:"function"})
-  WHERE (fn.name CONTAINS "auth" OR fn.name CONTAINS "login"
-         OR fn.name CONTAINS "authenticate" OR fn.name CONTAINS "verify_token")
-    AND NOT (fn)<-[:CALLS]-({kind:"entrypoint"})
-    AND NOT ()-[:CALLS*]->(fn)<-[:CALLS]-({kind:"entrypoint"})
-  RETURN fn.name, fn.file, fn.line
-  ORDER BY fn.file, fn.line
-' ./
+cgx search auth --repo PATH
+cgx callers my_module::authenticate --repo PATH --confidence probable
 ```
+
+A zero-result `cgx callers` response confirms the function is unreachable. CQL v0.3 cannot express "find functions with zero callers" in a single query (standalone `MATCH (fn)` without a relationship is a plan error; `NOT EXISTS` is deferred). Use `cgx unused --kind function` for the bulk scan, then `cgx callers` to verify specific symbols.
+
+Note: CQL does not support `CONTAINS`, `STARTS WITH`, or multi-condition node-property inline predicates (e.g. `{kind:"function", name:...}`). Name filtering requires exact FQN from `cgx search`.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `fn.name CONTAINS "auth"` (etc.) | Match functions whose qualified name includes common authentication terms. Adjust the list to your naming conventions. |
-| `NOT (fn)<-[:CALLS]-({kind:"entrypoint"})` | The function is not directly called by an entrypoint. |
-| `NOT ()-[:CALLS*]->(fn)<-[:CALLS]-({kind:"entrypoint"})` | The function is not transitively reachable from any entrypoint, regardless of depth. `CALLS*` means zero-or-more hops. |
+| `--kind function` | Restrict to function symbols. `--kind fn` is not a valid value; the accepted value is `function`. |
+| `cgx search auth --repo PATH` | Discover exact FQNs of auth-related functions before checking reachability. |
+| `cgx callers ... --confidence probable` | Include probable-confidence edges (dynamic dispatch candidates) to avoid false assurance. |
 
-**Reading the result** — Each returned function is authentication-related by name but unreachable from any declared entrypoint. Before deleting, verify the function is not called via dynamic dispatch (`possible`-confidence edges) and is not part of a public library API consumed by external callers.
+**Reading the result** — A zero-result `cgx callers` confirms the function is unreachable from any declared entrypoint. Before deleting, verify the function is not part of a public library API consumed by external callers.
 
 ---
 
@@ -96,60 +82,64 @@ Migration functions are typically written to run once, applied to production, an
 **The query**
 
 ```cgx
-cgx unused ./ --kind fn --path-filter '**/migrations/**'
+cgx unused --repo PATH --kind function
 ```
 
-Or with a name-pattern approach:
+`cgx unused` has no `--path-filter` flag. To narrow to migration functions, use `cgx search` to find FQNs matching your naming convention, then verify each with `cgx callers`:
 
 ```cgx
-cgx query '
-  MATCH (fn {kind:"function"})
-  WHERE (fn.name STARTS WITH "migrate_" OR fn.name STARTS WITH "migration_"
-         OR fn.file CONTAINS "/migrations/")
-    AND NOT ()-[:CALLS*]->(fn)
-  RETURN fn.name, fn.file, fn.line
-  ORDER BY fn.file, fn.line
-' ./
+cgx unused --repo PATH --kind function
+cgx search migrate --repo PATH
+cgx callers my_crate::migrations::v1_add_users --repo PATH --confidence probable
 ```
+
+Note: CQL v0.3 cannot express "find functions with zero callers" in a standalone query (standalone `MATCH (fn)` without a relationship is a plan error; `NOT EXISTS` is deferred). CQL does not support `CONTAINS`, `STARTS WITH`, or file-path substring matching; use `cgx search --regex` to discover exact FQNs first.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `fn.file CONTAINS "/migrations/"` | Target functions in the migrations directory by path convention. |
-| `NOT ()-[:CALLS*]->(fn)` | No caller anywhere in the graph reaches this function, at any depth. |
+| `--kind function` | Restrict to function symbols. `--kind fn` is not a valid value; the accepted value is `function`. |
+| `cgx search migrate --repo PATH` | Discover exact FQNs of migration functions before checking reachability. |
+| `cgx callers ... --confidence probable` | Include probable-confidence edges to avoid false assurance. Zero results confirms no callers. |
 
-**Reading the result** — Each returned function has zero callers. For migrations, that is expected once they have been applied. The list gives you a candidate set to archive or delete — cross-check against your migration runner's applied-migrations log before removing.
+**Reading the result** — Each zero-result `cgx callers` confirms the function is unreachable. For migrations, that is expected once they have been applied. The list gives you a candidate set to archive or delete — cross-check against your migration runner's applied-migrations log before removing.
 
 ---
 
 ### Q50 — List all functions that reference crypto primitives but are not reachable from any current entrypoint.
 
-**Personas:** PSE · **Status:** answerable-today
+**Personas:** PSE · **Status:** not answerable as specced — requires `sink_class` node property (deferred; plan error exit 2 in v0.3.0)
 
 Unreachable functions that touch cryptography are a special concern: they may contain older, weaker crypto that was replaced, and their dormancy means they are not included in ongoing security reviews. If an attacker finds a way to reactivate them, the codebase is exposed to a downgrade attack.
 
-**The query**
+The security-typed sink classification (`sink_class`, `source_class`, `sanitizer_class`, `taint_label`) is not yet backed by a node property in v0.3.0. Any query using these properties exits with a plan error (exit 2). The adjacent answerable form — finding unreachable functions whose names suggest crypto — requires first discovering the relevant FQNs via `cgx search`.
+
+**The query (v0.3.0 — name-based approximation)**
+
+```cgx
+cgx unused --repo PATH --kind function
+```
+
+Then cross-reference the results against known crypto function names from `cgx search` (e.g. `cgx search sha1 --repo PATH`, `cgx search md5 --repo PATH`). The Layer-2 form filtering by known crypto callee name:
 
 ```cgx
 cgx query '
-  MATCH (fn {kind:"function"})-[:CALLS*]->(crypto {sink_class:"crypto"})
-  WHERE NOT ()-[:CALLS*]->(fn)<-[:CALLS]-({kind:"entrypoint"})
-  RETURN fn.name, fn.file, fn.line,
-         collect(distinct crypto.name) AS crypto_callees
+  MATCH (fn)-[:CALLS*]->(crypto)
+  WHERE crypto.name = "my_crate::crypto::sha1_hash"
+    AND NOT ()-[:CALLS]->(fn)
+  RETURN fn.name, fn.file, fn.line
   ORDER BY fn.file, fn.line
-' ./
+' --repo PATH
 ```
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `(fn {kind:"function"})-[:CALLS*]->(crypto {sink_class:"crypto"})` | Find functions that transitively call into at least one node classified as a `crypto` sink. |
-| `NOT ()-[:CALLS*]->(fn)<-[:CALLS]-({kind:"entrypoint"})` | The function itself is not reachable from any entrypoint. |
-| `collect(distinct crypto.name) AS crypto_callees` | Aggregate all crypto functions the dead code touches into one result row per dead function. |
-
-**Reading the result** — Each row is a function that uses crypto but sits outside any live execution path. `crypto_callees` lists the specific crypto functions it calls. Prioritize reviewing functions that use deprecated algorithms (`md5`, `sha1`, `des`, `rc4`) — these are the highest-risk dormant code.
+| `(fn)-[:CALLS*]->(crypto)` | Find functions that transitively call the named crypto function. Replace `crypto.name` with the exact FQN from `cgx search`. |
+| `NOT ()-[:CALLS]->(fn)` | No direct callers exist for `fn` in the indexed graph. |
+| `sink_class:"crypto"` | **Not supported in v0.3.0** — exits with plan error (exit 2). Deferred to a future security-taint release. |
 
 ---
 
@@ -162,13 +152,13 @@ An AI coding agent about to delete a function needs a safety check: is the funct
 **The query**
 
 ```cgx
-cgx unused ./ --kind fn --entrypoint '**'
+cgx unused --repo PATH --kind function
 ```
 
-To check a specific function by name:
+`cgx unused` has no `--entrypoint` flag. It scans all symbols not reachable from any declared entrypoint in the indexed graph. To check a specific function by name:
 
 ```cgx
-cgx callers my_module::F ./ --depth 20 --confidence probable
+cgx callers my_module::F --repo PATH --depth 20 --confidence probable
 ```
 
 A zero-result response confirms no callers exist. The Layer-2 form:
@@ -179,14 +169,14 @@ cgx query '
   RETURN caller.name, caller.file, caller.line,
          caller.kind
   ORDER BY caller.file, caller.line
-' ./
+' --repo PATH
 ```
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `cgx callers my_module::F ./ --depth 20` | Walk up to 20 hops backward from `F`; any result means a caller exists. |
+| `cgx callers my_module::F --repo PATH --depth 20` | Walk up to 20 hops backward from `F`; any result means a caller exists. The repository path is `--repo PATH`, not a trailing positional argument. |
 | `--confidence probable` | Include probable-confidence edges (dynamic dispatch candidates) to avoid false assurance. |
 | In the query: `MATCH (caller)-[:CALLS*]->(fn {name:"my_module::F"})` | Find any node that reaches `F` transitively. If this returns zero rows, `F` is safe to delete. |
 
@@ -204,28 +194,25 @@ Determining which `match` arms are unreachable given the actual values supplied 
 
 ### Q53 — Which API endpoints defined in the router are never called by any integration test?
 
-**Personas:** PSE · **Status:** answerable-today
+**Personas:** PSE · **Status:** not answerable as specced — requires `entrypoint_class` node property (deferred; plan error exit 2 in v0.3.0)
 
 An API endpoint with no integration test coverage is a blind spot: regressions in its behavior go undetected. From a security perspective, an untested endpoint may harbor vulnerabilities that would have been caught by a test exercising its auth and input-validation paths.
 
-**The query**
+The `entrypoint_class` node property (e.g. `"http"`, `"test"`) is not backed in v0.3.0. Any query filtering on `entrypoint_class` exits with a plan error (exit 2). The adjacent answerable form — finding all symbols with kind `entrypoint` that have no callers — uses only supported properties:
+
+**The query (v0.3.0 — kind-only filter)**
 
 ```cgx
-cgx query '
-  MATCH (ep {kind:"entrypoint", entrypoint_class:"http"})
-  WHERE NOT ()-[:CALLS*]->(ep)<-[:CALLS]-({kind:"entrypoint", entrypoint_class:"test"})
-  RETURN ep.name, ep.file, ep.line,
-         ep.framework_pack AS established_by
-  ORDER BY ep.file, ep.line
-' ./
+cgx unused --repo PATH --kind entrypoint
 ```
+
+There is no working Layer-2 CQL equivalent: CQL v0.3 requires a relationship in every `MATCH` clause, so a standalone "find nodes with no callers" pattern cannot be expressed without `NOT EXISTS` (deferred). Use `cgx unused --kind entrypoint` for the bulk scan.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `ep {kind:"entrypoint", entrypoint_class:"http"}` | Find all HTTP entrypoints declared in the router (populated by framework packs or explicit `--entrypoint` declarations). |
-| `NOT ()-[:CALLS*]->(ep)<-[:CALLS]-({kind:"entrypoint", entrypoint_class:"test"})` | Exclude endpoints that are reachable from a test entrypoint — i.e., keep only those with no test coverage. |
-| `ep.framework_pack AS established_by` | Show which framework pack promoted this symbol to entrypoint, so you know whether the route is a Spring `@GetMapping`, an Axum handler, or something else. |
+| `--kind entrypoint` | Restrict to symbols promoted to entrypoints. Filtering to `"http"` or `"test"` subtypes via `entrypoint_class` is **not supported in v0.3.0** — exits with plan error (exit 2). |
+| `ep.framework_pack AS established_by` | **Not supported in v0.3.0** — `framework_pack` is not a known node property in this release. |
 
-**Reading the result** — Each row is an HTTP endpoint that no integration test exercises. The `established_by` column identifies the framework that registered the endpoint, useful for tracing where the route is defined if the router is annotation-driven.
+**Reading the result** — Each row is a symbol declared as an entrypoint with no callers in the indexed graph. HTTP-vs-test subtype discrimination and framework-pack attribution are deferred to a future release.

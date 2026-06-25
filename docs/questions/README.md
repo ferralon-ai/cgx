@@ -30,9 +30,21 @@ This directory contains 13 theme files totalling 138 answered questions drawn fr
 
 Each entry follows a consistent template defined in the cycle synthesis document. Understanding the template helps you get the most out of the recipes.
 
-**Header and status.** Every entry opens with `### Qnn — <question text>`, then a `**Personas:**` line naming which of the four personas (PSE = Principal Security Engineer, SSE = Staff Software Engineer, ACA = AI Coding Agent, ASA = AI Security Agent) find this question most relevant, and a `**Status:**` tag. Three status values appear: `answerable-today` means the query runs against a current `cgx` index; `needs-schema-room-feature (name)` means a specific schema-room feature must be implemented first; `roadmap` means the question depends on a feature not yet scheduled. Queries for non-`answerable-today` entries are headed with a comment line `-- illustrative: requires <feature-id> (schema-room)` or similar so you can distinguish runnable from illustrative queries at a glance.
+**Header and status.** Every entry opens with `### Qnn — <question text>`, then a `**Personas:**` line naming which of the four personas (PSE = Principal Security Engineer, SSE = Staff Software Engineer, ACA = AI Coding Agent, ASA = AI Security Agent) find this question most relevant, and a `**Status:**` tag. The status values used in this cookbook are:
 
-**The query block.** Most entries show a Layer 2 (`cgx query '…'`) expression in a fenced code block labelled `cgx`. Some simple lookups show the Layer 1 subcommand form (`cgx callers …`, `cgx paths …`) with a note that the Layer 2 form also exists. Query syntax follows the specification in [docs/05-queries.md](../05-queries.md) exactly: `MATCH … WHERE … RETURN`, `MATCH ALL … MUST PASS THROUGH / AVOIDING`, `CALL cgx.<proc>(…) YIELD …`, and the documented predicates (`COMPATIBLE_WITH`, `IS EMPTY`, `NONE`, `ANY`). No invented syntax is presented as runnable.
+| Status | Meaning |
+|---|---|
+| `answerable-today` | The query runs against a current v0.3 `cgx` index as written. |
+| `partial` | The structural portion of the query runs today; a secondary filter (e.g. `EXISTS { MATCH }`, `count(distinct …)`, a taint-class property) is deferred. The entry shows a runnable approximation and notes what is missing. |
+| `deferred (v0.3)` | One or more required CQL features or node/edge properties exit 2 with a plan or parse error in v0.3.0. A workaround or illustrative form is shown with a `-- NOT VALID in v0.3.0` comment. |
+| `needs-schema-room-feature (name)` | The question requires a schema-room feature (e.g. GM-14 dependency edges, DF-11 typed taint labels) that is not yet implemented. |
+| `schema-room` | Shorthand for the above when the blocking gate is a schema-room milestone rather than a named feature ID. |
+| `core-extension` | The question requires a core-extension feature (e.g. DF-19 lineage type reconstruction) that is planned but not in v0.3.0. |
+| `not answerable as specced` | The question as written requires capabilities outside `cgx`'s graph-reachability model (e.g. branch-predicate feasibility); no workaround exists. |
+
+Queries for non-`answerable-today` entries are headed with a comment line `-- illustrative: requires <feature-id>` or `-- NOT VALID in v0.3.0` so you can distinguish runnable from illustrative queries at a glance.
+
+**The query block.** Most entries show a Layer 2 (`cgx query '…'`) expression in a fenced code block labelled `cgx`. Some simple lookups show the Layer 1 subcommand form (`cgx callers …`, `cgx paths …`) with a note that the Layer 2 form also exists. Runnable forms in v0.3.0 include `MATCH … WHERE … RETURN`, `CALL cgx.<proc>(…) YIELD …`, and the predicates `COMPATIBLE_WITH`, `IS EMPTY`, `NONE`, `ANY`. The `MATCH ALL … MUST PASS THROUGH` and `AVOIDING` keyword forms are deferred (CQL parse error, exit 2 in v0.3.0); entries that show them label the block `-- NOT VALID in v0.3.0`. No deferred syntax is presented as runnable. The full syntax specification is in [docs/05-queries.md](../05-queries.md).
 
 **Breaking it down.** A table (for queries with three or more distinct fragments) or a short explanatory paragraph (for simpler queries) walks through each fragment of the query in plain English. The breakdown is written for a reader who can read the query language but does not write it beyond light use — every clause is explained, and every term of art used in the breakdown is defined in [docs/13-glossary.md](../13-glossary.md).
 
@@ -42,6 +54,6 @@ Each entry follows a consistent template defined in the cycle synthesis document
 
 ## Further reading
 
-- **Query language specification and worked examples:** [docs/05-queries.md](../05-queries.md) — the authoritative reference for all query syntax, subcommand signatures, and the full Q-1 through Q-32 feature list.
+- **Query language specification and worked examples:** [docs/05-queries.md](../05-queries.md) — the authoritative reference for all query syntax, subcommand signatures, and the full Q-1 through Q-33 feature list.
 - **Term definitions:** [docs/13-glossary.md](../13-glossary.md) — plain-language definitions of every term of art used across the cookbook, including edge conditions, confidence tiers, transience, pedigree, taint vocabulary, semantic classes, and indexing terms.
 - **Persona question inventory:** [docs/02-personas-and-questions.md](../02-personas-and-questions.md) — the authoritative list of all 138 questions, their themes, and the personas that ask them.

@@ -31,16 +31,22 @@ the index is absent. Force a rebuild at any time with `cgx index .`. There is no
 Since: v0.1
 
 ```
-cgx index <PATH>
+cgx index [OPTIONS] <PATH>
 ```
 
-| Argument | Default | Notes |
+| Argument / Flag | Default | Notes |
 |---|---|---|
 | `<PATH>` | required | Repository root or any subdirectory |
+| `--no-dataflow` | off (dataflow is on) | Produce a base/CALLS-only index without SSA value nodes or `DerivesFrom` edges. The result is byte-identical to the pre-v0.3 default. Disable persistently via `[index] data_flow = false` in `cgx.toml`. |
 
-**Example:**
+As of v0.3 SC6, a plain `cgx index .` builds the full dataflow index (SSA value nodes +
+intraprocedural and IFDS interprocedural `DerivesFrom` edges). Use `--no-dataflow` when
+you want a lighter index and do not need `flows-to`/`flows-from` or `:DATA_FLOW` queries.
+
+**Examples:**
 ```bash
-cgx index .
+cgx index .                     # full index including dataflow (default)
+cgx index --no-dataflow .       # base/CALLS-only index, no dataflow edges
 ```
 
 ---
@@ -245,8 +251,9 @@ Since: v0.3
 cgx flows-to [OPTIONS] <VALUE-NODE>
 ```
 
-Requires a `--dataflow` index (`cgx index --dataflow .`). Traverses `DerivesFrom` edges
-forward from the named value node to show what values it flows into.
+Traverses `DerivesFrom` edges forward from the named value node to show what values it flows
+into. Works out of the box with a default `cgx index .` (dataflow is on by default as of SC6).
+If the index was built with `cgx index --no-dataflow`, this command returns empty.
 
 `<VALUE-NODE>` is a synthetic FQN of the form `<fn>::<local>#<ver>`. Use `cgx search`
 to locate the exact name:
@@ -286,8 +293,10 @@ Since: v0.3
 cgx flows-from [OPTIONS] <VALUE-NODE>
 ```
 
-Requires a `--dataflow` index. Traverses `DerivesFrom` edges backward from the named
-value node to show where it originates. Accepts the same flags as `flows-to`.
+Traverses `DerivesFrom` edges backward from the named value node to show where it
+originates. Works out of the box with a default `cgx index .` (dataflow is on by default
+as of SC6). If the index was built with `cgx index --no-dataflow`, this command returns
+empty. Accepts the same flags as `flows-to`.
 
 **Example:**
 ```bash

@@ -22,7 +22,7 @@ reproducible. cgx tells you about *structure and reachability*; it does not run 
 cgx features are gated by version. **Run `cgx --version`** → `cgx 0.<MINOR>.<PATCH>`. A capability tagged
 `Since: v0.N` is available **iff `MINOR ≥ N`**. Everything in this skill carries a `Since:` tag. If a feature is
 above the running version, do not emit it — fall back to the highest available alternative or tell the user it
-needs `cgx ≥ 0.N`. The current shipped binary is **v0.2**. See `reference/versions.md` for the full ladder.
+needs `cgx ≥ 0.N`. The current shipped binary is **v0.3** (`cgx 0.3.0`). See `reference/versions.md` for the full ladder.
 
 ## STEP 1 — You need an exact symbol name
 
@@ -55,7 +55,7 @@ answer means.
 | Assess impact / blast radius of changing a symbol; what could break | `recipes/impact.md` |
 | Find dead / unused / unreachable code | `recipes/dead-code.md` |
 | Reason about exception / panic / failure paths; ∀-path "must pass through" | `recipes/failure-paths.md` |
-| Trace taint / data provenance; "can input reach this sink" *(v0.3)* | `recipes/taint.md` |
+| Trace data provenance; forward/backward value flows (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) *(v0.3, `--dataflow`)* | `recipes/taint.md` |
 | Map the public API surface / contracts | `recipes/api-contracts.md` |
 | See what changed in the call graph between commits/branches | `recipes/vcs-diffs.md` |
 | Drive cgx as an AI agent (MCP tools, token-efficient queries) | `recipes/ai-agent.md` + `reference/mcp.md` |
@@ -72,16 +72,18 @@ answer means.
 ## Common wrong turns (pre-empt these)
 
 - **`cgx query` runs, but CQL is gated per-clause.** In v0.1 only the **CALLS-graph** subset works
-  (`MATCH (a)-[:CALLS]->(b) … RETURN …`). `DATA_FLOW`, taint props, and `MUST PASS THROUGH`/`AVOIDING` are
-  **v0.3** and error or return empty today. See `reference/query-language.md`.
+  (`MATCH (a)-[:CALLS]->(b) … RETURN …`). At v0.3 with `cgx index --dataflow`, `DATA_FLOW` edges
+  return real rows. Taint props (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) and
+  `MUST PASS THROUGH`/`AVOIDING` remain deferred — plan error exit 2. See `reference/query-language.md`.
 - **Never emit unbounded `CALLS*` — it hangs.** Always bound the hops: `CALLS*2`.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
 - **Real flags, not the cookbook's:** `--repo ./` (not a trailing `./`);
   `--kind function` (not `--kind fn`); `cgx diff <BASE> <HEAD>` positional (not `--base/--head`). Flags like
   `--from-class`, `--avoiding`, `--only-edge-condition` **do not exist**.
-- **cgx answers reachability (call paths), not data flow.** `reaches A B` means "a call path exists", not
-  "data can flow A→B". Real taint is v0.3.
+- **cgx answers reachability (call paths), not taint.** `reaches A B` means "a call path exists", not
+  "tainted data flows A→B". Structural data flow (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) is v0.3
+  with `--dataflow` index. Security-typed taint (classes, sanitizers) is deferred past v0.3.
 - **Exit codes:** `0` = success *including empty results*; `2` = bad symbol / CQL parse-or-plan error / bad arg
   (not "empty"); `1`/`4` = `--assert-empty` outcomes. See `reference/output-and-exit.md`.
 

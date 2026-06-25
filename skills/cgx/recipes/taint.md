@@ -13,9 +13,13 @@ Run `cgx --version` first. A capability tagged `Since: v0.N` requires `MINOR ≥
 `cgx reaches SourceFn SinkFn` tells you a call path exists between two functions.
 It does **not** tell you that tainted data flows from one to the other.
 
-The full taint engine — `DATA_FLOW` edges, `source_class`/`sink_class`/`sanitizer_class`/`taint_label`
-node and edge properties, `CALL cgx.pedigree(...)`, and `MUST PASS THROUGH`/`AVOIDING` path-set algebra —
-is **Since: v0.3** and is inert or errors with exit 2 today.
+`DATA_FLOW` edges ship at v0.3 behind `cgx index --dataflow` (opt-in). The structural
+`DerivesFrom` walk is available via `flows-to`/`flows-from` subcommands and
+`MATCH (a)-[:DATA_FLOW*1..8]->(b)` CQL.
+
+The full taint engine — `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node
+and edge properties, `CALL cgx.pedigree(...)`, and `MUST PASS THROUGH`/`AVOIDING`
+path-set algebra — remains deferred past v0.3 and errors with exit 2 today.
 
 The questions in this theme (Q26–Q36, Q86, Q91, Q94–Q96, Q102) are documented in
 `docs/questions/03-provenance-and-taint.md`. That file tags them `answerable-today`; **that tag is wrong
@@ -132,7 +136,16 @@ invisible to the CALLS graph.
 ## Real taint queries — Since: v0.3
 
 > Check `cgx --version`. These queries require `MINOR ≥ 3`. On v0.1 they return empty or exit 2.
-> The `DATA_FLOW` edge type and all taint node/edge properties are inert until v0.3.
+
+**v0.3 status (SC5):** `DATA_FLOW` edges are live at v0.3 behind `cgx index --dataflow`
+(opt-in; on-by-default is SC6, not yet shipped). The `flows-to <value-node>` and
+`flows-from <value-node>` CLI subcommands surface the forward and backward `DerivesFrom`
+walks. Value-node names have the synthetic FQN form `<fn>::<local>#<ver>`; use
+`cgx search <pattern>` to locate them. `flows-to`/`flows-from` accept `--confidence`, `--depth`, `--tree`, `--at`, `--repo`, `--format`.
+
+Taint source/sink/sanitizer classes (`source_class`, `sink_class`, `sanitizer_class`,
+`taint_label`), `MUST PASS THROUGH`/`AVOIDING` path constraints, and the `pedigree`
+procedure remain deferred. Queries using those properties still produce plan error exit 2.
 
 For detailed CQL syntax — `DATA_FLOW`, `MUST PASS THROUGH`, `AVOIDING`, `ANY`/`NONE` over nodes,
 pedigree procedures — see `reference/query-language.md`.

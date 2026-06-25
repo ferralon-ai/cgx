@@ -3,7 +3,7 @@
 **Audience:** Engineers and AI agents driving cgx from the command line.
 
 Run `cgx --version` first. Parse the `0.<MINOR>.<PATCH>` after `cgx `. A capability tagged
-`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.2**.
+`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.3** (`cgx 0.3.0`).
 See `reference/versions.md` for the full ladder.
 
 > **Phantom flags — do not emit these.** They appear in upstream cookbook examples but cause
@@ -237,6 +237,65 @@ cgx search auth --limit 0                       # unlimited results
 
 ---
 
+### `flows-to` — forward data-flow slice from a value node
+
+Since: v0.3
+
+```
+cgx flows-to [OPTIONS] <VALUE-NODE>
+```
+
+Requires a `--dataflow` index (`cgx index --dataflow .`). Traverses `DerivesFrom` edges
+forward from the named value node to show what values it flows into.
+
+`<VALUE-NODE>` is a synthetic FQN of the form `<fn>::<local>#<ver>`. Use `cgx search`
+to locate the exact name:
+
+```bash
+cgx search process_request --kind variable   # find value-node FQNs in scope
+```
+
+| Argument / Flag | Default | Notes |
+|---|---|---|
+| `<VALUE-NODE>` | required | Exact value-node FQN (`<fn>::<local>#<ver>`) |
+| `--confidence <LEVEL>` | `possible` | Minimum floor: `possible`, `probable`, `certain` |
+| `--at <REF>` | HEAD | Pin query to git ref |
+| `--depth <N>` | unlimited | Traversal depth cap |
+| `--tree <full|spanning>` | `full` | Output tree shape |
+| `--repo <PATH>` | CWD | Repository root |
+| `--format <FMT>` | `human` | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
+
+Exit codes follow the standard contract: unknown value node → exit 2
+(`no symbol matched`); empty result → exit 0. See `reference/output-and-exit.md`.
+
+**Edge-condition rendering:** omit `always`; `conditional` renders as `if`;
+`exception` renders as `exc`; `loop` and `panic` render verbatim.
+
+**Example:**
+```bash
+cgx flows-from "<fn::local#1>" --confidence probable --depth 4 --tree spanning
+```
+
+---
+
+### `flows-from` — backward data-flow slice (pedigree) from a value node
+
+Since: v0.3
+
+```
+cgx flows-from [OPTIONS] <VALUE-NODE>
+```
+
+Requires a `--dataflow` index. Traverses `DerivesFrom` edges backward from the named
+value node to show where it originates. Accepts the same flags as `flows-to`.
+
+**Example:**
+```bash
+cgx flows-from 'write_log::msg#1' --confidence probable
+```
+
+---
+
 ### `unused` — find symbols not reachable from any entrypoint
 
 Since: v0.1
@@ -348,17 +407,18 @@ cgx mcp --root /path/to/repo
 
 ## Shared flags — subcommand applicability
 
-| Flag | callers | callees | reaches | paths | query | search | unused | explain | doctor | diff | mcp |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — |
-| `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y | Y | Y | Y | — |
-| `--at <REF>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
-| `--depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — |
-| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
-| `--assert-empty` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
-| `--allow-vacuous` | Y | Y | Y | Y | Y | — | Y | — | — | — | — |
-| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | Y | — | — | — |
-| `--newer-than` | — | — | — | — | — | — | — | — | — | Y | — |
+| Flag | callers | callees | reaches | paths | query | search | unused | explain | doctor | diff | mcp | flows-to | flows-from |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — | Y | Y |
+| `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y | Y | Y | Y | — | Y | Y |
+| `--at <REF>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — | Y | Y |
+| `--depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — | Y | Y |
+| `--tree <full|spanning>` | — | — | — | — | — | — | — | — | — | — | — | Y | Y |
+| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | Y | Y |
+| `--assert-empty` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | — | — |
+| `--allow-vacuous` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | — | — |
+| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | Y | — | — | — | Y | Y |
+| `--newer-than` | — | — | — | — | — | — | — | — | — | Y | — | — | — |
 
 **`--format` values:** `human` (default), `json`, `sarif`, `dot`, `mermaid`, `d2`.
 `dot`, `mermaid`, and `d2` are meaningful only for path-shaped results (`reaches`,

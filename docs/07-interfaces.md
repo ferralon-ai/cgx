@@ -32,7 +32,7 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | IF-5a | CI assertion mode: `--assert-count N`, `--assert-max N` | **Planned (not yet shipped in v0.3.0)** |
 | IF-6 | `--explain` flag: per-fact provenance, rule annotation, index version | Shipped |
 | IF-7 | `--at <ref>` flag: query against a specific commit | Shipped |
-| IF-8 | `--order` flag: stable result ordering | Shipped |
+| IF-8 | `--order` flag: stable result ordering | **Planned (not yet shipped in v0.3.0)** — engine already returns rows in a fixed deterministic order; no CLI flag exists |
 | IF-9 | MCP STDIO server mode: `cgx mcp` | Shipped |
 | IF-10 | MCP tool: `graph_query` | **Planned (not yet shipped in v0.3.0)** |
 | IF-11 | MCP tool: `callers` | Shipped |
@@ -232,16 +232,18 @@ cgx paths --from main::foo --to vulnerable::bar ./ --at v1.2.3
 
 `--at` enables: "Did this path exist before this PR?" and "Which commit introduced this edge?" The `diff` subcommand takes `<BASE> <HEAD>` as positional arguments rather than `--at`; see Q-7 in `docs/05-queries.md`.
 
-### IF-8: `--order` flag
+### IF-8: `--order` flag — **Planned (not yet shipped in v0.3.0)**
+
+There is no `--order` CLI flag today. What *is* shipped is an internal determinism invariant: the engine always returns rows in a fixed `(file_path, line, col)` order, stable across runs on identical graph data. The flag below is a Planned surface for selecting alternate orderings; it does not exist yet.
 
 ```
---order file        (default) Sort by (file_path, line, col) — deterministic
---order alpha       Sort by qualified symbol name
---order discovery   BFS/DFS traversal order from the query root
---order relevance   Depth-ascending from the query root
+--order file        (default) Sort by (file_path, line, col) — deterministic   [Planned]
+--order alpha       Sort by qualified symbol name                              [Planned]
+--order discovery   BFS/DFS traversal order from the query root                [Planned]
+--order relevance   Depth-ascending from the query root                        [Planned]
 ```
 
-The default `file` ordering is stable across runs on identical graph data. See `docs/05-queries.md` Q-17 for the full determinism contract.
+The default `file` ordering described above is the current shipped behavior even without a flag. See `docs/05-queries.md` Q-17 for the full determinism contract.
 
 ---
 

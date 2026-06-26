@@ -20,32 +20,35 @@ A TUI (terminal user interface) is explicitly out of scope for v1.
 
 ## Feature List
 
-| ID | Feature |
-|----|---------|
-| IF-1 | CLI entry point: `cgx <subcommand> [flags] <path>` |
-| IF-2 | TTY-aware output: text on TTY, jsonl when piped |
-| IF-3 | `--format` flag: text, tree, json, jsonl, csv, dot, mermaid, graphml, sarif |
-| IF-4 | Exit-code contract (0/1/2/3) |
-| IF-5 | CI assertion mode: `--assert-empty`, `--assert-count N`, `--assert-max N` |
-| IF-6 | `--explain` flag: per-fact provenance, rule annotation, index version |
-| IF-7 | `--at <ref>` flag: query against a specific commit |
-| IF-8 | `--order` flag: stable result ordering |
-| IF-9 | MCP STDIO server mode: `cgx mcp` |
-| IF-10 | MCP tool: `graph_query` |
-| IF-11 | MCP tool: `callers` |
-| IF-12 | MCP tool: `callees` |
-| IF-13 | MCP tool: `paths` |
-| IF-14 | MCP tool: `unused` |
-| IF-15 | MCP tool: `explain` |
-| IF-16 | MCP resources: `cgx://symbols/{root}`, `cgx://schema/{root}` |
-| IF-17 | MCP structured output: `structuredContent` + `outputSchema` per 2025-06-18 spec |
-| IF-18 | MCP pagination: `cursor` + `has_more` |
-| IF-19 | MCP token-efficiency: `max_results`, compact symbol IDs, `resource_link` for bulk evidence |
-| IF-20 | `paths` subcommand: must-analysis flags (`--must-pass-through`, `--avoiding`, `--quantifier`, `--including-exception-paths`, `--assert-all-reach-sink`) | 1 |
-| IF-21 | `paths` subcommand: typed-taint flags (`--from-class`, `--to-class`, `--require-sanitizer-class`, `--negate-sanitizer`, `--to-package`) | 1 |
-| IF-22 | `diff` subcommand: security-gate flags (`--new-paths-only`, `--calls-to-sink-class`) | 1 |
-| IF-23 | MCP tool: `taint_paths` | 2 |
-| IF-24 | MCP tool: `diff_security` | 2 |
+Shipped status reflects v0.3.0. Features without a "Planned" note are available in the current binary.
+
+| ID | Feature | v0.3.0 status |
+|----|---------|---------------|
+| IF-1 | CLI entry point: `cgx <subcommand> [flags] <path>` | Shipped |
+| IF-2 | TTY-aware output: text on TTY, jsonl when piped | Shipped |
+| IF-3 | `--format` flag: text, tree, json, jsonl, csv, dot, mermaid, graphml, sarif | Shipped |
+| IF-4 | Exit-code contract (0/1/2/3/4) | Shipped |
+| IF-5 | CI assertion mode: `--assert-empty` | Shipped |
+| IF-5a | CI assertion mode: `--assert-count N`, `--assert-max N` | **Planned (not yet shipped in v0.3.0)** |
+| IF-6 | `--explain` flag: per-fact provenance, rule annotation, index version | Shipped |
+| IF-7 | `--at <ref>` flag: query against a specific commit | Shipped |
+| IF-8 | `--order` flag: stable result ordering | Shipped |
+| IF-9 | MCP STDIO server mode: `cgx mcp` | Shipped |
+| IF-10 | MCP tool: `graph_query` | **Planned (not yet shipped in v0.3.0)** |
+| IF-11 | MCP tool: `callers` | Shipped |
+| IF-12 | MCP tool: `callees` | Shipped |
+| IF-13 | MCP tool: `paths` | Shipped |
+| IF-14 | MCP tool: `unused` | Shipped |
+| IF-15 | MCP tool: `explain` | Shipped |
+| IF-16 | MCP resources: `cgx://symbols/{root}`, `cgx://schema/{root}` | **Planned (not yet shipped in v0.3.0)** |
+| IF-17 | MCP structured output: `structuredContent` + `outputSchema` per 2025-06-18 spec | **Planned (not yet shipped in v0.3.0)** |
+| IF-18 | MCP pagination: `cursor` + `has_more` | **Planned (not yet shipped in v0.3.0)** |
+| IF-19 | MCP token-efficiency: `max_results`, compact symbol IDs, `resource_link` for bulk evidence | **Planned (not yet shipped in v0.3.0)** |
+| IF-20 | `paths` subcommand: must-analysis flags (`--must-pass-through`, `--avoiding`, `--quantifier`, `--including-exception-paths`, `--assert-all-reach-sink`) | **Planned (not yet shipped in v0.3.0)** |
+| IF-21 | `paths` subcommand: typed-taint flags (`--from-class`, `--to-class`, `--require-sanitizer-class`, `--negate-sanitizer`, `--to-package`) | **Planned (not yet shipped in v0.3.0)** |
+| IF-22 | `diff` subcommand: security-gate flags (`--new-paths-only`, `--calls-to-sink-class`) | **Planned (not yet shipped in v0.3.0)** |
+| IF-23 | MCP tool: `taint_paths` | **Planned (not yet shipped in v0.3.0)** |
+| IF-24 | MCP tool: `diff_security` | **Planned (not yet shipped in v0.3.0)** |
 
 ---
 
@@ -59,21 +62,33 @@ cgx <subcommand> [flags] <path>
 
 `<path>` is the repository root or any subdirectory. `cgx` locates the graph index by walking up to the `.git` directory (or the configured index root; see `docs/06-indexing-and-vcs.md`).
 
-**Top-level subcommands:**
+**Top-level subcommands (shipped in v0.3.0):**
 
 | Subcommand | Description |
 |------------|-------------|
+| `index` | Build or update the graph index (dataflow on by default; use `--no-dataflow` to disable) |
 | `callers` | Find symbols that call a given symbol |
 | `callees` | Find symbols a given symbol calls |
+| `reaches` | Whether one symbol reaches another (with a witness path) |
 | `paths` | Find call paths between two symbols |
+| `flows-to` | Forward data-flow walk from a value node (`Since: v0.3`) |
+| `flows-from` | Backward data-flow pedigree from a value node (`Since: v0.3`) |
 | `unused` | Find symbols not reachable from any entrypoint |
-| `pedigree` | Trace inbound value provenance for a variable |
 | `explain` | Show full provenance record for a symbol |
-| `diff` | Compute graph diff across commits or branches |
-| `query` | Execute a full query-language expression |
-| `index` | Build or update the graph index |
-| `prune` | Remove stale index entries (branches deleted, files removed) |
+| `diff` | Compute graph diff between two git refs (`<BASE> <HEAD>` positional; `--newer-than` flag) |
+| `query` | Execute a full CQL query-language expression |
+| `search` | Search the symbol table by FQN substring or regex (`Since: v0.2`) |
+| `doctor` | Report on the quality of the current on-disk index |
 | `mcp` | Start MCP STDIO server |
+
+**Planned subcommands (not yet shipped in v0.3.0):**
+
+| Subcommand | Description |
+|------------|-------------|
+| `prune` | Remove stale index entries (branches deleted, files removed) — **Planned (v0.4)** |
+| `policy check` | Evaluate `.cgx/policy.cql` assertions — **Planned (v0.5)** |
+
+> **Note:** `pedigree` was a working name for the value-provenance subcommand. The shipped subcommands are `flows-to` (forward) and `flows-from` (backward pedigree).
 
 See `docs/05-queries.md` for complete per-subcommand signatures and worked examples.
 
@@ -126,34 +141,36 @@ main::process_request
 | Code | Meaning |
 |------|---------|
 | 0 | Query completed; results returned (or zero results when that is expected) |
-| 1 | CI assertion failed: `--assert-empty` fired (results found when none expected), or `--assert-count` / `--assert-max` threshold exceeded |
+| 1 | CI assertion failed: `--assert-empty` fired (results found when none expected) |
 | 2 | Query parse error or invalid flag combination |
 | 3 | Graph error: index missing, corrupt, or build failed |
 | 4 | Assertion vacuously satisfied: the gate passed but matched zero symbols or filters excluded all candidate results; see IF-5. Suppress with `--allow-vacuous`. |
 
 Exit code 1 is the CI-gate signal. Exit codes 2 and 3 indicate tool or configuration problems, not result conditions. Exit code 4 indicates a vacuous pass — the assertion matched nothing, which is itself a warning condition (see IF-5).
 
+> **Note:** `--assert-count N` and `--assert-max N` are **Planned (not yet shipped in v0.3.0)**. Only `--assert-empty` is available today.
+
 ### IF-5: CI assertion mode
 
-`--assert-empty`, `--assert-count N`, and `--assert-max N` turn a query into a boolean CI check.
+**Shipped in v0.3.0:** `--assert-empty` turns a query into a boolean CI check (exit 1 when results are found).
+
+**Planned (not yet shipped in v0.3.0):** `--assert-count N` and `--assert-max N`.
 
 ```bash
-# Fail CI if any call path reaches a dangerous sink
+# Fail CI if any call path reaches a dangerous sink (shipped)
 cgx paths --from '**' --to dangerous::sink ./ \
     --assert-empty \
     --format sarif > security.sarif
 # Exit 1 if paths found; exit 0 if none
 
-# Fail CI if more than 5 paths reach the sink
-cgx paths --from '**' --to dangerous::sink ./ \
-    --assert-max 5
+# Fail CI if more than 5 paths reach the sink (PLANNED — not yet shipped)
+# cgx paths --from '**' --to dangerous::sink ./ --assert-max 5
 
-# Fail CI if the number of public unused methods changes
-cgx unused ./ --kind method --confidence certain \
-    --assert-count 0
+# Fail CI if the number of public unused methods changes (PLANNED — not yet shipped)
+# cgx unused ./ --kind method --confidence certain --assert-count 0
 ```
 
-These flags compose with any subcommand. When `--assert-empty` fires, output is still written (to stdout or `--output <file>`); the exit code signals the assertion result.
+`--assert-empty` composes with any subcommand. When it fires, output is still written to stdout; the exit code signals the assertion result.
 
 #### Vacuity guard
 
@@ -164,7 +181,7 @@ These flags compose with any subcommand. When `--assert-empty` fires, output is 
 
 **Default behavior:** a vacuous pass exits with **code 4** ("assertion vacuously satisfied") unless `--allow-vacuous` is given. With `--allow-vacuous`, the tool exits 0 and emits a stderr warning; JSON/`structuredContent` output includes `"vacuous": true`; SARIF output carries a `note`-level result.
 
-**`--assert-count N` / `--assert-max N`:** receive clause (a) only (zero-symbol match is always suspicious); clause (b) does not apply to count assertions.
+**`--assert-count N` / `--assert-max N` (Planned — not yet shipped in v0.3.0):** receive clause (a) only (zero-symbol match is always suspicious); clause (b) does not apply to count assertions.
 
 **Warning (confidence narrowing):** confidence filters such as `--confidence certain` narrow the assertion gate toward false safety. Before SCIP enrichment (Phase 2), almost no edge is labeled `certain`, so an `--assert-empty --confidence certain` gate passes vacuously on any pre-SCIP corpus — exit code 4 catches this. See docs/07-interfaces.md IF-9 and docs/05-queries.md Q-18.
 
@@ -213,7 +230,7 @@ cgx callers crypto::hash ./ --at HEAD~5
 cgx paths --from main::foo --to vulnerable::bar ./ --at v1.2.3
 ```
 
-`--at` enables: "Did this path exist before this PR?" and "Which commit introduced this edge?" When used with `diff`, `--base` and `--head` replace `--at`.
+`--at` enables: "Did this path exist before this PR?" and "Which commit introduced this edge?" The `diff` subcommand takes `<BASE> <HEAD>` as positional arguments rather than `--at`; see Q-7 in `docs/05-queries.md`.
 
 ### IF-8: `--order` flag
 
@@ -256,9 +273,11 @@ Configuration in Claude Code (`.mcp.json` or project settings):
 
 ### MCP tool surface
 
-The server exposes six tools and two resources.
+**Shipped in v0.3.0:** five tools — `callers` (IF-11), `callees` (IF-12), `paths` (IF-13), `unused` (IF-14), `explain` (IF-15). The tools below marked Planned are not yet available.
 
-#### IF-10: `graph_query`
+**Planned (not yet shipped in v0.3.0):** `graph_query` (IF-10), MCP resources (IF-16), structured output (IF-17), pagination (IF-18), token-efficiency features (IF-19), and the MCP tools `taint_paths` (IF-23) and `diff_security` (IF-24).
+
+#### IF-10: `graph_query` — **Planned (not yet shipped in v0.3.0)**
 
 Execute a full query-language expression and return structured results.
 
@@ -448,7 +467,7 @@ Returns the full provenance record for a single symbol: definition location, cal
 }
 ```
 
-### IF-16: MCP Resources
+### IF-16: MCP Resources — **Planned (not yet shipped in v0.3.0)**
 
 Resources let an agent load schema or symbol lists once and cache them, avoiding repeated tool calls.
 
@@ -460,7 +479,7 @@ Returns the graph schema: node types, edge types, condition label vocabulary, co
 
 Both resources are subscribable; the server sends a `notifications/resources/updated` event when the index changes (after `cgx index` completes).
 
-### IF-17: Structured output per 2025-06-18 MCP spec
+### IF-17: Structured output per 2025-06-18 MCP spec — **Planned (not yet shipped in v0.3.0)**
 
 All tools declare an `outputSchema` (JSON Schema) in their tool registration. The server response includes:
 
@@ -469,7 +488,7 @@ All tools declare an `outputSchema` (JSON Schema) in their tool registration. Th
 
 Agents that understand `structuredContent` can validate responses against the schema and do client-side type checking. Agents that only understand `TextContent` receive the JSON-serialized string and parse it themselves.
 
-### IF-18: Pagination
+### IF-18: Pagination — **Planned (not yet shipped in v0.3.0)**
 
 All tools that return multiple results support pagination via `cursor` / `has_more`.
 
@@ -479,7 +498,7 @@ All tools that return multiple results support pagination via `cursor` / `has_mo
 
 Agents implement multi-hop traversal by chaining tool calls (callers of result → callers of those callers) rather than requesting deep recursive expansion in a single call.
 
-### IF-19: Token-efficiency features
+### IF-19: Token-efficiency features — **Planned (not yet shipped in v0.3.0)**
 
 Token budgets are a real constraint for AI agent contexts. `cgx mcp` implements several token-efficiency patterns:
 
@@ -509,7 +528,7 @@ Token budgets are a real constraint for AI agent contexts. `cgx mcp` implements 
 
 ---
 
-## IF-20: `paths` Must-Analysis Flags
+## IF-20: `paths` Must-Analysis Flags — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — surface for Q-20 (must-pass-through / ∀-path) and Q-22 (acquire/release pairing). These flags extend the existing `paths` subcommand; no new subcommand is introduced.
 
@@ -537,7 +556,7 @@ The `--must-pass-through` and `--avoiding` / `--quantifier all` flags compile to
 
 ---
 
-## IF-21: `paths` Typed-Taint Flags
+## IF-21: `paths` Typed-Taint Flags — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — surface for Q-23 (typed taint queries). Adds class-based source, sink, and sanitizer selection to the `paths` subcommand.
 
@@ -563,9 +582,11 @@ See `docs/05-queries.md` Q-23 and Q-25 for worked examples.
 
 ---
 
-## IF-22: `diff` Security-Gate Flags
+## IF-22: `diff` Security-Gate Flags — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — surface for Q-25 Worked Example 6 (branch-diff security gate) and IX-9 (edge age attribution). Extends the existing `diff` subcommand.
+
+> **Current shipped syntax:** `cgx diff <BASE> <HEAD>` (positional refs) with `--newer-than` only. The `--base`/`--head` named flags and the security-gate flags below are planned.
 
 ```
 cgx diff --base <ref> [--head <ref>] <path>
@@ -586,7 +607,7 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
 
 ---
 
-## IF-23: MCP Tool `taint_paths`
+## IF-23: MCP Tool `taint_paths` — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — MCP surface for Q-23 typed taint queries. Security and AI coding agents use this tool to find source → sink paths with class-matched sanitizer checking.
 
@@ -646,7 +667,7 @@ See `docs/05-queries.md` Worked Example 6 and `docs/06-indexing-and-vcs.md` IX-9
 
 ---
 
-## IF-24: MCP Tool `diff_security`
+## IF-24: MCP Tool `diff_security` — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — MCP surface for the branch-diff security gate (Q-25 Worked Example 6, IX-9). Lets AI security agents query which edges and paths are new on a branch relative to a base ref, with sink-class filtering and author attribution.
 

@@ -119,9 +119,13 @@ pub fn eval_call(
     let plan = resolve_proc(call)?;
     validate_call(call)?;
 
+    // Cap the DerivesFrom fan-out at the default var-length depth so an
+    // `mutation_fanout`/`pedigree` over a dense dataflow graph can't walk the
+    // unbounded transitive closure. Anchored on a single resolved symbol, this
+    // is one BFS per anchor; the depth cap is the bound that matters here.
     let walker = PathWalker {
         filter: EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]),
-        max_depth: None,
+        max_depth: Some(crate::eval::DEFAULT_VAR_LENGTH_DEPTH),
         max_paths: None,
         max_steps: None,
     };

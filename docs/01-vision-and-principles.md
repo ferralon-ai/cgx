@@ -40,7 +40,7 @@ manage. The binary is invoked directly:
 ```
 cgx query 'QUERY' ./
 cgx index ./
-cgx prune ./
+cgx prune ./    # Planned (not yet shipped in v0.3.0)
 ```
 
 ### Deterministic answers — no LLM in the answer path
@@ -58,8 +58,7 @@ query execution reads from the stored graph, not from re-parsing source.
 ### Index fully auto-managed; explicit override commands available
 
 `cgx` detects when the index is missing or stale and rebuilds it automatically before
-answering. Engineers may also call `cgx index` and `cgx prune` directly to control
-indexing and to free storage.
+answering. Engineers may also call `cgx index` directly to control indexing. `cgx prune` (disk-space reclamation) is **Planned (not yet shipped in v0.3.0)**.
 
 ### STDIO MCP server mode
 

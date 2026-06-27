@@ -188,6 +188,12 @@ enum Command {
         format: Format,
     },
     /// Diff the call graph between two git refs.
+    ///
+    /// Without `--path-added`, prints the added/removed/changed edges and nodes,
+    /// optionally narrowed by the post-filters below (pure set math over the diff;
+    /// no re-parse). With `--path-added`, runs the CH-11 structural gate: report a
+    /// new call/dataflow *reachability path* from `--from` to `--to` introduced at
+    /// head. This is reachability, NOT a soundness/security guarantee.
     Diff {
         /// The base ref (e.g. `main`, `HEAD~1`, a tag, or a commit SHA).
         base: String,
@@ -199,9 +205,43 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
-        /// Show only edges added at head but absent at base (edges newer than base).
+        /// Show only edges added at head but absent at base (edges newer than
+        /// base). Sugar for `--added`; kept for compatibility.
         #[arg(long)]
         newer_than: bool,
+        /// Print the *added* bucket (edges/nodes present at head, not base).
+        /// With no `--added/--removed/--changed` flag, all buckets print.
+        #[arg(long)]
+        added: bool,
+        /// Print the *removed* bucket (edges/nodes present at base, not head).
+        #[arg(long)]
+        removed: bool,
+        /// Print the *changed* bucket (edges on both sides whose attributes differ).
+        #[arg(long)]
+        changed: bool,
+        /// Keep only edges of this kind. Repeatable; an edge matches if its kind is
+        /// any of those given (`data-flow` is the `DerivesFrom` dataflow edge).
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<DiffEdgeKind>,
+        /// Keep only edges with exactly this edge condition (GM-3). The
+        /// "tainted-on-the-error-path" lever is `--edge-condition exception`.
+        #[arg(long = "edge-condition", value_enum)]
+        edge_condition: Option<EdgeConditionArg>,
+        /// Keep only edges whose source FQN matches this glob (e.g.
+        /// `'*::handler::*'`). With `--path-added`, the path's source anchor.
+        #[arg(long)]
+        from: Option<String>,
+        /// Keep only edges whose destination FQN matches this glob (e.g.
+        /// `'std::process::Command::*'`). With `--path-added`, the path's sink.
+        #[arg(long)]
+        to: Option<String>,
+        /// Structural PR gate: report a new call/dataflow reachability path from
+        /// `--from` to `--to` that exists at head but not base. REQUIRES both
+        /// `--from` and `--to` (an unanchored path search is rejected). Reachability
+        /// only — NOT a security/soundness guarantee. Exits 1 when a new path is
+        /// found, 0 when clean.
+        #[arg(long)]
+        path_added: bool,
     },
     /// Start the MCP STDIO server (docs/07 IF-9).
     Mcp {
@@ -239,6 +279,81 @@ impl From<KindArg> for SymbolKind {
             KindArg::Macro => SymbolKind::Macro,
             KindArg::Lambda => SymbolKind::Lambda,
             KindArg::Entrypoint => SymbolKind::Entrypoint,
+        }
+    }
+}
+
+/// The edge kinds a user can filter `cgx diff` by with `--kind` (the full edge
+/// taxonomy, so a structural-gate author can scope to e.g. `data-flow`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DiffEdgeKind {
+    Calls,
+    CallsVirtual,
+    CallsClosure,
+    CallsCallback,
+    CallsAsync,
+    CallsIndirect,
+    Spawns,
+    Contains,
+    Imports,
+    DataFlow,
+    Overrides,
+    Implements,
+    Inherits,
+    References,
+    Instantiates,
+    Throws,
+    Catches,
+    ReadsField,
+    WritesField,
+}
+
+impl From<DiffEdgeKind> for EdgeKind {
+    fn from(k: DiffEdgeKind) -> Self {
+        match k {
+            DiffEdgeKind::Calls => EdgeKind::Calls,
+            DiffEdgeKind::CallsVirtual => EdgeKind::CallsVirtual,
+            DiffEdgeKind::CallsClosure => EdgeKind::CallsClosure,
+            DiffEdgeKind::CallsCallback => EdgeKind::CallsCallback,
+            DiffEdgeKind::CallsAsync => EdgeKind::CallsAsync,
+            DiffEdgeKind::CallsIndirect => EdgeKind::CallsIndirect,
+            DiffEdgeKind::Spawns => EdgeKind::Spawns,
+            DiffEdgeKind::Contains => EdgeKind::Contains,
+            DiffEdgeKind::Imports => EdgeKind::Imports,
+            DiffEdgeKind::DataFlow => EdgeKind::DerivesFrom,
+            DiffEdgeKind::Overrides => EdgeKind::Overrides,
+            DiffEdgeKind::Implements => EdgeKind::Implements,
+            DiffEdgeKind::Inherits => EdgeKind::Inherits,
+            DiffEdgeKind::References => EdgeKind::References,
+            DiffEdgeKind::Instantiates => EdgeKind::Instantiates,
+            DiffEdgeKind::Throws => EdgeKind::Throws,
+            DiffEdgeKind::Catches => EdgeKind::Catches,
+            DiffEdgeKind::ReadsField => EdgeKind::ReadsField,
+            DiffEdgeKind::WritesField => EdgeKind::WritesField,
+        }
+    }
+}
+
+/// The edge-condition labels a user can filter `cgx diff` by with
+/// `--edge-condition` (GM-3). Mirrors the three labels the structural gate cares
+/// about plus the two exceptional-class labels.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum EdgeConditionArg {
+    Always,
+    Conditional,
+    Loop,
+    Exception,
+    Panic,
+}
+
+impl From<EdgeConditionArg> for cgx_core::EdgeCondition {
+    fn from(c: EdgeConditionArg) -> Self {
+        match c {
+            EdgeConditionArg::Always => cgx_core::EdgeCondition::Always,
+            EdgeConditionArg::Conditional => cgx_core::EdgeCondition::Conditional,
+            EdgeConditionArg::Loop => cgx_core::EdgeCondition::Loop,
+            EdgeConditionArg::Exception => cgx_core::EdgeCondition::Exception,
+            EdgeConditionArg::Panic => cgx_core::EdgeCondition::Panic,
         }
     }
 }
@@ -354,7 +469,29 @@ fn run(command: Command) -> Result<(), CliError> {
             repo,
             format,
             newer_than,
-        } => run_diff(&base, &head, repo, format, newer_than),
+            added,
+            removed,
+            changed,
+            kinds,
+            edge_condition,
+            from,
+            to,
+            path_added,
+        } => run_diff(DiffArgs {
+            base,
+            head,
+            repo,
+            format,
+            newer_than,
+            added,
+            removed,
+            changed,
+            kinds,
+            edge_condition,
+            from,
+            to,
+            path_added,
+        }),
         Command::Mcp { root } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
         }
@@ -1112,18 +1249,27 @@ fn index_ref(
     Ok(outcome.graph_id)
 }
 
-fn run_diff(
-    base: &str,
-    head: &str,
+/// Parsed `cgx diff` invocation (S0 post-filters + the S1 path gate).
+struct DiffArgs {
+    base: String,
+    head: String,
     repo: Option<PathBuf>,
     format: Format,
     newer_than: bool,
-) -> Result<(), CliError> {
-    let repo_root = resolve_repo(repo)?;
+    added: bool,
+    removed: bool,
+    changed: bool,
+    kinds: Vec<DiffEdgeKind>,
+    edge_condition: Option<EdgeConditionArg>,
+    from: Option<String>,
+    to: Option<String>,
+    path_added: bool,
+}
+
+fn run_diff(args: DiffArgs) -> Result<(), CliError> {
+    let repo_root = resolve_repo(args.repo.clone())?;
 
     // Open (or create) the shared on-disk store for this diff session.
-    // We create a fresh in-memory store so the two indexed snapshots don't
-    // pollute the user's on-disk index.
     let db_file = db_path(&repo_root);
     std::fs::create_dir_all(cgx_dir(&repo_root))
         .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
@@ -1133,26 +1279,171 @@ fn run_diff(
     let blame = BlameRepo::discover(&repo_root)
         .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
     let base_commit = blame
-        .resolve_commit(base)
-        .map_err(|e| CliError::usage(format!("resolving base ref {base:?}: {e}")))?;
+        .resolve_commit(&args.base)
+        .map_err(|e| CliError::usage(format!("resolving base ref {:?}: {e}", args.base)))?;
     let head_commit = blame
-        .resolve_commit(head)
-        .map_err(|e| CliError::usage(format!("resolving head ref {head:?}: {e}")))?;
+        .resolve_commit(&args.head)
+        .map_err(|e| CliError::usage(format!("resolving head ref {:?}: {e}", args.head)))?;
 
     let base_id = index_ref(&repo_root, &base_commit, &mut store)?;
     let head_id = index_ref(&repo_root, &head_commit, &mut store)?;
 
+    // The S1 path gate is a distinct mode: it runs reachability over the two
+    // graphs rather than printing the edge/node buckets.
+    if args.path_added {
+        return run_path_added(&args, &store, base_id, head_id, &blame, &head_commit);
+    }
+
     let diff = cgx_diff::diff_trees(&store, base_id, head_id)
         .map_err(|e| CliError::graph(format!("diffing trees: {e}")))?;
 
-    if newer_than {
-        // Show only added edges.
-        print_diff_newer_than(&diff, format);
-    } else {
-        print_diff_full(&diff, format);
-    }
+    // `--newer-than` is sugar for `--added` (show only the added bucket).
+    let buckets = cgx_diff::BucketSelect::from_flags(
+        args.added || args.newer_than,
+        args.removed,
+        args.changed,
+    );
+    let filter = cgx_diff::DiffFilter {
+        buckets,
+        kinds: args.kinds.iter().copied().map(EdgeKind::from).collect(),
+        edge_condition: args.edge_condition.map(Into::into),
+        from: args.from.as_deref().map(parse_symbol),
+        to: args.to.as_deref().map(parse_symbol),
+    };
+    let filtered = filter.apply(&diff);
+
+    print_diff_full(&filtered, args.format);
 
     Ok(())
+}
+
+/// The CH-11 S1 structural gate. Reports a new call/dataflow *reachability path*
+/// from `--from` to `--to` introduced at head, attributes its introducing commit,
+/// and gates the exit code (1 = a new path was found, 0 = clean).
+///
+/// **Honesty:** this is reachability over the resolved graph, NOT a soundness or
+/// security guarantee. The framing is repeated in stdout/JSON so a reader never
+/// mistakes a reported path for a proven exploit.
+///
+/// **Anchor guard:** both `--from` and `--to` are required; a missing anchor is a
+/// usage error (exit 2), never an unanchored walk (the dense-graph blowup risk).
+fn run_path_added(
+    args: &DiffArgs,
+    store: &SqliteStore,
+    base_id: GraphId,
+    head_id: GraphId,
+    blame: &BlameRepo,
+    head_commit: &str,
+) -> Result<(), CliError> {
+    let (from, to) = match (&args.from, &args.to) {
+        (Some(f), Some(t)) => (parse_symbol(f), parse_symbol(t)),
+        _ => {
+            return Err(CliError::usage(
+                "--path-added requires both --from and --to (an unanchored path \
+                 search is rejected to avoid a dense-graph blowup)"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let base_graph = store
+        .read_graph(base_id)
+        .map_err(|e| CliError::graph(format!("reading base graph: {e}")))?;
+    let head_graph = store
+        .read_graph(head_id)
+        .map_err(|e| CliError::graph(format!("reading head graph: {e}")))?;
+
+    let path_diff = cgx_diff::path_diff_graphs(&base_graph, &head_graph, &from, &to);
+
+    // Attribute each new path's introducing commit off its source symbol at head.
+    let mut attributed: Vec<(cgx_diff::AddedPath, cgx_diff::EdgeAge)> =
+        Vec::with_capacity(path_diff.added_paths.len());
+    let mut warnings: Vec<cgx_diff::Warning> = Vec::new();
+    for p in &path_diff.added_paths {
+        let age = head_graph
+            .nodes
+            .iter()
+            .find(|n| n.fqn == p.from_fqn)
+            .map(|src| blame.symbol_age(src, head_commit, &mut warnings))
+            .unwrap_or_else(cgx_diff::EdgeAge::unattributed);
+        attributed.push((p.clone(), age));
+    }
+
+    print_path_added(&attributed, args.format);
+    for w in &warnings {
+        eprintln!("cgx: {}", w.0);
+    }
+
+    if path_diff.has_new_path() {
+        Err(CliError::new(
+            ExitCode::AssertionFailed,
+            format!(
+                "path-added gate: {} new call/dataflow reachability path(s) found",
+                path_diff.added_paths.len()
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Render the path-added gate result. Human format names the route and the
+/// introducing commit; JSON carries the structured shape. Both repeat the
+/// reachability-not-a-guarantee framing.
+fn print_path_added(
+    paths: &[(cgx_diff::AddedPath, cgx_diff::EdgeAge)],
+    format: Format,
+) {
+    match format {
+        Format::Json => {
+            let doc = serde_json::json!({
+                "kind": "path-added",
+                "semantics": "call/dataflow reachability (not a soundness/security guarantee)",
+                "added_paths": paths.iter().map(|(p, age)| serde_json::json!({
+                    "from": p.from_fqn,
+                    "to": p.to_fqn,
+                    "via": p.via,
+                    "introducing_commit": age.introducing_commit,
+                    "introducing_author": age.introducing_author,
+                    "introducing_email": age.introducing_email,
+                    "author_time": age.author_time,
+                })).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&doc).expect("path-added json serializes")
+            );
+        }
+        _ => {
+            if paths.is_empty() {
+                println!("(no new call/dataflow reachability path)");
+                return;
+            }
+            println!(
+                "{} new call/dataflow reachability path(s) [reachability, not a security guarantee]:",
+                paths.len()
+            );
+            for (p, age) in paths {
+                let route = if p.via.is_empty() {
+                    format!("{}  ~>  {}", p.from_fqn, p.to_fqn)
+                } else {
+                    p.via.join("  ->  ")
+                };
+                let commit = age
+                    .introducing_commit
+                    .as_deref()
+                    .map(|c| {
+                        let short = &c[..c.len().min(12)];
+                        match &age.introducing_author {
+                            Some(a) => format!("introduced by {short} ({a})"),
+                            None => format!("introduced by {short}"),
+                        }
+                    })
+                    .unwrap_or_else(|| "introducing commit unattributed".to_string());
+                println!("+ path  {route}  [{commit}]");
+            }
+        }
+    }
 }
 
 fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
@@ -1202,31 +1493,6 @@ fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
                 && diff.removed_nodes.is_empty()
             {
                 println!("(no diff)");
-            }
-        }
-    }
-}
-
-fn print_diff_newer_than(diff: &cgx_diff::GraphDiff, format: Format) {
-    match format {
-        Format::Json => {
-            let doc = serde_json::json!({
-                "added_edges": diff.added_edges.iter().map(diff_edge_json).collect::<Vec<_>>(),
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&doc).expect("diff json serializes")
-            );
-        }
-        _ => {
-            for e in &diff.added_edges {
-                println!(
-                    "+ edge  {}  ->  {}  ({})",
-                    e.identity.src_fqn, e.identity.dst_fqn, e.identity.file
-                );
-            }
-            if diff.added_edges.is_empty() {
-                println!("(no new edges)");
             }
         }
     }

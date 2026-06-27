@@ -26,7 +26,7 @@
 //!    work is capped at [`DEFAULT_MAX_STEPS`] DFS node-visits. Each (source, sink)
 //!    probe is a single bounded BFS shortest-path search.
 
-use cgx_core::{EdgeKind, SymbolPattern};
+use cgx_core::{EdgeKind, NodeId, SymbolPattern};
 use cgx_query::{reaches, EdgeFilter, GraphView, PathWalker, DEFAULT_MAX_STEPS};
 use cgx_store::LinkedGraph;
 
@@ -47,12 +47,20 @@ pub struct AddedPath {
 }
 
 /// The result of a path-added diff: every newly-introduced source→sink path, in
-/// deterministic `(from_fqn, to_fqn)` order, plus a flag noting whether any side's
-/// reachability search hit the work budget (so the gate can report "incomplete").
+/// deterministic `(from_fqn, to_fqn)` order, plus the per-anchor match counts so the
+/// caller can warn on a zero-match anchor (the false-negative trap: an anchor that
+/// matches no graph node makes "clean" mean "not indexed", not "no path exists").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathDiff {
     /// New paths present at HEAD but not BASE, in `(from_fqn, to_fqn)` order.
     pub added_paths: Vec<AddedPath>,
+    /// How many nodes the `from` anchor matched in the **HEAD** graph. Zero means
+    /// the source symbol is not a graph node at HEAD (e.g. an external/std symbol
+    /// without SCIP index data), so a clean result is vacuous, not reassuring.
+    pub from_matched: usize,
+    /// How many nodes the `to` anchor matched in the **HEAD** graph. Zero carries
+    /// the same caveat as [`PathDiff::from_matched`].
+    pub to_matched: usize,
 }
 
 impl PathDiff {
@@ -81,6 +89,17 @@ fn reachability_filter() -> EdgeFilter {
     ])
 }
 
+/// The node ids in `view` whose record matches `pattern`, in canonical (ascending
+/// id) order. Shared by [`reachable_pairs`] and the anchor-match count so the count
+/// and the search see exactly the same node set.
+fn matched_node_ids(view: &GraphView, pattern: &SymbolPattern) -> Vec<NodeId> {
+    view.nodes()
+        .iter()
+        .filter(|n| pattern.matches(n))
+        .map(|n| n.id)
+        .collect()
+}
+
 /// The set of `(from_fqn, to_fqn)` reachable pairs in `view`, plus a witness path
 /// for each, restricted to sources matching `from` and sinks matching `to`.
 ///
@@ -94,18 +113,8 @@ fn reachable_pairs(
     to: &SymbolPattern,
     max_steps: u64,
 ) -> Vec<AddedPath> {
-    let sources: Vec<_> = view
-        .nodes()
-        .iter()
-        .filter(|n| from.matches(n))
-        .map(|n| n.id)
-        .collect();
-    let sinks: Vec<_> = view
-        .nodes()
-        .iter()
-        .filter(|n| to.matches(n))
-        .map(|n| n.id)
-        .collect();
+    let sources = matched_node_ids(view, from);
+    let sinks = matched_node_ids(view, to);
 
     let walker = PathWalker {
         filter: reachability_filter(),
@@ -178,5 +187,15 @@ pub fn path_diff_graphs_bounded(
         (a.from_fqn.as_str(), a.to_fqn.as_str()).cmp(&(b.from_fqn.as_str(), b.to_fqn.as_str()))
     });
 
-    PathDiff { added_paths }
+    // Anchor-match counts are taken on the HEAD view: HEAD is the graph the gate
+    // evaluates ("is there a path NOW?"), so an anchor that matches no HEAD node is
+    // the zero-match trap the caller must surface.
+    let from_matched = matched_node_ids(&head_view, from).len();
+    let to_matched = matched_node_ids(&head_view, to).len();
+
+    PathDiff {
+        added_paths,
+        from_matched,
+        to_matched,
+    }
 }

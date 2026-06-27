@@ -118,10 +118,12 @@ pub fn handler() { sink() }
     );
 }
 
-/// When the `--to` glob matches nothing, no path is reported (open-world: an
-/// unmatched sink is simply not a sink).
+/// When the `--to` glob matches nothing, no path is reported BUT the zero-match is
+/// surfaced via `to_matched == 0` so the caller can warn that "clean" is vacuous
+/// (the sink is not indexed, not "no path exists"). Regression for the RFC §5.3
+/// cardinal-rule honesty bug: a zero-match anchor must never look like a real pass.
 #[test]
-fn unmatched_sink_yields_no_path() {
+fn unmatched_sink_is_surfaced_as_zero_match() {
     let src = r#"
 pub fn sink() {}
 pub fn handler() { sink() }
@@ -139,4 +141,6 @@ pub fn handler() { sink() }
     let to = SymbolPattern::glob("**::does_not_exist");
     let diff = path_diff_graphs(&base, &head, &from, &to);
     assert!(!diff.has_new_path(), "no sink matched, so no path");
+    assert_eq!(diff.to_matched, 0, "the unmatched sink is surfaced as zero-match");
+    assert!(diff.from_matched > 0, "the source anchor did match a node");
 }

@@ -165,8 +165,40 @@ fn path_added_flags_new_handler_to_exec_path_with_nonzero_exit_and_commit() {
 #[test]
 fn path_added_is_clean_when_no_new_path() {
     let (_tmp, repo) = gate_fixture();
-    // A sink glob that matches nothing → no new path → clean exit 0.
-    let (stdout, _stderr, code) = run_cgx(
+    // Both anchors match real nodes, but the reverse direction (Command -> handler)
+    // is unreachable on both sides → genuinely no new path → clean exit 0 with no
+    // zero-match warning.
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "diff",
+            "HEAD~1",
+            "HEAD",
+            "--path-added",
+            "--from",
+            "**::Command::*",
+            "--to",
+            "**::handler::*",
+        ],
+    );
+    assert_eq!(code, 0, "no new path exits 0: stdout={stdout}");
+    assert!(
+        stdout.contains("no new call/dataflow reachability path"),
+        "clean message present: {stdout}"
+    );
+    assert!(
+        !stderr.contains("matched 0 nodes"),
+        "no zero-match warning when both anchors match: {stderr}"
+    );
+}
+
+/// A zero-match anchor must NOT silently pass as "clean": by default the gate keeps
+/// exit 0 (open-world) but emits a stderr warning that the symbol is not indexed.
+/// Regression for the RFC §5.3 cardinal-rule honesty bug.
+#[test]
+fn zero_match_anchor_warns_but_stays_exit_0_by_default() {
+    let (_tmp, repo) = gate_fixture();
+    let (stdout, stderr, code) = run_cgx(
         &repo,
         &[
             "diff",
@@ -179,10 +211,40 @@ fn path_added_is_clean_when_no_new_path() {
             "**::NoSuchSink::*",
         ],
     );
-    assert_eq!(code, 0, "no new path exits 0: stdout={stdout}");
+    assert_eq!(code, 0, "open-world default keeps exit 0: stdout={stdout}");
     assert!(
-        stdout.contains("no new call/dataflow reachability path"),
-        "clean message present: {stdout}"
+        stderr.contains("--to") && stderr.contains("matched 0 nodes"),
+        "the zero-match warning names the anchor and the cause: {stderr}"
+    );
+    assert!(
+        stderr.contains("NOT that no path exists"),
+        "the warning states a clean result does not prove no path: {stderr}"
+    );
+}
+
+/// `--require-anchor-match` turns a zero-match anchor into a hard error (exit 2) so
+/// CI can fail closed when a configured sink isn't in the graph.
+#[test]
+fn require_anchor_match_turns_zero_match_into_exit_2() {
+    let (_tmp, repo) = gate_fixture();
+    let (_stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "diff",
+            "HEAD~1",
+            "HEAD",
+            "--path-added",
+            "--require-anchor-match",
+            "--from",
+            "**::handler::*",
+            "--to",
+            "**::NoSuchSink::*",
+        ],
+    );
+    assert_eq!(code, 2, "a zero-match anchor under --require-anchor-match is a usage error");
+    assert!(
+        stderr.contains("matched 0 nodes"),
+        "the error names the zero-match cause: {stderr}"
     );
 }
 

@@ -242,6 +242,13 @@ enum Command {
         /// found, 0 when clean.
         #[arg(long)]
         path_added: bool,
+        /// With `--path-added`: treat a `--from`/`--to` anchor that matches ZERO
+        /// graph nodes as a hard error (exit 2) instead of a stderr warning. A
+        /// zero-match anchor means the symbol is not indexed (e.g. an external/std
+        /// symbol without SCIP data), so a "clean" result proves nothing. Set this
+        /// in CI to fail closed when a configured sink isn't in the graph.
+        #[arg(long = "require-anchor-match")]
+        require_anchor_match: bool,
     },
     /// Start the MCP STDIO server (docs/07 IF-9).
     Mcp {
@@ -477,6 +484,7 @@ fn run(command: Command) -> Result<(), CliError> {
             from,
             to,
             path_added,
+            require_anchor_match,
         } => run_diff(DiffArgs {
             base,
             head,
@@ -491,6 +499,7 @@ fn run(command: Command) -> Result<(), CliError> {
             from,
             to,
             path_added,
+            require_anchor_match,
         }),
         Command::Mcp { root } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
@@ -1264,6 +1273,7 @@ struct DiffArgs {
     from: Option<String>,
     to: Option<String>,
     path_added: bool,
+    require_anchor_match: bool,
 }
 
 fn run_diff(args: DiffArgs) -> Result<(), CliError> {
@@ -1354,6 +1364,36 @@ fn run_path_added(
         .map_err(|e| CliError::graph(format!("reading head graph: {e}")))?;
 
     let path_diff = cgx_diff::path_diff_graphs(&base_graph, &head_graph, &from, &to);
+
+    // A zero-match anchor is the false-negative trap: the symbol is not a graph
+    // node at HEAD (e.g. an external/std symbol without SCIP data), so a "clean"
+    // result does NOT prove no path exists — it only proves the symbol isn't
+    // indexed. The glob strings are present here (the type-level guard above
+    // guarantees both `--from` and `--to` were supplied).
+    let from_glob = args.from.as_deref().unwrap_or_default();
+    let to_glob = args.to.as_deref().unwrap_or_default();
+    let mut zero_match = Vec::new();
+    if path_diff.from_matched == 0 {
+        zero_match.push(("--from", from_glob));
+    }
+    if path_diff.to_matched == 0 {
+        zero_match.push(("--to", to_glob));
+    }
+    if !zero_match.is_empty() {
+        for (flag, glob) in &zero_match {
+            let msg = format!(
+                "{flag} glob {glob:?} matched 0 nodes in the head graph — a \"clean\" \
+                 result means the symbol is not indexed (external/std symbols are not \
+                 graph nodes without SCIP index data), NOT that no path exists"
+            );
+            if args.require_anchor_match {
+                return Err(CliError::usage(format!(
+                    "{msg} (--require-anchor-match is set, so this is a hard error)"
+                )));
+            }
+            eprintln!("cgx: warning: {msg}");
+        }
+    }
 
     // Attribute each new path's introducing commit off its source symbol at head.
     let mut attributed: Vec<(cgx_diff::AddedPath, cgx_diff::EdgeAge)> =

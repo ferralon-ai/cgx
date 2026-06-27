@@ -13,7 +13,7 @@ This directory contains 13 theme files totalling 138 answered questions drawn fr
 | 03 | [03-provenance-and-taint.md](03-provenance-and-taint.md) | Provenance and Taint | Q26–Q36, Q86, Q91, Q94–Q96, Q102 | 17 |
 | 04 | [04-failure-path-behavior.md](04-failure-path-behavior.md) | Failure-Path Behavior | Q37–Q45, Q76–Q78, Q98, Q101, Q103, Q106 | 16 |
 | 05 | [05-dead-and-unused-code.md](05-dead-and-unused-code.md) | Dead and Unused Code | Q46–Q53 | 8 |
-| 06 | [06-temporal-and-vcs-graph-diffs.md](06-temporal-and-vcs-graph-diffs.md) | Temporal and VCS Graph Diffs | Q54–Q61, Q99, Q107 | 10 |
+| 06 | [06-temporal-and-vcs-graph-diffs.md](06-temporal-and-vcs-graph-diffs.md) | Temporal and VCS Graph Diffs | Q54–Q61, Q99, Q107, Q139 | 11 |
 | 07 | [07-api-surface-and-contracts.md](07-api-surface-and-contracts.md) | API Surface and Contracts | Q62–Q67 | 6 |
 | 08 | [08-ai-agent-specific-queries.md](08-ai-agent-specific-queries.md) | AI-Agent-Specific Queries | Q68–Q75, Q79–Q81 | 11 |
 | 09 | [09-threat-modeling-and-dfd.md](09-threat-modeling-and-dfd.md) | Threat Modeling and DFD | Q82–Q85 | 4 |
@@ -22,7 +22,7 @@ This directory contains 13 theme files totalling 138 answered questions drawn fr
 | 12 | [12-framework-semantics-and-metadata.md](12-framework-semantics-and-metadata.md) | Framework Semantics and Metadata | Q119–Q126 | 8 |
 | 13 | [13-object-model-and-inheritance.md](13-object-model-and-inheritance.md) | Object Model and Inheritance | Q127–Q138 | 12 |
 
-**Total: 138 questions.** Question IDs are globally unique; each question appears in exactly one file.
+**Total: 139 questions.** Question IDs are globally unique; each question appears in exactly one file.
 
 ---
 

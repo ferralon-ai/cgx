@@ -7,6 +7,7 @@
 //! facts, even those no adapter claims.
 
 use cgx_frontend::{FallbackFrontend, FrontendRegistry};
+use cgx_lang_go::GoFrontend;
 use cgx_lang_rust::RustFrontend;
 use cgx_lang_ts::TypeScriptFrontend;
 use std::sync::Arc;
@@ -19,5 +20,6 @@ pub fn default_registry() -> FrontendRegistry {
     let mut registry = FrontendRegistry::new(Arc::new(fallback));
     registry.register(Arc::new(RustFrontend::new()));
     registry.register(Arc::new(TypeScriptFrontend::new()));
+    registry.register(Arc::new(GoFrontend::new()));
     registry
 }

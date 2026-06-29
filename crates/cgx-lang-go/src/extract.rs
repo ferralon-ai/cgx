@@ -24,8 +24,8 @@ use cgx_core::effect::EffectSet;
 use cgx_core::node::{SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    EffectFact, FileCtx, FileFacts, FrontendError, Lang, LanguageFrontend, RawRef, RefKind,
-    RelPath, ScopeId, SymbolDef,
+    EffectFact, ExportFact, FileCtx, FileFacts, FrontendError, ImportFact, ImportedName, Lang,
+    LanguageFrontend, RawRef, RefKind, RelPath, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
@@ -217,6 +217,7 @@ impl<'a> Builder<'a> {
             "type_declaration" => self.walk_type_declaration(node, ctx),
             "const_declaration" => self.walk_value_declaration(node, ctx, SymbolKind::Constant),
             "var_declaration" => self.walk_value_declaration(node, ctx, SymbolKind::Variable),
+            "import_declaration" => self.walk_import(node, ctx),
             "call_expression" => self.walk_call_expression(node, ctx, stmt_index),
             "go_statement" => self.walk_go(node, ctx, stmt_index),
             "defer_statement" => self.walk_defer(node, ctx, stmt_index),
@@ -255,6 +256,7 @@ impl<'a> Builder<'a> {
             is_abstract: false,
             signature: None,
         });
+        self.maybe_export(&name, node);
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope);
@@ -337,6 +339,7 @@ impl<'a> Builder<'a> {
                 is_abstract: is_interface,
                 signature: None,
             });
+            self.maybe_export(&name, spec);
         }
     }
 
@@ -359,6 +362,7 @@ impl<'a> Builder<'a> {
                     is_abstract: false,
                     signature: None,
                 });
+                self.maybe_export(&name, name_node);
             }
         }
     }
@@ -368,6 +372,83 @@ impl<'a> Builder<'a> {
         node.child_by_field_name(name_field)
             .map(|n| self.span(n))
             .unwrap_or_else(|| self.span(node))
+    }
+
+    fn maybe_export(&mut self, name: &str, node: Node<'_>) {
+        if is_exported(name) {
+            self.facts.exports.push(ExportFact {
+                name: name.to_string(),
+                alias: None,
+                from: None,
+                span: self.span(node),
+            });
+        }
+    }
+
+    // --- imports ---
+
+    fn walk_import(&mut self, node: Node<'_>, ctx: &Ctx) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "import_spec" => self.record_import_spec(child, ctx),
+                "import_spec_list" => {
+                    let mut inner = child.walk();
+                    for spec in child.children(&mut inner) {
+                        if spec.kind() == "import_spec" {
+                            self.record_import_spec(spec, ctx);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_import_spec(&mut self, spec: Node<'_>, ctx: &Ctx) {
+        let Some(path_node) = spec.child_by_field_name("path") else {
+            return;
+        };
+        let specifier = string_literal_value(&self.text(path_node));
+        let last_segment = specifier
+            .rsplit('/')
+            .next()
+            .unwrap_or(&specifier)
+            .to_string();
+
+        let mut glob = false;
+        let names = match spec.child_by_field_name("name") {
+            Some(name_node) => match name_node.kind() {
+                // `. "path"` (dot import) pulls every exported name into scope.
+                "dot" => {
+                    glob = true;
+                    Vec::new()
+                }
+                // `_ "path"` (blank import) binds no name — a side-effect import.
+                "blank_identifier" => Vec::new(),
+                // `m "path"` (alias).
+                _ => {
+                    let alias = self.text(name_node);
+                    vec![ImportedName {
+                        name: last_segment,
+                        alias: Some(alias),
+                    }]
+                }
+            },
+            None => vec![ImportedName {
+                name: last_segment,
+                alias: None,
+            }],
+        };
+
+        self.facts.imports.push(ImportFact {
+            specifier,
+            names,
+            glob,
+            re_export: false,
+            scope: ctx.scope,
+            span: self.span(spec),
+        });
     }
 
     // --- references (calls) ---
@@ -645,4 +726,18 @@ fn vis(name: &str) -> Visibility {
 
 fn is_exported(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// The value of a Go string literal: strip the surrounding quotes/backticks.
+fn string_literal_value(literal: &str) -> String {
+    let trimmed = literal.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
 }

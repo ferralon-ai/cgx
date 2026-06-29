@@ -23,6 +23,7 @@ fn extract_valid_go_does_not_error() {
             &FileCtx::new("main.go", "oid"),
         )
         .expect("go extract must not error on valid source");
-    // Empty for now; later tasks populate it.
-    assert!(facts.scopes.len() >= 1);
+    // Extraction populates the `main` def and its body scope (root + body ≥ 2).
+    assert!(facts.defs.iter().any(|d| d.fqn.ends_with("::main")));
+    assert!(facts.scopes.len() >= 2);
 }

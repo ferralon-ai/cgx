@@ -939,6 +939,42 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
+            // `ch <- v` (DF-20): model the channel as an intermediary the value
+            // flows into. The matching receive `x := <-ch` links `x ⇝ ch` via the
+            // unary-receive operand, so `v ⇝ ch ⇝ x` is recoverable through `ch`.
+            "send_statement" => {
+                let cond = ctx.condition();
+                if let (Some(chan_node), Some(value)) = (
+                    node.child_by_field_name("channel"),
+                    node.child_by_field_name("value"),
+                ) {
+                    if let Some(name) = self.binding_name(chan_node) {
+                        let version = {
+                            let v = versions.entry(name.clone()).or_insert(0);
+                            *v += 1;
+                            *v
+                        };
+                        let derived = smallvec_one(name);
+                        let span = self.span(value);
+                        for source in self.operand_sources(value) {
+                            self.push_data_flow(
+                                fn_fqn,
+                                derived.clone(),
+                                version,
+                                source,
+                                ctx.scope,
+                                Transform::Other,
+                                cond,
+                                SmallVec::new(),
+                                None,
+                                SmallVec::new(),
+                                span.clone(),
+                            );
+                        }
+                    }
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
             // A func literal opens a new binding world; SC2 does not descend into
             // closure bodies for SSA (closure-capture dataflow is deferred).
             "func_literal" => {}
@@ -1147,7 +1183,13 @@ impl<'a> Builder<'a> {
                     .child_by_field_name("operand")
                     .map(|n| self.operand_sources(n))
                     .unwrap_or_default();
-                (Transform::Arith, sources, None)
+                // A channel receive (`<-ch`) is a transfer, not arithmetic.
+                let transform = if self.unary_operator(value).as_deref() == Some("<-") {
+                    Transform::Other
+                } else {
+                    Transform::Arith
+                };
+                (transform, sources, None)
             }
             "composite_literal" => (Transform::Composed, self.composed_sources(value), None),
             // A call result is opaque — no intraprocedural source (SC4 grounds it).
@@ -1200,6 +1242,11 @@ impl<'a> Builder<'a> {
                 .and_then(|v| self.deepest_base_ident(v)),
             _ => None,
         }
+    }
+
+    /// The operator token text of a `unary_expression` (`-x` → `-`, `<-ch` → `<-`).
+    fn unary_operator(&self, node: Node<'_>) -> Option<String> {
+        node.child_by_field_name("operator").map(|n| self.text(n))
     }
 
     /// The source bindings of one operand of an arith/composed expression.

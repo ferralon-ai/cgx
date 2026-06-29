@@ -99,3 +99,23 @@ fn reassignment_bumps_derived_version() {
     versions.sort_unstable();
     assert_eq!(versions, vec![1, 2], "got {f:?}");
 }
+
+#[test]
+fn channel_send_recv_chains_through_intermediary() {
+    // `a → ch` (send), `ch → b` (recv): the chain a ⇝ b is recoverable via ch.
+    let f = flows(
+        "package df\nfunc g(a int) int { ch := make(chan int, 1); ch <- a; b := <-ch; return b }\n",
+    );
+    assert!(
+        f.iter()
+            .any(|x| x.derived.last().map(String::as_str) == Some("ch")
+                && x.source.last().map(String::as_str) == Some("a")),
+        "send a -> ch missing: {f:?}"
+    );
+    assert!(
+        f.iter()
+            .any(|x| x.derived.last().map(String::as_str) == Some("b")
+                && x.source.last().map(String::as_str) == Some("ch")),
+        "recv ch -> b missing: {f:?}"
+    );
+}

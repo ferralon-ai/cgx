@@ -20,6 +20,31 @@ fn free_function_is_function_kind_with_capitalization_visibility() {
 }
 
 #[test]
+fn func_literal_is_lambda_def_and_body_is_walked() {
+    let src =
+        "package store\nfunc Outer() {\n\tf := func() { helper() }\n\t_ = f\n}\nfunc helper() {}\n";
+    let facts = extract(FILE, src);
+    // The closure is recorded as a Lambda def (synthesized `func@line:col` FQN).
+    assert!(
+        facts.defs.iter().any(|d| d.kind == SymbolKind::Lambda),
+        "expected a Lambda def, got {:?}",
+        facts
+            .defs
+            .iter()
+            .map(|d| (&d.fqn, d.kind))
+            .collect::<Vec<_>>()
+    );
+    // Its body is walked: the call to `helper` inside the closure is recorded.
+    assert!(
+        facts
+            .refs
+            .iter()
+            .any(|r| r.name_path.last().map(String::as_str) == Some("helper")),
+        "closure body should be walked (helper call recorded)"
+    );
+}
+
+#[test]
 fn method_nests_under_receiver_type_with_pointer_marker() {
     let src = "package store\ntype Server struct{}\nfunc (s *Server) Serve() {}\nfunc (s Server) Name() string { return \"\" }\n";
     let facts = extract(FILE, src);

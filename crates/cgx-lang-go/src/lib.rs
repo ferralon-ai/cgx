@@ -5,7 +5,9 @@
 //! `tree-sitter-go`, emitting per-file [`FileFacts`](cgx_frontend::FileFacts):
 //! defs (func/method/type/const/var with visibility from capitalization),
 //! call refs at the right [`RefKind`](cgx_frontend::RefKind), edge conditions,
-//! imports/exports, entrypoint hints (`main`/`init`/`TestXxx`), cut hints
+//! imports/exports, entrypoint hints (`main`/`TestXxx`/`BenchmarkXxx`/`ExampleXxx`;
+//! `init` is emitted as a plain function def, not an entrypoint — package
+//! static-init reachability is a known follow-up), cut hints
 //! (cgo `import "C"` → via-FFI, `reflect`/`plugin` → reflective/dynamic),
 //! own-effects, and intraprocedural SSA dataflow.
 //!

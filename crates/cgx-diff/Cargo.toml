@@ -11,6 +11,7 @@ description = "cgx graph diff (IX-4) and edge-age / introducing-commit attributi
 cgx-core.workspace = true
 cgx-store = { path = "../cgx-store" }
 cgx-index = { path = "../cgx-index" }
+cgx-query = { path = "../cgx-query" }
 gix = { version = "0.80", default-features = false, features = ["blame", "revision"] }
 thiserror.workspace = true
 

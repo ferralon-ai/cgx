@@ -227,6 +227,7 @@ dependencies = [
  "cgx-core",
  "cgx-frontend",
  "cgx-index",
+ "cgx-query",
  "cgx-store",
  "gix",
  "tempfile",

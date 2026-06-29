@@ -52,10 +52,19 @@ impl SymbolPattern {
 
     /// Whether `node`'s FQN matches this pattern.
     pub fn matches(&self, node: &NodeRecord) -> bool {
+        self.matches_fqn(&node.fqn)
+    }
+
+    /// Whether a bare FQN string matches this pattern. The FQN-only form of
+    /// [`matches`](Self::matches) — every pattern kind is a pure predicate over the
+    /// FQN, so callers that hold an FQN (e.g. the diff post-filters, which match a
+    /// `DiffEdge`'s endpoint FQNs without a `NodeRecord`) can match without
+    /// constructing a throwaway record.
+    pub fn matches_fqn(&self, fqn: &str) -> bool {
         match self.kind {
-            PatternKind::Fqn => node.fqn == self.text,
-            PatternKind::ShortName => short_name(&node.fqn) == self.text,
-            PatternKind::Glob => glob_match(&self.text, &node.fqn),
+            PatternKind::Fqn => fqn == self.text,
+            PatternKind::ShortName => short_name(fqn) == self.text,
+            PatternKind::Glob => glob_match(&self.text, fqn),
         }
     }
 }

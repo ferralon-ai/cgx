@@ -427,3 +427,82 @@ The `match-arm` node kind and its `is_exhaustive`/`missing_variants` attributes 
 | `match_site.missing_variants` | The attribute lists which variants are missing from the arms (a GM-19 schema-room attribute). |
 
 **Reading the result** — Each row is a match expression that is missing coverage for at least one enum variant added on this branch. The `missing_variants` attribute names the specific variants. In Rust, the compiler catches non-exhaustive matches on enums it owns — this query catches cases where the `match` is in a different crate from the enum definition, or where a wildcard arm was used and the new variant would fall through silently.
+
+---
+
+### Q139 — Did this PR introduce a new handler-to-exec path?
+
+**Personas:** PSE · **Status:** answerable-today (shipped at v0.3.x via `--path-added`)
+
+This is the structural PR gate use case for call/dataflow reachability: detect whether a new code path from a request-handling entry point to a command-execution sink was introduced by this branch. The gate exits 1 on a new path and 0 on clean, making it directly composable with CI.
+
+**Important:** `--path-added` reports *reachability*, not soundness. It cannot guarantee absence of a path — it can only confirm that the indexed graph contains or does not contain one. A "clean" exit 0 means no new path was found **in the indexed graph**. If the sink symbol is not in the graph (because it is an external/stdlib symbol not covered by SCIP index data), the gate exits 0 without searching. Always verify that your `--to` anchor matches at least one node; use `--require-anchor-match` in CI to fail closed when it does not.
+
+**The query**
+
+```bash
+cgx diff main HEAD \
+    --path-added \
+    --from '*::handler::*' \
+    --to '*::sys::Command::*' \
+    --require-anchor-match \
+    --repo /path/to/my-repo
+```
+
+For JSON output (CI artifact or further analysis):
+
+```bash
+cgx diff main HEAD \
+    --path-added \
+    --from '*::handler::*' \
+    --to '*::sys::Command::*' \
+    --require-anchor-match \
+    --format json \
+    --repo /path/to/my-repo
+```
+
+**Breaking it down**
+
+| Fragment | What it means |
+|---|---|
+| `main HEAD` | Compare the graph at the PR's base (`main`) to the graph at the PR's head (`HEAD`). The gate reports paths present at head but absent at base. |
+| `--path-added` | Enter structural gate mode. Uses BFS shortest-path reachability over call and `DerivesFrom` (dataflow) edges. Exits 1 if any new path is found; 0 if clean. |
+| `--from '*::handler::*'` | Source anchor: any function whose FQN contains `::handler::`. This matches handler functions in any module named `handler`. |
+| `--to '*::sys::Command::*'` | Sink anchor: any function in an in-repo `sys::Command` wrapper. This is an **in-repo** symbol, not `std::process::Command::*` (see caveat below). |
+| `--require-anchor-match` | Fail closed: if the `--to` glob matches zero nodes in the head graph, exit 2 instead of silently returning exit 0. Required in CI to catch misconfigured or stale sinks. |
+| `--format json` | Emit a JSON document with `semantics`, `added_paths`, `introducing_commit`, and `via` (the shortest witness path). |
+
+**Reading the result**
+
+- **Exit 0** — no new reachability path from any `*::handler::*` node to any `*::sys::Command::*` node was introduced at head. The gate is clean.
+- **Exit 1** — at least one new path was found. The output names the `from` and `to` FQNs, the shortest witness path (`via`), and the `introducing_commit`. Assign review to that commit's author.
+- **Exit 2** — anchor error. Either `--from` or `--to` matched zero graph nodes (with `--require-anchor-match`), or both `--from` and `--to` were not supplied. Fix the glob or the anchor before trusting a clean result.
+
+**The external-sink caveat (why `*::sys::Command::*` and not `*std::process::Command::*`):**
+
+A plain `cgx index` does not index external (standard-library or third-party) symbols as graph nodes. A glob like `--to 'std::process::Command::*'` will match zero nodes and return exit 0 — meaning "sink not indexed," not "no path." To gate on the actual exec boundary, use an in-repo wrapper function (here, `sys::Command::run`) that calls the external API. Gate on the wrapper's FQN. To index external symbols directly, produce a SCIP index covering the relevant dependencies.
+
+**GitHub Actions example**
+
+```yaml
+- name: Handler-to-exec path gate
+  run: |
+    cgx diff ${{ github.event.pull_request.base.sha }} HEAD \
+        --path-added \
+        --from '*::handler::*' \
+        --to '*::sys::Command::*' \
+        --require-anchor-match \
+        --format json \
+        --repo . \
+      > path-gate.json
+  # exit 0 → clean; exit 1 → new path found (gate fails); exit 2 → anchor error (gate fails)
+
+- name: Upload gate artifact
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: path-gate
+    path: path-gate.json
+```
+
+Treat any exit other than 0 as a gate failure. Exit 2 (anchor error) is as important to surface as exit 1 (new path) — a misconfigured sink can make a gate silently useless.

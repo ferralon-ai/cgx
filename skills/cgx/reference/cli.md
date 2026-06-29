@@ -207,19 +207,22 @@ supported/unsupported clause list.
 
 ### `search` — find symbols by partial name
 
-Since: v0.2
+Since: v0.2 (`--all`: v0.3)
 
 ```
 cgx search [OPTIONS] <PATTERN>
+cgx search --all [OPTIONS]
 ```
 
 A pure node-table scan (no graph walk). Resolves a partial or half-remembered name to exact FQNs for use
 with `callers`/`callees`/`reaches`. Default match is a case-insensitive substring over the whole FQN;
-`--regex` switches to a full regex match.
+`--regex` switches to a full regex match. `--all` lists **every** symbol with no pattern (the explicit,
+discoverable form of a match-everything search — use it instead of the unobvious `cgx search '.' --regex`).
 
 | Argument / Flag | Default | Notes |
 |---|---|---|
-| `<PATTERN>` | required | Substring (default) or regex (`--regex`) matched against the full FQN |
+| `<PATTERN>` | required¹ | Substring (default) or regex (`--regex`) matched against the full FQN |
+| `--all` | off | List every symbol, no pattern. **Mutually exclusive** with `<PATTERN>` (passing both → exit 2). Composes with `--kind`/`--limit`/`--format` |
 | `--regex` | off | Treat `<PATTERN>` as a regex over the whole FQN. Invalid regex → exit 2 |
 | `--kind <KIND>` | (all) | Restrict to a symbol kind: `function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint`. Unknown value → exit 2 |
 | `--limit <N>` | `50` | Max results to print. `0` = unlimited. Truncated output adds a footer `… (N more — raise --limit)` |
@@ -227,8 +230,11 @@ with `callers`/`callees`/`reaches`. Default match is a case-insensitive substrin
 | `--format <FMT>` | `human` | `human` or `json`. JSON shape: `[{ "file", "fqn", "kind", "line" }]` |
 | `--no-auto-index` | off | Exit 3 if index missing instead of auto-building |
 
+¹ `<PATTERN>` is required **unless** `--all` is given. Exactly one of the two must be present.
+
 **Exit codes:** empty result → exit 0 (unlike exact-symbol commands which exit 2 on `no symbol matched`).
-Bad regex or unknown `--kind` value → exit 2. Bare `cgx search` (no pattern) → exit 2.
+Bad regex or unknown `--kind` value → exit 2. Bare `cgx search` with neither a pattern nor `--all`, or both
+together → exit 2.
 
 **Output columns (human):** FQN (left-aligned), `file:line`, `[kind]`. Sorted by FQN for deterministic output.
 
@@ -239,6 +245,60 @@ cgx search make --kind function                 # narrow to functions only
 cgx search 'derive_key' --regex                 # regex over the full FQN
 cgx search Counter --format json                # JSON array output
 cgx search auth --limit 0                       # unlimited results
+cgx search --all                                # list every symbol (no pattern)
+cgx search --all --kind type --limit 0          # every type, unlimited
+```
+
+---
+
+### `symbols` — rank symbols by reference count, with edge breakdown
+
+Since: v0.3
+
+```
+cgx symbols [OPTIONS]
+```
+
+The hub / importance lens. Unlike `search` (a name filter), `symbols` ranks **every** symbol by how
+depended-upon it is and decomposes each one's incident edges. A cheap aggregation over the loaded graph —
+no walk, no new persistence. Use it to find graph hubs, attack-surface entry points, and refactor
+blast-radius candidates; complements `unused` (binary reachability) with a *ranked* degree view.
+
+**Ranking:** default is **inbound degree** — callers + data-flow consumers (how depended-upon). `--total`
+ranks by total degree (`in + out`). Ties break by FQN then `(file, line)`, so output is byte-identical
+across runs.
+
+**Edge orientation:** "inbound" consistently means "things that depend on this symbol". For a CALLS edge
+that is its callers; for a `DerivesFrom` edge (stored anti-causally, `derived → source`) it is the values
+derived *from* this one (its `flows-to` consumers). Outbound is the mirror (callees / `flows-from` sources).
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--total` | off | Rank by total degree (`in + out`) instead of inbound degree |
+| `--kind <KIND>` | (all) | Restrict to a symbol kind (same set as `search`). Unknown value → exit 2 |
+| `--limit <N>` | `50` | Max ranked rows. `0` = unlimited. Truncated output adds a footer `… (N more)` |
+| `--top <N>` | — | Sugar for `--limit N` (the top-N most-referenced). Overrides `--limit` when both given |
+| `--repo <PATH>` | CWD | Repository root |
+| `--format <FMT>` | `human` | `human` or `json` |
+| `--no-auto-index` | off | Exit 3 if index missing instead of auto-building |
+
+**Exit codes:** empty graph → exit 0 (like `search`, not an error). Unknown `--kind` / unsupported
+`--format` (only `human`/`json`) → exit 2.
+
+**Output (human):** one row per symbol —
+`<fqn>  (file:line)  [kind]  in=<n> out=<m>  in:{<family/condition split>}  out:{…}`.
+The `{…}` group shows the family split (`calls`, `derives_from`) and the condition split
+(`always`/`conditional`/`loop`/`exception`/`panic`) of that direction's edges.
+
+**Output (json):** array of `{ fqn, file, line, kind, in_degree, out_degree, inbound, outbound }` where each
+of `inbound`/`outbound` is `{ total, by_family, by_condition, by_confidence }` (each a key→count object).
+
+**Examples:**
+```bash
+cgx symbols                                     # top 50 by inbound degree
+cgx symbols --top 10                            # the 10 most-depended-upon symbols
+cgx symbols --total --kind function             # functions ranked by total degree
+cgx symbols --format json --limit 0             # every symbol, full breakdown, JSON
 ```
 
 ---
@@ -416,25 +476,28 @@ cgx mcp --root /path/to/repo
 
 ## Shared flags — subcommand applicability
 
-| Flag | callers | callees | reaches | paths | query | search | unused | explain | doctor | diff | mcp | flows-to | flows-from |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — | Y | Y |
-| `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y | Y | Y | Y | — | Y | Y |
-| `--at <REF>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — | Y | Y |
-| `--depth <N>` | Y | Y | Y | Y | Y | — | Y* | — | — | — | — | Y | Y |
-| `--tree <full|spanning>` | — | — | — | — | — | — | — | — | — | — | — | Y | Y |
-| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | Y | Y |
-| `--assert-empty` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | — | — |
-| `--allow-vacuous` | Y | Y | Y | Y | Y | — | Y | — | — | — | — | — | — |
-| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | Y | — | — | — | Y | Y |
-| `--newer-than` | — | — | — | — | — | — | — | — | — | Y | — | — | — |
+| Flag | callers | callees | reaches | paths | query | search | symbols | unused | explain | doctor | diff | mcp | flows-to | flows-from |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--repo <PATH>` | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | — | Y | Y |
+| `--format <FMT>` | Y | Y | Y | Y | Y | Y† | Y† | Y | Y | Y | Y | — | Y | Y |
+| `--at <REF>` | Y | Y | Y | Y | Y | — | — | Y* | — | — | — | — | Y | Y |
+| `--depth <N>` | Y | Y | Y | Y | Y | — | — | Y* | — | — | — | — | Y | Y |
+| `--tree <full|spanning>` | — | — | — | — | — | — | — | — | — | — | — | — | Y | Y |
+| `--confidence <LEVEL>` | Y | Y | Y | Y | Y | — | — | Y | — | — | — | — | Y | Y |
+| `--assert-empty` | Y | Y | Y | Y | Y | — | — | Y | — | — | — | — | — | — |
+| `--allow-vacuous` | Y | Y | Y | Y | Y | — | — | Y | — | — | — | — | — | — |
+| `--no-auto-index` | Y | Y | Y | Y | Y | Y | Y | Y | Y | — | — | — | Y | Y |
+| `--newer-than` | — | — | — | — | — | — | — | — | — | — | Y | — | — | — |
 
 **`--format` values:** `human` (default), `json`, `sarif`, `dot`, `mermaid`, `d2`.
 `dot`, `mermaid`, and `d2` are meaningful only for path-shaped results (`reaches`,
 `paths`, or `RETURN path` queries).
 
-**`†` (on `search`):** `search` accepts only `human` and `json`. `sarif`, `dot`, `mermaid`, and `d2` are not
-meaningful for a symbol-list result and are not accepted.
+**`†` (on `search` / `symbols`):** both accept only `human` and `json`. `sarif`, `dot`, `mermaid`, and `d2`
+are not meaningful for a symbol-list / ranked-symbol result and are not accepted.
+
+**`symbols`-only flags:** `--total` (rank by total degree), `--top <N>` (sugar for `--limit N`),
+plus `--kind` and `--limit` (shared with `search`).
 
 **`*` (on `unused`):** the binary accepts `--at`, `--depth`, and `--confidence` on
 `unused` (exit 0); `--depth`/`--at` have no effect on the unused-symbol computation,

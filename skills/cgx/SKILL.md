@@ -35,6 +35,7 @@ For binaries older than v0.2, or when you need raw-text matching, grep/ripgrep t
 cgx search Counter                     # case-insensitive substring over the whole FQN
 cgx search make --kind function        # narrow to functions
 cgx search 'derive_key' --regex        # regex over the full FQN
+cgx search --all                       # list every symbol (no pattern; Since: v0.3)
 ```
 
 The index auto-builds on first query into `.cgx/`; force a rebuild with `cgx index .`.
@@ -54,6 +55,7 @@ answer means.
 | Find who calls / what calls a symbol; whether/how X reaches Y; enumerate call paths | `recipes/reachability.md` |
 | Assess impact / blast radius of changing a symbol; what could break | `recipes/impact.md` |
 | Find dead / unused / unreachable code | `recipes/dead-code.md` |
+| Rank symbols by importance / find graph hubs / attack-surface entry points (`cgx symbols`, ref-count + edge breakdown) *(v0.3)* | `reference/cli.md` (`symbols`) |
 | Reason about exception / panic / failure paths; ∀-path "must pass through" | `recipes/failure-paths.md` |
 | Trace data provenance; forward/backward value flows (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) *(v0.3, on by default)* | `recipes/taint.md` |
 | Map the public API surface / contracts | `recipes/api-contracts.md` |

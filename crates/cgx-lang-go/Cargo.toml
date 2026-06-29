@@ -1,0 +1,15 @@
+[package]
+name = "cgx-lang-go"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx Go language adapter: tree-sitter-go frontend emitting defs/refs/imports/scopes, edge conditions, entrypoints, effects, and intraprocedural dataflow."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-frontend.workspace = true
+smallvec.workspace = true
+tree-sitter.workspace = true
+tree-sitter-go.workspace = true

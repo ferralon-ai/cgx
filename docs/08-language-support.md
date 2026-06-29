@@ -5,6 +5,8 @@
 **Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/03-code-graph-model.md (GM-) · docs/04-dataflow-and-provenance.md (DF-) · docs/09-architecture.md (AR-)
 
+> Implementation status by language: see [14 — Implementation Status Matrix](14-implementation-status-matrix.md).
+
 ---
 
 ## Overview

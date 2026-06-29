@@ -62,9 +62,14 @@ fn own_effects_column_is_denormalized_for_sql() {
         .unwrap();
     // The canonical-string projection is queryable via the v_symbols view.
     let n = store
-        .query_count("SELECT COUNT(*) FROM v_symbols WHERE own_effects = 'io.file,nondeterministic'")
+        .query_count(
+            "SELECT COUNT(*) FROM v_symbols WHERE own_effects = 'io.file,nondeterministic'",
+        )
         .unwrap();
-    assert_eq!(n, 1, "denormalized own_effects column reflects the label list");
+    assert_eq!(
+        n, 1,
+        "denormalized own_effects column reflects the label list"
+    );
 }
 
 #[test]
@@ -278,6 +283,181 @@ fn shared_blob_survives_when_still_live() {
     live.insert(shared.clone());
     store.prune(&live, false).unwrap();
     assert!(store.fragment(&shared).unwrap().is_some());
+}
+
+// ---- Layer-2 graph GC (blast-radius P1) -------------------------------------
+
+#[test]
+fn prune_graphs_except_keeps_live_graph_and_removes_the_rest() {
+    let mut store = open();
+    let t1 = TreeOid::new("tree-gone-1");
+    let t2 = TreeOid::new("tree-gone-2");
+    let t3 = TreeOid::new("tree-keep");
+    store.put_graph(&t1, None, &sample_graph()).unwrap();
+    store.put_graph(&t2, None, &sample_graph()).unwrap();
+    let keep_id = store.put_graph(&t3, None, &sample_graph()).unwrap();
+
+    let removed = store.prune_graphs_except(&[&t3]).unwrap();
+    assert_eq!(removed, 2, "the two superseded graphs are GC'd");
+
+    // The kept graph still loads correctly (read-path regression guard).
+    assert_eq!(store.read_graph(keep_id).unwrap(), sample_graph());
+    assert!(store.graph_for(&t1).unwrap().is_none());
+    assert!(store.graph_for(&t2).unwrap().is_none());
+    assert_eq!(store.graph_for(&t3).unwrap(), Some(keep_id));
+
+    // Cascade reclaimed the dead graphs' node/edge rows (no orphans).
+    let kept = keep_id.0;
+    let orphan_nodes = store
+        .query_count(&format!(
+            "SELECT COUNT(*) FROM nodes WHERE graph_id <> {kept}"
+        ))
+        .unwrap();
+    assert_eq!(orphan_nodes, 0, "FK cascade removed dead graphs' nodes");
+}
+
+#[test]
+fn prune_graphs_except_can_retain_multiple_graphs() {
+    // The diff session model: two tree-OIDs must survive when both are kept.
+    let mut store = open();
+    let a = TreeOid::new("tree-a");
+    let b = TreeOid::new("tree-b");
+    let c = TreeOid::new("tree-c");
+    let ida = store.put_graph(&a, None, &sample_graph()).unwrap();
+    let idb = store.put_graph(&b, None, &sample_graph()).unwrap();
+    store.put_graph(&c, None, &sample_graph()).unwrap();
+
+    let removed = store.prune_graphs_except(&[&a, &b]).unwrap();
+    assert_eq!(removed, 1);
+    assert_eq!(store.read_graph(ida).unwrap(), sample_graph());
+    assert_eq!(store.read_graph(idb).unwrap(), sample_graph());
+    assert!(store.graph_for(&c).unwrap().is_none());
+}
+
+#[test]
+fn prune_graphs_except_is_a_noop_when_nothing_is_stale() {
+    let mut store = open();
+    let t = TreeOid::new("tree-only");
+    store.put_graph(&t, None, &sample_graph()).unwrap();
+    assert_eq!(store.prune_graphs_except(&[&t]).unwrap(), 0);
+}
+
+// ---- Keyed-delta cache writes (blast-radius P2) -----------------------------
+
+#[test]
+fn fn_intraproc_cache_keyed_delta_preserves_unchanged_and_drops_stale() {
+    let mut store = open();
+    let r = |b: &str, f: &str, h: &str| ((b.to_string(), f.to_string()), h.to_string());
+    store
+        .put_fn_intraproc_cache(&[r("blob1", "f::a", "h1"), r("blob1", "f::b", "h2")])
+        .unwrap();
+
+    // Re-index: f::a unchanged, f::b changed, f::c new, (the old set's nothing dropped yet).
+    store
+        .put_fn_intraproc_cache(&[
+            r("blob1", "f::a", "h1"),
+            r("blob1", "f::b", "h2-new"),
+            r("blob1", "f::c", "h3"),
+        ])
+        .unwrap();
+    let mut got = store.load_fn_intraproc_cache().unwrap();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (("blob1".into(), "f::a".into()), "h1".into()),
+            (("blob1".into(), "f::b".into()), "h2-new".into()),
+            (("blob1".into(), "f::c".into()), "h3".into()),
+        ]
+    );
+
+    // Drop f::b entirely on the next index: only the stale key is removed.
+    store
+        .put_fn_intraproc_cache(&[r("blob1", "f::a", "h1"), r("blob1", "f::c", "h3")])
+        .unwrap();
+    let mut got = store.load_fn_intraproc_cache().unwrap();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (("blob1".into(), "f::a".into()), "h1".into()),
+            (("blob1".into(), "f::c".into()), "h3".into()),
+        ]
+    );
+}
+
+#[test]
+fn summary_deps_keyed_delta_round_trips() {
+    let mut store = open();
+    let d = |f: &str, c: &str| (f.to_string(), c.to_string());
+    store.put_summary_deps(&[d("f", "g"), d("f", "*")]).unwrap();
+    // Re-put with one removed, one added.
+    store.put_summary_deps(&[d("f", "g"), d("f", "h")]).unwrap();
+    assert_eq!(
+        store
+            .query_count("SELECT COUNT(*) FROM summary_deps")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .query_count("SELECT COUNT(*) FROM summary_deps WHERE callee_fqn = '*'")
+            .unwrap(),
+        0,
+        "stale wildcard dep removed"
+    );
+}
+
+#[test]
+fn fn_summaries_keyed_delta_preserves_unchanged_bytes() {
+    let mut store = open();
+    let r = |b: &str, f: &str, s: &[u8]| ((b.to_string(), f.to_string()), s.to_vec());
+    store
+        .put_fn_summaries(&[r("b", "f::a", b"sumA"), r("b", "f::b", b"sumB")])
+        .unwrap();
+    store
+        .put_fn_summaries(&[r("b", "f::a", b"sumA"), r("b", "f::b", b"sumB-2")])
+        .unwrap();
+    let mut got = store.load_fn_summaries().unwrap();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (("b".into(), "f::a".into()), b"sumA".to_vec()),
+            (("b".into(), "f::b".into()), b"sumB-2".to_vec()),
+        ]
+    );
+}
+
+/// Physical byte-stability: re-indexing an unchanged cache set on a file-backed
+/// store leaves the db bytes identical (the keyed-delta path performs no writes
+/// when nothing changed). This is the blast-radius win, measured.
+#[test]
+fn unchanged_cache_reindex_leaves_db_bytes_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let r = |b: &str, f: &str, h: &str| ((b.to_string(), f.to_string()), h.to_string());
+    let rows = [
+        r("b", "f::a", "h1"),
+        r("b", "f::b", "h2"),
+        r("b", "f::c", "h3"),
+    ];
+
+    {
+        let mut store = SqliteStore::open(&db).unwrap();
+        store.put_fn_intraproc_cache(&rows).unwrap();
+    } // drop checkpoints WAL into the main db file
+
+    let before = std::fs::read(&db).unwrap();
+    {
+        let mut store = SqliteStore::open(&db).unwrap();
+        store.put_fn_intraproc_cache(&rows).unwrap();
+    }
+    let after = std::fs::read(&db).unwrap();
+    assert_eq!(
+        before, after,
+        "re-indexing an unchanged cache set must not rewrite the db"
+    );
 }
 
 // ---- Property: round-trip identity over arbitrary graphs --------------------

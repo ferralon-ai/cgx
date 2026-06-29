@@ -15,9 +15,10 @@ predicates). See `reference/cli.md` for shared flag reference.
 | `r.condition = "exception"` / `r.condition = "panic"` edge filtering | v0.1 | Syntactic labels; run today |
 | `ANY` / `NONE` quantifiers over bounded `*N` paths | v0.1 | Always bound hops — unbounded `CALLS*` hangs |
 | Direct-edge `WHERE r.condition` (no path variable) | v0.1 | Simplest form for single-hop queries |
-| `MUST PASS THROUGH` / `AVOIDING` (∀-path / must-pass-through) | v0.3 | Binary rejects as deferred today |
-| `DATA_FLOW` edges, `transitive_effects`, `sink_class`, taint props | v0.3 | Inert or plan-error today |
-| Effect/resource pairing (`acquire`→`release` analysis) | v0.3 | Deferred |
+| `MUST PASS THROUGH` / `AVOIDING` (∀-path / must-pass-through) | deferred | Binary plan error (exit 2) today |
+| `DATA_FLOW` edges in CQL (`[:DATA_FLOW]`) | v0.3 | Works; returns empty when no flows indexed |
+| `transitive_effects`, `sink_class`, taint props | deferred | Plan error (exit 2) today |
+| Effect/resource pairing (`acquire`→`release` analysis) | deferred | Not shipped in v0.3.0 |
 
 ---
 
@@ -34,16 +35,20 @@ cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE r.condition = "exception" RETURN a.nam
 
 ### ANY quantifier — path contains at least one exception edge
 
+Anchor the source node (`{name:"…"}`) to avoid a full-graph traversal, which hangs on real codebases.
+
 ```bash
-# Since: v0.1
-cgx query 'MATCH path = (a)-[:CALLS*3]->(b) WHERE ANY(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 10'
+# Since: v0.1 — anchor 'a' to a specific source symbol
+cgx query 'MATCH path = (a {name:"orders::handler::processOrder"})-[:CALLS*3]->(b) WHERE ANY(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 10'
 ```
 
 ### NONE quantifier — path contains no exception or panic edge (happy-path filter)
 
+Anchor the source node to avoid a full-graph traversal.
+
 ```bash
-# Since: v0.1
-cgx query 'MATCH path = (a)-[:CALLS*3]->(b) WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"]) RETURN a.name, b.name LIMIT 10'
+# Since: v0.1 — anchor 'a' to a specific source symbol
+cgx query 'MATCH path = (a {name:"orders::handler::processOrder"})-[:CALLS*3]->(b) WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"]) RETURN a.name, b.name LIMIT 10'
 ```
 
 ### NOT in a quantifier predicate — use `NOT x = …`, never `NOT IN`
@@ -53,19 +58,30 @@ cgx query 'MATCH path = (a)-[:CALLS*3]->(b) WHERE NONE(r IN relationships(path) 
 cgx query 'MATCH path = (a)-[:CALLS*2]->(b) WHERE NONE(r IN relationships(path) WHERE NOT r.condition = "exception") RETURN a.name LIMIT 5'
 ```
 
-**Why bounding matters:** `CALLS*` (no number) hangs. Always write `CALLS*N` with an explicit hop count.
-Adjust `N` to the depth appropriate for your codebase; start small (2–4) and increase if results are sparse.
+**Why bounding and anchoring matter:** `CALLS*` (no number) hangs. Unanchored `CALLS*N` over a full graph
+(no source predicate) is also very slow — always anchor at least one endpoint via a node property predicate
+(`{name:"…"}` or `{fqn:"…"}`). Start with `CALLS*2` and increase hop count if results are sparse.
 
 ---
 
 ## Step 0 — Find exact symbol names first
 
-cgx has no search, glob, or fuzzy match. Commands need the fully-qualified symbol name and fail with
-`no symbol matched '<x>'` (exit 2) otherwise. Grep the source first:
+Commands need the fully-qualified symbol name and fail with `no symbol matched '<x>'` (exit 2) if the name
+does not match. Use `cgx search` to discover the exact FQN:
+
+```bash
+# Since: v0.3 — case-insensitive substring search
+cgx search "processOrder" --repo /path/to/repo
+# Returns FQNs, e.g. orders::handler::processOrder
+
+# Filter to functions only
+cgx search "processOrder" --kind function --repo /path/to/repo
+```
+
+`cgx search` is available in v0.3.0. As a fallback for older index builds, grep the source:
 
 ```bash
 grep -r "processOrder" src/ --include="*.rs" -l
-# Then use the exact qualified name, e.g. orders::handler::processOrder
 ```
 
 ---
@@ -131,24 +147,26 @@ cgx query 'MATCH (caller)-[r:CALLS]->(panic_site) WHERE r.condition = "panic" AN
 ```
 
 To narrow to functions that also write to state, use `--format json` and post-filter by `file` in your
-pipeline, since `own_effects` is a v0.3 node property (not available today):
+pipeline. The `own_effects` node property is not supported in v0.3.0 (plan error); file-based filtering
+is the available proxy:
 
 ```bash
 # Since: v0.1 — pipe JSON output to jq for post-filtering
-cgx query 'MATCH (caller)-[r:CALLS]->(panic_site) WHERE r.condition = "panic" AND panic_site.name IN ["panic!", "unwrap", "expect"] RETURN caller.name, caller.file, caller.line' --format json | jq '.results[]'
+# JSON envelope uses .rows (array of arrays) and .columns (array of column names)
+cgx query 'MATCH (caller)-[r:CALLS]->(panic_site) WHERE r.condition = "panic" AND panic_site.name IN ["panic!", "unwrap", "expect"] RETURN caller.name, caller.file, caller.line' --format json | jq '.rows[]'
 ```
 
-**Reading the result:** These are functions with syntactically-identified panic-conditioned calls. At v0.1,
+**Reading the result:** These are functions with syntactically-identified panic-conditioned calls.
 `panic`-conditioned labels are syntactic; they do not confirm runtime reachability under real inputs.
 
 ---
 
 ### Which error paths skip a required call (e.g., audit_log)?
 
-**Status:** v0.1 for the NONE-on-nodes form; v0.3 for `MUST PASS THROUGH`/`AVOIDING`
+**Status:** NONE-on-nodes form runnable today; `MUST PASS THROUGH`/`AVOIDING` deferred past v0.3.0
 
-The `AVOIDING` keyword and `MATCH ALL … MUST PASS THROUGH` are v0.3 — the binary rejects them today.
-Use the `NONE(n IN nodes(path) …)` form as the v0.1 equivalent:
+`AVOIDING` and `MATCH ALL … MUST PASS THROUGH` produce a plan error (exit 2) in v0.3.0.
+Use the `NONE(n IN nodes(path) …)` form as the structural approximation:
 
 ```bash
 # Since: v0.1 — paths to a sensitive operation that include an exception edge AND skip audit_log
@@ -164,10 +182,11 @@ bypass audit logging.
 qualified name of your audit function. Confidence is `possible` at v0.1 — treat results as candidates for
 manual confirmation.
 
-**Since: v0.3** — `MUST PASS THROUGH` / `AVOIDING` (∀-path quantification):
+**Deferred past v0.3.0** — `MUST PASS THROUGH` / `AVOIDING` (∀-path quantification):
 
 ```
-# NOT runnable today — binary returns: "not supported in this release (deferred)"
+# NOT runnable — exit 2: plan error: `MATCH ALL … MUST PASS THROUGH/AVOIDING` (Q-20 guarded-cut)
+#                         is not supported in this release (deferred)
 MATCH ALL path = (ep {kind:"entrypoint"})-[:CALLS*]->(sink {name:"sensitive_operation"})
 AVOIDING (audit {name:"audit_log"})
 RETURN ep.name, sink.name
@@ -177,7 +196,7 @@ RETURN ep.name, sink.name
 
 ### Are there transaction paths without commit or rollback?
 
-**Status:** v0.1 for reachability shape; v0.3 for full acquire/release pairing analysis
+**Status:** reachability shape runnable today; full acquire/release pairing analysis is deferred past v0.3.0
 
 Use `cgx paths` to check whether `commit` is reachable from `begin`:
 
@@ -206,32 +225,36 @@ cgx query 'MATCH path = (begin {name:"db::Connection::begin"})-[:CALLS*6]->(exit
 
 **Reading the result:** Non-empty results indicate exception-path routes from the transaction begin that
 reach a callee (possibly an exit site or error handler) without passing through commit or rollback. This is
-a heuristic at v0.1 — `exit_node.is_return_site` and `last_node()` are v0.3 predicates. Use the node-name
-approach as a proxy.
+a heuristic — `exit_node.is_return_site` and `last_node()` are not supported in v0.3.0. Use the
+node-name approach as a proxy until those predicates are available.
 
-**Since: v0.3** — full acquire/release pairing analysis with `CALL cgx.pedigree(...)` and
-`exit_node.is_return_site` predicates.
+Full acquire/release pairing analysis (`CALL cgx.pedigree(...)`, `exit_node.is_return_site`) is deferred
+past v0.3.0.
 
 ---
 
-## Questions deferred to v0.3
+## Questions deferred past v0.3.0
 
-These questions from the upstream cookbook are tagged `answerable-today` but require v0.3 features.
-Do not emit them as runnable in a v0.1 environment.
+These questions require node properties or CQL constructs that are plan errors in v0.3.0.
+The `cgx query` command exits 2 with a "not supported in this release" message when they are used.
 
-| Question | What it needs | Since |
+| Question | What it needs | Status in v0.3.0 |
 |---|---|---|
-| Q38 — catch/recover blocks calling network/disk I/O | `transitive_effects` node property | v0.3 |
-| Q40 — exception-path values flowing to log sinks | `DATA_FLOW` edges, `sink_class` property | v0.3 |
-| Q44 — `#[must_use]` return values dropped on exception path | `DATA_FLOW*1..1`, `returns_result`, `derives_from_call` | v0.3 |
-| Q45 full — transaction lifecycle with `is_return_site` | `exit_node.is_return_site`, `last_node()` | v0.3 |
-| Q76 / Q98 — fail-open auth bypass with `position_in()` ordering | `position_in()` path helper | v0.3 |
-| Q77 — catch-all handlers with `NOT EXISTS {}` subqueries | `NOT EXISTS` subquery | v0.3 |
-| Q78 / Q103 — compensating-call pairing on all exit paths | `last_node()`, full acquire/release pairing | v0.3 |
-| Q106 — shared-state mutation + panic (`own_effects`) | `own_effects` node property | v0.3 |
-| `MUST PASS THROUGH` / `AVOIDING` (∀-path forms) | Path-set algebra engine | v0.3 |
+| Q38 — catch/recover blocks calling network/disk I/O | `transitive_effects` node property | plan error (exit 2) |
+| Q40 — exception-path values flowing to log sinks | `sink_class` property | plan error (exit 2) |
+| Q44 — `#[must_use]` return values dropped on exception path | `returns_result`, `derives_from_call` props | plan error (exit 2) |
+| Q45 full — transaction lifecycle with `is_return_site` | `exit_node.is_return_site`, `last_node()` | plan error (exit 2) |
+| Q76 / Q98 — fail-open auth bypass with `position_in()` ordering | `position_in()` path helper | plan error (exit 2) |
+| Q77 — catch-all handlers with `NOT EXISTS {}` subqueries | `NOT EXISTS` subquery | plan error (exit 2) |
+| Q78 / Q103 — compensating-call pairing on all exit paths | `last_node()`, full acquire/release pairing | plan error (exit 2) |
+| Q106 — shared-state mutation + panic (`own_effects`) | `own_effects` node property | plan error (exit 2) |
+| `MUST PASS THROUGH` / `AVOIDING` (∀-path forms) | Path-set algebra engine | plan error (exit 2) |
 
-The v0.1 workaround for most of these is to run a `NONE(n IN nodes(path) …)` approximation and accept
+Note: `[:DATA_FLOW]` edges themselves work in v0.3.0 (`MATCH (a)-[:DATA_FLOW]->(b)` is valid CQL and
+returns rows when the index was built with dataflow enabled). It is the semantic taint properties
+(`source_class`, `sink_class`, `taint_label`, etc.) layered on top of those edges that remain deferred.
+
+The structural workaround for most of these is to run a `NONE(n IN nodes(path) …)` approximation and accept
 that it is a heuristic, not a proven ∀-path guarantee.
 
 ---

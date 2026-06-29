@@ -24,6 +24,26 @@ use crate::lower::{
 use crate::value::{PathValue, Value};
 use crate::ResultTable;
 
+/// Default upper hop bound for an *unbounded* var-length walk (a bare `*` with no
+/// explicit `*N..M` range). Without this, `(a)-[:DATA_FLOW*]->(b)` walks the full
+/// transitive closure from every anchor; on a dense dataflow graph that is the
+/// O(anchors × reachable) result-set blowup the SOTU flagged (~1.87M rows / 71s on
+/// a 135k-LOC corpus). 8 mirrors the documented `:DATA_FLOW*1..8` idiom (parser.rs,
+/// skill recipes) — deep enough for real provenance chains, shallow enough to bound
+/// cost. The escape hatch is explicit `*N..M` syntax, which overrides this default
+/// (see [`effective_max_depth`]).
+pub const DEFAULT_VAR_LENGTH_DEPTH: u32 = 8;
+
+/// Default cap on result rows emitted by the *peer-set* branch of a var-length walk
+/// (the no-`path =` case). The per-anchor BFS is bounded by graph size, but the
+/// cross product across a large anchor set (e.g. `AnchorSet::All` for an unanchored
+/// `(a)-[:DATA_FLOW*]->(b)`) is not — this caps total materialised rows. Hitting it
+/// is surfaced as [`TruncationReason::PathCap`], never an error, matching the
+/// CutMarker honesty idiom the path-enumeration branch already follows. Sized to the
+/// path-enumeration default ([`cgx_query::DEFAULT_MAX_PATHS`] = 1024) so both
+/// branches truncate at a comparable result volume.
+pub const DEFAULT_VAR_LENGTH_ROWS: usize = 1024;
+
 /// A single pattern solution: variable bindings plus the optional bound path.
 #[derive(Debug, Clone, Default)]
 pub struct Binding {
@@ -443,14 +463,29 @@ fn expand_single_hop(
     }
 }
 
+/// The effective upper hop bound for a var-length walk: the query's explicit
+/// `*N..M` upper bound when present, else [`DEFAULT_VAR_LENGTH_DEPTH`]. A bare `*`
+/// (or open-ended `*N..`) is thus depth-capped by default; writing an explicit
+/// range is the escape hatch that raises (or lowers) the bound.
+fn effective_max_depth(max: Option<u32>) -> u32 {
+    max.unwrap_or(DEFAULT_VAR_LENGTH_DEPTH)
+}
+
 /// A var-length walk from the anchor. When a `path =` var is bound (or path
 /// predicates exist), each reachable peer's witness simple path is enumerated;
 /// otherwise the peer set alone is bound.
 ///
-/// The `PathWalker` defaults (`DEFAULT_MAX_PATHS` / `DEFAULT_MAX_STEPS`) are
-/// honored so a dense graph terminates instead of hanging — matching the Layer-1
-/// `paths` perf gate. When enumeration is cut short, `truncation` is set (or
-/// upgraded) to surface the honesty marker to the caller.
+/// Two bounds keep the walk from blowing up time/memory on a dense graph:
+/// 1. **Depth** — an unbounded `*` is capped at [`DEFAULT_VAR_LENGTH_DEPTH`]
+///    ([`effective_max_depth`]); an explicit `*N..M` overrides it.
+/// 2. **Result rows / work** — the path-enumeration branch honors the `PathWalker`
+///    defaults (`DEFAULT_MAX_PATHS` / `DEFAULT_MAX_STEPS`); the peer-set branch caps
+///    emitted rows at [`DEFAULT_VAR_LENGTH_ROWS`] (the per-anchor BFS is graph-size
+///    bounded, but the cross product across a large anchor set is not).
+///
+/// On any bound, the walk *truncates* and sets (or upgrades) `truncation` to the
+/// honesty marker — it never errors and never silently drops, matching the
+/// CutMarker idiom (`walk.rs`).
 #[allow(clippy::too_many_arguments)]
 fn expand_var_length(
     view: &GraphView,
@@ -462,11 +497,11 @@ fn expand_var_length(
     out: &mut Vec<Binding>,
     truncation: &mut Option<TruncationReason>,
 ) {
-    // Use PathWalker defaults (None = DEFAULT_MAX_PATHS / DEFAULT_MAX_STEPS),
-    // which activates the same perf gate Layer-1 `paths` uses (GM-perf).
+    // A bare `*` would walk the full transitive closure; cap it at the default
+    // depth so an unbounded DATA_FLOW*/CALLS* query can't expand without bound.
     let walker = PathWalker {
         filter: plan.filter.clone(),
-        max_depth: max,
+        max_depth: Some(effective_max_depth(max)),
         max_paths: None,
         max_steps: None,
     };
@@ -511,14 +546,23 @@ fn expand_var_length(
         // No path binding: bind the reachable peer set (BFS shortest-depth).
         // `goals` is already the set of nodes satisfying the peer constraints, so
         // a reachable node is admitted iff it is in that set.
-        // BFS does not enumerate exponential simple-path sets, so the budget is
-        // not relevant here — the BFS is always bounded by the graph size.
+        //
+        // The per-anchor BFS is graph-size bounded, but `expand_var_length` is
+        // called once per anchor, and an unanchored pattern (`AnchorSet::All`)
+        // resolves *every* node as an anchor — so the cross product of emitted
+        // rows is O(anchors × reachable) and unbounded by the depth cap alone.
+        // Cap the total rows accumulated in `out` at DEFAULT_VAR_LENGTH_ROWS and
+        // surface PathCap when the cap stops us early (honesty marker, not error).
         for d in walker.bfs(view, anchor, plan.direction) {
             if d.depth < min {
                 continue;
             }
             if !goals.contains(&d.node) {
                 continue;
+            }
+            if out.len() >= DEFAULT_VAR_LENGTH_ROWS {
+                upgrade_truncation(truncation, TruncationReason::PathCap);
+                return;
             }
             let mut b = base.clone();
             bind_node(&mut b, &plan.anchor_var, anchor);
@@ -1361,12 +1405,14 @@ fn pattern_exists(
                 }
             }
             Cardinality::VarLength { min, .. } => {
+                // Same default depth cap as `expand_var_length`: a bare `*` in an
+                // existence predicate must not walk the unbounded transitive closure.
                 let walker = PathWalker {
                     filter: plan.filter.clone(),
-                    max_depth: match &plan.cardinality {
-                        Cardinality::VarLength { max, .. } => *max,
-                        _ => None,
-                    },
+                    max_depth: Some(match &plan.cardinality {
+                        Cardinality::VarLength { max, .. } => effective_max_depth(*max),
+                        _ => DEFAULT_VAR_LENGTH_DEPTH,
+                    }),
                     max_paths: None,
                     max_steps: None,
                 };

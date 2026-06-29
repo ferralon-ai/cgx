@@ -24,6 +24,9 @@ constraints), `cgx` reconstructs the candidate type set. Specified in docs/05 Q-
 **The query**
 
 ```cgx
+-- illustrative: requires DF-19 (core-extension) type reconstruction procedure
+-- DEFERRED: `cgx.type_reconstruct` and named-argument CALL syntax are not supported in v0.3.0;
+--           `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
 MATCH (v {name:"v", scope:"process"})
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 RETURN candidate_type, confidence, evidence
@@ -32,9 +35,7 @@ ORDER BY confidence DESC
 
 Via the Layer 1 subcommand:
 
-```bash
-cgx type-of payload ./ --at-function RpcHandler::dispatch
-```
+`cgx type-of` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-19 (schema-room) is available. The flag `--at-function` does not exist.
 
 **Breaking it down**
 
@@ -63,6 +64,10 @@ bug query).
 **The query**
 
 ```cgx
+-- illustrative: requires DF-19 (core-extension) type reconstruction procedure
+-- DEFERRED: `MATCH (v)` with no relationship causes a plan error (exit 2); `IS NOT NULL` /
+--           `IS EMPTY` predicates are not supported in v0.3.0 (exit 2); `cgx.type_reconstruct`
+--           and `COMPATIBLE_WITH` predicate are not supported in v0.3.0 (exit 2)
 MATCH (v)
 WHERE v.declared_type IS NOT NULL
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
@@ -79,6 +84,9 @@ ORDER BY v.file, v.line
 For checking a specific value:
 
 ```cgx
+-- illustrative: requires DF-19 (core-extension) type reconstruction procedure
+-- DEFERRED: named-argument CALL syntax and `cgx.type_reconstruct` are not supported in
+--           v0.3.0; `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
 MATCH (v {name:"result", scope:"Processor::run"})
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 RETURN v.name, v.file, v.line, candidate_type, confidence
@@ -121,9 +129,7 @@ ORDER BY confidence DESC, mutator.file
 
 Via Layer 1:
 
-```bash
-cgx mutation-fanout user_record ./ --at-function AuthHandler::validate --depth 5
-```
+`cgx mutation-fanout` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-17 (schema-room) is available. The flags `--at-function` and the trailing-path convention do not exist; use `--repo <path>` when specifying a repository.
 
 **Breaking it down**
 
@@ -202,6 +208,8 @@ docs/05 Q-27 (sanitization invalidation).
 ```cgx
 -- illustrative: requires DF-17 (schema-room) for `taint_label.re_applied` and
 --               `taint_label.reason = "mutation-after-sanitization"` edge attributes
+-- DEFERRED: `sanitizer_class`, `sink_class`, and `taint_label` are not supported node/edge
+--           properties in v0.3.0; submitting this query produces a plan error (exit 2)
 MATCH path = (sanitizer)-[:DATA_FLOW*]->(use {sink_class:"sql"})
 WHERE sanitizer.sanitizer_class = "sql"
   AND ANY(edge IN relationships(path)
@@ -215,10 +223,10 @@ RETURN sanitizer.name, sanitizer.file, sanitizer.line,
 
 | Fragment | What it means |
 |---|---|
-| `sanitizer.sanitizer_class = "sql"` | The path starts at a SQL-class sanitizer — a function whose purpose is to make data safe for SQL sinks. |
-| `use {sink_class:"sql"}` | The path ends at a SQL sink — a query builder or direct SQL execution site. |
-| `edge.taint_label.re_applied = true` | An edge on the path carries the `re_applied` attribute, meaning the taint analysis detected that a taint label was cleared by a sanitizer and then restored because the underlying value was mutated through an alias after sanitization. |
-| `taint_label.reason = "mutation-after-sanitization"` | Narrows to the specific re-application reason — mutation via alias — rather than other re-introduction patterns (e.g. tainted value flowing into the sanitized variable through a different pedigree branch). |
+| `sanitizer.sanitizer_class = "sql"` | The path starts at a SQL-class sanitizer. **Deferred in v0.3.0:** `sanitizer_class` is not a supported node property; using it causes a plan error (exit 2). |
+| `use {sink_class:"sql"}` | The path ends at a SQL sink. **Deferred in v0.3.0:** `sink_class` is not a supported node property; using it causes a plan error (exit 2). |
+| `edge.taint_label.re_applied = true` | An edge on the path carries the `re_applied` attribute, meaning the taint analysis detected that a taint label was cleared and then restored because the underlying value was mutated through an alias after sanitization. **Deferred in v0.3.0:** `taint_label` is not a supported edge property; using it causes a plan error (exit 2). |
+| `taint_label.reason = "mutation-after-sanitization"` | Narrows to the specific re-application reason — mutation via alias. **Deferred in v0.3.0** (same as above). |
 
 **Reading the result** — Each row is a sanitize-then-mutate-via-alias pattern where tainted data reaches a SQL sink despite passing through a sanitizer. The `sanitizer.file`/`line` is where sanitization occurred; the `use.file`/`line` is the SQL sink. Examine the intermediate call chain (the path nodes between sanitizer and use) to find the alias-holding callee that performed the mutation.
 
@@ -249,9 +257,7 @@ ORDER BY loop_var.file, loop_var.line
 
 Via the Layer 1 shorthand:
 
-```bash
-cgx query --capture-bug loop-variable ./ --format json
-```
+`cgx query --capture-bug` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-18 (schema-room) is available. The flag `--capture-bug` does not exist on `cgx query`; the trailing-path convention is also wrong — use `--repo <path>`.
 
 **Breaking it down**
 
@@ -303,9 +309,7 @@ RETURN v.name, v.file, v.line,
 
 Via Layer 1:
 
-```bash
-cgx query --capture-bug resource-lifetime ./ --format json
-```
+`cgx query --capture-bug` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-18 and GM-13 (schema-room) are available. The flag `--capture-bug` does not exist; use `--repo <path>` instead of a trailing path argument.
 
 **Breaking it down**
 
@@ -343,9 +347,7 @@ ORDER BY callsite.confidence DESC, target.name
 
 Via Layer 1:
 
-```bash
-cgx pedigree callback ./ --at-function process --kind function-value
-```
+`cgx pedigree` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-18 (schema-room) is available. The `--at-function` flag does not exist (the unrelated `--at` flag pins to a git ref); use `--repo <path>` instead of a trailing path argument.
 
 **Breaking it down**
 
@@ -374,6 +376,8 @@ without providing the correct value. Specified in docs/05 Q-30 (type-juggling-in
 
 ```cgx
 -- illustrative: requires DF-10 coerce(from,to) transformation kind (schema-room)
+-- DEFERRED: `source_class`, `sink_class`, and `sanitizer_class` are not supported node
+--           properties in v0.3.0; submitting this query produces a plan error (exit 2)
 MATCH path = (src)-[:DATA_FLOW*]->(coerce_site)-[:DATA_FLOW {transformation_kind:"coerce"}]
               ->(sink {sink_class:"auth-check"})
 WHERE src.source_class IN ["network","user-input"]
@@ -387,21 +391,16 @@ ORDER BY src.file, src.line
 
 Via Layer 1:
 
-```bash
-cgx paths --from-class user-input --to-class auth-check \
-          --require-transformation coerce \
-          --confidence probable \
-          <path>
-```
+`cgx paths --from-class` does not exist in v0.3.0. The flags `--from-class`, `--to-class`, and `--require-transformation` are phantom; they do not exist on `cgx paths`. Use `cgx query` with the CQL form above once DF-10 taint properties (schema-room) are available. Use `--repo <path>` to specify the repository; the trailing-path convention does not exist.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `src.source_class IN ["network","user-input"]` | The source is attacker-controlled — data from the network or from explicit user input. |
+| `src.source_class IN ["network","user-input"]` | The source is attacker-controlled — data from the network or from explicit user input. **Deferred in v0.3.0:** `source_class` is not a supported node property; using it causes a plan error (exit 2). |
 | `[:DATA_FLOW {transformation_kind:"coerce"}]` | Exactly one edge in the path must carry the `coerce` transformation kind — the DF-10 label applied when a type conversion changes the value's type. This is the coercion site. |
-| `sink {sink_class:"auth-check"}` | The path ends at an authorization decision point — a comparison or check that determines whether access is granted. |
-| `NONE(n IN nodes(path) WHERE n.sanitizer_class = "auth-check")` | No auth-check-class sanitizer sits between the source and the coercion — no function has cleaned the value with an understanding of auth semantics. |
+| `sink {sink_class:"auth-check"}` | The path ends at an authorization decision point. **Deferred in v0.3.0:** `sink_class` is not a supported node property; using it causes a plan error (exit 2). |
+| `NONE(n IN nodes(path) WHERE n.sanitizer_class = "auth-check")` | No auth-check-class sanitizer sits between the source and the coercion. **Deferred in v0.3.0:** `sanitizer_class` is not a supported node property; using it causes a plan error (exit 2). |
 | `[e IN relationships(path) | e.transformation_kind] AS transformations` | The full transformation sequence on the path — shows every type change the value underwent, not just the coercion. |
 
 **Reading the result** — Each row names an attacker-controlled value that reaches an authorization check through at least one type coercion. The `coerce_site.file`/`line` is where the coercion occurs; that is the location to harden (by using strict equality or explicit type casting). The `transformations` list shows whether the coercion was the only transformation or one of many, which helps triage whether the coercion is incidental or structural.

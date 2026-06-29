@@ -78,7 +78,11 @@ answer means.
   the box — a plain `cgx index .` is sufficient; use `cgx index --no-dataflow` to opt out. Taint props
   (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) and `MUST PASS THROUGH`/`AVOIDING`
   remain deferred — plan error exit 2. See `reference/query-language.md`.
-- **Never emit unbounded `CALLS*` — it hangs.** Always bound the hops: `CALLS*2`.
+- **Bound your var-length hops — don't lean on the default.** At v0.3 an unbounded `CALLS*`/`DATA_FLOW*`
+  no longer hangs: it is depth-capped at 8 hops and row-capped (~1024 rows) and truncates with a
+  `PathCap` marker rather than walking the full transitive closure. But the cap silently drops deeper
+  results, so always write the bound you mean — `CALLS*2`, `DATA_FLOW*1..8` — and raise it explicitly
+  (`*1..12`) when you need more reach.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
 - **Real flags, not the cookbook's:** `--repo ./` (not a trailing `./`);
@@ -93,6 +97,7 @@ answer means.
 
 ## Note on the question cookbook
 
-`docs/questions/` (the upstream cookbook) is a rich source of phrasings, but several entries tagged
-"answerable-today" use flags or analysis that the v0.1 binary does not implement. This skill is tagged against
-what actually runs (`reference/versions.md`). When they disagree, trust the version tags here.
+`docs/questions/` (the upstream cookbook) is a rich source of phrasings, but some entries tagged
+"answerable-today" use features deferred past v0.3 (taint properties, `MUST PASS THROUGH`/`AVOIDING`,
+`own_effects`, `is_return_site`, and other v0.3+ predicates). This skill is tagged against what actually
+runs on the current binary (`reference/versions.md`). When they disagree, trust the version tags here.

@@ -43,10 +43,14 @@
 mod age;
 mod diff;
 mod error;
+mod filter;
+mod path_diff;
 
 pub use age::{BlameRepo, EdgeAge, Warning};
 pub use diff::{diff_graphs, ChangedEdge, DiffEdge, DiffNode, EdgeChanges, GraphDiff};
 pub use error::{DiffError, Result};
+pub use filter::{BucketSelect, DiffFilter};
+pub use path_diff::{path_diff_graphs, path_diff_graphs_bounded, AddedPath, PathDiff};
 
 use cgx_store::{FactStore, GraphId, LinkedGraph, TreeOid};
 

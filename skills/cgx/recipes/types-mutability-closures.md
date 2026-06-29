@@ -2,31 +2,48 @@
 
 **Theme 11 of 13** — Type reconstruction, mutation fan-out, capture edges, coercion.
 
-**Not answerable in v0.1; requires cgx >= 0.3.**
+**Version posture: all questions in this theme are deferred past v0.3.**
 
-Run `cgx --version` before using this recipe. If `MINOR < 3`, none of these
-queries run. See `reference/versions.md` for the full version ladder.
+Run `cgx --version` before using this recipe. The queries below all require CQL
+constructs, edge types, or node properties that produce exit 2 plan or parse errors
+in v0.3.0. Even if `MINOR >= 3`, none of these queries run today. See
+`reference/versions.md` for the full version ladder and `reference/query-language.md`
+for the current CQL clause matrix.
 
 The enabling features (DF-17 mutability model, DF-18 function values and closures,
 DF-19 lineage type reconstruction, DF-10 coercion transformation kind, GM-14.6
-type-confidence boundaries) are all `schema-room` work scheduled for v0.3. The
-CALLS-graph CQL subset available in v0.1 does not model DATA_FLOW edges, capture
-edges, effect summaries, or type-confidence attributes. Attempting any query below
-on a v0.1 binary will exit 2 with a plan error or return empty.
+type-confidence boundaries) are all `schema-room` work scheduled after v0.3. The
+CQL constructs they require include `CALL cgx.type_reconstruct(...)`
+(unknown procedure, exit 2), `CAPTURE` edges (unknown edge type, exit 2),
+`CALLS:indirect` edges (sub-type qualifier deferred, exit 2), `STARTS WITH`,
+`IS NULL`/`IS EMPTY`, and `COMPATIBLE_WITH` predicates (parse or plan errors,
+exit 2), and many node/edge properties (`scope`, `declared_type`,
+`binding_mutability`, `is_loop_variable`, `resource_class`,
+`return_mutability`, `return_is_internal_field`, `type_confidence_boundary`,
+`transformation_kind`). `cgx.mutation_fanout` is partially registered but yields
+only `mutator` and `confidence` — `effect` and `transform` are deferred — and
+the Q111 recipe query also uses the deferred `scope` node property, so Q111 exits
+2 today.
 
 **Step 0 — find the exact symbol name first.**
-cgx has no search, glob, or fuzzy match. An unknown symbol exits 2 with
-`no symbol matched '<x>'`. Grep/ripgrep the source for the fully-qualified name
-before running any cgx command.
+Use `cgx search <pattern>` (Since: v0.2) to resolve a partial or half-remembered
+name to an exact FQN before running any cgx command. An unknown symbol exits 2 with
+`no symbol matched '<x>'`.
+
+```bash
+cgx search "make_adder" --repo /path/to/repo
+cgx search "closure" --repo /path/to/repo --kind lambda
+cgx search "validate" --repo /path/to/repo --kind method
+```
 
 ---
 
-## Documented v0.3 forms (not runnable today)
+## Documented deferred forms (not runnable in v0.3)
 
-All entries below are `Since: v0.3`. Gate every invocation on `cgx --version`:
+All entries below are deferred. Gate every invocation on `cgx --version`:
 
 ```bash
-cgx --version   # look at MINOR; proceed only if MINOR >= 3
+cgx --version   # look at MINOR; none of these run yet even at MINOR == 3
 ```
 
 The canonical CQL patterns use double-quoted string literals inside a
@@ -36,18 +53,18 @@ single-quoted shell argument. Wrap all cgx query invocations as shown.
 
 ### What concrete types can this `interface{}`-typed value actually hold? (Q109)
 
-**Status:** spec-only (DF-19 type reconstruction)   **Since:** v0.3
+**Status:** deferred (DF-19 type reconstruction — `CALL cgx.type_reconstruct(...)` procedure not implemented; exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: cgx.type_reconstruct procedure (DF-19)
-MATCH (v {name: "v", scope: "process"})
+-- Requires: cgx.type_reconstruct procedure (DF-19) — NOT available in v0.3
+MATCH (v)-[:DATA_FLOW]->(w)
+WHERE v.name = "v"
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 RETURN candidate_type, confidence, evidence
 ORDER BY confidence DESC
 ```
 
-**Why this works:** `cgx.type_reconstruct` gathers constraints from three
+**Why this will work:** `cgx.type_reconstruct` gathers constraints from three
 directions: upstream constructors (pedigree), downstream parameter sinks (usage),
 and sideways join arms or channel pairs. The constraint intersection yields the
 candidate type set.
@@ -62,13 +79,13 @@ candidates are structural footprint matches — treat them as hypotheses. The
 
 ### Which values are used in two incompatible ways — a type contradiction? (Q110)
 
-**Status:** spec-only (DF-19 type reconstruction, `IS EMPTY` and `COMPATIBLE_WITH` predicates)   **Since:** v0.3
+**Status:** deferred (DF-19 type reconstruction; `IS NULL`/`IS EMPTY` and `COMPATIBLE_WITH` predicates — all exit 2 in v0.3)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: cgx.type_reconstruct procedure (DF-19)
-MATCH (v)
-WHERE v.declared_type IS NOT NULL
+-- Requires: cgx.type_reconstruct procedure (DF-19),
+--           IS EMPTY / IS NULL predicates, COMPATIBLE_WITH predicate
+--           — NONE available in v0.3
+MATCH (v)-[:DATA_FLOW]->(w)
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 WHERE candidate_type IS EMPTY
    OR (confidence IN ["certain", "probable"]
@@ -80,7 +97,7 @@ RETURN v.name, v.file, v.line,
 ORDER BY v.file, v.line
 ```
 
-**Why this works:** `candidate_type IS EMPTY` fires when no single type satisfies
+**Why this will work:** `candidate_type IS EMPTY` fires when no single type satisfies
 all usage constraints simultaneously. `NOT candidate_type COMPATIBLE_WITH v.declared_type`
 catches cases where reconstruction and declaration diverge without an empty set.
 
@@ -94,12 +111,17 @@ means two call sites treat the same value as different types entirely.
 
 ### Which callees can mutate this validated value before it reaches the auth check? (Q111)
 
-**Status:** spec-only (DF-17 mutability model, `writes-param` / `writes-receiver` effect summaries)   **Since:** v0.3
+**Status:** deferred (DF-17 mutability model — `cgx.mutation_fanout` is
+partially registered but yields only `mutator` and `confidence`; `effect` /
+`writes-param` / `writes-receiver` effect summaries are deferred. The recipe
+query also uses the deferred `scope` node property and `YIELD effect` column,
+both of which exit 2 today.)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: cgx.mutation_fanout procedure (DF-17)
-MATCH (v {name: "user_record", scope: "AuthHandler::validate"})
+-- Requires: effect summary columns (DF-17) and scope node property
+--           — YIELD effect and scope property both exit 2 in v0.3
+MATCH (v {name: "user_record"})-[:DATA_FLOW]->(w)
+WHERE v.scope = "AuthHandler::validate"
 CALL cgx.mutation_fanout(v) YIELD mutator, effect, confidence
 RETURN mutator.name, mutator.file, mutator.line,
        effect,
@@ -107,7 +129,7 @@ RETURN mutator.name, mutator.file, mutator.line,
 ORDER BY confidence DESC, mutator.file
 ```
 
-**Why this works:** `cgx.mutation_fanout` is the outbound dual of pedigree: from
+**Why this will work:** `cgx.mutation_fanout` is the outbound dual of pedigree: from
 a given program point it traverses alias edges (DF-16) and effect summaries (DF-17)
 to find every function that can write to the value between that point and a
 downstream check.
@@ -121,11 +143,12 @@ validated value is passed to too many callees before the authorization check.
 
 ### Which getters return a mutable reference to an internal field? (Q112)
 
-**Status:** spec-only (DF-17 mutability model, `return_is_internal_field` and `return_mutability` node attributes)   **Since:** v0.3
+**Status:** deferred (DF-17 mutability model — `MEMBER_OF` edge carries no data in v0.3; `STARTS WITH` predicate is a parse error; `return_mutability` / `return_is_internal_field` node properties are unknown — all exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: DF-17 attributes: return_mutability, return_is_internal_field
+-- Requires: MEMBER_OF edge data (DF-17), return_mutability and
+--           return_is_internal_field attributes, STARTS WITH predicate
+--           — NONE available in v0.3
 MATCH (getter:method)-[:MEMBER_OF]->(t)
 WHERE getter.name STARTS WITH "get"
   AND getter.return_mutability = "mutable"
@@ -135,7 +158,7 @@ RETURN getter.name, getter.file, getter.line,
 ORDER BY t.name, getter.name
 ```
 
-**Why this works:** DF-17 analysis sets `return_is_internal_field = true` when
+**Why this will work:** DF-17 analysis sets `return_is_internal_field = true` when
 the returned value's pedigree traces to a field of `self`/`this` without a
 defensive copy. `return_mutability = "mutable"` restricts to cases where the
 caller receives write access.
@@ -149,13 +172,15 @@ a `MATCH (caller)-[:CALLS]->(getter)` arm and `cgx.mutation_fanout(getter)`.
 
 ### Can a callee mutate a sanitized value through an alias, re-introducing taint? (Q113)
 
-**Status:** spec-only (DF-17 sanitization-invalidation via alias, DF-11 taint labels)   **Since:** v0.3
+**Status:** deferred — two independent deferrals: (1) taint props `sink_class` / `sanitizer_class` / `taint_label.re_applied` are not implemented in any v0.3 release (exit 2 plan error); (2) DF-17 alias-mutation detection is also deferred past v0.3.
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: DATA_FLOW edges (DF-11), taint_label.re_applied attribute (DF-17.4)
-MATCH path = (sanitizer)-[:DATA_FLOW*2]->(use {sink_class: "sql"})
+-- Requires: sink_class / sanitizer_class node properties (taint engine, deferred),
+--           taint_label.re_applied edge attribute (DF-17.4, deferred)
+--           — ALL deferred past v0.3
+MATCH path = (sanitizer)-[:DATA_FLOW*2]->(use)
 WHERE sanitizer.sanitizer_class = "sql"
+  AND use.sink_class = "sql"
   AND ANY(edge IN relationships(path)
           WHERE edge.taint_label.re_applied = true
             AND edge.taint_label.reason = "mutation-after-sanitization")
@@ -163,7 +188,7 @@ RETURN sanitizer.name, sanitizer.file, sanitizer.line,
        use.name, use.file, use.line
 ```
 
-**Why this works:** Sanitizing a value clears its taint label, but if a callee
+**Why this will work:** Sanitizing a value clears its taint label, but if a callee
 holds an alias to the same memory and overwrites it after sanitization, the taint
 re-enters the path. DF-17 detects this and sets `taint_label.re_applied = true`
 with `reason = "mutation-after-sanitization"` on the relevant DATA_FLOW edge.
@@ -177,11 +202,12 @@ the alias-holding callee that performed the mutation.
 
 ### Which closures capture a loop variable by reference — late-binding bug? (Q114)
 
-**Status:** spec-only (DF-18 capture edges, `by-ref` × binding mutability attributes)   **Since:** v0.3
+**Status:** deferred (DF-18 capture edges — `CAPTURE` is an unknown edge type in v0.3, exit 2; `binding_mutability` / `is_loop_variable` node properties are unknown, exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: CAPTURE edges with by-ref and binding mutability (DF-18)
+-- Requires: CAPTURE edges with by-ref and binding mutability (DF-18),
+--           binding_mutability and is_loop_variable node properties
+--           — NONE available in v0.3
 MATCH (loop_var)-[cap:CAPTURE {capture: "by-ref"}]->(closure)
 WHERE loop_var.binding_mutability = "mutable"
   AND loop_var.is_loop_variable = true
@@ -191,7 +217,7 @@ RETURN loop_var.name, loop_var.file, loop_var.line,
 ORDER BY loop_var.file, loop_var.line
 ```
 
-**Why this works:** DF-18 records a typed `CAPTURE` edge from each captured
+**Why this will work:** DF-18 records a typed `CAPTURE` edge from each captured
 variable to its closure. Filtering on `capture:"by-ref"` and
 `binding_mutability:"mutable"` and `is_loop_variable:true` isolates the specific
 pattern that produces the classic late-binding bug: the closure sees the final
@@ -208,11 +234,11 @@ late-binding lambdas through the same graph shape.
 
 ### Which closures capture a file handle, lock guard, or db connection — resource lifetime extended? (Q115)
 
-**Status:** spec-only (DF-18 capture edges, GM-13 resource lifecycle pairs)   **Since:** v0.3
+**Status:** deferred (DF-18 capture edges — `CAPTURE` is an unknown edge type in v0.3, exit 2; `resource_class` node property is unknown, exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
 -- Requires: CAPTURE edges (DF-18), resource_class attribute (GM-13)
+--           — NONE available in v0.3
 MATCH (resource)-[cap:CAPTURE]->(closure)
 WHERE resource.resource_class IN ["lock", "file-handle", "db-connection"]
 RETURN resource.name, resource.file, resource.line,
@@ -221,7 +247,7 @@ RETURN resource.name, resource.file, resource.line,
 ORDER BY resource.resource_class, resource.file, resource.line
 ```
 
-**Why this works:** GM-13 annotates nodes whose types carry acquire/release
+**Why this will work:** GM-13 annotates nodes whose types carry acquire/release
 lifecycle semantics with a `resource_class` label. DF-18 then records a `CAPTURE`
 edge when such a resource is captured inside a closure, extending its lifetime
 to match the closure's execution context.
@@ -236,20 +262,19 @@ closure's lifetime rather than the enclosing scope's exit.
 
 ### What concrete functions can flow to this indirect call site? (Q116)
 
-**Status:** spec-only (DF-18 function-value pedigree, indirect-call resolution)   **Since:** v0.3
+**Status:** deferred (DF-18 function-value pedigree — `CALLS:indirect` sub-type qualifier is recognised but deferred in v0.3, exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
 -- Requires: CALLS:indirect edges from function-value pedigree (DF-18)
+--           — sub-type qualifier deferred in v0.3 (exit 2)
 MATCH (callsite)-[:CALLS:indirect]->(target)
-WHERE callsite.scope = "process"
-  AND callsite.arg_position = 0
+WHERE callsite.name = "process"
 RETURN target.name, target.file, target.line,
        callsite.confidence AS resolution_confidence
 ORDER BY callsite.confidence DESC, target.name
 ```
 
-**Why this works:** When a call site invokes a function value rather than a named
+**Why this will work:** When a call site invokes a function value rather than a named
 function, the CALLS graph has a gap. DF-18 fills it by tracing the pedigree of the
 function value to its constructors and recording `CALLS:indirect` edges with per-candidate
 confidence.
@@ -257,30 +282,32 @@ confidence.
 **Reading the result:** `resolution_confidence:"certain"` means only one concrete
 function can ever flow to this call site. `"probable"` means a branch merge or
 container store introduces ambiguity. `"possible"` reflects an opaque boundary
-or FFI — these may include false positives. No v0.1 mechanism surfaces this;
-v0.1 CALLS edges only represent syntactically-direct calls.
+or FFI — these may include false positives. In v0.3 today, `cgx callees` surfaces
+indirect calls as `[probable]` or `[possible]` edges in the forest using
+conventional CHA/RTA narrowing, without the per-candidate pedigree detail that Q116 provides.
 
 ---
 
 ### Does a tainted value reach an auth check through a type coercion — type-juggling bypass? (Q117)
 
-**Status:** spec-only (DF-10 `coerce` transformation kind, DATA_FLOW edges)   **Since:** v0.3
+**Status:** deferred — three independent deferrals: (0) `path =` binding over a multi-relationship pattern (`[…*2]…[…]`) is a plan error in v0.3, exit 2 — this fires before taint props are evaluated; (1) `source_class` / `sink_class` taint node properties exit 2 in v0.3; (2) `transformation_kind` edge property is unknown in v0.3, exit 2.
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: DATA_FLOW edges (DF-11), coerce transformation_kind (DF-10)
-MATCH path = (src)-[:DATA_FLOW*2]->(coerce_site)-[:DATA_FLOW {transformation_kind: "coerce"}]
-             ->(sink {sink_class: "auth-check"})
+-- Requires: multi-segment path= binding (deferred),
+--           source_class / sink_class node properties (taint engine, deferred),
+--           transformation_kind edge property (DF-10, deferred)
+--           — ALL deferred past v0.3
+MATCH path = (src)-[:DATA_FLOW*2]->(coerce_site)-[:DATA_FLOW]->(sink)
 WHERE src.source_class IN ["network", "user-input"]
+  AND sink.sink_class = "auth-check"
   AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "auth-check")
 RETURN src.name, src.file, src.line,
        coerce_site.name, coerce_site.file, coerce_site.line,
-       [e IN relationships(path) | e.transformation_kind] AS transformations,
        sink.name, sink.file, sink.line
 ORDER BY src.file, src.line
 ```
 
-**Why this works:** DF-10 labels DATA_FLOW edges with a `transformation_kind`
+**Why this will work:** DF-10 labels DATA_FLOW edges with a `transformation_kind`
 attribute, including `"coerce"` for type conversions. Filtering to paths where
 at least one edge carries `"coerce"` and the path ends at an `auth-check` sink
 isolates the type-juggling-in-auth pattern (e.g., PHP `"0e123" == "0"`).
@@ -292,21 +319,18 @@ which helps triage whether coercion is incidental or structural.
 
 Note: the cookbook shows a Layer-1 shorthand using `--from-class` and
 `--require-transformation` flags. Those flags do not exist in any version of the
-binary (see `reference/cli.md`). Use the CQL form above.
+binary (see `reference/cli.md`). Use the CQL form above when the taint engine ships.
 
 ---
 
 ### Where does the `any`/`interface{}`/unannotated-parameter frontier begin? (Q118)
 
-**Status:** spec-only (GM-14.6 type-confidence boundary attribute)   **Since:** v0.3
+**Status:** deferred (GM-14.6 type-confidence boundary — `type_confidence_boundary` node property is unknown in v0.3, exit 2)
 
 ```cypher
--- Gate: cgx --version MINOR >= 3
--- Requires: type_confidence_boundary attribute (GM-14.6)
+-- Requires: type_confidence_boundary attribute (GM-14.6) — NOT available in v0.3
 MATCH (typed_src)-[r:DATA_FLOW]->(boundary)
 WHERE typed_src.declared_type IS NOT NULL
-  AND typed_src.declared_type <> "any"
-  AND typed_src.declared_type <> "interface{}"
   AND boundary.type_confidence_boundary = true
 RETURN typed_src.name, typed_src.file, typed_src.line,
        boundary.name, boundary.file, boundary.line,
@@ -314,7 +338,7 @@ RETURN typed_src.name, typed_src.file, typed_src.line,
 ORDER BY typed_src.file, typed_src.line
 ```
 
-**Why this works:** GM-14.6 marks nodes as `type_confidence_boundary = true`
+**Why this will work:** GM-14.6 marks nodes as `type_confidence_boundary = true`
 at the point where static type guarantees lose precision — the `any`-frontier.
 The query finds every crossing from fully-typed territory into untyped territory.
 
@@ -327,20 +351,20 @@ relies on runtime type correctness rather than compile-time enforcement.
 
 ---
 
-## Summary: all questions in this theme are Since: v0.3
+## Summary: all questions in this theme are deferred past v0.3
 
-| Q | Question | Feature | Since |
-|---|----------|---------|-------|
-| Q109 | Candidate type set for `interface{}`-typed value | DF-19 type reconstruction | v0.3 |
-| Q110 | Values used in two incompatible ways (type contradiction) | DF-19 + `IS EMPTY` / `COMPATIBLE_WITH` | v0.3 |
-| Q111 | Callees that can mutate a validated value via alias | DF-17 mutation fan-out | v0.3 |
-| Q112 | Getters returning mutable internal field reference | DF-17 `return_is_internal_field` | v0.3 |
-| Q113 | Sanitize-then-mutate alias re-introducing taint | DF-17 + DF-11 taint | v0.3 |
-| Q114 | Closures capturing loop variable by reference (late-binding) | DF-18 capture edges | v0.3 |
-| Q115 | Closures capturing resource — extended lifetime | DF-18 + GM-13 | v0.3 |
-| Q116 | Candidate callees for indirect call site | DF-18 function-value pedigree | v0.3 |
-| Q117 | Tainted value through coercion to auth check | DF-10 + DF-11 DATA_FLOW | v0.3 |
-| Q118 | `any`/`interface{}`-frontier boundary crossings | GM-14.6 type-confidence | v0.3 |
+| Q | Question | Feature | Blocking construct |
+|---|----------|---------|-------------------|
+| Q109 | Candidate type set for `interface{}`-typed value | DF-19 type reconstruction | `CALL cgx.type_reconstruct` procedure |
+| Q110 | Values used in two incompatible ways (type contradiction) | DF-19 + `IS EMPTY` / `COMPATIBLE_WITH` | `IS EMPTY`/`IS NULL` + `COMPATIBLE_WITH` predicates |
+| Q111 | Callees that can mutate a validated value via alias | DF-17 mutation fan-out | `CALL cgx.mutation_fanout` procedure; `scope` node property |
+| Q112 | Getters returning mutable internal field reference | DF-17 `return_is_internal_field` | `STARTS WITH` predicate; `return_mutability` / `return_is_internal_field` node props |
+| Q113 | Sanitize-then-mutate alias re-introducing taint | DF-17 + taint engine | `sanitizer_class`/`sink_class` node props; `taint_label` edge prop |
+| Q114 | Closures capturing loop variable by reference (late-binding) | DF-18 capture edges | `CAPTURE` edge type; `binding_mutability`/`is_loop_variable` node props |
+| Q115 | Closures capturing resource — extended lifetime | DF-18 + GM-13 | `CAPTURE` edge type; `resource_class` node prop |
+| Q116 | Candidate callees for indirect call site | DF-18 function-value pedigree | `CALLS:indirect` sub-type qualifier |
+| Q117 | Tainted value through coercion to auth check | DF-10 + taint engine | `path =` multi-segment binding; `source_class`/`sink_class` node props; `transformation_kind` edge prop |
+| Q118 | `any`/`interface{}`-frontier boundary crossings | GM-14.6 type-confidence | `IS NOT NULL` predicate; `type_confidence_boundary`/`declared_type` node props |
 
 ---
 
@@ -350,5 +374,5 @@ relies on runtime type correctness rather than compile-time enforcement.
 - CQL syntax, supported/unsupported clauses: `reference/query-language.md`
 - Edge-condition labels, confidence ladder, transience: `reference/mental-model.md`
 - Exact subcommand flags: `reference/cli.md`
-- Taint source/sink/sanitizer classes (v0.3 context): `recipes/taint.md`
+- Taint source/sink/sanitizer classes (taint engine, deferred): `recipes/taint.md`
 - Object-model edges (MEMBER_OF, method nodes): `recipes/object-model.md`

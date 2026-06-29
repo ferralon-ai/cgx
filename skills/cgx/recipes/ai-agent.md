@@ -1,13 +1,13 @@
 ---
 title: AI-Agent-Specific Queries
 audience: AI agents (ACA/ASA) driving cgx with a limited tool-call budget
-since: v0.1 (MCP core + CLI subcommands); v0.3 (taint/sanitizer); v0.5 (working graph_query MCP tool)
+since: v0.1 (MCP core + CLI subcommands); v0.3 (DATA_FLOW edges, flows-to/flows-from); v0.5 (working graph_query MCP tool)
 ---
 
 # AI-Agent-Specific Queries
 
 **Run `cgx --version` first.** A capability tagged `Since: v0.N` is available iff your minor
-version is ≥ N. The current shipped binary is v0.1. See `reference/versions.md` for the full
+version is ≥ N. The current shipped binary is v0.3.0. See `reference/versions.md` for the full
 ladder.
 
 This recipe targets agents (ACA/ASA) with a small tool-call budget. Every pattern here minimizes
@@ -185,34 +185,35 @@ paths(from="http::Router::handle", to="payments::process_payment",
 explain(symbol="payments::process_payment", root="/workspace")
 ```
 
-**CLI form (arbitrary CALLS-graph CQL):**
+**CLI form (CALLS-graph CQL — Since: v0.1):**
 ```bash
-# Bounded hop count is required — never omit the N in CALLS*N (unbounded hangs)
+# Bound the hop count when combining with path= variable binding (see CQL notes below)
+# Use cgx paths for multi-hop chains; CQL is useful for filtering or tabular output
 cgx query '
-  MATCH path = (ep)-[:CALLS*5]->(fn)
-  WHERE fn.name = "payments::process_payment"
-  RETURN ep.name, ep.file, ep.line,
-         [n IN nodes(path) | {name: n.name, file: n.file, line: n.line}] AS chain,
-         [r IN relationships(path) | r.condition] AS edge_conditions,
-         length(path) AS hops
-  ORDER BY hops
+  MATCH (a)-[:CALLS*3]->(b)
+  WHERE b.name = "payments::process_payment"
+  RETURN a.name, a.file, a.line
   LIMIT 3
 ' --format json
 ```
 
 **Why this works:** `paths` MCP + `explain` MCP covers the complete chain in 2 calls.
-The CQL form captures the chain in 1 CLI call. Both avoid the need for repeated grep/LSP/file-read
+The CQL form captures entrypoints in 1 CLI call. Both avoid the need for repeated grep/LSP/file-read
 tool calls.
 
-**Reading the result:** `edge_conditions` on each hop tells you which steps are always-condition
-vs. exception-only — the critical context for safe edits. `chain` gives all intermediate
-function locations without additional reads.
+**Reading the result:** Use `cgx paths <ep> payments::process_payment` to get per-hop
+edge-condition labels on a specific chain after identifying the entrypoint with the CQL query.
 
-**CQL notes (v0.1 CALLS-graph CQL only):**
-- Always bound the hop count: `CALLS*5`, `CALLS*10`. Unbounded `CALLS*` hangs.
+**CQL notes — Since: v0.1:**
+- Unbounded `CALLS*` (no `N`) is work-budget-capped and returns results, but may be slow on very large graphs. Prefer `CALLS*N` with an explicit N when you know the chain depth.
+- `path = (a)-[:CALLS*N]->(b)` (path-variable binding) with `nodes(path)` and `relationships(path)`
+  works for N=1. For N≥2 the work budget may be exceeded on large graphs; prefer `cgx paths` for
+  multi-hop path enumeration.
+- Object literals `{key: value}` are NOT supported in list comprehensions — a parse error (exit 2).
+  Use `[n IN nodes(path) | n.name]` (scalar projections only).
 - String literals must be double-quoted inside the query. Wrap the whole query in single quotes
   for the shell.
-- Available node properties: `name`, `kind`, `file`, `line`.
+- Available node properties: `name`, `fqn`, `kind`, `file`, `line`.
 - Available edge properties: `condition`, `confidence`.
 - `MATCH` must contain at least one relationship — `MATCH (n) RETURN n` is a plan error.
 
@@ -247,20 +248,26 @@ setup function (e.g., `validate_email_address`), your new call should follow the
 ## Spec-only recipes (not runnable today)
 
 These questions appear in the cookbook with `answerable-today` tags, but they require features
-not present in the v0.1 binary. Do not emit these as runnable commands.
+not yet available in v0.3.0. Do not emit these as runnable commands.
 
 | Question | Requires | Since |
 |----------|----------|-------|
-| Codebase-wide command-injection scan (HTTP → shell sink, no sanitizer on path) | `DATA_FLOW` edges, `source_class`/`sink_class`/`sanitizer_class` node props | v0.3 |
-| Generate SARIF taint report (HTTP input → SQL sinks, full call chain) | `DATA_FLOW`, `--from-class`/`--to-class`, `sanitizer_class` | v0.3 |
-| CVE reachability triage (cargo audit advisory → entrypoints, sanitizer on path) | `--to-package`, `sanitizer_class IS NOT NULL`, unbounded CALLS* (v0.3 guard) | v0.4 |
+| Codebase-wide command-injection scan (HTTP → shell sink, no sanitizer on path) | `source_class`/`sink_class`/`sanitizer_class` node props (plan error exit 2 in v0.3) | deferred |
+| Generate SARIF taint report (HTTP input → SQL sinks, full call chain) | `--from-class`/`--to-class` (phantom flags), `sanitizer_class` CQL prop (plan error exit 2) | deferred |
+| CVE reachability triage (cargo audit advisory → entrypoints, sanitizer on path) | `--to-package` (phantom flag), `sanitizer_class IS NOT NULL` (plan error exit 2) | deferred |
 | Arbitrary CQL via MCP `graph_query` tool | working `graph_query` implementation | v0.5 |
 | MCP token-efficiency (compact symbol IDs, resource_link, lazy schema) | full token-efficiency features | v0.5 |
 
-**Workaround for taint questions (until v0.3):** Use `cgx paths <from> <to>` to check call
-reachability (whether a call path exists). This answers "can control flow reach the sink" — not
-"can data flow there". State that boundary explicitly when reporting findings. Real taint with
-source/sink/sanitizer classification is Since: v0.3.
+**Note on structural dataflow (available today — Since: v0.3):** `DATA_FLOW` edges and
+`:DATA_FLOW` CQL queries work today. `cgx flows-to` and `cgx flows-from` (CLI-only, no MCP
+equivalent) traverse `derives-from` edges to show which values a value node flows into or derives
+from. These operate on SSA value-node FQNs (e.g. `fn::local#1`), not on function FQNs.
+
+**Workaround for security-typed taint questions (deferred):** Use `cgx paths <from> <to>` to
+check call reachability (whether a call path exists), and `cgx query` with `:DATA_FLOW` edges to
+trace structural data flow. This answers "can control flow/data flow reach the sink" — not "is
+the flow tainted and unsanitized". Security-typed taint with source/sink/sanitizer classification
+is deferred beyond v0.3.
 
 **Workaround for graph_query (until v0.5):** Shell out to `cgx query '<CQL>'` using the
 CALLS-graph CQL subset documented in `reference/query-language.md`.
@@ -281,21 +288,25 @@ cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE b.name = "my_fn" AND r.condition = "ex
 # Bounded transitive callers (N hops — always specify N)
 cgx query 'MATCH (a)-[:CALLS*3]->(b) WHERE b.name = "my_fn" RETURN a.name, a.file LIMIT 10' --format json
 
-# ANY quantifier: paths that contain at least one exception edge
+# ANY quantifier: direct callers that have at least one exception edge
+# Note: path= binding with N≥2 may exhaust the work budget on large graphs — keep N=1 for path-variable queries
 cgx query '
-  MATCH path = (a)-[:CALLS*3]->(b)
+  MATCH path = (a)-[:CALLS*1]->(b)
   WHERE b.name = "my_fn"
     AND ANY(r IN relationships(path) WHERE r.condition = "exception")
   RETURN a.name, a.file LIMIT 10
 ' --format json
 
-# NONE quantifier: paths with no always-condition edge
+# NONE quantifier: direct callers with no always-condition edge on the path
 cgx query '
-  MATCH path = (a)-[:CALLS*3]->(b)
+  MATCH path = (a)-[:CALLS*1]->(b)
   WHERE b.name = "my_fn"
     AND NONE(r IN relationships(path) WHERE r.condition = "always")
   RETURN a.name, a.file LIMIT 5
 ' --format json
+
+# DATA_FLOW edges (Since: v0.3 — present by default; absent on --no-dataflow indexes)
+cgx query 'MATCH (a)-[:DATA_FLOW]->(b) RETURN a.name, b.name LIMIT 20' --format json
 
 # Filter by kind
 cgx query 'MATCH (a)-[:CALLS]->(b) WHERE a.kind = "function" RETURN a.name LIMIT 20' --format json
@@ -310,8 +321,12 @@ cgx query 'MATCH (a)-[:CALLS]->(b) RETURN a.name LIMIT 5' --at HEAD~1
 **Shell quoting rule:** Wrap the entire CQL expression in single quotes. Use double quotes for
 string literals inside the query. Single quotes inside the query are a parse error.
 
-**Never emit:** `CALLS*` (unbounded — hangs), `DATA_FLOW` edges, `NOT IN [...]` (parse error),
-`MATCH (n) RETURN n` (no relationship — plan error), `entrypoint_class`/`source_class`/
-`sink_class`/`sanitizer_class`/`taint_label` properties (plan error exit 2).
+**Never emit:**
+- `path = (a)-[:CALLS*]->(b)` with no N (unbounded path-variable binding — work budget exceeded; use N=1 or `cgx paths`)
+- `path = (a)-[:CALLS*N]->(b)` with N≥2 (path-variable binding with multi-hop — work budget exceeded on large graphs; use N=1 or use `cgx paths` instead)
+- `{key: value}` object literals in list comprehensions — parse error exit 2 (use scalar projections: `[n IN nodes(path) | n.name]`)
+- `NOT IN [...]` — parse error
+- `MATCH (n) RETURN n` — no relationship, plan error
+- `entrypoint_class`/`source_class`/`sink_class`/`sanitizer_class`/`taint_label` properties — plan error exit 2
 
 See `reference/query-language.md` for the full supported/unsupported clause list.

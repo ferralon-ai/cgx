@@ -223,8 +223,7 @@ in the Layer 1 index. They waste space but do not produce incorrect results;
 content-addressed keying means a stale entry for a blob OID can never corrupt
 facts for a different blob.
 
-Orphaned entries are **not** removed automatically. `cgx prune` performs the
-cleanup:
+Orphaned entries are **not** removed automatically. `cgx prune` (Planned — not yet shipped in v0.3.0) will perform the cleanup:
 
 1. Run `git for-each-ref` to obtain the set of live tip commit OIDs.
 2. Run `git rev-list --objects --all` to collect all blob OIDs reachable from
@@ -238,9 +237,9 @@ This is safe: a blob OID reachable from any live commit keeps its entry alive
 regardless of which branch deleted it. A blob OID unique to a deleted branch
 has no live referents and is safe to remove.
 
-**`--aggressive` flag:** `cgx prune --aggressive` also compacts the storage
+**`--aggressive` flag (Planned):** `cgx prune --aggressive` will also compact the storage
 file (removes freed pages, reclaims disk). Without `--aggressive`, deleted
-entries are simply marked as free in the B-tree but the file does not shrink.
+entries would be simply marked as free in the B-tree but the file would not shrink.
 
 ### Refcounting semantics
 
@@ -251,18 +250,18 @@ reaches zero.
 
 ### Explicit management commands
 
-| Command | Effect |
-|---------|--------|
-| `cgx index` | Index HEAD of current branch (default: auto on any query) |
-| `cgx index --all-branches` | Eagerly index all local branch refs |
-| `cgx index --ref <ref>` | Index a specific ref |
-| `cgx prune` | Remove orphaned blob-OID entries from deleted branches |
-| `cgx prune --aggressive` | Prune + compact storage file |
-| `cgx status` | Show indexed tree OID, HEAD tree OID, cached blob count, index size |
+| Command | Effect | v0.3.0 status |
+|---------|--------|---------------|
+| `cgx index` | Index HEAD of current branch (default: auto on any query) | Shipped |
+| `cgx index --no-dataflow` | Build a CALLS-only index, skipping the DATA_FLOW layer | Shipped |
+| `cgx index --scip <path>` | Apply SCIP semantic-precision re-label pass (upgrade-only; requires user-supplied SCIP index) | Shipped (`Since: v0.2`) |
+| `cgx index --all-branches` | Eagerly index all local branch refs | **Planned** |
+| `cgx index --ref <ref>` | Index a specific ref | **Planned** |
+| `cgx prune` | Remove orphaned blob-OID entries from deleted branches | **Planned (not yet shipped in v0.3.0)** |
+| `cgx prune --aggressive` | Prune + compact storage file | **Planned (not yet shipped in v0.3.0)** |
+| `cgx status` | Show indexed tree OID, HEAD tree OID, cached blob count, index size | **Planned** |
 
-Fully automatic management: under normal use, none of these commands are
-required. `cgx` re-indexes on every query when stale and silently tolerates
-orphaned entries. `cgx prune` is for disk-space reclamation only.
+Fully automatic management: under normal use, only `cgx index` is needed (it runs automatically on every query when stale). `cgx` tolerates orphaned entries silently; `cgx prune` for disk-space reclamation is planned for a future release.
 
 ---
 
@@ -334,7 +333,7 @@ choice that provides these semantics.
 
 ### Advisory locking for writes
 
-Index write operations (re-indexing, prune) acquire an exclusive advisory file
+Index write operations (re-indexing; `prune` when it ships) acquire an exclusive advisory file
 lock on a lockfile in the index directory before modifying index state. Lock
 acquisition has a 1–2 second timeout; if the lock cannot be acquired, `cgx`
 exits with an error rather than blocking indefinitely.
@@ -450,19 +449,28 @@ Both attributes are available in the full query language and as diff-subcommand 
 
 **Layer 1 — diff subcommand:**
 
+**Shipped (v0.3.0):** `cgx diff <BASE> <HEAD>` with `--newer-than` only.
+
+```bash
+# New edges added at HEAD that were absent at main (shipped)
+cgx diff main HEAD --newer-than
+```
+
+**Planned (v0.4) — not yet runnable:**
+
 ```bash
 # New edges into sensitive sinks introduced by this branch
-cgx diff --base main --head HEAD ./ \
-    --calls-to-sink-class sql \
-    --calls-to-sink-class shell \
-    --calls-to-sink-class eval \
-    --format sarif > new-sink-edges.sarif
+# cgx diff --base main --head HEAD ./ \
+#     --calls-to-sink-class sql \
+#     --calls-to-sink-class shell \
+#     --calls-to-sink-class eval \
+#     --format sarif > new-sink-edges.sarif
 
 # Newest edges into sql sinks across all branches (review prioritization)
-cgx diff --base HEAD~30 --head HEAD ./ \
-    --calls-to-sink-class sql \
-    --order introducing_commit \
-    --format json | jq '.[] | {edge, introducing_author, introducing_commit}'
+# cgx diff --base HEAD~30 --head HEAD ./ \
+#     --calls-to-sink-class sql \
+#     --order introducing_commit \
+#     --format json | jq '.[] | {edge, introducing_author, introducing_commit}'
 ```
 
 **Layer 2 — query language:**
@@ -502,7 +510,10 @@ An edge that is structurally new (IX-4) typically also has `introducing_commit` 
 
 The branch-diff security gate (docs/05-queries.md, Worked Example 6) combines IX-4 (which edges are new) with IX-9 (which commit introduced each new edge) to produce annotated SARIF findings:
 
+The CI integration below uses `--calls-to-sink-class` and `--assert-empty` with `diff` — these are **Planned (not yet shipped in v0.3.0)**. At v0.3.0, use `cgx diff origin/main HEAD --newer-than` and inspect output manually.
+
 ```yaml
+# PLANNED (v0.4) — not yet runnable
 - name: Security diff gate
   run: |
     PR_COMMITS=$(git log origin/main..HEAD --format='%H')

@@ -52,7 +52,8 @@ LIMIT 20
 To additionally check whether a sanitizer sits on every path (the sanitizer-negation variant from Q-23):
 
 ```cgx
--- illustrative: requires GM-14 (schema-room)
+-- illustrative: requires GM-14 (schema-room) AND deferred sanitizer_class node property
+-- n.sanitizer_class causes a plan error (exit 2) in v0.3.0; update when sanitizer taint ships
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::parse_header"})
 WHERE ANY(edge IN relationships(path)
           WHERE edge.dependency.package = "libfoo")
@@ -66,14 +67,14 @@ RETURN ep.name, ep.file, ep.line, length(path) AS hops
 
 ### Q83 — Produce a reachability matrix: rows = entrypoint classes (HTTP, gRPC, CLI, cron), columns = sink classes (SQL, shell, file, network, crypto). Fill with path counts.
 
-**Personas:** ASA · **Status:** answerable-today — uses Q-15 (reachability matrix, Layer 2 full query)
+**Personas:** ASA · **Status:** deferred — requires `entrypoint_class` and `sink_class` node properties (plan error, exit 2 in v0.3.0; deferred to security-taint milestone)
 
 This question produces a one-glance threat model summary: which attack surfaces
 connect to which dangerous operations, and how many distinct paths exist for each
 pair. Security agents running unattended in CI can emit this as structured JSON;
-human reviewers can paste the CSV into a spreadsheet.
+human reviewers can paste the output into a spreadsheet.
 
-**The query**
+**The query** (illustrative — `entrypoint_class` and `sink_class` are deferred node properties; this query exits 2 in v0.3.0)
 
 ```cgx
 MATCH (ep)-[:CALLS*]->(sink)
@@ -83,36 +84,36 @@ RETURN ep.entrypoint_class, sink.sink_class, count(*) AS path_count
 ORDER BY ep.entrypoint_class, sink.sink_class
 ```
 
-Or via the Layer 1 subcommand with CSV output for a spreadsheet:
+Or via the Layer 1 subcommand with JSON output:
 
-`cgx query '<expression above>' ./ --format csv`
+`cgx query '<expression above>' --repo ./ --format json`
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
 | `MATCH (ep)-[:CALLS*]->(sink)` | Find every transitive call path from any node `ep` to any node `sink`. |
-| `ep.entrypoint_class IN ["http", "grpc", "cli", "cron"]` | Restrict `ep` to the four declared entrypoint classes. `entrypoint_class` is set during indexing or by framework packs. |
-| `sink.sink_class IN ["sql", "shell", "file_write", "network_send", "crypto"]` | Restrict `sink` to the declared sink classes from the DF-12 vocabulary. |
+| `ep.entrypoint_class IN ["http", "grpc", "cli", "cron"]` | Restrict `ep` to the four declared entrypoint classes. `entrypoint_class` is set during indexing or by framework packs. Deferred in v0.3.0. |
+| `sink.sink_class IN ["sql", "shell", "file_write", "network_send", "crypto"]` | Restrict `sink` to the declared sink classes from the DF-12 vocabulary. Deferred in v0.3.0. |
 | `count(*) AS path_count` | Count distinct paths — this is the value filling each cell of the matrix. |
 | `ORDER BY ep.entrypoint_class, sink.sink_class` | Sort rows to produce a consistent matrix layout across runs. |
 
-**Reading the result** — Each row is one cell of the matrix. A `path_count` of zero means no path from that entrypoint class reaches that sink class — a useful negative confirmation. Non-zero counts with `sql` or `shell` sinks reachable from `http` or `grpc` entrypoints warrant further investigation with Q82 or Q92. Use `--format csv` to produce a spreadsheet-compatible file.
+**Reading the result** — Each row is one cell of the matrix. A `path_count` of zero means no path from that entrypoint class reaches that sink class — a useful negative confirmation. Non-zero counts with `sql` or `shell` sinks reachable from `http` or `grpc` entrypoints warrant further investigation with Q82 or Q92. Use `--format json` for machine-readable output.
 
 ---
 
 ### Q84 — Which data flows cross trust boundaries (e.g., from external-user zone to internal-service zone) without passing through a validation function?
 
-**Personas:** PSE · **Status:** answerable-today — uses Q-14 (negative path constraint, Layer 2) and Q-20 (must-pass-through), with GM-14 trust boundaries (syntactic tier available in Phase 1)
+**Personas:** PSE · **Status:** deferred — requires `trust_zone` node property (unknown property, plan error exit 2 in v0.3.0) and `AVOIDING` keyword (parse error, exit 2 in v0.3.0); both are deferred to the security-taint milestone. The `NONE`-predicate form of the negative path constraint is answerable-today when applied to node names (not deferred properties).
 
 Trust boundaries are not just about input validation. A call that moves a value from
 an external-user zone to an internal-service zone without a validation step is a
-structural gap in the defense-in-depth model. `cgx` models code-trust boundaries
-via GM-14 `unsafe`/FFI boundary markers in Phase 1; the query below uses the
-`trust_boundary` attribute on nodes and the `NONE` predicate to find crossing
+structural gap in the defense-in-depth model. `cgx` will model code-trust boundaries
+via GM-14 `unsafe`/FFI boundary markers; the query below uses the deferred
+`trust_zone` attribute on nodes and the `NONE` predicate to find crossing
 paths that skip validation.
 
-**The query**
+**The query** (illustrative — `trust_zone` is a deferred node property; this query exits 2 in v0.3.0)
 
 ```cgx
 MATCH path = (src)-[:CALLS*]->(sink)
@@ -125,9 +126,10 @@ RETURN src.name, src.file, src.line,
 ORDER BY hops, src.file, src.line
 ```
 
-Using the ∀-path must-pass-through form (clearest expression of the intent):
+The ∀-path must-pass-through form using the `AVOIDING` keyword is also deferred (`AVOIDING` is not a recognized CQL keyword in v0.3.0 and causes a parse error, exit 2):
 
 ```cgx
+-- deferred: AVOIDING is not a valid CQL keyword in v0.3.0 (parse error, exit 2)
 MATCH ALL path = (src)-[:CALLS*]->(sink)
 WHERE src.trust_zone = "external"
   AND sink.trust_zone = "internal"
@@ -140,10 +142,10 @@ RETURN src.name, src.file, src.line, sink.name, length(path) AS hops
 
 | Fragment | What it means |
 |---|---|
-| `src.trust_zone = "external"` | The source node is in the externally-controlled trust zone — user input, network data, or deserialized bytes. `trust_zone` is set from GM-14 source class declarations. |
-| `sink.trust_zone = "internal"` | The destination is in the internal-service zone — database writes, service calls, state mutations. |
-| `NONE(n IN nodes(path) WHERE n.name IN [...])` | The negative path constraint: the path is only returned if none of the named validation functions appears on it. Any path where at least one of these names is present is excluded — it is assumed to have a check. |
-| `MATCH ALL path ... AVOIDING` | The ∀-path form of the same question: find paths where no node on any path to the sink is the named check. Zero results means every cross-boundary path passes through a validator. |
+| `src.trust_zone = "external"` | The source node is in the externally-controlled trust zone — user input, network data, or deserialized bytes. `trust_zone` is a deferred GM-14 node property (plan error, exit 2 in v0.3.0). |
+| `sink.trust_zone = "internal"` | The destination is in the internal-service zone — database writes, service calls, state mutations. Deferred alongside `trust_zone`. |
+| `NONE(n IN nodes(path) WHERE n.name IN [...])` | The negative path constraint: the path is only returned if none of the named validation functions appears on it. Any path where at least one of these names is present is excluded — it is assumed to have a check. This clause is answerable-today when filtering by `n.name`. |
+| `MATCH ALL path ... AVOIDING` | The ∀-path form of the same question. `AVOIDING` is not a recognized keyword in v0.3.0 CQL — using it causes a parse error (exit 2). This form is deferred. |
 
 **Reading the result** — Non-empty results name the specific entry and exit points of unvalidated trust-boundary crossings. The `hops` count indicates directness: a 1-hop crossing (a single call directly from external source to internal sink) is the highest-priority finding. Review the named `src` nodes to understand which external-facing functions are the immediate callers.
 
@@ -151,15 +153,14 @@ RETURN src.name, src.file, src.line, sink.name, length(path) AS hops
 
 ### Q85 — Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and edge-condition labels.
 
-**Personas:** PSE · **Status:** answerable-today — uses Q-3 (`paths` subcommand), Q-14 (negative path constraint), and Q-11 (edge-condition filter)
+**Personas:** PSE · **Status:** partially-answerable — the `NONE`-predicate negative path constraint and edge-condition filtering are answerable-today (v0.3.0); the `entrypoint_class` and `sink_class` node properties are deferred (plan error, exit 2). The CQL query below is illustrative; the name-based variant is runnable today.
 
 An attack tree is a structured enumeration of all paths an attacker can take from
 an initial capability (unauthenticated HTTP access) to a high-value target
-(database write). `cgx` produces this directly from the call graph by finding all
-paths from HTTP entrypoints to the database sink class, filtered to exclude
-authenticated paths.
+(database write). `cgx` produces this from the call graph by finding paths from
+declared entrypoints to sink functions, filtered to exclude authenticated paths.
 
-**The query**
+**The query** (illustrative — `entrypoint_class` and `sink_class` are deferred node properties; they cause plan errors in v0.3.0. Substitute `n.name` filters for source and sink identification until these properties ship.)
 
 ```cgx
 MATCH path = (ep {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink)
@@ -174,14 +175,25 @@ RETURN ep.name, ep.file, ep.line,
 ORDER BY depth, ep.name
 ```
 
-Or using the Layer 1 subcommand for a quick scan:
+**Name-based variant (answerable-today in v0.3.0):** replace the deferred property filters with `n.name` matches for known entrypoint and sink function names:
+
+```cgx
+MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(sink {name:"db_execute"})
+WHERE NONE(n IN nodes(path) WHERE n.name IN ["require_auth", "require_admin",
+                                             "check_session", "authenticate"])
+  AND NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+RETURN ep.name, ep.file, ep.line,
+       [n IN nodes(path) | n.name + "@" + n.file + ":" + n.line] AS call_chain,
+       [r IN relationships(path) | r.condition] AS edge_conditions,
+       length(path) AS depth
+ORDER BY depth, ep.name
+```
+
+Or using the `paths` subcommand for a quick scan between two known symbol FQNs (positional `FROM TO` args; no `--from`, `--to-class`, `--avoiding`, or `--exclude-edge-condition` flags exist):
 
 ```bash
-cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
-          --to-class sql \
-          --avoiding require_auth \
-          --exclude-edge-condition exception \
-          --exclude-edge-condition panic \
+cgx paths 'my_crate::handlers::handle_request' 'my_crate::db::execute' \
+          --repo ./ \
           --format sarif > attack-tree.sarif
 ```
 
@@ -189,10 +201,10 @@ cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
 
 | Fragment | What it means |
 |---|---|
-| `ep {kind:"entrypoint", entrypoint_class:"http"}` | Start from HTTP handler entrypoints declared during indexing or by framework packs. |
-| `sink.sink_class = "sql"` | End at any node that is a SQL sink — the database write target. |
-| `NONE(n IN nodes(path) WHERE n.name IN [...])` | Exclude paths that pass through any named authentication check. Paths that include an auth check are assumed to be guarded; paths that avoid all named checks are the attack paths. |
-| `NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | Restrict to non-exception paths — structural attack paths, not paths that only exist in error-handling branches (those are a separate concern). |
+| `ep {kind:"entrypoint", entrypoint_class:"http"}` | Start from HTTP handler entrypoints. `kind:"entrypoint"` is supported today; `entrypoint_class:"http"` is a deferred property (plan error, exit 2 in v0.3.0). |
+| `sink.sink_class = "sql"` | End at any node that is a SQL sink. `sink_class` is a deferred node property (plan error, exit 2 in v0.3.0). |
+| `NONE(n IN nodes(path) WHERE n.name IN [...])` | Exclude paths that pass through any named authentication check. Paths that include an auth check are assumed to be guarded; paths that avoid all named checks are the attack paths. This clause is answerable-today. |
+| `NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | Restrict to non-exception paths — structural attack paths, not paths that only exist in error-handling branches. This clause is answerable-today. |
 | `[n IN nodes(path) | n.name + "@" + n.file + ":" + n.line] AS call_chain` | Project the full list of call nodes on the path as a human-readable call chain, each node named with its source location. |
 | `[r IN relationships(path) | r.condition] AS edge_conditions` | Project the edge condition label at each hop — shows where conditional, loop, or exception-class edges appear on paths that are otherwise non-exception. |
 

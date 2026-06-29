@@ -15,18 +15,20 @@ Every subcommand accepts `--format <FMT>`. The default is `human`.
 
 | Format | Since | Best for |
 |--------|-------|----------|
-| `human` | v0.1 | Reading at a terminal. `callers`/`callees`/`reaches <from>` render an ASCII call **forest** (see §1.1); `paths`/`unused` render a list. File:line evidence and edge/confidence tags inline. |
+| `human` | v0.1 | Reading at a terminal. `callers`/`callees`/`flows-to`/`flows-from`/`reaches <from>` render an ASCII call **forest** (see §1.1); `paths`/`unused` render a list. File:line evidence and edge/confidence tags inline. |
 | `json` | v0.1 | Scripting, agents, CI pipelines. Structured envelope with `count` and `results[]`. |
 | `sarif` | v0.1 | Security tooling. SARIF 2.1.0 — uploads to GitHub Advanced Security, VS Code SARIF viewer, and any OASIS-compliant tool. |
 | `dot` | v0.1 | Path-shaped results only. Feeds `dot -Tsvg` or any Graphviz consumer for SVG/PNG artifacts. Use for large graphs (Mermaid has a node limit). |
 | `mermaid` | v0.1 | Path-shaped results only. Renders inline in GitHub Markdown, Notion, and most docs platforms. Human-writeable and diff-friendly. |
 | `d2` | v0.1 | Path-shaped results only. Feeds the D2 diagramming tool or https://play.d2lang.com. |
 
-**Path-shaped restriction:** `dot`, `mermaid`, and `d2` are only meaningful for output that describes a
-graph path — the `reaches` and `paths` subcommands, or a `cgx query` that uses `RETURN path`. Applying
-them to flat-list results (e.g., `callers`, `unused`) produces degenerate or empty graphs.
+**Path-shaped restriction:** `dot`, `mermaid`, and `d2` are only valid for output that describes a
+graph path — the `paths` and `reaches <from> <to>` subcommands, or a `cgx query` that uses `RETURN path`.
+Applying them to any other command (e.g., `callers`, `callees`, `unused`) exits `2` with an error:
+`Dot format is only valid for path-returning results`. The flag is accepted in the help text but
+rejected at runtime for non-path commands.
 
-### 1.1 The human call forest (`callers` / `callees` / `reaches <from>`)
+### 1.1 The human call forest (`callers` / `callees` / `flows-to` / `flows-from` / `reaches <from>`)
 
 The default human view of the neighbor-set commands is an ASCII forest: the
 queried symbol is the bare root line and the symbols it calls (or that call it)
@@ -52,10 +54,12 @@ work-budget cap prints `… (truncated: N more)` at the cut:
 
 ```
 cgx_core::confidence::Confidence::weakest  crates/cgx-core/src/confidence.rs:40
-├─ cgx_query::engine::build_path_result::{closure@205:14}  …/engine.rs:205  [if]  [probable]
+├─ cgx_query::engine::build_path_result::{closure@220:14}  …/engine.rs:220  [if]  [probable]
+│  ├─ ts_sample::closures::closureVariable  …/closures.ts:6  [possible]  (+1 call sites)
+│  ├─ ts_sample::closures::nestedClosures  …/closures.ts:57  [possible]  (+1 call sites)
 │  └─ ts_sample::closures::nestedClosures::outer  …/closures.ts:58  [possible]  (+1 call sites)
-└─ cgx_query::engine::weakest_confidence_to  …/engine.rs:78  [loop]  [probable]
-   └─ cgx_query::engine::neighbor_walk  …/engine.rs:36
+└─ cgx_query::engine::weakest_confidence_to  …/engine.rs:93  [loop]  [probable]
+   └─ cgx_query::engine::neighbor_walk  …/engine.rs:51
 ```
 
 `reaches <from> <to>` (with a target) answers a single reachability question and
@@ -77,7 +81,7 @@ The following samples are from a live run of
 **human:**
 ```
 path 1 (1 hops, min-confidence=probable):
-     cgx_cli::emit  (crates/cgx-cli/src/main.rs:647)
+     cgx_cli::emit  (crates/cgx-cli/src/main.rs:989)
   -> cgx_cli::assertions::evaluate  (crates/cgx-cli/src/assertions.rs:57) [always]
 ```
 
@@ -125,7 +129,7 @@ makes SARIF upload and build failure composable in the same step.
 | `1` | Assert failure — `--assert-empty` fired because results were found | `cgx callers foo --assert-empty` when `foo` has callers |
 | `2` | Usage error — unresolved symbol, CQL parse or plan error, bad argument | `cgx callers nonexistent_xyz`; unsupported CQL property; phantom flag |
 | `3` | Graph missing or corrupt (only reachable with `--no-auto-index`) | `cgx callers foo --no-auto-index` with no `.cgx/` directory present |
-| `4` | Vacuous pass — `--assert-empty` exited 0 but matched zero nodes | `cgx callers nonexistent_xyz --assert-empty` |
+| `4` | Vacuous pass — `--assert-empty` would exit 0 but the query matched zero nodes; the guard fires instead | `cgx callers nonexistent_xyz --assert-empty --repo /path/to/repo` |
 
 **Key insight — exit 0 includes empty results.** A query that finds nothing is not an error. Empty
 results exit `0`. Only assertion flags (`--assert-empty`) change that. Exit `2` means the command
@@ -134,11 +138,11 @@ itself was malformed (bad symbol name, bad CQL, bad flag) — not that results w
 **Auto-index is on by default.** A missing `.cgx/` triggers an automatic build. Exit `3` is only
 reachable when `--no-auto-index` is passed explicitly.
 
-**Exit 2 disambiguation.** All three of these produce exit 2:
+**Exit 2 disambiguation.** All of these produce exit 2:
 - Unknown or mistyped symbol name: `no symbol matched pattern '<x>'`
-- CQL parse error (e.g., single-quoted string, `NOT IN [...]`, node-only MATCH with no relationship)
-- CQL plan error (e.g., deferred node property such as `entrypoint_class`)
-- Phantom flag that does not exist (e.g., `--max-depth`, `--base`, `--avoiding`)
+- CQL parse error (e.g., single-quoted string, `NOT IN [...]`, node-only MATCH with no relationship, `MUST PASS THROUGH`, `AVOIDING`)
+- CQL plan error (e.g., unsupported node property: `source_class`, `sink_class`, `sanitizer_class`, `taint_label`, `entrypoint_class`)
+- Phantom flag that does not exist (e.g., `--max-depth`, `--base`, `--dataflow`, `--assert-count`, `--assert-max`)
 
 Exit 2 is the signal to check the symbol name (grep source first), the CQL syntax, and the flag
 names against `reference/cli.md`. It is never "empty results."
@@ -164,13 +168,6 @@ cgx reaches cgx_cli::emit cgx_cli::assertions::evaluate --assert-empty
 # Emit a SARIF report AND fail CI if the path exists
 cgx paths FromFn ToFn --assert-empty --format sarif > findings.sarif
 ```
-
-### `--assert-count` and `--assert-max` (Since: v0.3)
-
-`--assert-count N` exits `1` if the result count does not equal N.
-`--assert-max N` exits `1` if the result count exceeds N.
-
-These flags are not available in v0.1.
 
 ### Vacuity guard and `--allow-vacuous`
 

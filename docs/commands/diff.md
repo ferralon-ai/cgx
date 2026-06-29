@@ -251,5 +251,7 @@ Exit code is 0.
 - [cgx doctor](doctor.md) — inspect the quality of the current on-disk index
 - [cgx reaches](reaches.md) — single-snapshot reachability between two symbols
 - [cgx paths](paths.md) — enumerate all call paths between two symbols at a single ref
+- [cgx callers](callers.md) — query callers of a symbol in the current index
+- [cgx callees](callees.md) — query callees of a symbol in the current index
 - [06-indexing-and-vcs.md](../06-indexing-and-vcs.md) — VCS integration, git-ref pinning, and how snapshots are stored
 - [questions/06-temporal-and-vcs-graph-diffs.md](../questions/06-temporal-and-vcs-graph-diffs.md) — cookbook recipes for graph diff questions (Q54–Q61)

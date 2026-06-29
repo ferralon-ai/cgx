@@ -20,41 +20,45 @@ Both layers produce identical result objects: every result node and edge carries
 
 ## Feature List
 
-| ID | Feature | Layer |
-|----|---------|-------|
-| Q-1 | `callers` subcommand | 1 |
-| Q-2 | `callees` subcommand | 1 |
-| Q-3 | `paths` subcommand with edge-condition filter | 1 |
-| Q-4 | `unused` subcommand | 1 |
-| Q-5 | `pedigree` subcommand (value provenance fan-in) | 1 |
-| Q-6 | `explain` subcommand | 1 |
-| Q-7 | `diff` subcommand (graph diff across commits or branches) | 1 |
-| Q-8 | Full query language: `cgx query '<q>' ./` | 2 |
-| Q-9 | Query from file: `cgx query @file.cql ./` | 2 |
-| Q-10 | SQL alternative: `cgx query --sql 'WITH RECURSIVE ...' ./` | 2 |
-| Q-11 | Edge-condition filters on any query | 1 + 2 |
-| Q-12 | Path-relative transience predicates | 2 |
-| Q-13 | Depth limits | 1 + 2 |
-| Q-14 | Negative path constraints (`reaches X WITHOUT passing through Y`) | 2 |
-| Q-15 | Reachability matrix queries | 2 |
-| Q-16 | Graph diff queries across commit or branch ranges | 1 + 2 |
-| Q-17 | Determinism guarantee: stable ordering, query against a specific commit (`--at`) | 1 + 2 |
-| Q-18 | Confidence-tier filtering (`--confidence certain|probable|possible`) | 1 + 2 |
-| Q-19 | Entrypoint-scoped reachability | 1 + 2 |
-| Q-20 | Path quantifiers and must-pass-through (∀-path / must-analysis) | 1 + 2 |
-| Q-21 | Path-set algebra (complement, intersection, difference) | 2 |
-| Q-22 | Ordering and pairing predicates (A-then-B on all paths; acquire/release) | 1 + 2 |
-| Q-23 | Typed taint queries (class-matched source → sink with sanitizer-class clearing) | 1 + 2 |
-| Q-24 | Concurrency queries (lock sets, await-holding-lock, blocking-in-async, cross-spawn races) | 1 + 2 |
-| Q-25 | Dependency and CVE reachability queries | 1 + 2 |
-| Q-26 | Lineage type reconstruction queries (type discovery; type-contradiction bug query) | 1 + 2 |
-| Q-27 | Mutation fan-out and exposed-state queries | 1 + 2 |
-| Q-28 | Closure-capture queries (loop-variable capture; captured-resource lifetime) | 1 + 2 |
-| Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 |
-| Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 |
-| Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 |
-| Q-32 | Override-contract drift queries (exception-widening, dropped-base-guard, field-footprint drift) | 2 |
-| Q-33 | Recursion / SCC / architecture-cycle queries | 1 + 2 |
+Shipped status reflects v0.3.0. Features without a "Planned" note are available in the current binary.
+
+| ID | Feature | Layer | v0.3.0 status |
+|----|---------|-------|---------------|
+| Q-1 | `callers` subcommand | 1 | Shipped |
+| Q-2 | `callees` subcommand | 1 | Shipped |
+| Q-3 | `paths` subcommand with edge-condition filter | 1 | Shipped |
+| Q-4 | `unused` subcommand | 1 | Shipped |
+| Q-5a | `flows-from` subcommand (backward data-flow pedigree from a value node) | 1 | Shipped (`Since: v0.3`) |
+| Q-5b | `flows-to` subcommand (forward data-flow walk from a value node) | 1 | Shipped (`Since: v0.3`) |
+| Q-5 | `pedigree` subcommand (value provenance with `--at-function`) | 1 | **Planned** — use `flows-from` today |
+| Q-6 | `explain` subcommand | 1 | Shipped |
+| Q-7 | `diff` subcommand (`<BASE> <HEAD>` positional, `--newer-than` only) | 1 | Shipped (full flags at v0.4) |
+| Q-8 | Full query language: `cgx query '<q>' ./` | 2 | Shipped (CALLS + DATA_FLOW) |
+| Q-9 | Query from file: `cgx query @file.cql ./` | 2 | Shipped |
+| Q-10 | SQL alternative: `cgx query --sql 'WITH RECURSIVE ...' ./` | 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-11 | Edge-condition filters on any query | 1 + 2 | Shipped |
+| Q-12 | Path-relative transience predicates | 2 | Shipped |
+| Q-13 | Depth limits | 1 + 2 | Shipped |
+| Q-14 | Negative path constraints (`reaches X WITHOUT passing through Y`) | 2 | Shipped |
+| Q-15 | Reachability matrix queries | 2 | Shipped |
+| Q-16 | Graph diff queries across commit or branch ranges | 1 + 2 | Shipped (`--newer-than`); full diff filters at v0.4 |
+| Q-17 | Determinism guarantee: stable ordering, query against a specific commit (`--at`) | 1 + 2 | Shipped |
+| Q-18 | Confidence-tier filtering (`--confidence certain|probable|possible`) | 1 + 2 | Shipped |
+| Q-19 | Entrypoint-scoped reachability | 1 + 2 | Shipped |
+| Q-20 | Path quantifiers and must-pass-through (∀-path / must-analysis) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-21 | Path-set algebra (complement, intersection, difference) | 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-22 | Ordering and pairing predicates (A-then-B on all paths; acquire/release) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-23 | Typed taint queries (class-matched source → sink with sanitizer-class clearing) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-24 | Concurrency queries (lock sets, await-holding-lock, blocking-in-async, cross-spawn races) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-25 | Dependency and CVE reachability queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-26 | Lineage type reconstruction queries (type discovery; type-contradiction bug query) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-27 | Mutation fan-out and exposed-state queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-28 | Closure-capture queries (loop-variable capture; captured-resource lifetime) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-32 | Override-contract drift queries (exception-widening, dropped-base-guard, field-footprint drift) | 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-33 | Recursion / SCC / architecture-cycle queries | 1 + 2 | Shipped |
 
 ---
 
@@ -175,7 +179,19 @@ cgx unused ./ --kind field --type OrderState
 cgx unused ./ --confidence certain
 ```
 
-### Q-5: pedigree
+### Q-5: pedigree — **Planned (not yet shipped in v0.3.0)**
+
+> **v0.3.0 shipped subcommands:** `flows-from` (backward/pedigree) and `flows-to` (forward). These operate on **value nodes** (e.g., `fn::local#1`), not function symbols. Use `cgx search <name>` to discover value-node FQNs.
+>
+> ```bash
+> # Backward pedigree (where does this value derive from?)
+> cgx flows-from fn::local#1 ./
+>
+> # Forward walk (what does this value flow into?)
+> cgx flows-to fn::local#1 ./
+> ```
+>
+> The `pedigree` subcommand with `--at-function` is a planned future surface that will operate on named variables within a function scope.
 
 Trace all inbound provenance for a value at a named program point: which callers, fields, return values, and transformations populate it. This is the fan-in slice of `docs/04-dataflow-and-provenance.md` DF-* features.
 
@@ -192,7 +208,7 @@ as leaves with their degree (the summarised-pedigree default generalised in
 docs/04-dataflow-and-provenance.md DF-1.4); `--through-sentinels` expands through
 them and `--max-fanout N` caps per-node breadth. See Q-13.
 
-**Examples:**
+**Planned examples (not yet runnable):**
 
 ```bash
 # Where does the value of `user_input` come from in AuthHandler::handle?
@@ -224,6 +240,13 @@ cgx explain crypto::hash ./ --at HEAD~5
 
 Compute the graph diff between two commits or branches: which edges were added, which were removed, and which symbols changed reachability status.
 
+**Shipped syntax (v0.3.0):** `<BASE>` and `<HEAD>` are positional arguments. Only `--newer-than` is available today. The named `--base`/`--head` flags and `--calls-to`/`--edge-condition`/`--taint-class` security-gate filters are **Planned (v0.4)**.
+
+```
+cgx diff <BASE> <HEAD> [--newer-than] [--format <fmt>] [--repo <path>]
+```
+
+**Planned full syntax (v0.4):**
 ```
 cgx diff --base <ref> [--head <ref>] <path>
          [--calls-to <symbol>]
@@ -231,17 +254,24 @@ cgx diff --base <ref> [--head <ref>] <path>
          [--format <fmt>]
 ```
 
-**Examples:**
+**Examples (shipped):**
 
 ```bash
 # All edge changes between main and a feature branch
-cgx diff --base main --head feature/new-auth ./
-
-# New edges that reach vulnerable::bar on an exception path
-cgx diff --base main --head feature/new-auth ./ --calls-to vulnerable::bar --edge-condition exception
+cgx diff main feature/new-auth
 
 # Edge changes between two specific commits
-cgx diff --base abc1234 --head def5678 ./
+cgx diff abc1234 def5678
+
+# Only edges added at HEAD that were absent at main
+cgx diff main HEAD --newer-than
+```
+
+**Examples (planned — not yet runnable):**
+
+```bash
+# New edges that reach vulnerable::bar on an exception path (planned v0.4)
+# cgx diff --base main --head feature/new-auth ./ --calls-to vulnerable::bar --edge-condition exception
 ```
 
 ---
@@ -345,7 +375,7 @@ RETURN src.name, src.file, src.line,
 ORDER BY src.file, src.line
 ```
 
-### Q-10: SQL alternative (unstable, view-based)
+### Q-10: SQL alternative (unstable, view-based) — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** (the views ship with the SQLite backend).
 
@@ -556,13 +586,20 @@ cgx query '
 
 This question combines graph diff (Q-16) with edge-condition filtering (Q-11).
 
-**Subcommand:**
+**Subcommand (shipped v0.3.0 — positional refs, `--newer-than` only):**
+
+```bash
+# Show edges added at feature/risky-change that were absent at main
+cgx diff main feature/risky-change --newer-than
+```
+
+**Planned subcommand flags (v0.4 — not yet runnable):**
 
 ```bash
 # Compare each feature branch against main; show only exception-path edges to the target
-cgx diff --base main --head feature/risky-change ./ \
-    --calls-to vulnerable::bar \
-    --edge-condition exception
+# cgx diff --base main --head feature/risky-change ./ \
+#     --calls-to vulnerable::bar \
+#     --edge-condition exception
 ```
 
 **Full query (per-branch comparison):**
@@ -575,10 +612,10 @@ cgx query '
 ' ./
 ```
 
-To check all branches at once against main:
+To check all branches at once against main (planned v0.4):
 
 ```bash
-cgx diff --base main --head "refs/heads/*" ./ --calls-to vulnerable::bar --edge-condition exception
+# cgx diff --base main --head "refs/heads/*" ./ --calls-to vulnerable::bar --edge-condition exception
 ```
 
 ---
@@ -681,11 +718,14 @@ See `docs/07-interfaces.md` for the full exit-code contract and `--assert-count`
 ### Question class: Graph diff across commit range (Q-16)
 
 ```bash
-# All edge changes between two commits
-cgx diff --base HEAD~10 --head HEAD ./
+# All edge changes between two commits (shipped v0.3.0 — positional refs)
+cgx diff HEAD~10 HEAD
 
-# New exception-path edges introduced in the last commit
-cgx diff --base HEAD~1 --head HEAD ./ --edge-condition exception
+# Only edges added at HEAD that were absent at HEAD~1 (--newer-than shipped)
+cgx diff HEAD~1 HEAD --newer-than
+
+# New exception-path edges introduced in the last commit (PLANNED v0.4 — not yet runnable)
+# cgx diff --base HEAD~1 --head HEAD ./ --edge-condition exception
 
 # Diff expressed as a query (compare graph at two commits)
 cgx query --at HEAD '
@@ -882,7 +922,7 @@ cgx index --entrypoint 'my_module::start_server' ./
 
 ---
 
-## Q-20: Path Quantifiers and Must-Pass-Through (∀-Path / Must-Analysis)
+## Q-20: Path Quantifiers and Must-Pass-Through (∀-Path / Must-Analysis) — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — the ∃-path default already covers "exists a path from A to B"; Q-20 adds the dual must-analysis (∀-path) that security questions almost always require.
 
@@ -992,7 +1032,7 @@ When `MATCH ALL ... AVOIDING` returns zero paths, every path passes through the 
 
 ---
 
-## Q-21: Path-Set Algebra (Complement, Intersection, Difference)
+## Q-21: Path-Set Algebra (Complement, Intersection, Difference) — **Planned (not yet shipped in v0.3.0)**
 
 > **Note.** Ordering/algebra forms written with `NONE` node-membership inherit the sibling-guard caveat from Q-20: inline sibling guards are not detected by the node-membership predicate. The dominance-correct forms arrive with Q-20 Phase-3 facts.
 
@@ -1055,7 +1095,7 @@ RETURN path
 
 ---
 
-## Q-22: Ordering and Pairing Predicates
+## Q-22: Ordering and Pairing Predicates — **Planned (not yet shipped in v0.3.0)**
 
 > **Note.** The `A BEFORE B ON ALL PATHS` and acquire/release forms written with `NONE` node-membership inherit the sibling-guard caveat from Q-20: inline sibling guards in callers are not detected by the node-membership predicate. The dominance-correct forms arrive with Q-20 Phase-3 facts.
 
@@ -1139,7 +1179,7 @@ Full typestate — "no `write()` after `close()`", "every `begin()` reaches exac
 
 ---
 
-## Q-23: Typed Taint Queries
+## Q-23: Typed Taint Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — builds on DF-11 (typed taint labels and class-matched sanitization) and DF-12 (source and sink classes). Adds the query-layer surface for composing class-matched taint predicates.
 

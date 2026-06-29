@@ -29,7 +29,7 @@ use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -583,6 +583,14 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
     let mut store = open_store(repo_root)?;
     let outcome = index_path(repo_root, &registry, &mut store, opts)
         .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
+    // Blast-radius fix (sparse-storage RFC P1): GC every superseded Layer-2 graph,
+    // keeping only the one we just wrote. No read path needs historical graphs on
+    // the normal index path; the `diff` path uses its own session and never lands
+    // here. Bounded (retain exactly 1) and deterministic (delete-by-key, no VACUUM).
+    let keep = cgx_store::TreeOid::new(outcome.graph_key.clone());
+    store
+        .prune_graphs_except(&[&keep])
+        .map_err(|e| CliError::graph(format!("pruning stale graphs: {e}")))?;
     write_pointer(
         repo_root,
         &IndexPointer {
@@ -1281,8 +1289,7 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
 
     // Open (or create) the shared on-disk store for this diff session.
     let db_file = db_path(&repo_root);
-    std::fs::create_dir_all(cgx_dir(&repo_root))
-        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    ensure_cgx_dir(&repo_root)?;
     let mut store =
         SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
@@ -1675,8 +1682,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
 /// index its tree via [`index_ref`], then read the resulting graph straight out of
 /// the store by id (no pointer involved).
 fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
-    std::fs::create_dir_all(cgx_dir(repo_root))
-        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    ensure_cgx_dir(repo_root)?;
     let db_file = db_path(repo_root);
     let mut store =
         SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;

@@ -1,5 +1,6 @@
 # Recipe: Dead and Unused Code
-**Since: v0.1** (full theme; confidence sharpens at v0.2)
+**Since: v0.1** (full theme; confidence sharpens at v0.2; DATA_FLOW layer added at v0.3)
+**Verified against: v0.3.0**
 **Audience:** AI agents and engineers auditing for dead or unreachable code.
 **Cross-refs:** `reference/cli.md` (flag syntax) · `reference/mental-model.md` (confidence ladder) · `reference/versions.md`
 
@@ -76,7 +77,7 @@ cgx unused --kind method | grep "UserService"
 ### Which authentication-related functions are never called?
 **Status:** runnable today (two steps) **Since: v0.1**
 
-There is no one-shot flag for this. The cookbook's `--path-filter` and `CONTAINS` CQL forms do not exist or fail in v0.1.
+There is no one-shot flag for this. The cookbook's `--path-filter` and `CONTAINS` CQL forms do not exist in cgx.
 
 ```bash
 # Step 1: collect all unused functions
@@ -113,7 +114,10 @@ For CI (assert no callers, fail if any found):
 
 ```bash
 cgx callers my_module::my_function --assert-empty --confidence possible
-# exits 1 if callers found, 0 if none
+# exit 1: callers found (CI failure)
+# exit 0: symbol resolved and no callers exist
+# exit 4: vacuous — symbol matched zero nodes OR confidence filter excluded all candidates; suppress with --allow-vacuous
+# exit 2: bad symbol FQN (only without --assert-empty; with --assert-empty an unresolved symbol exits 4)
 ```
 
 **Why this works:** `callers` walks backward from the symbol. `--confidence possible` is the loosest floor — it includes dynamic-dispatch candidates. If even `possible` returns nothing, the symbol is unreachable.
@@ -125,7 +129,7 @@ cgx callers my_module::my_function --assert-empty --confidence possible
 ### Which database migration functions have no callers?
 **Status:** runnable today (two steps) **Since: v0.1**
 
-The cookbook's `--path-filter '**/migrations/**'` flag does not exist in v0.1.
+The cookbook's `--path-filter '**/migrations/**'` flag does not exist in cgx.
 
 ```bash
 # Step 1: all unused functions
@@ -154,7 +158,7 @@ To fail CI if any unused symbols of a given kind exist:
 
 ```bash
 cgx unused --kind function --assert-empty
-# exit 0: no unused functions found
+# exit 0: no unused functions found (results were genuinely empty)
 # exit 1: unused functions exist (CI failure)
 ```
 
@@ -162,24 +166,49 @@ See `reference/output-and-exit.md` for the full exit-code contract.
 
 ---
 
+## Data-flow dead code (v0.3)
+
+**Since: v0.3.** The v0.3 index includes a DATA_FLOW layer (SSA value nodes and `derives-from` edges). This is built by default; pass `--no-dataflow` to `cgx index` to skip it.
+
+Two runnable approaches for data-flow tracing:
+
+**CQL with `:DATA_FLOW` edges** — works today, returns value-node pairs:
+
+```bash
+cgx query 'MATCH (a)-[:DATA_FLOW]->(b) RETURN a.name, b.name' \
+  --repo /path/to/repo
+```
+
+**`flows-to` / `flows-from`** — forward and backward value-node slices. These operate on value-node FQNs (e.g. `rust_sample::fn::local#1`), not function FQNs. Discover value-node FQNs with `cgx search <name>`.
+
+```bash
+cgx search flow_example --repo /path/to/repo   # find value-node FQNs
+cgx flows-to "rust_sample::dataflow::flow_example::b#1" --repo /path/to/repo
+cgx flows-from "rust_sample::dataflow::flow_example::b#1" --repo /path/to/repo
+```
+
+**Security-typed taint (deferred).** CQL properties `source_class`, `sink_class`, `sanitizer_class`, and `taint_label` are not backed by any field on symbol nodes in v0.3.0 — they produce plan errors (exit 2). Do not emit queries using these properties. Use structural `flows-to`/`flows-from` or `:DATA_FLOW` edges instead for reachability checks.
+
+---
+
 ## What is NOT runnable today
 
-The following cookbook entries for this theme require features not in v0.1:
+The following cookbook entries for this theme require features not in v0.3.0:
 
 | Question | Why it cannot run | Available |
 |---|---|---|
-| Q50 — find unused functions calling crypto sinks | Uses `sink_class:"crypto"` node property — plan error exit 2 | v0.3 |
-| Q53 — API endpoints not called by integration tests | Uses `entrypoint_class:"http"` and `entrypoint_class:"test"` node properties — plan error exit 2 | v0.3 |
+| Q50 — find unused functions calling crypto sinks | Uses `sink_class:"crypto"` node property — plan error exit 2 in v0.3.0 | deferred |
+| Q53 — API endpoints not called by integration tests | Uses `entrypoint_class:"http"` and `entrypoint_class:"test"` node properties — plan error exit 2 in v0.3.0 | deferred |
 | Q48 — dead branches given a flag is always false | Requires branch-predicate / path-feasibility modeling — out of scope for call-graph reachability | not planned |
 | Q52 — unreachable match arms on enum | Requires branch-predicate / argument-value reasoning — out of scope | not planned |
 
-The CQL form for Q50/Q53 parses but fails at the plan step (exit 2) because `sink_class` and `entrypoint_class` node properties are deferred to v0.3. Do not emit these queries as runnable in v0.1 environments.
+The CQL form for Q50/Q53 parses but fails at the plan step (exit 2) because `sink_class` and `entrypoint_class` node properties are not backed by any field on symbol nodes in the current release. Do not emit these queries as runnable.
 
 ---
 
 ## Key caveats
 
-**Dynamic dispatch and false positives.** `unused` is relative to the indexed call graph. A symbol reachable only via a `dyn Trait` vtable may appear as unused in v0.1 because the edge is `possible`-confidence or absent entirely. At v0.2, SCIP enrichment sharpens `certain`/`probable` edges for CHA/RTA-resolved dynamic dispatch. Until then, manually verify any symbol before deletion if its type implements a trait used as a trait object.
+**Dynamic dispatch and false positives.** `unused` is relative to the indexed call graph. A symbol reachable only via a `dyn Trait` vtable may appear as unused because the edge is `possible`-confidence or absent entirely. SCIP enrichment (v0.2+) sharpens `certain`/`probable` edges for CHA/RTA-resolved dynamic dispatch. Manually verify any symbol before deletion if its type implements a trait used as a trait object.
 
 **The indexed graph is the scope.** `unused` does not know about external callers — library consumers in other repositories, FFI callers, or dynamically-loaded plugins. A public symbol with no in-graph callers is dead to THIS codebase's index; it may still be part of a public API surface.
 

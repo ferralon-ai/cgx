@@ -33,6 +33,7 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
+use crate::effects::effects_of_call;
 use crate::module::module_path_for_pkg;
 
 /// The Go language adapter. Stateless; one instance handles every `.go` file.
@@ -230,9 +231,8 @@ impl<'a> Builder<'a> {
         String::new()
     }
 
-    /// Record an own-effect set against the enclosing callable (Phase-2 hook;
-    /// unused in Phase 1). Inside a body `ctx.fqn_prefix` is the callable's FQN.
-    #[allow(dead_code)]
+    /// Record an own-effect set against the enclosing callable. Inside a body
+    /// `ctx.fqn_prefix` is the callable's FQN (set by [`Ctx::enter_body`]).
     fn record_effects(&mut self, ctx: &Ctx, set: EffectSet) {
         if set.is_empty() {
             return;
@@ -556,6 +556,7 @@ impl<'a> Builder<'a> {
             self.emit_call_cut_hints(func);
             let (name_path, kind) = self.classify_callee(func);
             if !name_path.is_empty() {
+                self.record_effects(ctx, effects_of_call(&name_path.join("::")));
                 self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index, None);
                 *stmt_index += 1;
             }
@@ -569,6 +570,11 @@ impl<'a> Builder<'a> {
                 if let Some(func) = call.child_by_field_name("function") {
                     let (name_path, _) = self.classify_callee(func);
                     if !name_path.is_empty() {
+                        // `go f()` launches detached concurrent work; the spawned
+                        // callee's own effects also attribute to this body.
+                        let mut set = effects_of_call(&name_path.join("::"));
+                        set.insert(cgx_core::effect::Effect::Spawns);
+                        self.record_effects(ctx, set);
                         self.push_ref(
                             name_path,
                             RefKind::Spawn,
@@ -594,6 +600,7 @@ impl<'a> Builder<'a> {
                     self.emit_call_cut_hints(func);
                     let (name_path, kind) = self.classify_callee(func);
                     if !name_path.is_empty() {
+                        self.record_effects(ctx, effects_of_call(&name_path.join("::")));
                         self.push_ref(
                             name_path,
                             kind,

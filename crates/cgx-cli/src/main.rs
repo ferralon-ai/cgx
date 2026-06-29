@@ -29,7 +29,7 @@ use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{ensure_cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -437,6 +437,14 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
     let mut store = open_store(repo_root)?;
     let outcome = index_path(repo_root, &registry, &mut store, opts)
         .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
+    // Blast-radius fix (sparse-storage RFC P1): GC every superseded Layer-2 graph,
+    // keeping only the one we just wrote. No read path needs historical graphs on
+    // the normal index path; the `diff` path uses its own session and never lands
+    // here. Bounded (retain exactly 1) and deterministic (delete-by-key, no VACUUM).
+    let keep = cgx_store::TreeOid::new(outcome.graph_key.clone());
+    store
+        .prune_graphs_except(&[&keep])
+        .map_err(|e| CliError::graph(format!("pruning stale graphs: {e}")))?;
     write_pointer(
         repo_root,
         &IndexPointer {

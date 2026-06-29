@@ -263,6 +263,16 @@ NODE_MULT="${DF_NODE_MULT:-n/a}"
 EDGE_MULT="${DF_EDGE_MULT:-n/a}"
 
 # ------------------------------------------------------------------
+# 8b. GO ADAPTER — indexing + dataflow budget gate (Go analogue of SC6).
+#     Indexes the committed fixtures/go module through the same engine and
+#     asserts Go indexing + dataflow stays within the §C budget envelope.
+# ------------------------------------------------------------------
+echo "" | tee -a "$RESULTS_FILE"
+echo "--- [8b] Go adapter — indexing + dataflow budget ---" | tee -a "$RESULTS_FILE"
+bash "$BENCH_DIR/perf_gate_go.sh" 2>&1 | tee /tmp/cgx_go_perf.txt | tee -a "$RESULTS_FILE"
+GO_PERF_VERDICT=$(awk -F'= ' '/^GO_PERF_VERDICT/ {print $2; exit}' /tmp/cgx_go_perf.txt)
+
+# ------------------------------------------------------------------
 # 9. VERDICT
 # ------------------------------------------------------------------
 echo "" | tee -a "$RESULTS_FILE"

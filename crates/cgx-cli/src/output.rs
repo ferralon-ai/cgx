@@ -1013,6 +1013,108 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
     }
 }
 
+/// Render `cgx symbols` results (B-2, Since: v0.3) as a human table (default) or
+/// `--format json`. Ranks arrive pre-sorted by reference count (inbound or total
+/// degree) with a deterministic FQN tiebreak; this applies the `--limit`/`--top`
+/// cap (`0` = unlimited) and, when results exceed it, prints the top-N then a
+/// `… (N more)` footer (never silently dropped).
+///
+/// Human form, one row per symbol:
+/// `<fqn>  (file:line)  [kind]  in=<n> out=<m>  in:{…}  out:{…}` where each `{…}` is
+/// the family/condition breakdown of that direction's edges. JSON mirrors the rank
+/// struct with nested `inbound`/`outbound` breakdown objects.
+pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: usize) -> String {
+    let shown = if limit == 0 {
+        ranks.len()
+    } else {
+        limit.min(ranks.len())
+    };
+    let visible = &ranks[..shown];
+    let hidden = ranks.len() - shown;
+
+    match format {
+        Format::Json => {
+            let items: Vec<Value> = visible.iter().map(symbol_rank_json).collect();
+            let mut s = serde_json::to_string_pretty(&items).expect("symbols results serialize");
+            s.push('\n');
+            s
+        }
+        _ => {
+            if ranks.is_empty() {
+                return "(no results)\n".to_string();
+            }
+            let fqn_width = visible.iter().map(|r| r.fqn.chars().count()).max().unwrap_or(0);
+            let mut out = String::new();
+            for r in visible {
+                let pad = fqn_width.saturating_sub(r.fqn.chars().count());
+                out.push_str(&format!(
+                    "{}{}  ({}:{})  [{}]  in={} out={}  in:{}  out:{}\n",
+                    r.fqn,
+                    " ".repeat(pad),
+                    r.file,
+                    r.line,
+                    kind_str(r.kind),
+                    r.in_degree,
+                    r.out_degree,
+                    breakdown_human(&r.inbound),
+                    breakdown_human(&r.outbound),
+                ));
+            }
+            if hidden > 0 {
+                out.push_str(&format!("… ({hidden} more)\n"));
+            }
+            out
+        }
+    }
+}
+
+/// A compact `{family=n, …}`-style summary of one direction's edge breakdown, used
+/// in the human `symbols` row. Renders the family split (CALLS vs DERIVES_FROM)
+/// plus the condition split so both decompositions are visible at a glance.
+/// `BTreeMap` iteration keeps the key order deterministic.
+fn breakdown_human(b: &cgx_query::EdgeBreakdown) -> String {
+    if b.total == 0 {
+        return "{}".to_string();
+    }
+    let mut parts: Vec<String> = b.by_family.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let conds: Vec<String> = b
+        .by_condition
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    if !conds.is_empty() {
+        parts.push(conds.join(","));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
+/// JSON for one ranked symbol: the location fields plus nested inbound/outbound
+/// breakdown objects (each with `total` and the family/condition/confidence maps).
+fn symbol_rank_json(r: &cgx_query::SymbolRank) -> Value {
+    json!({
+        "fqn": r.fqn,
+        "file": r.file,
+        "line": r.line,
+        "kind": kind_str(r.kind),
+        "in_degree": r.in_degree,
+        "out_degree": r.out_degree,
+        "inbound": breakdown_json(&r.inbound),
+        "outbound": breakdown_json(&r.outbound),
+    })
+}
+
+/// JSON for one [`cgx_query::EdgeBreakdown`]: `{ total, by_family, by_condition,
+/// by_confidence }` with each map serialized as an object (deterministic key order
+/// via the source `BTreeMap`).
+fn breakdown_json(b: &cgx_query::EdgeBreakdown) -> Value {
+    json!({
+        "total": b.total,
+        "by_family": b.by_family,
+        "by_condition": b.by_condition,
+        "by_confidence": b.by_confidence,
+    })
+}
+
 /// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text
 /// (default) or `--format json`. SARIF is not a meaningful shape for a single
 /// symbol's provenance, so `explain` supports only human/json (the dispatch scope).

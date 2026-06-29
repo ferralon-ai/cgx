@@ -19,15 +19,17 @@ use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
-    callees, callers, neighborhood, paths as query_paths, reaches, search_symbols, unused,
-    Direction, EdgeFilter, GraphView, PathSet, PathWalker, Subgraph,
+    callees, callers, neighborhood, paths as query_paths, rank_symbols, reaches, search_symbols,
+    unused, Direction, EdgeFilter, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
-use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
+use cgx_cli::output::{
+    render, render_explanation, render_search, render_symbols, Format, ResultSet, TableData,
+};
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -144,11 +146,18 @@ enum Command {
     /// A pure node-table scan (no graph walk): resolves a partial/half-remembered
     /// name to exact FQNs to feed into `callers`/`callees`/`reaches`. Default match
     /// is a case-insensitive substring against the whole FQN (matches anywhere);
-    /// `--regex` matches the whole FQN as a regex. Finding nothing exits 0 (search
-    /// is not the exact-symbol surface). `Since: v0.2`.
+    /// `--regex` matches the whole FQN as a regex. `--all` lists every symbol with
+    /// no pattern (mutually exclusive with a pattern). Finding nothing exits 0
+    /// (search is not the exact-symbol surface). `Since: v0.2` (`--all`: `v0.3`).
     Search {
-        /// The pattern to match against each symbol's fully-qualified name.
-        pattern: String,
+        /// The pattern to match against each symbol's fully-qualified name. Optional:
+        /// omit it and pass `--all` to list every symbol.
+        pattern: Option<String>,
+        /// List every indexed symbol (optionally narrowed by `--kind`), no pattern
+        /// required. Mutually exclusive with a `pattern` (passing both → exit 2).
+        /// The explicit, discoverable form of a match-everything search.
+        #[arg(long)]
+        all: bool,
         /// Treat `pattern` as a regular expression over the whole FQN (replaces the
         /// default case-insensitive substring match). Invalid regex → exit 2.
         #[arg(long)]
@@ -160,6 +169,41 @@ enum Command {
         /// When results exceed the limit, the sorted top-N print with a footer.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format (human or json).
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+        /// Do not auto-index when the `.cgx/` store is missing or stale.
+        #[arg(long)]
+        no_auto_index: bool,
+    },
+    /// Rank symbols by reference count, with a per-symbol edge breakdown.
+    ///
+    /// The hub / importance lens (B-2): unlike `search` (a name filter) this ranks
+    /// every symbol by how depended-upon it is — its inbound degree (callers +
+    /// data-flow consumers) by default, or total degree (`--total`, in+out). Each
+    /// row decomposes its incident edges by family (CALLS vs DERIVES_FROM), by
+    /// condition (always/conditional/loop/exception/panic) and by confidence. A
+    /// cheap aggregation over the loaded graph — no walk, no new persistence. Use it
+    /// to find graph hubs, attack-surface entry points, and refactor blast-radius
+    /// candidates. `Since: v0.3`.
+    Symbols {
+        /// Rank by total degree (`in + out`) instead of the default inbound degree.
+        #[arg(long)]
+        total: bool,
+        /// Restrict to a symbol kind (e.g. `function`, `method`, `type`).
+        #[arg(long, value_enum)]
+        kind: Option<KindArg>,
+        /// Maximum number of ranked rows to print. Default 50; `0` = unlimited. When
+        /// results exceed it, the top-N print with a `… (N more)` footer.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Sugar for `--limit N`: show the top-N most-referenced symbols. Overrides
+        /// `--limit` when both are given.
+        #[arg(long, value_name = "N")]
+        top: Option<usize>,
         /// Path to the indexed repository (defaults to the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -339,13 +383,23 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Query { query, query_args } => run_query(&query, query_args),
         Command::Search {
             pattern,
+            all,
             regex,
             kind,
             limit,
             repo,
             format,
             no_auto_index,
-        } => run_search(&pattern, regex, kind, limit, repo, format, no_auto_index),
+        } => run_search(pattern, all, regex, kind, limit, repo, format, no_auto_index),
+        Command::Symbols {
+            total,
+            kind,
+            limit,
+            top,
+            repo,
+            format,
+            no_auto_index,
+        } => run_symbols(total, kind, limit, top, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -944,15 +998,17 @@ fn run_explain(
     Ok(())
 }
 
-/// `cgx search <pattern>` (Since: v0.2): a pure node-table scan that resolves a
-/// partial/half-remembered name to exact FQNs. Distinct from the exact-symbol
-/// surface in two ways the spec calls out: (1) an empty result set is **exit 0**,
-/// not a not-found error; (2) it carries no vacuity/assertion machinery, so it
-/// bypasses [`emit`]. Usage errors (all exit 2): an unsupported `--format`, an
-/// empty or invalid `--regex` pattern; a missing `--kind` value or a bare `cgx
-/// search` (no pattern) are rejected by clap before this runs.
+/// `cgx search <pattern>` / `cgx search --all` (Since: v0.2; `--all` since v0.3): a
+/// pure node-table scan that resolves a partial/half-remembered name to exact FQNs,
+/// or — with `--all` — lists every symbol. Distinct from the exact-symbol surface
+/// in two ways the spec calls out: (1) an empty result set is **exit 0**, not a
+/// not-found error; (2) it carries no vacuity/assertion machinery, so it bypasses
+/// [`emit`]. Usage errors (all exit 2): an unsupported `--format`; an empty or
+/// invalid `--regex` pattern; passing both a `pattern` and `--all`, or neither.
+#[allow(clippy::too_many_arguments)]
 fn run_search(
-    pattern: &str,
+    pattern: Option<String>,
+    all: bool,
     regex: bool,
     kind: Option<KindArg>,
     limit: usize,
@@ -970,6 +1026,24 @@ fn run_search(
         )));
     }
 
+    // `--all` and a `pattern` are mutually exclusive; one of them is required. clap
+    // leaves `pattern` optional (so `--all` needs no positional), so the
+    // either-or-but-not-both contract is enforced here (B-1, exit 2 on violation).
+    let selector = match (all, pattern.as_deref()) {
+        (true, Some(_)) => {
+            return Err(CliError::usage(
+                "pass either a pattern or --all, not both".to_string(),
+            ))
+        }
+        (false, None) => {
+            return Err(CliError::usage(
+                "a search pattern is required (or pass --all to list every symbol)".to_string(),
+            ))
+        }
+        (true, None) => SearchMatch::All,
+        (false, Some(p)) => SearchMatch::Pattern { pattern: p, regex },
+    };
+
     let repo_root = resolve_repo(repo)?;
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
@@ -977,10 +1051,47 @@ fn run_search(
     let view = load_view(&repo_root)?;
 
     let kind_filter = kind.map(SymbolKind::from);
-    let hits = search_symbols(&view, pattern, regex, kind_filter)
-        .map_err(|e| CliError::usage(e.to_string()))?;
+    let hits =
+        search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
 
     print!("{}", render_search(format, &hits, limit));
+    Ok(())
+}
+
+/// `cgx symbols` (Since: v0.3): rank symbols by reference count with a per-symbol
+/// edge breakdown (B-2). Like `search` it is a cheap aggregation that bypasses the
+/// vacuity/assertion machinery and exits 0 on an empty graph. `--top N` is sugar
+/// for `--limit N` (and overrides it). Surface restricted to `--format human|json`
+/// (the same shapes `search` supports; the path-graph/SARIF emitters are
+/// meaningless for a ranked symbol table).
+fn run_symbols(
+    total: bool,
+    kind: Option<KindArg>,
+    limit: usize,
+    top: Option<usize>,
+    repo: Option<PathBuf>,
+    format: Format,
+    no_auto_index: bool,
+) -> Result<(), CliError> {
+    if !matches!(format, Format::Human | Format::Json) {
+        return Err(CliError::usage(format!(
+            "{format:?} format is not supported by `symbols` — use --format human|json"
+        )));
+    }
+
+    let repo_root = resolve_repo(repo)?;
+    if !no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    let view = load_view(&repo_root)?;
+
+    let kind_filter = kind.map(SymbolKind::from);
+    let rank_by = if total { RankBy::Total } else { RankBy::Inbound };
+    let ranks = rank_symbols(&view, rank_by, kind_filter);
+
+    // `--top N` is sugar for `--limit N`; when both are given `--top` wins.
+    let effective_limit = top.unwrap_or(limit);
+    print!("{}", render_symbols(format, &ranks, effective_limit));
     Ok(())
 }
 

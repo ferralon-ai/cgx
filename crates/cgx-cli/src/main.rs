@@ -182,17 +182,19 @@ enum Command {
     /// Rank symbols by reference count, with a per-symbol edge breakdown.
     ///
     /// The hub / importance lens (B-2): unlike `search` (a name filter) this ranks
-    /// every symbol by how depended-upon it is — its inbound degree (callers +
-    /// data-flow consumers) by default, or total degree (`--total`, in+out). Each
-    /// row decomposes its incident edges by family (CALLS vs DERIVES_FROM), by
-    /// condition (always/conditional/loop/exception/panic) and by confidence. A
-    /// cheap aggregation over the loaded graph — no walk, no new persistence. Use it
-    /// to find graph hubs, attack-surface entry points, and refactor blast-radius
+    /// every symbol by overall connectedness — its total degree (`in + out`) by
+    /// default, or by inbound or outbound degree via `--rank`. Each row decomposes
+    /// its incident edges by family (CALLS vs DERIVES_FROM), by condition
+    /// (always/conditional/loop/exception/panic) and by confidence. A cheap
+    /// aggregation over the loaded graph — no walk, no new persistence. Use it to
+    /// find graph hubs, attack-surface entry points, and refactor blast-radius
     /// candidates. `Since: v0.3`.
     Symbols {
-        /// Rank by total degree (`in + out`) instead of the default inbound degree.
-        #[arg(long)]
-        total: bool,
+        /// Ranking basis: `total` (in+out, default), `inbound` (how depended-upon:
+        /// callers + data-flow consumers), or `outbound` (how many things it depends
+        /// on). All three are computed in one pass, so the choice is free.
+        #[arg(long, value_enum, default_value_t = RankArg::Total)]
+        rank: RankArg,
         /// Restrict to a symbol kind (e.g. `function`, `method`, `type`).
         #[arg(long, value_enum)]
         kind: Option<KindArg>,
@@ -268,6 +270,28 @@ enum KindArg {
     Macro,
     Lambda,
     Entrypoint,
+}
+
+/// The `--rank` basis for `cgx symbols`. Mirrors [`RankBy`]; an unknown value is
+/// rejected by clap as a usage error (exit 2), per the exit-code contract.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum RankArg {
+    /// Total degree (`in + out`) — the default.
+    Total,
+    /// Inbound degree (how depended-upon a symbol is).
+    Inbound,
+    /// Outbound degree (how many things a symbol depends on).
+    Outbound,
+}
+
+impl From<RankArg> for RankBy {
+    fn from(r: RankArg) -> Self {
+        match r {
+            RankArg::Total => RankBy::Total,
+            RankArg::Inbound => RankBy::Inbound,
+            RankArg::Outbound => RankBy::Outbound,
+        }
+    }
 }
 
 impl From<KindArg> for SymbolKind {
@@ -392,14 +416,14 @@ fn run(command: Command) -> Result<(), CliError> {
             no_auto_index,
         } => run_search(pattern, all, regex, kind, limit, repo, format, no_auto_index),
         Command::Symbols {
-            total,
+            rank,
             kind,
             limit,
             top,
             repo,
             format,
             no_auto_index,
-        } => run_symbols(total, kind, limit, top, repo, format, no_auto_index),
+        } => run_symbols(rank, kind, limit, top, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
@@ -1065,7 +1089,7 @@ fn run_search(
 /// (the same shapes `search` supports; the path-graph/SARIF emitters are
 /// meaningless for a ranked symbol table).
 fn run_symbols(
-    total: bool,
+    rank: RankArg,
     kind: Option<KindArg>,
     limit: usize,
     top: Option<usize>,
@@ -1086,8 +1110,7 @@ fn run_symbols(
     let view = load_view(&repo_root)?;
 
     let kind_filter = kind.map(SymbolKind::from);
-    let rank_by = if total { RankBy::Total } else { RankBy::Inbound };
-    let ranks = rank_symbols(&view, rank_by, kind_filter);
+    let ranks = rank_symbols(&view, RankBy::from(rank), kind_filter);
 
     // `--top N` is sugar for `--limit N`; when both are given `--top` wins.
     let effective_limit = top.unwrap_or(limit);

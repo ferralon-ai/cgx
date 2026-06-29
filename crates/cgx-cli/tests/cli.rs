@@ -1167,7 +1167,7 @@ fn symbols_fixture_repo() -> (tempfile::TempDir, PathBuf) {
 fn symbols_ranks_hub_first_by_inbound_degree() {
     let (_tmp, repo) = symbols_fixture_repo();
     index(&repo);
-    let (out, code) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "inbound", "--format", "json"]);
     assert_eq!(code, 0, "symbols exits 0: {out}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
     let arr = v.as_array().expect("array");
@@ -1217,10 +1217,33 @@ fn symbols_human_row_shows_degree_and_breakdown() {
 }
 
 #[test]
-fn symbols_total_flag_ranks_by_in_plus_out() {
+fn symbols_default_rank_is_total_degree() {
     let (_tmp, repo) = symbols_fixture_repo();
     index(&repo);
-    let (out, code) = run_cgx(&repo, &["symbols", "--total", "--format", "json"]);
+    // No `--rank`: the default is total degree (`in + out`). The top row's total
+    // must be >= every other row's total.
+    let (out, code) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    assert_eq!(code, 0, "symbols exits 0: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    let total = |s: &serde_json::Value| {
+        s.get("in_degree").unwrap().as_u64().unwrap()
+            + s.get("out_degree").unwrap().as_u64().unwrap()
+    };
+    let top_total = total(&arr[0]);
+    for s in arr {
+        assert!(top_total >= total(s), "default rank is total degree descending: {out}");
+    }
+    // The default surface and `--rank total` agree byte-for-byte.
+    let (explicit, _) = run_cgx(&repo, &["symbols", "--rank", "total", "--format", "json"]);
+    assert_eq!(out, explicit, "default == --rank total");
+}
+
+#[test]
+fn symbols_rank_total_counts_in_plus_out() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "total", "--format", "json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
     let arr = v.as_array().unwrap();
@@ -1231,6 +1254,36 @@ fn symbols_total_flag_ranks_by_in_plus_out() {
         s.get("in_degree").unwrap().as_u64().unwrap() + s.get("out_degree").unwrap().as_u64().unwrap()
     };
     assert!(total("fixture::main") >= 2, "main has out-degree counted: {out}");
+}
+
+#[test]
+fn symbols_rank_outbound_leads_with_caller() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    // Outbound ranks by callees. `main` (out=2) and `hub` (out=0) sit at opposite
+    // ends, so the top row's out-degree dominates and `hub` is not first.
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "outbound", "--format", "json"]);
+    assert_eq!(code, 0, "symbols exits 0: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    let out_deg = |s: &serde_json::Value| s.get("out_degree").unwrap().as_u64().unwrap();
+    let top_out = out_deg(&arr[0]);
+    for s in arr {
+        assert!(top_out >= out_deg(s), "outbound rank is out-degree descending: {out}");
+    }
+    assert_ne!(
+        arr[0].get("fqn").unwrap().as_str().unwrap(),
+        "fixture::hub",
+        "hub (out=0) must not lead an outbound ranking: {out}"
+    );
+}
+
+#[test]
+fn symbols_unknown_rank_value_exits_2() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (_out, code) = run_cgx(&repo, &["symbols", "--rank", "sideways"]);
+    assert_eq!(code, 2, "an unknown --rank value is a usage error → exit 2");
 }
 
 #[test]

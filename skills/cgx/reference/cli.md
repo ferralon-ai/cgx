@@ -259,14 +259,16 @@ Since: v0.3
 cgx symbols [OPTIONS]
 ```
 
-The hub / importance lens. Unlike `search` (a name filter), `symbols` ranks **every** symbol by how
-depended-upon it is and decomposes each one's incident edges. A cheap aggregation over the loaded graph —
+The hub / importance lens. Unlike `search` (a name filter), `symbols` ranks **every** symbol by its
+connectedness and decomposes each one's incident edges. A cheap aggregation over the loaded graph —
 no walk, no new persistence. Use it to find graph hubs, attack-surface entry points, and refactor
 blast-radius candidates; complements `unused` (binary reachability) with a *ranked* degree view.
 
-**Ranking:** default is **inbound degree** — callers + data-flow consumers (how depended-upon). `--total`
-ranks by total degree (`in + out`). Ties break by FQN then `(file, line)`, so output is byte-identical
-across runs.
+**Ranking:** `--rank <BASIS>` selects the ordering key — `total` (in+out, **default**), `inbound`
+(callers + data-flow consumers; how depended-upon), or `outbound` (callees + data-flow sources; how much
+it depends on others). All three degrees are computed in the same single pass, so the basis is free to
+change. An unknown `--rank` value is a usage error (exit 2). Ties break by FQN then `(file, line)`, so
+output is byte-identical across runs.
 
 **Edge orientation:** "inbound" consistently means "things that depend on this symbol". For a CALLS edge
 that is its callers; for a `DerivesFrom` edge (stored anti-causally, `derived → source`) it is the values
@@ -274,7 +276,7 @@ derived *from* this one (its `flows-to` consumers). Outbound is the mirror (call
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--total` | off | Rank by total degree (`in + out`) instead of inbound degree |
+| `--rank <BASIS>` | `total` | Ranking basis: `total` (in+out), `inbound`, or `outbound`. Unknown value → exit 2 |
 | `--kind <KIND>` | (all) | Restrict to a symbol kind (same set as `search`). Unknown value → exit 2 |
 | `--limit <N>` | `50` | Max ranked rows. `0` = unlimited. Truncated output adds a footer `… (N more)` |
 | `--top <N>` | — | Sugar for `--limit N` (the top-N most-referenced). Overrides `--limit` when both given |
@@ -295,9 +297,9 @@ of `inbound`/`outbound` is `{ total, by_family, by_condition, by_confidence }` (
 
 **Examples:**
 ```bash
-cgx symbols                                     # top 50 by inbound degree
-cgx symbols --top 10                            # the 10 most-depended-upon symbols
-cgx symbols --total --kind function             # functions ranked by total degree
+cgx symbols                                     # top 50 by total degree (in+out)
+cgx symbols --rank inbound --top 10             # the 10 most-depended-upon symbols
+cgx symbols --rank outbound --kind function     # functions ranked by how much they call out
 cgx symbols --format json --limit 0             # every symbol, full breakdown, JSON
 ```
 
@@ -496,8 +498,8 @@ cgx mcp --root /path/to/repo
 **`†` (on `search` / `symbols`):** both accept only `human` and `json`. `sarif`, `dot`, `mermaid`, and `d2`
 are not meaningful for a symbol-list / ranked-symbol result and are not accepted.
 
-**`symbols`-only flags:** `--total` (rank by total degree), `--top <N>` (sugar for `--limit N`),
-plus `--kind` and `--limit` (shared with `search`).
+**`symbols`-only flags:** `--rank <total|inbound|outbound>` (ranking basis, default `total`),
+`--top <N>` (sugar for `--limit N`), plus `--kind` and `--limit` (shared with `search`).
 
 **`*` (on `unused`):** the binary accepts `--at`, `--depth`, and `--confidence` on
 `unused` (exit 0); `--depth`/`--at` have no effect on the unused-symbol computation,

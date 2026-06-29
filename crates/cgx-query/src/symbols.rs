@@ -8,9 +8,11 @@
 //!
 //! ## Ranking
 //!
-//! Default rank is **inbound degree** — how depended-upon a symbol is: its
-//! call-family callers plus its DerivesFrom consumers. `total` ranks by `in + out`.
-//! Ties break by FQN then `(file, line)` so output is byte-identical across runs.
+//! Default rank is **total degree** (`in + out`) — overall connectedness. Both the
+//! inbound and outbound tallies are computed in the same single pass, so `inbound`
+//! (how depended-upon: callers + DerivesFrom consumers) and `outbound` (how many
+//! things a symbol depends on) cost nothing extra to select. Ties break by FQN then
+//! `(file, line)` so output is byte-identical across runs.
 //!
 //! ## Edge orientation (knowledge `cgx-dataflow-edge-orientation.md`)
 //!
@@ -115,12 +117,15 @@ impl SymbolRank {
 }
 
 /// How [`rank_symbols`] orders results before the `--limit`/`--top` cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RankBy {
-    /// Default: inbound degree descending (how depended-upon a symbol is).
-    Inbound,
-    /// Total degree (`in + out`) descending.
+    /// Default: total degree (`in + out`) descending — overall connectedness.
+    #[default]
     Total,
+    /// Inbound degree descending (how depended-upon a symbol is).
+    Inbound,
+    /// Outbound degree descending (how many things a symbol depends on).
+    Outbound,
 }
 
 /// Rank every symbol (optionally narrowed to one `kind`) by reference count, each
@@ -182,8 +187,9 @@ pub fn rank_symbols(
 
     ranks.sort_by(|a, b| {
         let key = |r: &SymbolRank| match rank_by {
-            RankBy::Inbound => r.in_degree,
             RankBy::Total => r.total_degree(),
+            RankBy::Inbound => r.in_degree,
+            RankBy::Outbound => r.out_degree,
         };
         // Descending on the rank key; ascending on (fqn, file, line) for a stable,
         // reproducible tiebreak.
@@ -327,6 +333,29 @@ mod tests {
         let pos = |f: &str| order.iter().position(|x| *x == f).unwrap();
         assert!(pos("app::a") < pos("app::hub"));
         assert_eq!(ranks.iter().find(|r| r.fqn == "app::a").unwrap().total_degree(), 2);
+    }
+
+    #[test]
+    fn outbound_ranking_orders_by_out_degree_descending() {
+        let view = call_view();
+        let ranks = rank_symbols(&view, RankBy::Outbound, None);
+        // `a` calls hub and leaf (out=2) — the most outbound — so it leads.
+        assert_eq!(ranks[0].fqn, "app::a");
+        assert_eq!(ranks[0].out_degree, 2);
+        // Descending on out-degree throughout.
+        for w in ranks.windows(2) {
+            assert!(w[0].out_degree >= w[1].out_degree);
+        }
+    }
+
+    #[test]
+    fn default_rank_by_is_total() {
+        let view = call_view();
+        let by_default = rank_symbols(&view, RankBy::default(), None);
+        let by_total = rank_symbols(&view, RankBy::Total, None);
+        assert_eq!(RankBy::default(), RankBy::Total);
+        let names = |rs: &[SymbolRank]| rs.iter().map(|r| r.fqn.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&by_default), names(&by_total));
     }
 
     #[test]

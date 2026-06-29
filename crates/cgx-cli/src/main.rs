@@ -29,7 +29,7 @@ use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{render, render_explanation, render_search, Format, ResultSet, TableData};
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{ensure_cgx_dir, db_path, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -1125,8 +1125,7 @@ fn run_diff(
     // We create a fresh in-memory store so the two indexed snapshots don't
     // pollute the user's on-disk index.
     let db_file = db_path(&repo_root);
-    std::fs::create_dir_all(cgx_dir(&repo_root))
-        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    ensure_cgx_dir(&repo_root)?;
     let mut store =
         SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
@@ -1369,8 +1368,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
 /// index its tree via [`index_ref`], then read the resulting graph straight out of
 /// the store by id (no pointer involved).
 fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
-    std::fs::create_dir_all(cgx_dir(repo_root))
-        .map_err(|e| CliError::graph(format!("creating .cgx dir: {e}")))?;
+    ensure_cgx_dir(repo_root)?;
     let db_file = db_path(repo_root);
     let mut store =
         SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;

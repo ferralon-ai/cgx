@@ -81,16 +81,27 @@ MATCH (f) RETURN f
 MATCH (a)-[:CALLS]->(b) RETURN a.name LIMIT 10
 ```
 
-### Never emit unbounded `CALLS*`
+### Always bound var-length `CALLS*` / `DATA_FLOW*`
 
-`MATCH (a)-[:CALLS*]->(b)` with no bound hangs. Always provide a bound:
+A bare `*` (`MATCH (a)-[:CALLS*]->(b)`) used to hang by walking the full transitive
+closure from every anchor — on a dense `DATA_FLOW` graph this was the ~1.87M-row /
+~71s blowup. As of v0.3 an unbounded `*` is **capped by default**: depth 8 hops and
+~1024 result rows, after which the walk *truncates* and surfaces a `PathCap`
+truncation marker (it no longer hangs and never silently errors).
+
+The cap is a safety net, not a substitute for a real bound — it drops results past
+the cap. Always write the bound you mean, and raise it explicitly when you need more
+reach (an explicit `*N..M` overrides the default):
 
 ```cypher
--- hangs — do not use
+-- runs, but depth/row-capped at the default; deeper results are truncated
 MATCH (a)-[:CALLS*]->(b) RETURN a.name
 
--- correct — bounded
+-- correct — explicit bound
 MATCH (a)-[:CALLS*3]->(b) RETURN a.name LIMIT 10
+
+-- escape hatch — explicit range raises the default cap
+MATCH (a)-[:DATA_FLOW*1..12]->(b) RETURN a.name
 ```
 
 ### Supported node properties
@@ -258,8 +269,7 @@ error exit 2). The example above omits them intentionally.
 
 | Trap | Effect | Fix |
 |---|---|---|
-| Unbounded `CALLS*` | Hangs — no termination | Always bound: `CALLS*3` or `CALLS*1..5` |
-| `path = (a)-[:CALLS*N]->(b)` with N ≥ 2, no endpoint anchor | Hangs — materializes all paths | Anchor one endpoint: add `WHERE a.fqn = "…"` or use `CALLS*1` |
+| Unbounded `CALLS*`/`DATA_FLOW*` | Depth/row-capped by default (8 hops, ~1024 rows), truncates with `PathCap` — deeper results dropped | Always bound: `CALLS*3` or `DATA_FLOW*1..8`; raise with explicit `*N..M` |
 | Single-quoted strings inside query | Parse error exit 2 | Use double quotes inside; wrap query in single quotes |
 | `NOT IN […]` | Parse error exit 2 | Use `NOT x = …` or repeated `AND NOT x = …` |
 | Node-only MATCH (no relationship) | Plan error exit 2 | Add `[:CALLS]->` or any valid relationship |

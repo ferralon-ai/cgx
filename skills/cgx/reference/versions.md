@@ -67,7 +67,8 @@ on the TypeScript frontend.
 | `query` | v0.1 | **CALLS-graph CQL subset only** — see "CQL clause gating" below |
 | `diff` | v0.1 | `<BASE> <HEAD>` are positional; `--newer-than` only; full filters at v0.4 |
 | `mcp` | v0.1 | STDIO server; 6 tools registered (callers/callees/paths/unused/explain + graph_query); `graph_query` is registered in the tool list but always returns an error on call — use the other 5 tools |
-| `search` | v0.2 | `--regex`, `--kind`, `--limit`, `--format human\|json`; empty result → exit 0 |
+| `search` | v0.2 | `--regex`, `--kind`, `--limit`, `--format human\|json`; empty result → exit 0. **`--all`** (list every symbol, no pattern; mutually exclusive with a pattern) added in v0.3 |
+| `symbols` | v0.3 | Rank symbols by reference count with a per-symbol edge breakdown. `--rank total\|inbound\|outbound` (default `total`), `--top N`, `--kind`, `--limit`, `--format human\|json`; empty graph → exit 0 |
 | `flows-to` | v0.3 | Forward `DerivesFrom` walk from a value node. On by default (SC6); disable with `cgx index --no-dataflow`. Accepts `--confidence`, `--depth`, `--tree`, `--at`, `--repo`, `--format`. |
 | `flows-from` | v0.3 | Backward `DerivesFrom` walk (pedigree) from a value node. On by default (SC6); disable with `cgx index --no-dataflow`. Same flags as `flows-to`. |
 | `prune --branches` | v0.4 *(planned)* | |

@@ -3,7 +3,7 @@
 **Audience:** Engineers and AI agents driving cgx from the command line.
 
 **Authoritative, comprehensive reference:** [`docs/commands/`](../../../docs/commands/)
-and its [`README`](../../../docs/commands/README.md) (14 command pages with full flag tables,
+and its [`README`](../../../docs/commands/README.md) (per-command pages with full flag tables,
 output samples, and exit-code details).
 
 This file is a **cheat-sheet only** — one line per subcommand and the flags you reach for
@@ -11,7 +11,7 @@ most. Look up edge cases in `docs/commands/`.
 
 ---
 
-## All 14 subcommands
+## All 15 subcommands
 
 | Subcommand | One-job summary | Most-used flags |
 |---|---|---|
@@ -24,7 +24,8 @@ most. Look up edge cases in `docs/commands/`.
 | `paths` | Enumerate every distinct call path from one symbol to another | `--depth` (default 6), `--format` |
 | `explain` | Full provenance for one symbol: definition, edge counts, all incident edges | `--format`, `--repo` |
 | `query` | Run a CQL (Cypher-subset) expression against the call or dataflow graph | `--at`, `--depth`, `--format` |
-| `search` | Find symbols by FQN substring or regex; no graph walk | `--kind`, `--regex`, `--limit` |
+| `search` | Find symbols by FQN substring or regex (or `--all`); no graph walk | `--all`, `--kind`, `--regex`, `--limit` |
+| `symbols` | Rank symbols by reference count, with inbound/outbound edge breakdown (v0.3) | `--rank total\|inbound\|outbound`, `--top`, `--kind` |
 | `unused` | Symbols not reachable from any indexed entrypoint | `--kind`, `--format` |
 | `doctor` | Report on the quality and trust level of the current on-disk index | `--format` |
 | `diff` | Diff the call graph between two git refs | `--newer-than`, `--format` |
@@ -104,6 +105,12 @@ cgx explain rust_sample::conditions::dispatch --repo fixtures/rust-sample
 # Search by substring
 cgx search dispatch --repo fixtures/rust-sample --limit 5
 
+# Search — list every symbol (no pattern)
+cgx search --all --repo fixtures/rust-sample --limit 0
+
+# Symbols — top-N by reference count (in+out)
+cgx symbols --rank inbound --top 10 --repo fixtures/rust-sample
+
 # Unused functions
 cgx unused --kind function --repo fixtures/rust-sample
 
@@ -126,6 +133,10 @@ cgx doctor --repo fixtures/rust-sample
 > not function symbols. Use `cgx search <name> --kind variable` to find the exact FQN.
 > The index must have been built without `--no-dataflow` (the default); on a `--no-dataflow`
 > index, value nodes are absent and the symbol does not resolve (exit 2).
+
+> **`search --all`** lists every symbol with no pattern — the explicit, discoverable form of
+> a match-everything search (use it instead of `cgx search '.' --regex`). `--all` is mutually
+> exclusive with a `<PATTERN>` (passing both → exit 2) and composes with `--kind`/`--limit`/`--format`.
 
 ---
 

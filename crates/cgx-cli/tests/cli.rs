@@ -1031,3 +1031,301 @@ fn dataflow_index_then_query_call_graph_still_works() {
     assert_eq!(code, 0, "callees over a dataflow index works: {out}");
     assert!(out.contains("fixture::alpha"), "alpha still reached: {out}");
 }
+
+// --- `cgx search --all` (B-1, match-everything convenience, Since: v0.3) ------
+
+#[test]
+fn search_all_lists_every_symbol_no_pattern() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "--all"]);
+    assert_eq!(code, 0, "--all is a successful, pattern-free listing: {out}");
+    // Both functions and the type appear — no name predicate filters anything out.
+    assert!(out.contains("fixture::search_target_alpha"), "fn listed: {out}");
+    assert!(out.contains("fixture::helper::SearchWidget"), "type listed: {out}");
+    assert!(
+        out.contains("fixture::helper::search_target_beta"),
+        "helper fn listed: {out}"
+    );
+}
+
+#[test]
+fn search_all_equals_match_all_pattern() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // `--all` must produce the same result set as the unobvious `.` regex idiom it
+    // exists to replace (B-1): both list every symbol.
+    let (all_out, all_code) = run_cgx(&repo, &["search", "--all"]);
+    let (dot_out, dot_code) = run_cgx(&repo, &["search", ".", "--regex"]);
+    assert_eq!(all_code, 0);
+    assert_eq!(dot_code, 0);
+    assert_eq!(all_out, dot_out, "--all == match-all regex, byte-identical");
+}
+
+#[test]
+fn search_all_composes_with_kind_filter() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "--all", "--kind", "type"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("fixture::helper::SearchWidget"), "type kept: {out}");
+    assert!(
+        !out.contains("search_target_alpha"),
+        "functions excluded by --kind type: {out}"
+    );
+}
+
+#[test]
+fn search_all_and_pattern_together_exit_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // Mutually exclusive: a pattern AND --all is a usage error (B-1, exit 2).
+    let (_out, code) = run_cgx(&repo, &["search", "search_target", "--all"]);
+    assert_eq!(code, 2, "pattern + --all → usage exit 2");
+}
+
+#[test]
+fn search_neither_pattern_nor_all_exit_2() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    // A bare `cgx search` (no pattern, no --all) is still a usage error.
+    let (_out, code) = run_cgx(&repo, &["search"]);
+    assert_eq!(code, 2, "neither pattern nor --all → usage exit 2");
+}
+
+#[test]
+fn search_all_json_is_array_of_objects() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "--all", "--format", "json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().expect("array");
+    assert!(!arr.is_empty(), "has hits: {out}");
+    for key in ["fqn", "file", "line", "kind"] {
+        assert!(arr[0].get(key).is_some(), "object has `{key}`: {out}");
+    }
+}
+
+// --- `cgx symbols` (B-2, reference-count ranking + edge breakdown, v0.3) ------
+
+/// A fixture where `hub` is called by two callers, so the reference-count ranking
+/// has a clear, deterministic winner.
+const SYMBOLS_MAIN_RS: &str = "\
+fn main() {
+    caller_one();
+    caller_two();
+}
+
+fn caller_one() {
+    hub();
+}
+
+fn caller_two() {
+    hub();
+}
+
+fn hub() {
+    let _ = 1;
+}
+";
+
+fn symbols_fixture_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), SYMBOLS_MAIN_RS).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+#[test]
+fn symbols_ranks_hub_first_by_inbound_degree() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "inbound", "--format", "json"]);
+    assert_eq!(code, 0, "symbols exits 0: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().expect("array");
+    // The most-depended-upon symbol leads. `hub` has 2 inbound callers — the most.
+    let top = &arr[0];
+    assert_eq!(top.get("fqn").unwrap().as_str().unwrap(), "fixture::hub");
+    assert_eq!(top.get("in_degree").unwrap().as_u64().unwrap(), 2);
+}
+
+#[test]
+fn symbols_breakdown_decomposes_inbound_edges() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, _code) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    let hub = arr
+        .iter()
+        .find(|s| s.get("fqn").unwrap() == "fixture::hub")
+        .expect("hub present");
+    let inbound = hub.get("inbound").expect("inbound object");
+    assert_eq!(inbound.get("total").unwrap().as_u64().unwrap(), 2);
+    // Both inbound edges are CALLS — the family breakdown reflects that.
+    assert_eq!(
+        inbound
+            .pointer("/by_family/calls")
+            .and_then(|c| c.as_u64()),
+        Some(2),
+        "inbound family split present: {out}"
+    );
+}
+
+#[test]
+fn symbols_human_row_shows_degree_and_breakdown() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["symbols"]);
+    assert_eq!(code, 0);
+    // The human row carries in=/out= degrees and the in:{…}/out:{…} breakdowns.
+    let hub_line = out
+        .lines()
+        .find(|l| l.contains("fixture::hub"))
+        .expect("hub row present");
+    assert!(hub_line.contains("in=2"), "hub inbound degree: {hub_line}");
+    assert!(hub_line.contains("in:{"), "inbound breakdown rendered: {hub_line}");
+    assert!(hub_line.contains("calls="), "family split rendered: {hub_line}");
+}
+
+#[test]
+fn symbols_default_rank_is_total_degree() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    // No `--rank`: the default is total degree (`in + out`). The top row's total
+    // must be >= every other row's total.
+    let (out, code) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    assert_eq!(code, 0, "symbols exits 0: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    let total = |s: &serde_json::Value| {
+        s.get("in_degree").unwrap().as_u64().unwrap()
+            + s.get("out_degree").unwrap().as_u64().unwrap()
+    };
+    let top_total = total(&arr[0]);
+    for s in arr {
+        assert!(top_total >= total(s), "default rank is total degree descending: {out}");
+    }
+    // The default surface and `--rank total` agree byte-for-byte.
+    let (explicit, _) = run_cgx(&repo, &["symbols", "--rank", "total", "--format", "json"]);
+    assert_eq!(out, explicit, "default == --rank total");
+}
+
+#[test]
+fn symbols_rank_total_counts_in_plus_out() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "total", "--format", "json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    // `main` has out=2 in=0 (total 2); `hub` in=2 out=0 (total 2); `caller_one`
+    // out=1 in=1 (total 2) ... a tie at 2 broken by FQN, so caller_one leads main.
+    let total = |fqn: &str| {
+        let s = arr.iter().find(|s| s.get("fqn").unwrap() == fqn).unwrap();
+        s.get("in_degree").unwrap().as_u64().unwrap() + s.get("out_degree").unwrap().as_u64().unwrap()
+    };
+    assert!(total("fixture::main") >= 2, "main has out-degree counted: {out}");
+}
+
+#[test]
+fn symbols_rank_outbound_leads_with_caller() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    // Outbound ranks by callees. `main` (out=2) and `hub` (out=0) sit at opposite
+    // ends, so the top row's out-degree dominates and `hub` is not first.
+    let (out, code) = run_cgx(&repo, &["symbols", "--rank", "outbound", "--format", "json"]);
+    assert_eq!(code, 0, "symbols exits 0: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+    let arr = v.as_array().unwrap();
+    let out_deg = |s: &serde_json::Value| s.get("out_degree").unwrap().as_u64().unwrap();
+    let top_out = out_deg(&arr[0]);
+    for s in arr {
+        assert!(top_out >= out_deg(s), "outbound rank is out-degree descending: {out}");
+    }
+    assert_ne!(
+        arr[0].get("fqn").unwrap().as_str().unwrap(),
+        "fixture::hub",
+        "hub (out=0) must not lead an outbound ranking: {out}"
+    );
+}
+
+#[test]
+fn symbols_unknown_rank_value_exits_2() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (_out, code) = run_cgx(&repo, &["symbols", "--rank", "sideways"]);
+    assert_eq!(code, 2, "an unknown --rank value is a usage error → exit 2");
+}
+
+#[test]
+fn symbols_top_sugar_caps_rows() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["symbols", "--top", "1"]);
+    assert_eq!(code, 0);
+    let body = out.lines().filter(|l| !l.starts_with('…')).count();
+    assert_eq!(body, 1, "--top 1 shows exactly one ranked row: {out}");
+    assert!(out.contains("more)"), "footer reports hidden rows: {out}");
+}
+
+#[test]
+fn symbols_kind_filter_narrows() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    // Narrowing to functions and checking the hub is still ranked — and that the
+    // filter is honored (a kind with no members would yield (no results)).
+    let (out, code) = run_cgx(&repo, &["symbols", "--kind", "function"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("fixture::hub"), "function hub kept: {out}");
+}
+
+#[test]
+fn symbols_unsupported_format_exits_2() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    for fmt in ["sarif", "dot", "mermaid", "d2"] {
+        let (_out, code) = run_cgx(&repo, &["symbols", "--format", fmt]);
+        assert_eq!(code, 2, "--format {fmt} unsupported by symbols → exit 2");
+    }
+}
+
+#[test]
+fn symbols_output_is_byte_identical_across_runs() {
+    let (_tmp, repo) = symbols_fixture_repo();
+    index(&repo);
+    let (a, _) = run_cgx(&repo, &["symbols"]);
+    let (b, _) = run_cgx(&repo, &["symbols"]);
+    assert_eq!(a, b, "two symbols runs must be byte-identical");
+    let (ja, _) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    let (jb, _) = run_cgx(&repo, &["symbols", "--format", "json"]);
+    assert_eq!(ja, jb, "two json symbols runs must be byte-identical");
+}

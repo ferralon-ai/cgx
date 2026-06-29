@@ -49,12 +49,14 @@ pub mod filter;
 pub mod result;
 pub mod search;
 pub mod view;
+pub mod symbols;
 pub mod walk;
 
 pub use engine::{
     callees, callers, explain, neighborhood, paths, reaches, reaches_all, resolve_anchor, unused,
 };
-pub use search::{search_symbols, SearchError, SymbolHit};
+pub use search::{search_symbols, SearchError, SearchMatch, SymbolHit};
+pub use symbols::{rank_symbols, EdgeBreakdown, EdgeFamily, RankBy, SymbolRank};
 pub use filter::{ConditionFilter, Direction, EdgeFilter};
 pub use result::{
     ExplainEdge, Explanation, NeighborResult, PathResult, PathSet, PathStep, ReachResult,

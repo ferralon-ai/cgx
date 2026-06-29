@@ -19,16 +19,18 @@
 //!   walk, mirroring the Rust adapter's `walk_function_ssa`.
 
 use cgx_core::condition::EdgeCondition;
+use cgx_core::cut::CutMarker;
 use cgx_core::edge::ImplicitKind;
 use cgx_core::effect::EffectSet;
-use cgx_core::node::{SymbolKind, Visibility};
+use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    EffectFact, ExportFact, FileCtx, FileFacts, FrontendError, ImportFact, ImportedName, Lang,
-    LanguageFrontend, RawRef, RefKind, RelPath, ScopeId, SymbolDef,
+    CutHint, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError,
+    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, RawRef, RefKind, RelPath,
+    RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 use crate::module::module_path_for_pkg;
@@ -75,6 +77,7 @@ impl LanguageFrontend for GoFrontend {
 
         let module_prefix = module_path_for_pkg(ctx.path.as_str(), ctx.package.as_deref());
         let mut builder = Builder::new(src, ctx.path.as_str());
+        builder.package_name = builder.read_package_name(tree.root_node());
 
         let root_ctx = Ctx::root(module_prefix);
         let mut stmt_index = 0u32;
@@ -139,6 +142,16 @@ struct Builder<'a> {
     src: &'a [u8],
     file: String,
     facts: FileFacts,
+    /// The `package` clause name (`package main` → `"main"`), used to gate the
+    /// `main` entrypoint hint.
+    package_name: String,
+    /// In-file interface method-name sets, keyed by interface type name; used in
+    /// [`Builder::finish`] to emit same-file `Implements` relations.
+    interfaces: BTreeMap<String, BTreeSet<String>>,
+    /// In-file concrete-type method-name sets (collected from method receivers).
+    type_methods: BTreeMap<String, BTreeSet<String>>,
+    /// Span of each concrete type's declaration, for the `Implements` relation.
+    type_spans: BTreeMap<String, Span>,
     /// Phase-2 hook: accumulated syntactic own-effects keyed by the enclosing
     /// definition's local FQN. Flushed into `facts.effects` in [`Builder::finish`].
     /// Empty in Phase 1.
@@ -155,12 +168,17 @@ impl<'a> Builder<'a> {
             src,
             file: file.to_string(),
             facts: FileFacts::empty(),
+            package_name: String::new(),
+            interfaces: BTreeMap::new(),
+            type_methods: BTreeMap::new(),
+            type_spans: BTreeMap::new(),
             effects: BTreeMap::new(),
             data_flows: BTreeMap::new(),
         }
     }
 
     fn finish(mut self) -> FileFacts {
+        self.emit_in_file_implements();
         for (fqn, set) in self.effects {
             if !set.is_empty() {
                 self.facts.effects.push(EffectFact { fqn, effects: set });
@@ -170,6 +188,46 @@ impl<'a> Builder<'a> {
             self.facts.data_flows.extend(facts);
         }
         self.facts
+    }
+
+    /// A concrete type whose method set ⊇ a (non-empty) interface's method set
+    /// satisfies that interface in-file. Cross-file satisfaction is the CHA pass's
+    /// job; this only emits the relations both of whose ends are declared here.
+    fn emit_in_file_implements(&mut self) {
+        let mut rels = Vec::new();
+        for (ty, methods) in &self.type_methods {
+            for (iface, iface_methods) in &self.interfaces {
+                if iface_methods.is_empty() || ty == iface {
+                    continue;
+                }
+                if iface_methods.is_subset(methods) {
+                    let span = self
+                        .type_spans
+                        .get(ty)
+                        .cloned()
+                        .unwrap_or_else(|| Span::new(self.file.clone(), 1, None));
+                    rels.push(ImplRelation {
+                        kind: RelationKind::Implements,
+                        subject: smallvec_one(ty.clone()),
+                        object: smallvec_one(iface.clone()),
+                        span,
+                    });
+                }
+            }
+        }
+        self.facts.impl_relations.extend(rels);
+    }
+
+    fn read_package_name(&self, root: Node<'_>) -> String {
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "package_clause" {
+                if let Some(id) = child.named_child(0) {
+                    return self.text(id);
+                }
+            }
+        }
+        String::new()
     }
 
     /// Record an own-effect set against the enclosing callable (Phase-2 hook;
@@ -257,6 +315,7 @@ impl<'a> Builder<'a> {
             signature: None,
         });
         self.maybe_export(&name, node);
+        self.record_fn_entrypoints(&name, &fqn);
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope);
@@ -289,6 +348,12 @@ impl<'a> Builder<'a> {
             is_abstract: false,
             signature: None,
         });
+
+        // The receiver type's method set drives same-file `Implements` detection.
+        self.type_methods
+            .entry(recv_type)
+            .or_default()
+            .insert(name.clone());
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope);
@@ -329,18 +394,41 @@ impl<'a> Builder<'a> {
                 .map(|t| t.kind() == "interface_type")
                 .unwrap_or(false);
             let fqn = join(&ctx.fqn_prefix, &name);
+            let span = self.def_span(spec, "name");
             self.facts.defs.push(SymbolDef {
                 fqn,
                 kind: SymbolKind::Type,
                 visibility: vis(&name),
                 scope: ctx.scope,
-                span: self.def_span(spec, "name"),
+                span: span.clone(),
                 line_end: self.end_line(spec),
                 is_abstract: is_interface,
                 signature: None,
             });
             self.maybe_export(&name, spec);
+            self.type_spans.entry(name.clone()).or_insert(span);
+
+            if is_interface {
+                if let Some(t) = type_node {
+                    let methods = self.interface_methods(t);
+                    self.interfaces.insert(name, methods);
+                }
+            }
         }
+    }
+
+    /// The method-name set declared by an `interface_type` (`method_elem` members).
+    fn interface_methods(&self, iface: Node<'_>) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut cursor = iface.walk();
+        for m in iface.children(&mut cursor) {
+            if m.kind() == "method_elem" {
+                if let Some(name) = self.field_text(m, "name") {
+                    out.insert(name);
+                }
+            }
+        }
+        out
     }
 
     fn walk_value_declaration(&mut self, node: Node<'_>, ctx: &Ctx, kind: SymbolKind) {
@@ -441,6 +529,16 @@ impl<'a> Builder<'a> {
             }],
         };
 
+        // cgo: `import "C"` pulls in a foreign (C) translation unit — every call
+        // through it crosses the FFI boundary the graph cannot see into.
+        if specifier == "C" {
+            self.facts.cut_hints.push(CutHint {
+                marker: CutMarker::ViaFfi,
+                span: self.span(spec),
+                macro_origin: None,
+            });
+        }
+
         self.facts.imports.push(ImportFact {
             specifier,
             names,
@@ -455,6 +553,7 @@ impl<'a> Builder<'a> {
 
     fn walk_call_expression(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         if let Some(func) = node.child_by_field_name("function") {
+            self.emit_call_cut_hints(func);
             let (name_path, kind) = self.classify_callee(func);
             if !name_path.is_empty() {
                 self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index, None);
@@ -492,6 +591,7 @@ impl<'a> Builder<'a> {
         if let Some(call) = node.named_child(0) {
             if call.kind() == "call_expression" {
                 if let Some(func) = call.child_by_field_name("function") {
+                    self.emit_call_cut_hints(func);
                     let (name_path, kind) = self.classify_callee(func);
                     if !name_path.is_empty() {
                         self.push_ref(
@@ -518,7 +618,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn walk_func_literal(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+    fn walk_func_literal(&mut self, node: Node<'_>, ctx: &Ctx, _stmt_index: &mut u32) {
         // An anonymous callable with a stable allocation site (GM-1.1 Lambda); its
         // FQN is synthesized from the enclosing FQN plus the source position.
         let fqn = format!(
@@ -598,6 +698,32 @@ impl<'a> Builder<'a> {
             _ => {}
         }
         out
+    }
+
+    /// `reflect.*` → reflective cut, `plugin.*` → dynamic cut (GM-5.3). Keyed off
+    /// the selector's leading package operand.
+    fn emit_call_cut_hints(&mut self, func: Node<'_>) {
+        if func.kind() != "selector_expression" {
+            return;
+        }
+        let Some(operand) = func.child_by_field_name("operand") else {
+            return;
+        };
+        if operand.kind() != "identifier" {
+            return;
+        }
+        let marker = match self.text(operand).as_str() {
+            "reflect" => Some(CutMarker::Reflective),
+            "plugin" => Some(CutMarker::Dynamic),
+            _ => None,
+        };
+        if let Some(marker) = marker {
+            self.facts.cut_hints.push(CutHint {
+                marker,
+                span: self.span(func),
+                macro_origin: None,
+            });
+        }
     }
 
     fn push_ref(
@@ -696,6 +822,22 @@ impl<'a> Builder<'a> {
             }
         }
     }
+
+    // --- entrypoints ---
+
+    fn record_fn_entrypoints(&mut self, name: &str, fqn: &str) {
+        if name == "main" && self.package_name == "main" {
+            self.facts.entrypoint_hints.push(EntrypointHint {
+                fqn: fqn.to_string(),
+                kind: EntrypointKind::Main,
+            });
+        } else if is_test_func(name) {
+            self.facts.entrypoint_hints.push(EntrypointHint {
+                fqn: fqn.to_string(),
+                kind: EntrypointKind::Test,
+            });
+        }
+    }
 }
 
 // === free functions ===
@@ -726,6 +868,19 @@ fn vis(name: &str) -> Visibility {
 
 fn is_exported(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Go test-binary entrypoints: `TestXxx`, `BenchmarkXxx`, `ExampleXxx` (where the
+/// suffix does not start with a lowercase letter, per `go test` conventions).
+fn is_test_func(name: &str) -> bool {
+    for prefix in ["Test", "Benchmark", "Example"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if rest.is_empty() || rest.chars().next().is_some_and(|c| !c.is_lowercase()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The value of a Go string literal: strip the surrounding quotes/backticks.

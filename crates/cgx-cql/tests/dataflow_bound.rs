@@ -4,8 +4,9 @@
 //! over a dense dataflow graph can expand without bound (full transitive closure
 //! from every anchor), blowing up time/memory. The guard adds:
 //!   * a default upper hop bound (`DEFAULT_VAR_LENGTH_DEPTH`) for an unbounded `*`,
-//!   * a result-row cap (`DEFAULT_VAR_LENGTH_ROWS`) on the peer-set branch,
-//! both *truncating* with a surfaced `TruncationReason::PathCap` marker rather than
+//!   * a result-row cap (`DEFAULT_VAR_LENGTH_ROWS`) on the peer-set branch.
+//!
+//! Both *truncate* with a surfaced `TruncationReason::PathCap` marker rather than
 //! erroring (the CutMarker honesty idiom).
 //!
 //! Source: internal design notes

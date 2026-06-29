@@ -59,6 +59,9 @@ fn go_statement_spawns() {
 
 #[test]
 fn pure_func_has_no_effects() {
-    let facts = extract("app/svc.go", "package svc\nfunc F(a int) int { return a + 1 }\n");
+    let facts = extract(
+        "app/svc.go",
+        "package svc\nfunc F(a int) int { return a + 1 }\n",
+    );
     assert!(effects_of(&facts, "::F").is_empty());
 }

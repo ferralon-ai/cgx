@@ -39,10 +39,10 @@ RETURN path
 Run as:
 
 ```bash
-cgx query @toctou.cql ./ \
-  --param validate_fn=fs::metadata \
-  --param use_fn=fs::read
+cgx query @toctou.cql --repo ./
 ```
+
+Note: CQL query parameters (`$validate_fn`, `$use_fn`) must be substituted as literals directly in the `.cql` file before running — `cgx query` does not accept a `--param` flag in v0.3.0. The query above uses `n.suspends`, which requires GM-10 (schema-room); running it in v0.3.0 produces a plan error and exits 2. Substitute the query only after GM-10 is available.
 
 For a broader sweep — any check-then-use with an `await` between them:
 
@@ -92,16 +92,13 @@ RETURN acquire.file, acquire.line,
 ORDER BY on_exception_path DESC, acquire.file
 ```
 
-Or using the Layer 1 subcommand:
+Or using the Layer 1 subcommand (checks whether the acquire site reaches a release — does not cover the all-paths exhaustiveness check, which requires the CQL form above):
 
 ```bash
-cgx paths --from db::Connection::begin \
-          --to db::Connection::commit db::Connection::rollback \
-          --quantifier all \
-          --including-exception-paths \
-          --assert-all-reach-sink \
-          ./
+cgx paths db::Connection::begin db::Connection::commit --repo ./
 ```
+
+Note: `cgx paths` takes two positional arguments (`<FROM>` and `<TO>`) and uses `--repo PATH`. The flags `--from`, `--to`, `--quantifier`, `--including-exception-paths`, and `--assert-all-reach-sink` do not exist in v0.3.0. One `<TO>` symbol at a time; to check rollback coverage run a second invocation with `db::Connection::rollback`.
 
 **Breaking it down**
 
@@ -110,8 +107,7 @@ cgx paths --from db::Connection::begin \
 | `acquire {name:"db::Connection::begin"}` | The acquire call — the start of the resource's lifecycle. Replace with the relevant acquire symbol for the resource under audit. |
 | `exit_node.is_return_site = true` | The path must end at a function exit site, not an arbitrary intermediate node. |
 | `NONE(n IN nodes(path) WHERE n.name IN ["db::Connection::commit", "db::Connection::rollback"])` | The leak condition: no commit and no rollback on this path. Any path satisfying this predicate is a path that leaves the resource unreleased. |
-| `ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"]) AS on_exception_path` | Distinguish leaks that only occur on exception-class paths (the most common) from leaks on the happy path (the most severe). |
-| `--including-exception-paths` | The subcommand flag that extends the path search to include edges labeled `exception` and `panic` — the paths most commonly missing release calls. |
+| `ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"]) AS on_exception_path` | (CQL form only) Distinguishes leaks that only occur on exception-class paths from leaks on the happy path. `cgx paths` does not have an `--including-exception-paths` flag; exhaustive exception-path coverage requires the CQL query form. |
 
 **Reading the result** — Non-empty results indicate resource leaks. The `on_exception_path` field tells you whether the leak occurs only on error branches (`true`) or on normal execution too (`false`). Happy-path leaks are the highest priority. Exception-path leaks are still real bugs; they are the class that Infer Pulse addresses for known API pairs but does not expose as a user-parameterizable query.
 
@@ -172,7 +168,10 @@ Await-holding-lock (inter-procedural):
 
 ```cgx
 -- illustrative: requires GM-10 (schema-room) and GM-11 (schema-room)
-MATCH (site)
+-- Note: MATCH (site) with no relationship is a plan error in v0.3.0 (exit 2).
+-- When GM-10/GM-11 are available this will require a relationship clause, e.g.:
+-- MATCH (caller)-[:CALLS]->(site) WHERE site.suspends = true ...
+MATCH (caller)-[:CALLS]->(site)
 WHERE site.suspends = true
   AND size(site.lock_set) > 0
 RETURN site.name, site.file, site.line,
@@ -196,10 +195,7 @@ ORDER BY depth, fn.file
 
 Via Layer 1:
 
-```bash
-cgx query --concurrency await-holding-lock ./
-cgx query --concurrency blocking-in-async ./
-```
+These patterns require schema-room properties (GM-10, GM-11, GM-12) and have no dedicated Layer 1 shorthand in v0.3.0. Use `cgx query` with the CQL form above once those schema properties are available. The flag `--concurrency` does not exist.
 
 **Breaking it down**
 
@@ -284,10 +280,13 @@ For a broader sweep of all functions whose transitively-computed effects include
 
 ```cgx
 -- illustrative: requires GM-12 (schema-room)
-MATCH (fn)
+-- Note: MATCH (fn) with no relationship is a plan error in v0.3.0 (exit 2).
+-- When GM-12 is available this will require a relationship clause, e.g.:
+-- MATCH (fn)-[:CALLS]->(callee) WHERE ...
+MATCH (fn)-[:CALLS]->(callee)
 WHERE "nondeterministic" IN fn.transitive_effects
   AND NOT "nondeterministic" IN fn.own_effects
-RETURN fn.name, fn.file, fn.line,
+RETURN DISTINCT fn.name, fn.file, fn.line,
        fn.transitive_effects
 ORDER BY fn.file, fn.line
 ```

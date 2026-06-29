@@ -4,12 +4,12 @@
 contract footprint.
 
 Run `cgx --version` first. Parse the `0.<MINOR>.<PATCH>` after `cgx `. A capability tagged
-`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.1**.
+`Since: v0.N` is available **iff MINOR ≥ N**. The current shipped binary is **v0.3.0**.
 See `reference/versions.md` for the full ladder.
 
-**Step 0 — you need an exact symbol name.** cgx has no search or glob. Use `grep`/`ripgrep` on
-the source to find the fully-qualified symbol name before passing it to any command. An
-unresolved symbol causes exit 2.
+**Step 0 — you need an exact symbol name.** Use `cgx search <pattern>` to find the
+fully-qualified symbol name before passing it to any command. An unresolved symbol causes exit 2.
+Fall back to `grep`/`ripgrep` on the source if the symbol is not yet indexed.
 
 For flag details, output formats, and exit codes see `reference/cli.md` and
 `reference/output-and-exit.md`. For dead-code questions (public items with zero callers treated
@@ -136,9 +136,9 @@ on an error branch — not on the happy path. Filter by `--confidence certain` i
 low-confidence edges from speculative dynamic dispatch. `cgx reaches` exits 0 for both "path found"
 and "no path found" (empty result is success); use `--assert-empty` to flip exit 1 on non-empty.
 
-**Wrong turn:** `reaches A B` means a call path exists, not that data flows from A to B. Taint and
-data provenance require the DATA_FLOW edge type, which is Since: v0.3. Emitting `cgx reaches` for
-a taint question gives structurally misleading results.
+**Wrong turn:** `reaches A B` means a call path exists, not that data flows from A to B. Data
+provenance questions require `flows-to`/`flows-from` (v0.3) or a CQL `[:DATA_FLOW]` query. Emitting
+`cgx reaches` for a taint question gives structurally misleading results.
 
 ---
 
@@ -151,52 +151,59 @@ a taint question gives structurally misleading results.
 Use `cgx query` when you need filtering, aggregation, or multi-hop patterns the subcommands alone
 cannot express. Wrap the query in single quotes for the shell; use double-quoted strings inside.
 
+Node properties `name` and `fqn` both store the full FQN. Use `b.fqn = "MyModule::my_fn"` (or
+`b.name`) to match by exact fully-qualified name — short-name suffix matching is not supported.
+
 ```bash
 # Who calls a specific function? (equivalent to cgx callers, but composable)
-cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "my_fn" RETURN a.name, a.file, a.line LIMIT 20'
+cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.fqn = "MyModule::my_fn" RETURN a.fqn, a.file, a.line LIMIT 20'
 
 # Filter by edge condition — only callers on the always-executed path
-cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE b.name = "my_fn" AND r.condition = "always" RETURN a.name, a.file LIMIT 20'
+cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE b.fqn = "MyModule::my_fn" AND r.condition = "always" RETURN a.fqn, a.file LIMIT 20'
 
 # Multi-hop: functions reachable from a public entry point within 3 hops
-cgx query 'MATCH (a)-[:CALLS*3]->(b) WHERE a.name = "my_entry" RETURN b.name, b.file LIMIT 50'
+cgx query 'MATCH (a)-[:CALLS*3]->(b) WHERE a.fqn = "MyModule::my_entry" RETURN b.fqn, b.file LIMIT 50'
 
-# Paths that pass through an exception edge at any hop (bounded 4 hops)
-cgx query 'MATCH path = (a)-[:CALLS*4]->(b)
-WHERE a.name = "my_entry"
-  AND ANY(r IN relationships(path) WHERE r.condition = "exception")
-RETURN a.name, b.name LIMIT 20'
+# DATA_FLOW edges (v0.3): query data-flow graph for a value node
+cgx query 'MATCH (a)-[:DATA_FLOW]->(b) WHERE a.fqn = "MyModule::my_fn::val#1" RETURN a.fqn, b.fqn LIMIT 20'
 ```
 
-**CQL rules (v0.1):**
+**CQL rules (v0.3):**
 - MATCH must contain at least one relationship — `MATCH (n) RETURN n` is a plan error (exit 2).
 - Always bound multi-hop traversals: `[:CALLS*4]` not `[:CALLS*]` (unbounded hangs).
+- **Do not use `MATCH path = (a)-[:CALLS*N]->` with N > 1.** Variable-length path binding with
+  `RETURN path` or `ANY(r IN relationships(path) WHERE ...)` hangs on large indices. Use `cgx paths`
+  for path enumeration; use a flat `[:CALLS*N]` (without the `path =` variable) for hop-count
+  filtering.
 - String literals use double quotes; single quotes inside a query are a parse error.
-- Supported node properties: `name`, `kind`, `file`, `line`. Properties like `visibility`,
-  `module`, `trust_zone` are **not known to the v0.1 planner** — filtering on them is a plan error
-  (exit 2, `unknown node property '<x>'`), not an empty result. Restrict filters to the four
-  supported properties.
-- Unsupported in v0.1: `DATA_FLOW` edges, `entrypoint_class`/`source_class`/`sink_class`/
-  `sanitizer_class` node props, `MUST PASS THROUGH`/`AVOIDING`, `NOT IN [...]`. These cause
-  exit 2 (plan or parse error). See `reference/query-language.md` for the full list.
+- Supported node properties: `fqn`, `name`, `kind`, `file`, `line`. Properties like `visibility`,
+  `module`, `trust_zone` are not supported — filtering on them is a plan error
+  (exit 2, `unknown node property '<x>'`), not an empty result.
+- `DATA_FLOW` edges are supported (v0.3) and present by default. On an index built with
+  `cgx index --no-dataflow`, `DATA_FLOW` queries return empty results.
+- Deferred (exit 2): `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node props,
+  `MUST PASS THROUGH`, `AVOIDING`. These are plan or parse errors in v0.3.
+  See `reference/query-language.md` for the full list.
 
 **Reading the result:** Edge condition and confidence on each hop affect interpretation — an
 exception-condition hop fires only on an error branch. See `reference/mental-model.md`.
 
 ---
 
-## Spec-only questions (Since: v0.3)
+## Deferred questions
 
-The following questions from this theme require features not yet in v0.1. Do not emit these as
-runnable today — confirm with `cgx --version` that MINOR ≥ 3 before using.
+The following questions are not runnable in v0.3.0. The table shows what each requires and its
+deferral status.
 
-| Question | Requires | Since |
+| Question | Requires | Status |
 |---|---|---|
-| Cross-module coupling (caller.module ≠ fn.module, non-pub fns) | `module` node property populated | v0.3 |
-| Exported functions invoking caller-provided closures/callbacks with data-flow context | `DATA_FLOW` edges + DF-18 closure capture schema | v0.3 |
-| Trust-boundary crossing without annotation (`trust_zone`, `sanitizer_class` props) | taint schema (GM-14, DF-11..15) | v0.3 |
-| Override-contract drift — public override changes signature vs. declared interface | `RESOLVES_TO`/`PROVIDES_BODY` edges + MRO | v0.3 |
-| Inheritance-aware API contracts (which override bodies are reachable per-callsite) | `RESOLVES_TO` + object-model schema | v0.3 |
+| Cross-module coupling (caller.module ≠ fn.module, non-pub fns) | `module` node property populated | deferred — `module` not a planner property |
+| Trust-boundary crossing without annotation (`trust_zone`, `sanitizer_class` props) | taint schema (GM-14, DF-11..15) | deferred — props are plan errors (exit 2) |
+| Override-contract drift — public override changes signature vs. declared interface | `RESOLVES_TO`/`PROVIDES_BODY` edges + MRO | deferred — edges not in v0.3 graph |
+| Inheritance-aware API contracts (which override bodies are reachable per-callsite) | `RESOLVES_TO` + object-model schema | deferred — edges not in v0.3 graph |
 
-When MINOR ≥ 3, consult `reference/query-language.md` for the then-supported CQL dialect and
-`recipes/object-model.md` for inheritance-aware contract questions.
+Data-flow questions (exported functions invoking closures/callbacks with data-flow context) are
+**runnable in v0.3.0** via `cgx flows-to`, `cgx flows-from`, and `MATCH (a)-[:DATA_FLOW]->(b)` CQL.
+See `recipes/taint.md` for the structural data-flow workflow.
+
+Consult `reference/query-language.md` for the full CQL clause support matrix.

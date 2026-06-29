@@ -1,7 +1,7 @@
 ---
 title: Language Support
 audience: agents and engineers using cgx
-Last Updated: 2026-06-19
+Last Updated: 2026-06-25
 ---
 
 # Language Support
@@ -21,24 +21,24 @@ how each language's semantics map to those labels.
 cgx assigns every edge a confidence label. That label's ceiling is determined by the language's support
 tier, which controls how deeply cgx resolves call targets.
 
-| Tier | Description | Confidence ceiling |
-|------|-------------|-------------------|
-| **1 — Deep semantics** | Full parse + language-specific scope graph; closure and higher-order tracking; error-path annotation | `certain` (static/monomorphized), `probable` (virtual/interface), `possible` (unresolvable dynamic) |
-| **2 — Graph + heuristic** | tree-sitter parse + heuristic cross-file name matching; no type-based dispatch narrowing | `probable` (unique name), `possible` (overloaded or ambiguous) |
-| **3 — Syntactic only** | tree-sitter parse; intra-file symbol inventory; no cross-file edges | `possible` (all edges) |
+| Tier | Description | Confidence ceiling (with SCIP) | Confidence ceiling (no SCIP) |
+|------|-------------|-------------------------------|------------------------------|
+| **1 — Deep semantics** | Full parse + language-specific scope graph; closure and higher-order tracking; error-path annotation | `certain` (intra-file + SCIP direct), `probable` (virtual/interface), `possible` (unresolvable dynamic) | `certain` (intra-file scope-ref only), `possible` (all other calls) |
+| **2 — Graph + heuristic** | tree-sitter parse + heuristic cross-file name matching; no type-based dispatch narrowing | `probable` (unique name), `possible` (overloaded or ambiguous) | `probable` (unique name), `possible` (overloaded or ambiguous) |
+| **3 — Syntactic only** | tree-sitter parse; intra-file symbol inventory; no cross-file edges | `possible` (all edges) | `possible` (all edges) |
 
-Confidence *discriminates* only after SCIP enrichment (Since: v0.2). In v0.1, edge labels are
-populated but the index does not yet use CHA/RTA to promote heuristic edges; treat `certain` and `probable`
-as indicative rather than definitive until v0.2.
+Confidence above `possible` for cross-file or dispatch edges requires SCIP enrichment (Since: v0.2).
+Without SCIP, Tier 1 produces `certain` only for intra-file scope-ref calls; all other Tier 1 edges are
+`possible`.
 
 ---
 
-## Languages runnable today (v0.1)
+## Languages runnable today (v0.3)
 
 ### Rust — Tier 1 (primary, fully exercised)
 
-The language frontend shipping and exercised in v0.1 is `cgx-lang-rust`. Rust is the primary language for
-all tested examples and real output shapes in this skill.
+The language frontend is `cgx-lang-rust`. Rust is the primary language for all tested examples and real
+output shapes in this skill.
 
 **Error model — `Result` and `panic`**
 
@@ -61,45 +61,50 @@ computed at query time, not stored per edge — see `reference/mental-model.md`.
 
 **Dynamic dispatch — `dyn Trait`**
 
-Rust static and monomorphized calls resolve at `certain`. `dyn Trait` object calls produce a candidate set
-of known implementations, labeled `probable`. A closure stored in an unknown variable or passed as an
-untyped callback resolves at `possible`.
+Rust direct intra-module calls resolve at `certain` (scope-ref rule). Cross-module calls (import-ref or
+name-method rule) resolve at `possible` without SCIP enrichment. `dyn Trait` object calls produce a
+candidate set of known implementations, labeled `possible` in the Phase-1 syntactic graph (no SCIP). A
+closure stored in an unknown variable or passed as an untyped callback also resolves at `possible`.
 
-Since: v0.2 — SCIP enrichment promotes `dyn Trait` resolution from heuristic to CHA/RTA-backed. In v0.1
-the candidate set is syntactically derived; the `probable` label is present but not yet discriminating.
+Since: v0.2 — SCIP enrichment promotes `dyn Trait` resolution from `possible` (heuristic scope-graph
+rule) to `probable` (CHA/RTA-backed candidate set). Cross-module direct calls are promoted to `certain`
+where SCIP provides a single precise target.
 
 **Closures and captures**
 
 cgx emits a call edge from the call site to the closure body. Captures are tracked for data-flow pedigree
-(Since: v0.3). In v0.1, the call edge is present; confidence follows the resolution path above.
+(Since: v0.3). The call edge is present in all versions; confidence follows the resolution path above.
 
 ---
 
 ### TypeScript — Tier 1 (present, same crate family as JavaScript)
 
-The language frontend is `cgx-lang-ts`. TypeScript and JavaScript share one adapter. TypeScript is present
-in v0.1 alongside Rust; it is exercised but the primary validated examples are Rust.
+The language frontend is `cgx-lang-ts`. TypeScript and JavaScript share one adapter. TypeScript is
+exercised alongside Rust; the primary validated examples are Rust.
 
 **Error model — `throw` / `catch` and `Promise.reject`**
 
 TypeScript uses exceptions for synchronous errors and rejected promises for async errors. cgx labels:
 
-- Edges inside `catch`/`finally` blocks: `exception`
+- Edges inside `catch` blocks: `exception`
+- Edges inside `finally` blocks: unlabeled (always — `finally` runs on every path)
 - `.catch()` callback edges: `exception`
 
 **Dynamic dispatch — structural typing and interface dispatch**
 
-Direct static calls with type narrowing: `certain`. Interface implementations resolved via structural
-match: `probable`. Generic type parameter calls and Proxy traps: `possible`.
+Direct intra-file calls (scope-ref rule): `certain`. Cross-file calls and import-resolved references:
+`possible` without SCIP enrichment. Interface implementations resolved via structural name match:
+`possible` in the Phase-1 syntactic graph. Generic type parameter calls and Proxy traps: `possible`.
 
-Since: v0.2 — SCIP enrichment via `scip-typescript` promotes structural-match edges from heuristic to
-type-resolved.
+Since: v0.2 — SCIP enrichment via `scip-typescript` promotes structural-match edges from `possible`
+(heuristic) to `probable` (type-resolved), and cross-file direct calls to `certain` where SCIP gives a
+single precise target.
 
 **Closures and captures**
 
 Tagged template literal calls and unhandled async IIFEs produce `spawns`-attribute edges (schema reserved,
-Since: v0.3 for full effect propagation). Closure call edges are present in v0.1 at `probable` or
-`possible` depending on capture context.
+Since: v0.3 for full effect propagation). Closure call edges are present; without SCIP enrichment they
+resolve at `possible` (sig-compat or cha_rta rule).
 
 ---
 
@@ -111,7 +116,7 @@ and semantics ahead of implementation. Tag: not available until the language's T
 ### Tier 1 planned (in order): Python, Go, Java, C#
 
 These have full LS-2/LS-3/LS-4/LS-7/LS-8 specifications in docs/08-language-support.md but no
-language-specific crate in v0.1.
+language-specific crate as of v0.3.
 
 Key reading caveats for when these ship:
 
@@ -138,14 +143,21 @@ Intra-file symbol inventory only. All edges `possible`. No cross-file edges.
 The table below shows how the confidence ceiling decreases with tier and dispatch complexity.
 `--confidence` filtering (Since: v0.1) applies this floor at query time.
 
-| Call pattern | Tier 1 | Tier 2 | Tier 3 |
-|---|---|---|---|
-| Direct static call to named function | `certain` | `probable` | `possible` |
-| Virtual / interface dispatch (resolved candidate set) | `probable` | `possible` | — |
-| Dynamic dispatch / reflection / `eval` | `possible` | `possible` | — |
-| Cross-file call (import-resolved) | `certain` or `probable` | `probable` | — |
-| Intra-file call | `certain` | `probable` | `possible` |
-| Async callback / closure via unknown capture | `probable` | `possible` | — |
+**Without SCIP enrichment** (the default for a plain `cgx index`), the Phase-1 graph applies:
+- Intra-file scope-ref calls (same file, unambiguous target): `certain`
+- All other calls (cross-file import-ref, name-method, dispatch): `possible`
+
+**With SCIP enrichment** (`cgx index --scip <file>`, Since: v0.2):
+- `dyn Trait` / interface dispatch candidate sets: promoted to `probable`
+- Cross-file direct calls with a single precise SCIP target: promoted to `certain`
+
+| Call pattern | Tier 1 (with SCIP) | Tier 1 (no SCIP) | Tier 2 | Tier 3 |
+|---|---|---|---|---|
+| Direct intra-file call (scope-ref) | `certain` | `certain` | `probable` | `possible` |
+| Direct cross-file call (import-resolved) | `certain` | `possible` | `probable` | — |
+| Virtual / interface dispatch (resolved candidate set) | `probable` | `possible` | `possible` | — |
+| Dynamic dispatch / reflection / `eval` | `possible` | `possible` | `possible` | — |
+| Async callback / closure via unknown capture | `probable` | `possible` | `possible` | — |
 
 Every edge carries an explicit confidence label — cgx never silently drops uncertain edges. It labels them
 `possible` and lets the caller decide whether to include them (`--confidence possible|probable|certain`).
@@ -155,11 +167,12 @@ Every edge carries an explicit confidence label — cgx never silently drops unc
 ## SCIP enrichment (Since: v0.2)
 
 SCIP (Stack-based Index of Positions and Calls) is optional pre-computed resolution that upgrades
-heuristic (`probable`) edges to type-resolved (`certain`) edges. Supported generators:
-`scip-typescript`, `rust-analyzer --emit-scip` (`scip-rust`), `scip-python`.
+heuristic (`possible`) edges to type-resolved (`probable` for dispatch candidate sets, `certain` for
+single-target direct calls). Supported generators: `scip-typescript`, `rust-analyzer --emit-scip`
+(`scip-rust`), `scip-python`.
 
-SCIP ingestion is not required; cgx falls back to heuristic resolution without it. In v0.1 the `--scip`
-flag is not yet available; this section is informational for v0.2 planning.
+SCIP ingestion is not required; cgx falls back to heuristic resolution without it. The `--scip` flag is
+available on `cgx index` since v0.2.
 
 LSP-based extraction (shelling out to a running language server) is out of scope for v1 — incompatible
 with the <100ms warm startup target.
@@ -173,7 +186,9 @@ with the <100ms warm startup target.
    `if err != nil`, not an exception object. See `reference/mental-model.md` for the `exception` label.
 3. **Is the edge `possible`?** — the callee was not statically resolved. In Tier 1 this is `dyn Trait`,
    closure-via-capture, or an untyped callback. Treat as a candidate, not a confirmed call.
-4. **Is SCIP available (`cgx --version` ≥ 0.2)?** — if not, `certain`/`probable` are syntactically
-   derived; the distinction is present but not yet discriminating.
+4. **Was the index built with `--scip`?** — without SCIP enrichment, cross-file calls and dispatch
+   candidate sets are `possible` regardless of call type. With SCIP, dispatch candidate sets are
+   promoted to `probable` and single-target direct calls to `certain`. The `--scip` flag has been
+   available since v0.2.
 5. **Is the call exception-transient on this path?** — computed at query time. Use edge-condition filters
    or the `ANY`/`NONE` CQL quantifiers. See `reference/mental-model.md`.

@@ -14,7 +14,7 @@ query-language familiarity will find each clause explained in the breakdown tabl
 
 ### Q119 — Does every path from an HTTP handler to a protected resource traverse the `@PreAuthorize` annotation guard — or can any path reach the resource without the guard being on the call path?
 
-**Personas:** PSE · **Status:** core-extension — uses Q-31 framework-aware queries, Q-20 must-pass-through, GM-15 `guard` semantic class (`core-extension`)
+**Personas:** PSE · **Status:** deferred — framework-pack properties (`guard_class`, `entrypoint_class`, `framework_pack`) and `IS NULL`/`IS NOT NULL` predicates are not supported in v0.3.0 (plan error, exit 2); answerable once GM-15 framework packs and predicate support ship
 
 Without framework packs, a must-pass-through query on an annotated codebase reports
 every `@PreAuthorize`-annotated endpoint as an authorization bypass — because the
@@ -26,6 +26,10 @@ false positives. Specified in docs/05 Q-31 (metadata-guard-aware authorization b
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — entrypoint_class, guard_class, framework_pack are
+-- unknown node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+-- Illustrative of the intended GM-15 query shape; not executable until framework
+-- pack properties and IS NULL predicates are supported.
 MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
 WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
   AND NONE(n IN nodes(path)
@@ -41,11 +45,17 @@ ORDER BY hops, h.file, h.line
 CI gate (exits 1 if any bypass path exists):
 
 ```bash
-cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
-          --to db::write \
-          --avoiding 'name:require_admin OR guard_class:*' \
-          --exclude-edge-condition exception \
-          --assert-empty
+-- NOTE: deferred in v0.3.0 — cgx paths takes two positional args <FROM> <TO>;
+-- it has no --from, --to, --avoiding, or --exclude-edge-condition flags.
+-- The guard-class / entrypoint-class filter requires framework pack properties
+-- (GM-15) not yet supported. Use cgx query with a CQL predicate once supported.
+--
+-- Intended form (not yet executable):
+-- cgx query 'MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
+--   WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+--     AND NONE(n IN nodes(path) WHERE n.name = "require_admin" OR n.guard_class IS NOT NULL)
+--   RETURN h.name, sink.name, length(path) AS hops' \
+--   --repo PATH --assert-empty
 ```
 
 **Breaking it down**
@@ -63,7 +73,7 @@ cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
 
 ### Q120 — Which endpoints carry a negative-guard annotation — `@csrf_exempt`, `[AllowAnonymous]`, or `@PermitAll` — disabling a protection that is on by default?
 
-**Personas:** PSE · **Status:** core-extension — uses Q-31 framework-aware queries, GM-15 `negative-guard` semantic class (`core-extension`)
+**Personas:** PSE · **Status:** deferred — `negative_guard_class` and `framework_pack` are unknown node properties in v0.3.0 (plan error, exit 2); `IS NOT NULL` predicate also unsupported; answerable once GM-15 framework packs ship
 
 A negative-guard annotation explicitly disables a protection that the framework
 applies by default to all endpoints. These annotations are often legitimate
@@ -75,6 +85,10 @@ docs/05 Q-31 (negative-guard inventory).
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — negative_guard_class, framework_pack are unknown
+-- node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+-- Illustrative of the intended GM-15 negative-guard query; not executable until
+-- framework pack properties and IS NULL predicates are supported.
 MATCH (ep {kind:"entrypoint"})
 WHERE ep.negative_guard_class IS NOT NULL
 RETURN ep.name, ep.file, ep.line,
@@ -98,7 +112,7 @@ ORDER BY ep.negative_guard_class, ep.name
 
 ### Q121 — Which annotation-declared entrypoints (`@GetMapping`, `@app.route`, `#[tokio::main]`, `@KafkaListener`) are reachable without passing through the authentication middleware?
 
-**Personas:** PSE · **Status:** core-extension — uses Q-31 framework-aware queries, GM-15 `entrypoint` semantic class, GM-16 implicit call sites, Q-20 must-pass-through (`core-extension`)
+**Personas:** PSE · **Status:** deferred — `guard_class`, `entrypoint_class`, `framework_pack`, `is_protected` are unknown node properties in v0.3.0 (plan error, exit 2); `IS NULL`/`IS NOT NULL` predicates unsupported; answerable once GM-15/GM-16 framework packs and predicate support ship
 
 Framework-registered entrypoints are invisible to plain reachability analysis: no
 call expression in the source code invokes `@GetMapping` handlers — the framework
@@ -110,6 +124,9 @@ docs/05 Q-31 (framework entrypoint reachability).
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — guard_class, entrypoint_class, framework_pack are
+-- unknown node properties (plan error, exit 2); IS NULL predicate unsupported.
+-- Illustrative of the intended GM-15 entrypoint query; not executable in v0.3.0.
 MATCH (ep {kind:"entrypoint"})
 WHERE ep.guard_class IS NULL
   AND ep.name NOT IN ["health_check", "favicon", "metrics"]
@@ -122,6 +139,9 @@ ORDER BY ep.framework_pack, ep.entrypoint_class, ep.name
 To find annotation-declared entrypoints that specifically lack auth middleware on every path to a protected resource:
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — guard_class, framework_pack, is_protected are
+-- unknown node properties (plan error, exit 2); IS NULL/IS NOT NULL unsupported.
+-- Illustrative of the intended GM-15/GM-16 extended query; not executable in v0.3.0.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(resource)
 WHERE resource.is_protected = true
   AND ep.guard_class IS NULL
@@ -149,7 +169,7 @@ ORDER BY hops, ep.name
 
 ### Q122 — Which reflective dispatch calls — `Method.invoke`, `getattr`, `Class.forName` — receive a string whose pedigree includes user-controlled input?
 
-**Personas:** PSE · **Status:** core-extension — uses Q-31 framework-aware queries, GM-18 reflection and string-mediated dispatch, taint propagation (`core-extension`)
+**Personas:** PSE · **Status:** deferred — `source_class`, `sanitizer_class` are unsupported node properties in v0.3.0 (plan error, exit 2); `cut_marker`, `string_pedigree` are unknown node properties; `transformation_kind` is an unknown edge property; security-typed taint classification (source_class, sink_class, sanitizer_class) is deferred per the v0.3.0 plan
 
 A reflective dispatch call invoked with an attacker-controlled string means an
 attacker controls which code executes. GM-18 models the `string_pedigree` attribute
@@ -159,6 +179,11 @@ common reflection sites. Specified in docs/05 Q-31 (tainted-string reflective di
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
+-- node properties (plan error, exit 2); cut_marker and string_pedigree are unknown
+-- node properties; transformation_kind is an unknown edge property.
+-- Security-typed taint (source_class, sink_class, sanitizer_class) and GM-18
+-- reflection attributes are deferred; this query is illustrative only.
 MATCH path = (src)-[:DATA_FLOW*]->(dispatch {cut_marker:"reflective"})
 WHERE src.source_class IN ["network","user-input"]
   AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "method-name")
@@ -185,7 +210,7 @@ ORDER BY src.file, src.line
 
 ### Q123 — Which reflective calls have a string with a literal pedigree — the class or method name comes from a string constant — and what are the probable call targets?
 
-**Personas:** SSE · **Status:** core-extension — uses Q-31 framework-aware queries, GM-18 literal-pedigree reflection resolution (`core-extension` in Phase 2 for literal resolution; base reflection schema is Phase 1)
+**Personas:** SSE · **Status:** deferred — `CALLS:indirect` sub-type qualifier is recognised but deferred (plan error, exit 2); `cut_marker`, `string_pedigree`, `candidate_set` are unknown node properties (exit 2); GM-18 reflection attributes are deferred
 
 When the string passed to a reflection call is a compile-time constant, `cgx` can
 resolve the call to `probable` confidence. This turns an unresolvable reflection
@@ -195,6 +220,10 @@ internals, ORM mappings, and plugin systems. Specified in docs/05 Q-31.
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — CALLS:indirect sub-type qualifier is recognised
+-- but not supported (plan error, exit 2); cut_marker and string_pedigree are
+-- unknown node properties (exit 2). r.confidence is a valid edge property but
+-- this query cannot run until GM-18 attributes and CALLS:indirect ship.
 MATCH (callsite)-[r:CALLS:indirect]->(target)
 WHERE callsite.cut_marker = "reflective"
   AND r.confidence IN ["certain","probable"]
@@ -208,6 +237,9 @@ ORDER BY r.confidence DESC, callsite.file, callsite.line
 For unresolved reflection sites (no `probable` or better target found):
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — CALLS:indirect deferred (exit 2); cut_marker and
+-- candidate_set are unknown node properties (exit 2); r.cut_marker is an
+-- unknown edge property (exit 2). Illustrative only.
 MATCH (callsite)-[r:CALLS:indirect]->(target)
 WHERE callsite.cut_marker = "reflective"
   AND r.confidence = "possible"
@@ -232,7 +264,7 @@ ORDER BY callsite.file, callsite.line
 
 ### Q124 — Which call edges in this Spring or NestJS application are established by dependency injection rather than a direct call expression — and what annotation or config entry established each edge?
 
-**Personas:** SSE · **Status:** core-extension — uses Q-31 framework-aware queries, GM-17 mediated call edges, `established-by` provenance (`core-extension`)
+**Personas:** SSE · **Status:** deferred — `established_by` and `wiring_annotation` are unknown edge properties in v0.3.0 (plan error, exit 2); `IS NOT NULL` predicate unsupported; `entrypoint_class` and `framework_pack` are unknown node properties; GM-17 mediated call edges are deferred
 
 DI-wired edges are invisible in the source code: the container calls the constructor
 and injects the dependency; no call expression links the injection site to the
@@ -242,6 +274,9 @@ provenance. Specified in docs/05 Q-31 (framework-aware queries via GM-15/GM-17).
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — established_by and wiring_annotation are unknown
+-- edge properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+-- GM-17 mediated call edges are deferred; this query is illustrative only.
 MATCH (caller)-[r:CALLS {established_by:"annotation"}]->(callee)
 WHERE r.established_by IS NOT NULL
 RETURN caller.name, caller.file, caller.line,
@@ -255,6 +290,9 @@ ORDER BY r.confidence DESC, caller.file, caller.name
 For auditing which frameworks are doing the wiring:
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — entrypoint_class, framework_pack are unknown node
+-- properties (exit 2); established_by is unknown edge property (exit 2);
+-- IS NOT NULL predicate unsupported. Illustrative only.
 MATCH (ep {kind:"entrypoint"})-[:CALLS*]->(sink)
 WHERE ep.entrypoint_class = "http"
 MATCH (caller)-[r:CALLS]->(impl)
@@ -281,7 +319,7 @@ ORDER BY ep.framework_pack, caller.name
 
 ### Q125 — Does tainted data sent on a Go channel or Rust `mpsc` channel reach a sensitive sink on the receiving side — tracing the dataflow through the send↔recv pair?
 
-**Personas:** PSE · **Status:** core-extension — uses Q-31 framework-aware queries, DF-20 non-call dataflow linkages, taint propagation through channel edges (`core-extension`)
+**Personas:** PSE · **Status:** deferred — `source_class`, `sink_class`, `sanitizer_class` are unsupported node properties in v0.3.0 (plan error, exit 2); `linkage_kind` and `transformation_kind` are unknown edge properties (exit 2); security-typed taint classification and DF-20 channel linkage attributes are deferred
 
 A channel send↔recv pair is a non-call dataflow edge: the sender puts a value into
 the channel; the receiver takes it out; there is no function call from sender to
@@ -292,6 +330,11 @@ Specified in docs/05 Q-31 (via DF-20 and taint propagation).
 **The query**
 
 ```cgx
+-- NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
+-- node properties (plan error, exit 2); sink_class is an unsupported node property
+-- (exit 2); linkage_kind and transformation_kind are unknown edge properties (exit 2).
+-- Security-typed taint (source_class, sink_class, sanitizer_class) and DF-20
+-- channel-linkage attributes are deferred; this query is illustrative only.
 MATCH path = (src {source_class:"network"})-[:DATA_FLOW*]->(sink)
 WHERE sink.sink_class IN ["sql", "shell", "file_write"]
   AND ANY(edge IN relationships(path)
@@ -333,6 +376,9 @@ Specified in docs/05 Q-31 (via GM-19).
 
 ```cgx
 -- illustrative: requires GM-19 (schema-room) `cfg-condition` attribute on nodes and edges
+-- NOTE: deferred in v0.3.0 — cfg_condition is an unknown edge property (plan error,
+-- exit 2); IS NULL predicate unsupported. The ALL/ANY path-predicate forms over
+-- r.cfg_condition cannot run until GM-19 ships.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(target {name:"legacy_auth"})
 WHERE ALL(r IN relationships(path)
           WHERE r.cfg_condition = "feature = \"LEGACY_AUTH\""
@@ -349,6 +395,9 @@ To find all configuration-gated paths to any sink class (broader security gate):
 
 ```cgx
 -- illustrative: requires GM-19 (schema-room)
+-- NOTE: deferred in v0.3.0 — sink_class is an unsupported node property (plan
+-- error, exit 2); cfg_condition is an unknown edge property (exit 2);
+-- IS NOT NULL predicate unsupported. Illustrative only.
 MATCH (ep {kind:"entrypoint"})-[r:CALLS]->(sink)
 WHERE sink.sink_class IN ["sql","shell","eval"]
   AND r.cfg_condition IS NOT NULL

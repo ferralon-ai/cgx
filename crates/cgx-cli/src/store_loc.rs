@@ -20,6 +20,19 @@ pub const CGX_DIR: &str = ".cgx";
 pub const DB_FILE: &str = "index.db";
 /// The current-index pointer filename within [`CGX_DIR`].
 pub const HEAD_FILE: &str = "HEAD.json";
+/// The self-ignoring gitignore filename within [`CGX_DIR`].
+pub const GITIGNORE_FILE: &str = ".gitignore";
+/// Body of the self-ignoring `.cgx/.gitignore` (default "nothing committed"
+/// posture). `*` ignores everything in this directory — including the
+/// `.gitignore` itself — so the whole `.cgx/` is invisible to the parent repo's
+/// `git status` with **zero** change to any project-owned file.
+///
+/// Forward-compat (sparse-storage RFC §7, option c): when a user opts into the
+/// in-tree committable loose store, cgx will *rewrite* this file selectively
+/// (keep ignoring the rebuildable cache `index.db*`/`*.lock`, but un-ignore the
+/// committable `objects/` + manifest via `!objects/` then `!objects/**`). Do not
+/// build that mode now — `*` is correct for the default posture.
+const GITIGNORE_BODY: &str = "*\n";
 
 /// The pointer written by `cgx index` and read by every query subcommand: which
 /// stored Layer-2 graph is "current", and what tree/workdir key it came from.
@@ -36,6 +49,29 @@ pub fn cgx_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(CGX_DIR)
 }
 
+/// The self-ignoring gitignore path within [`CGX_DIR`].
+pub fn gitignore_path(repo_root: &Path) -> PathBuf {
+    cgx_dir(repo_root).join(GITIGNORE_FILE)
+}
+
+/// Ensure `.cgx/` exists and holds the self-ignoring `.gitignore` (sparse-storage
+/// RFC §7, option b). cgx owns this file: it is purely additive, fully owned by
+/// cgx, and removed when `.cgx/` is removed — the parent project never needs a
+/// root-`.gitignore` change and never sees `.cgx/` in `git status`.
+///
+/// Idempotent: if a `.gitignore` already exists we leave it untouched (a future
+/// in-tree-committable mode rewrites it selectively; we must not clobber it).
+pub fn ensure_cgx_dir(repo_root: &Path) -> Result<(), CliError> {
+    let dir = cgx_dir(repo_root);
+    std::fs::create_dir_all(&dir).map_err(|e| CliError::graph(format!("creating {dir:?}: {e}")))?;
+    let gi = gitignore_path(repo_root);
+    if !gi.exists() {
+        std::fs::write(&gi, GITIGNORE_BODY)
+            .map_err(|e| CliError::graph(format!("writing {gi:?}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// The store database path for a repository rooted at `repo_root`.
 pub fn db_path(repo_root: &Path) -> PathBuf {
     cgx_dir(repo_root).join(DB_FILE)
@@ -49,8 +85,7 @@ pub fn head_path(repo_root: &Path) -> PathBuf {
 /// Persist the current-index pointer (deterministic: stable field order, trailing
 /// newline). Called by `cgx index` after a successful store.
 pub fn write_pointer(repo_root: &Path, ptr: &IndexPointer) -> Result<(), CliError> {
-    let dir = cgx_dir(repo_root);
-    std::fs::create_dir_all(&dir).map_err(|e| CliError::graph(format!("creating {dir:?}: {e}")))?;
+    ensure_cgx_dir(repo_root)?;
     let mut json = serde_json::to_string_pretty(ptr).expect("IndexPointer serializes");
     json.push('\n');
     let path = head_path(repo_root);
@@ -73,4 +108,57 @@ pub fn read_pointer(repo_root: &Path) -> Result<IndexPointer, CliError> {
     })?;
     serde_json::from_slice(&bytes)
         .map_err(|e| CliError::graph(format!("corrupt index pointer {path:?}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_cgx_dir_emits_self_ignoring_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(!cgx_dir(root).exists());
+
+        ensure_cgx_dir(root).unwrap();
+
+        let gi = gitignore_path(root);
+        assert!(gi.exists(), ".cgx/.gitignore must be created");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "*\n");
+    }
+
+    #[test]
+    fn ensure_cgx_dir_is_idempotent_and_never_clobbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // First index creates the default self-ignoring file.
+        ensure_cgx_dir(root).unwrap();
+        // Simulate a future selective (in-tree-committable) form the user/cgx put there.
+        let gi = gitignore_path(root);
+        let selective = "index.db\nindex.db-wal\n!objects/\n!objects/**\n";
+        std::fs::write(&gi, selective).unwrap();
+
+        // A subsequent index must not clobber an existing .gitignore.
+        ensure_cgx_dir(root).unwrap();
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), selective);
+    }
+
+    #[test]
+    fn write_pointer_also_emits_gitignore_on_first_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pointer(
+            root,
+            &IndexPointer {
+                graph_key: "deadbeef".into(),
+                graph_id: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(gitignore_path(root)).unwrap(),
+            "*\n"
+        );
+    }
 }

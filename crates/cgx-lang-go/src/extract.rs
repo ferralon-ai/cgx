@@ -19,12 +19,13 @@
 //!   walk, mirroring the Rust adapter's `walk_function_ssa`.
 
 use cgx_core::condition::EdgeCondition;
+use cgx_core::edge::ImplicitKind;
 use cgx_core::effect::EffectSet;
 use cgx_core::node::{SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    EffectFact, FileCtx, FileFacts, FrontendError, Lang, LanguageFrontend, RelPath, ScopeId,
-    SymbolDef,
+    EffectFact, FileCtx, FileFacts, FrontendError, Lang, LanguageFrontend, RawRef, RefKind,
+    RelPath, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
@@ -111,7 +112,24 @@ impl Ctx {
         }
     }
 
-    #[allow(dead_code)]
+    fn with_condition(&self, cond: EdgeCondition) -> Self {
+        let mut conditions = self.conditions.clone();
+        conditions.push(cond);
+        Ctx {
+            fqn_prefix: self.fqn_prefix.clone(),
+            scope: self.scope,
+            conditions,
+        }
+    }
+
+    fn with_scope(&self, scope: ScopeId) -> Self {
+        Ctx {
+            fqn_prefix: self.fqn_prefix.clone(),
+            scope,
+            conditions: self.conditions.clone(),
+        }
+    }
+
     fn condition(&self) -> EdgeCondition {
         EdgeCondition::resolve(self.conditions.iter().copied())
     }
@@ -199,6 +217,15 @@ impl<'a> Builder<'a> {
             "type_declaration" => self.walk_type_declaration(node, ctx),
             "const_declaration" => self.walk_value_declaration(node, ctx, SymbolKind::Constant),
             "var_declaration" => self.walk_value_declaration(node, ctx, SymbolKind::Variable),
+            "call_expression" => self.walk_call_expression(node, ctx, stmt_index),
+            "go_statement" => self.walk_go(node, ctx, stmt_index),
+            "defer_statement" => self.walk_defer(node, ctx, stmt_index),
+            "if_statement" => self.walk_if(node, ctx, stmt_index),
+            "for_statement" => self.walk_loop(node, ctx, stmt_index),
+            "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
+                self.walk_switch(node, ctx, stmt_index)
+            }
+            "func_literal" => self.walk_func_literal(node, ctx, stmt_index),
             _ => self.walk_children(node, ctx, stmt_index),
         }
     }
@@ -342,6 +369,252 @@ impl<'a> Builder<'a> {
             .map(|n| self.span(n))
             .unwrap_or_else(|| self.span(node))
     }
+
+    // --- references (calls) ---
+
+    fn walk_call_expression(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(func) = node.child_by_field_name("function") {
+            let (name_path, kind) = self.classify_callee(func);
+            if !name_path.is_empty() {
+                self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index, None);
+                *stmt_index += 1;
+            }
+        }
+        self.walk_children(node, ctx, stmt_index);
+    }
+
+    fn walk_go(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(call) = node.named_child(0) {
+            if call.kind() == "call_expression" {
+                if let Some(func) = call.child_by_field_name("function") {
+                    let (name_path, _) = self.classify_callee(func);
+                    if !name_path.is_empty() {
+                        self.push_ref(
+                            name_path,
+                            RefKind::Spawn,
+                            ctx,
+                            self.span(call),
+                            *stmt_index,
+                            None,
+                        );
+                        *stmt_index += 1;
+                    }
+                }
+                self.walk_call_args(call, ctx, stmt_index);
+                return;
+            }
+        }
+        self.walk_children(node, ctx, stmt_index);
+    }
+
+    fn walk_defer(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(call) = node.named_child(0) {
+            if call.kind() == "call_expression" {
+                if let Some(func) = call.child_by_field_name("function") {
+                    let (name_path, kind) = self.classify_callee(func);
+                    if !name_path.is_empty() {
+                        self.push_ref(
+                            name_path,
+                            kind,
+                            ctx,
+                            self.span(call),
+                            *stmt_index,
+                            Some(ImplicitKind::Defer),
+                        );
+                        *stmt_index += 1;
+                    }
+                }
+                self.walk_call_args(call, ctx, stmt_index);
+                return;
+            }
+        }
+        self.walk_children(node, ctx, stmt_index);
+    }
+
+    fn walk_call_args(&mut self, call: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(args) = call.child_by_field_name("arguments") {
+            self.walk(args, ctx, stmt_index);
+        }
+    }
+
+    fn walk_func_literal(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        // An anonymous callable with a stable allocation site (GM-1.1 Lambda); its
+        // FQN is synthesized from the enclosing FQN plus the source position.
+        let fqn = format!(
+            "{}::{{func@{}:{}}}",
+            ctx.fqn_prefix,
+            self.line(node),
+            self.col(node)
+        );
+        self.facts.defs.push(SymbolDef {
+            fqn: fqn.clone(),
+            kind: SymbolKind::Lambda,
+            visibility: Visibility::Private,
+            scope: ctx.scope,
+            span: self.span(node),
+            line_end: self.end_line(node),
+            is_abstract: false,
+            signature: None,
+        });
+        let scope = self.facts.scopes.push(ctx.scope, Some(fqn));
+        let inner = ctx.with_scope(scope);
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut local = 0u32;
+            self.walk(body, &inner, &mut local);
+        }
+    }
+
+    /// Classify a call's `function` operand into its `(name_path, RefKind)`:
+    /// a bare `identifier` → `Call`; a `selector_expression` `x.Foo` →
+    /// `CallVirtualReceiver` (the resolver decides package-call vs method via
+    /// imports / CHA).
+    fn classify_callee(&self, func: Node<'_>) -> (SmallVec<[String; 2]>, RefKind) {
+        match func.kind() {
+            "identifier" => (smallvec_one(self.text(func)), RefKind::Call),
+            "selector_expression" => {
+                let segs = self.selector_segments(func);
+                if segs.is_empty() {
+                    (SmallVec::new(), RefKind::Call)
+                } else {
+                    (segs, RefKind::CallVirtualReceiver)
+                }
+            }
+            "parenthesized_expression" => func
+                .named_child(0)
+                .map(|inner| self.classify_callee(inner))
+                .unwrap_or((SmallVec::new(), RefKind::Call)),
+            _ => {
+                let seg: String = self
+                    .text(func)
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if seg.is_empty() {
+                    (SmallVec::new(), RefKind::Call)
+                } else {
+                    (smallvec_one(seg), RefKind::Call)
+                }
+            }
+        }
+    }
+
+    /// The segment path of a `selector_expression` (`a.b.c` → `[a, b, c]`),
+    /// recursing through the operand chain.
+    fn selector_segments(&self, node: Node<'_>) -> SmallVec<[String; 2]> {
+        let mut out = SmallVec::new();
+        match node.kind() {
+            "selector_expression" => {
+                if let Some(operand) = node.child_by_field_name("operand") {
+                    out = self.selector_segments(operand);
+                }
+                if let Some(field) = node.child_by_field_name("field") {
+                    out.push(self.text(field));
+                }
+            }
+            "identifier" | "field_identifier" | "type_identifier" | "package_identifier" => {
+                out.push(self.text(node));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn push_ref(
+        &mut self,
+        name_path: SmallVec<[String; 2]>,
+        kind: RefKind,
+        ctx: &Ctx,
+        span: Span,
+        stmt_index: u32,
+        implicit: Option<ImplicitKind>,
+    ) {
+        self.facts.refs.push(RawRef {
+            name_path,
+            scope: ctx.scope,
+            kind,
+            edge_condition: ctx.condition(),
+            implicit,
+            span,
+            stmt_index,
+            arity: None,
+            cut_markers: SmallVec::new(),
+        });
+    }
+
+    // --- conditions ---
+
+    fn walk_if(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(c) = node.child_by_field_name("condition") {
+            self.walk(c, ctx, stmt_index);
+        }
+        // An `if err != nil { … }` guard is exceptional control flow; any other
+        // boolean branch is merely conditional.
+        let is_exc = node
+            .child_by_field_name("condition")
+            .map(|c| self.is_err_nil_guard(c))
+            .unwrap_or(false);
+        let branch = if is_exc {
+            EdgeCondition::Exception
+        } else {
+            EdgeCondition::Conditional
+        };
+        let inner = ctx.with_condition(branch);
+        if let Some(c) = node.child_by_field_name("consequence") {
+            self.walk(c, &inner, stmt_index);
+        }
+        if let Some(a) = node.child_by_field_name("alternative") {
+            self.walk(a, &inner, stmt_index);
+        }
+    }
+
+    /// Whether a condition is a `<expr> != nil` error guard: a `!=` comparison
+    /// against `nil` whose other operand names an `err`-ish binding.
+    fn is_err_nil_guard(&self, cond: Node<'_>) -> bool {
+        if cond.kind() != "binary_expression" {
+            return false;
+        }
+        let has_nil = ["left", "right"]
+            .iter()
+            .filter_map(|f| cond.child_by_field_name(f))
+            .any(|n| n.kind() == "nil");
+        if !has_nil {
+            return false;
+        }
+        let text = self.text(cond);
+        text.contains("!=") && text.to_lowercase().contains("err")
+    }
+
+    fn walk_loop(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        let body = node.child_by_field_name("body");
+        if let Some(body) = body {
+            let inner = ctx.with_condition(EdgeCondition::Loop);
+            self.walk(body, &inner, stmt_index);
+        }
+        // Walk any non-body children (init/condition/range clause) unguarded.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if Some(child) == body {
+                continue;
+            }
+            self.walk(child, ctx, stmt_index);
+        }
+    }
+
+    fn walk_switch(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        let inner = ctx.with_condition(EdgeCondition::Conditional);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            // Case bodies are conditional; the scrutinee/guard is unguarded.
+            if matches!(
+                child.kind(),
+                "expression_case" | "type_case" | "default_case" | "communication_case"
+            ) {
+                self.walk(child, &inner, stmt_index);
+            } else {
+                self.walk(child, ctx, stmt_index);
+            }
+        }
+    }
 }
 
 // === free functions ===
@@ -352,6 +625,12 @@ fn join(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}::{name}")
     }
+}
+
+fn smallvec_one(s: String) -> SmallVec<[String; 2]> {
+    let mut v = SmallVec::new();
+    v.push(s);
+    v
 }
 
 /// Go visibility: an exported (Capitalized) identifier is `Public`; anything else

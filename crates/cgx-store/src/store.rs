@@ -53,6 +53,16 @@ pub trait FactStore {
     /// `VACUUM`s to reclaim disk.
     fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats>;
 
+    /// Garbage-collect every Layer-2 graph except the ones in `keep` (their tree
+    /// OIDs), returning the number of graph rows removed. Deletes from `graphs`;
+    /// the FK `ON DELETE CASCADE` reclaims the dependent `nodes`/`edges`/
+    /// `candidates` rows. No `VACUUM` — byte-determinism of the surviving rows is
+    /// preserved (the blast-radius fix relies on this).
+    ///
+    /// The normal `cgx index` path keeps exactly the current tree's graph; the
+    /// `diff` path, which accumulates two graphs in one session, never calls this.
+    fn prune_graphs_except(&mut self, keep: &[&TreeOid]) -> Result<usize>;
+
     /// Load the entire per-function intraproc cache (v0.3 SC3): a map from
     /// `(blob_oid, fn_fqn)` to the function's `DataFlowFact`-subset content hash.
     /// Consulted before a dataflow re-link to decide which functions changed.
@@ -539,6 +549,32 @@ impl FactStore for SqliteStore {
         Ok(stats)
     }
 
+    fn prune_graphs_except(&mut self, keep: &[&TreeOid]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let removed = {
+            // Collect tree OIDs not in `keep`, then delete by tree_oid. The FK
+            // ON DELETE CASCADE drops the dependent nodes/edges/candidates rows.
+            // Iterating-then-deleting (rather than a NOT IN (...) clause) keeps the
+            // statement bound-parameter-free and order-independent.
+            let stored: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT tree_oid FROM graphs")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut del = tx.prepare("DELETE FROM graphs WHERE tree_oid = ?1")?;
+            let mut n = 0usize;
+            for oid in stored {
+                if !keep.iter().any(|k| k.as_str() == oid) {
+                    del.execute(params![oid])?;
+                    n += 1;
+                }
+            }
+            n
+        };
+        tx.commit()?;
+        Ok(removed)
+    }
+
     fn load_fn_intraproc_cache(&self) -> Result<Vec<((String, String), String)>> {
         let mut stmt = self
             .conn
@@ -555,13 +591,23 @@ impl FactStore for SqliteStore {
     fn put_fn_intraproc_cache(&mut self, rows: &[((String, String), String)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            tx.execute("DELETE FROM fn_intraproc_cache", [])?;
-            let mut stmt = tx.prepare(
-                "INSERT INTO fn_intraproc_cache(blob_oid, fn_fqn, facts_hash) VALUES(?1, ?2, ?3)",
+            // Keyed delta (sparse-storage RFC P2): upsert only rows whose hash
+            // changed (the `WHERE` guard makes an unchanged row a true no-op so its
+            // bytes stay put), then delete only keys absent from the new set. An
+            // unchanged function's row is byte-stable across re-index.
+            let mut up = tx.prepare(
+                "INSERT INTO fn_intraproc_cache(blob_oid, fn_fqn, facts_hash) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(blob_oid, fn_fqn) DO UPDATE SET facts_hash = excluded.facts_hash
+                   WHERE facts_hash <> excluded.facts_hash",
             )?;
             for ((blob_oid, fn_fqn), facts_hash) in rows {
-                stmt.execute(params![blob_oid, fn_fqn, facts_hash])?;
+                up.execute(params![blob_oid, fn_fqn, facts_hash])?;
             }
+            delete_stale_keyed(
+                &tx,
+                "fn_intraproc_cache",
+                rows.iter().map(|((b, f), _)| (b.as_str(), f.as_str())),
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -570,13 +616,22 @@ impl FactStore for SqliteStore {
     fn put_summary_deps(&mut self, rows: &[(String, String)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            tx.execute("DELETE FROM summary_deps", [])?;
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO summary_deps(fn_fqn, callee_fqn) VALUES(?1, ?2)",
+            // Keyed delta: the whole row IS the key (PK is `(fn_fqn, callee_fqn)`),
+            // so a present row already holds the right bytes — INSERT-or-ignore is a
+            // true no-op for an unchanged dep. Then delete only the deps that are
+            // gone from the new set.
+            let mut up = tx.prepare(
+                "INSERT INTO summary_deps(fn_fqn, callee_fqn) VALUES(?1, ?2)
+                 ON CONFLICT(fn_fqn, callee_fqn) DO NOTHING",
             )?;
             for (fn_fqn, callee_fqn) in rows {
-                stmt.execute(params![fn_fqn, callee_fqn])?;
+                up.execute(params![fn_fqn, callee_fqn])?;
             }
+            delete_stale_keyed(
+                &tx,
+                "summary_deps",
+                rows.iter().map(|(f, c)| (f.as_str(), c.as_str())),
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -598,17 +653,64 @@ impl FactStore for SqliteStore {
     fn put_fn_summaries(&mut self, rows: &[FnSummaryRow]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            tx.execute("DELETE FROM fn_summaries", [])?;
-            let mut stmt = tx.prepare(
-                "INSERT INTO fn_summaries(blob_oid, fn_fqn, summary_bytes) VALUES(?1, ?2, ?3)",
+            // Keyed delta: upsert only summaries whose bytes changed (the `WHERE`
+            // guard keeps an unchanged summary's BLOB physically put), then delete
+            // only the keys absent from the new set.
+            let mut up = tx.prepare(
+                "INSERT INTO fn_summaries(blob_oid, fn_fqn, summary_bytes) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(blob_oid, fn_fqn) DO UPDATE SET summary_bytes = excluded.summary_bytes
+                   WHERE summary_bytes <> excluded.summary_bytes",
             )?;
             for ((blob_oid, fn_fqn), summary_bytes) in rows {
-                stmt.execute(params![blob_oid, fn_fqn, summary_bytes])?;
+                up.execute(params![blob_oid, fn_fqn, summary_bytes])?;
             }
+            delete_stale_keyed(
+                &tx,
+                "fn_summaries",
+                rows.iter().map(|((b, f), _)| (b.as_str(), f.as_str())),
+            )?;
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Delete every row of `table` whose two-column composite primary key is absent
+/// from `live_keys`. Shared by the three SC3/SC4 caches, all keyed by exactly two
+/// TEXT columns. Deletes only stale keys — present rows are untouched, so an
+/// unchanged function's cache row stays byte-stable across re-index (the
+/// blast-radius fix, sparse-storage RFC P2). The `WITHOUT ROWID` PK column pair is
+/// the same for the SELECT and the DELETE, so this is order-independent.
+fn delete_stale_keyed<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    live_keys: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    use std::collections::HashSet;
+    let live: HashSet<(&str, &str)> = live_keys.collect();
+
+    // The two PK columns differ per table; resolve them once.
+    let (col_a, col_b) = match table {
+        "fn_intraproc_cache" | "fn_summaries" => ("blob_oid", "fn_fqn"),
+        "summary_deps" => ("fn_fqn", "callee_fqn"),
+        other => unreachable!("delete_stale_keyed called for unknown table {other}"),
+    };
+
+    let stored: Vec<(String, String)> = {
+        let sql = format!("SELECT {col_a}, {col_b} FROM {table}");
+        let mut stmt = tx.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let del_sql = format!("DELETE FROM {table} WHERE {col_a} = ?1 AND {col_b} = ?2");
+    let mut del = tx.prepare(&del_sql)?;
+    for (a, b) in &stored {
+        if !live.contains(&(a.as_str(), b.as_str())) {
+            del.execute(params![a, b])?;
+        }
+    }
+    Ok(())
 }
 
 /// Render a `cgx-core` enum to its serde string token, for the denormalized

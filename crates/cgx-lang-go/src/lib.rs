@@ -18,5 +18,7 @@
 #![warn(missing_debug_implementations)]
 
 mod extract;
+mod module;
 
 pub use extract::GoFrontend;
+pub use module::{module_path_for, module_path_for_pkg};

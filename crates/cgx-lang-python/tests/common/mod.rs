@@ -1,7 +1,8 @@
 //! Shared test helpers for the Python frontend suite.
 #![allow(dead_code)]
 
-use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, SymbolDef};
+use cgx_core::condition::EdgeCondition;
+use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RefKind, SymbolDef};
 use cgx_lang_python::PythonFrontend;
 use std::path::PathBuf;
 
@@ -41,4 +42,13 @@ pub fn def<'a>(facts: &'a FileFacts, fqn: &str) -> &'a SymbolDef {
         .iter()
         .find(|d| d.fqn == fqn)
         .unwrap_or_else(|| panic!("no def {fqn:?}; have {:?}", def_fqns(facts)))
+}
+
+/// Whether a ref exists whose callee last segment, kind, and edge condition match.
+pub fn has_ref(facts: &FileFacts, callee_last: &str, kind: RefKind, cond: EdgeCondition) -> bool {
+    facts.refs.iter().any(|r| {
+        r.name_path.last().map(String::as_str) == Some(callee_last)
+            && r.kind == kind
+            && r.edge_condition == cond
+    })
 }

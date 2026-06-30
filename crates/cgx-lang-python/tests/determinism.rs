@@ -19,6 +19,24 @@ fn inline_extraction_is_byte_identical_across_runs() {
 }
 
 #[test]
+fn refs_imports_hints_are_identical_across_runs() {
+    // A source exercising Cycle-2 facts: imports, a call ref, an instantiate, an
+    // export, an entrypoint, and a cut hint.
+    let src = "from a.b import c\nimport os.path as p\n__all__ = [\"run\"]\nclass W:\n    pass\ndef run(x):\n    w = W()\n    if x:\n        getattr(w, \"go\")()\nif __name__ == \"__main__\":\n    run(1)\n";
+    let a = extract("app/store.py", src);
+    let b = extract("app/store.py", src);
+    assert_eq!(a.refs, b.refs);
+    assert_eq!(a.imports, b.imports);
+    assert_eq!(a.exports, b.exports);
+    assert_eq!(a.entrypoint_hints, b.entrypoint_hints);
+    assert_eq!(a.cut_hints, b.cut_hints);
+    // Non-empty: the facts actually emit.
+    assert!(!a.refs.is_empty() && !a.imports.is_empty());
+    assert!(!a.exports.is_empty() && !a.entrypoint_hints.is_empty());
+    assert!(!a.cut_hints.is_empty());
+}
+
+#[test]
 fn fixture_def_set_is_complete() {
     let facts = extract_fixture("shapes.py");
     let fqns: Vec<&str> = facts.defs.iter().map(|d| d.fqn.as_str()).collect();

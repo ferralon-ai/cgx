@@ -49,6 +49,20 @@ fn inheritance_relations_are_identical_across_runs() {
 }
 
 #[test]
+fn effect_facts_are_identical_across_runs() {
+    // The effects fixture exercises every effect kind (io.*, nondeterministic,
+    // dynamic-code, blocking, spawns); the BTreeMap-keyed accumulator flushed in
+    // finish must canonicalize to a byte-identical order across runs.
+    let a = extract_fixture("Effects.java");
+    let b = extract_fixture("Effects.java");
+    assert_eq!(a, b, "canonical effect facts must be stable");
+    assert!(
+        !a.effects.is_empty(),
+        "the effects fixture must emit effect facts"
+    );
+}
+
+#[test]
 fn fixture_def_set_is_complete_and_stable() {
     let facts = extract_fixture("Shapes.java");
     let fqns = def_fqns(&facts);

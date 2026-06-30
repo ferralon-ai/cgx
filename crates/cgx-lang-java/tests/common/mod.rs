@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use cgx_core::condition::EdgeCondition;
-use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RefKind, SymbolDef};
+use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RefKind, RelationKind, SymbolDef};
 use cgx_lang_java::JavaFrontend;
 use std::path::PathBuf;
 
@@ -53,5 +53,31 @@ pub fn has_ref(facts: &FileFacts, callee_last: &str, kind: RefKind, cond: EdgeCo
         r.name_path.last().map(String::as_str) == Some(callee_last)
             && r.kind == kind
             && r.edge_condition == cond
+    })
+}
+
+/// Whether an `ImplRelation` of `kind` was emitted whose `subject` ends in
+/// `subject_last` and whose `object` ends in `object_last` (both compared on the
+/// final name-path segment).
+pub fn has_relation(
+    facts: &FileFacts,
+    kind: RelationKind,
+    subject_last: &str,
+    object_last: &str,
+) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == kind
+            && r.subject.last().map(String::as_str) == Some(subject_last)
+            && r.object.last().map(String::as_str) == Some(object_last)
+    })
+}
+
+/// Whether an `Overrides` relation was emitted whose `subject` ends in
+/// `method` and whose `object` is exactly `[supertype, method]`.
+pub fn has_override(facts: &FileFacts, supertype: &str, method: &str) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == RelationKind::Overrides
+            && r.subject.last().map(String::as_str) == Some(method)
+            && r.object.as_slice().iter().map(String::as_str).eq([supertype, method])
     })
 }

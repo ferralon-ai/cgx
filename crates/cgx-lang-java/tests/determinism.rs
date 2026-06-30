@@ -35,6 +35,20 @@ fn refs_imports_hints_are_identical_across_runs() {
 }
 
 #[test]
+fn inheritance_relations_are_identical_across_runs() {
+    // The lattice fixture exercises Inherits/Implements/Overrides, whose
+    // accumulation (BTreeMap-keyed, flushed in finish) must canonicalize to a
+    // byte-identical order across runs.
+    let a = extract_fixture("Lattice.java");
+    let b = extract_fixture("Lattice.java");
+    assert_eq!(a, b, "canonical inheritance relations must be stable");
+    assert!(
+        !a.impl_relations.is_empty(),
+        "the lattice fixture must emit impl_relations"
+    );
+}
+
+#[test]
 fn fixture_def_set_is_complete_and_stable() {
     let facts = extract_fixture("Shapes.java");
     let fqns = def_fqns(&facts);

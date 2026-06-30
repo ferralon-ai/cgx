@@ -20,17 +20,19 @@
 
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
+use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImplRelation,
-    ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, RelationKind,
-    ScopeId, SymbolDef,
+    CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts,
+    FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef,
+    RefKind, RelPath, RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
+use crate::effects::effects_of_call;
 use crate::module::module_path_for;
 
 /// The Python language adapter. Stateless; one instance handles every `.py` file.
@@ -156,6 +158,14 @@ struct Builder<'a> {
     /// a method overriding a base declared *later* in the file still matches —
     /// declaration order is irrelevant, mirroring Java's `flush_overrides`).
     classes: BTreeMap<String, ClassRec>,
+    /// Cycle-4 hook: accumulated syntactic own-effects keyed by the enclosing
+    /// definition's local FQN (`ctx.fqn_prefix`). Flushed into `facts.effects` in
+    /// [`Builder::finish`], mirroring Go's `effects` accumulator.
+    effects: BTreeMap<String, EffectSet>,
+    /// Cycle-5 hook (wired empty/ready): accumulated intraprocedural dataflow facts
+    /// keyed by the owning function's local FQN. Flushed into `facts.data_flows` in
+    /// [`Builder::finish`]. Empty until SC2-style SSA dataflow (Cycle 5).
+    data_flows: BTreeMap<String, Vec<DataFlowFact>>,
 }
 
 /// Dedup key for an `Overrides` relation: `(subject FQN segments, [Base, method])`.
@@ -191,12 +201,36 @@ impl<'a> Builder<'a> {
             dunder_all: None,
             module_defs: Vec::new(),
             classes: BTreeMap::new(),
+            effects: BTreeMap::new(),
+            data_flows: BTreeMap::new(),
         }
     }
 
     fn finish(mut self) -> FileFacts {
         self.flush_overrides();
+        for (fqn, set) in std::mem::take(&mut self.effects) {
+            if !set.is_empty() {
+                self.facts.effects.push(EffectFact { fqn, effects: set });
+            }
+        }
+        for (_fqn, facts) in std::mem::take(&mut self.data_flows) {
+            self.facts.data_flows.extend(facts);
+        }
         self.facts
+    }
+
+    /// Record an own-effect set against the enclosing callable. Inside a body
+    /// `ctx.fqn_prefix` is the callable's FQN (set by [`Ctx::enter_body`]); at
+    /// module level it is the module prefix, so a top-level effectful call is
+    /// attributed to the module pseudo-symbol (consistent with Go).
+    fn record_effects(&mut self, ctx: &Ctx, set: EffectSet) {
+        if set.is_empty() {
+            return;
+        }
+        self.effects
+            .entry(ctx.fqn_prefix.clone())
+            .or_default()
+            .union_with(set);
     }
 
     /// Emit `Overrides` relations now that every class/method in the file is known.
@@ -282,6 +316,8 @@ impl<'a> Builder<'a> {
             "import_statement" => self.walk_import(node, ctx),
             "import_from_statement" => self.walk_import_from(node, ctx),
             "call" => self.walk_call(node, ctx, stmt_index),
+            "await" => self.walk_await(node, ctx, stmt_index),
+            "with_statement" => self.walk_with(node, ctx, stmt_index),
             "if_statement" => self.walk_if(node, ctx, stmt_index),
             "conditional_expression" => self.walk_conditional_expr(node, ctx, stmt_index),
             "match_statement" => self.walk_match(node, ctx, stmt_index),
@@ -569,7 +605,19 @@ impl<'a> Builder<'a> {
             self.emit_call_cut_hints(func, node);
             let (name_path, kind) = self.classify_callee(func);
             if !name_path.is_empty() {
-                self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index);
+                let joined = name_path.join("::");
+                // A concurrency spawn site (`asyncio.create_task`,
+                // `threading.Thread(...)`, `multiprocessing.Process`,
+                // `*Executor.submit`, …) launches detached work: emit the ref as a
+                // `Spawn` and label the enclosing function `spawns` (LS-7.1 / GM-9).
+                // Otherwise record any own-effects the callee implies (LS-7.4).
+                if is_spawn_path(&joined) {
+                    self.record_effects(ctx, EffectSet::single(Effect::Spawns));
+                    self.push_ref(name_path, RefKind::Spawn, ctx, self.span(node), *stmt_index);
+                } else {
+                    self.record_effects(ctx, effects_of_call(&joined));
+                    self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index);
+                }
                 *stmt_index += 1;
             }
             // The callee operand may itself nest a call (`getattr(o, "m")()`,
@@ -582,6 +630,77 @@ impl<'a> Builder<'a> {
         // Walk the argument list for nested calls (`f(g())`).
         if let Some(args) = node.child_by_field_name("arguments") {
             self.walk(args, ctx, stmt_index);
+        }
+    }
+
+    /// An `await <expr>` suspension point (LS-7.2). When the awaited operand is a
+    /// `call`, emit the call ref as a [`RefKind::CallAsync`] edge (the resolver
+    /// stamps `suspends` on the source), mirroring the Rust adapter's `walk_await`.
+    /// A non-call awaited operand (`await some_future`) is walked for nested refs.
+    fn walk_await(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        let Some(inner) = node.named_child(0) else {
+            return self.walk_children(node, ctx, stmt_index);
+        };
+        if inner.kind() == "call" {
+            if let Some(func) = inner.child_by_field_name("function") {
+                self.emit_call_cut_hints(func, inner);
+                let (name_path, _) = self.classify_callee(func);
+                if !name_path.is_empty() {
+                    self.record_effects(ctx, effects_of_call(&name_path.join("::")));
+                    self.push_ref(name_path, RefKind::CallAsync, ctx, self.span(inner), *stmt_index);
+                    *stmt_index += 1;
+                }
+            }
+            if let Some(args) = inner.child_by_field_name("arguments") {
+                self.walk(args, ctx, stmt_index);
+            }
+        } else {
+            self.walk(inner, ctx, stmt_index);
+        }
+    }
+
+    /// A `with`/`async with` statement (LS-7.3 lock construct). A `with_item` whose
+    /// context manager is a lock (`threading.Lock()`/`RLock`/`Semaphore`, or a name
+    /// that reads as a lock) labels the enclosing function `blocking` (acquire at
+    /// entry, release at `__exit__`). The body is walked normally for refs.
+    fn walk_with(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "with_clause" {
+                let mut item_cursor = child.walk();
+                for item in child.children(&mut item_cursor) {
+                    if item.kind() == "with_item" {
+                        if self.with_item_is_lock(item) {
+                            self.record_effects(ctx, EffectSet::single(Effect::Blocking));
+                        }
+                        // Walk the context-manager expression for nested call refs
+                        // (`with open(p):` is itself an io.file call site).
+                        self.walk_children(item, ctx, stmt_index);
+                    }
+                }
+            } else if child.kind() == "block" {
+                self.walk_block(child, ctx, stmt_index);
+            }
+        }
+    }
+
+    /// Whether a `with_item`'s context manager is a lock/semaphore construct: a
+    /// `threading.Lock()`/`RLock()`/`Semaphore()`/`Condition()` call, or a bare name
+    /// that reads as a lock (`lock`, `mutex`, `*_lock`).
+    fn with_item_is_lock(&self, item: Node<'_>) -> bool {
+        let Some(value) = item.named_child(0) else {
+            return false;
+        };
+        match value.kind() {
+            "call" => value
+                .child_by_field_name("function")
+                .map(|f| is_lock_ctor(&self.classify_callee(f).0.join("::")))
+                .unwrap_or(false),
+            "identifier" | "attribute" => {
+                let segs = self.attribute_segments(value);
+                segs.last().map(|s| is_lock_name(s)).unwrap_or(false)
+            }
+            _ => false,
         }
     }
 
@@ -1122,6 +1241,58 @@ fn name_path_two(a: &str, b: &str) -> SmallVec<[Name; 2]> {
 /// rejoins for an exact `def_to_node` lookup).
 fn fqn_segments(fqn: &str) -> SmallVec<[Name; 2]> {
     fqn.split("::").map(str::to_string).collect()
+}
+
+/// Whether a `::`-joined callee name path is a known concurrency spawn site
+/// (LS-7.1): `asyncio` task launchers, `threading.Thread`, `multiprocessing.Process`,
+/// and `concurrent.futures` `*Executor.submit`. Matched on the joined path and its
+/// trailing segment (a same-named user API is the heuristic's accepted false
+/// positive, exactly like the effect table).
+fn is_spawn_path(path: &str) -> bool {
+    let tail = path.rsplit("::").next().unwrap_or(path);
+    // asyncio coroutine/task launchers.
+    if path.contains("asyncio")
+        && matches!(
+            tail,
+            "create_task" | "ensure_future" | "gather" | "run" | "run_coroutine_threadsafe"
+        )
+    {
+        return true;
+    }
+    // loop.run_in_executor / loop.create_task.
+    if matches!(tail, "run_in_executor") {
+        return true;
+    }
+    // threading.Thread(...), multiprocessing.Process(...) constructors.
+    if matches!(tail, "Thread" | "Process") {
+        return true;
+    }
+    // concurrent.futures executor submit / map.
+    if matches!(tail, "submit") || (path.contains("Executor") && tail == "map") {
+        return true;
+    }
+    false
+}
+
+/// Whether a `::`-joined context-manager constructor names a lock/semaphore
+/// (`threading.Lock()`/`RLock`/`Semaphore`/`BoundedSemaphore`/`Condition`,
+/// `asyncio.Lock`, `multiprocessing.Lock`).
+fn is_lock_ctor(path: &str) -> bool {
+    let tail = path.rsplit("::").next().unwrap_or(path);
+    matches!(
+        tail,
+        "Lock" | "RLock" | "Semaphore" | "BoundedSemaphore" | "Condition"
+    )
+}
+
+/// Whether a bare context-manager name reads as a lock (`lock`, `mutex`, a
+/// `*_lock`/`*_mutex` suffix).
+fn is_lock_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "lock"
+        || lower == "mutex"
+        || lower.ends_with("_lock")
+        || lower.ends_with("_mutex")
 }
 
 /// Python has no access modifiers; PEP-8 leading-underscore convention is the

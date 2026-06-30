@@ -48,6 +48,19 @@ fn inheritance_relations_are_identical_across_runs() {
 }
 
 #[test]
+fn effects_and_concurrency_are_identical_across_runs() {
+    // A source exercising Cycle-4 facts: own-effects (io.net, io.proc,
+    // nondeterministic, blocking), a spawn site, an await suspension, and a lock
+    // `with` block — all of which feed `effects` and the spawn/async refs.
+    let src = "import os, asyncio, threading, subprocess\nasync def run(u):\n    data = await fetch(u)\n    subprocess.run(['ls'])\n    _ = os.getenv('X')\n    asyncio.create_task(work())\n    threading.Thread(target=work)\n    with threading.Lock():\n        pass\n    return data\n";
+    let a = extract("app/store.py", src);
+    let b = extract("app/store.py", src);
+    assert_eq!(a.effects, b.effects);
+    assert_eq!(a.refs, b.refs);
+    assert!(!a.effects.is_empty(), "effects must emit for this source");
+}
+
+#[test]
 fn fixture_def_set_is_complete() {
     let facts = extract_fixture("shapes.py");
     let fqns: Vec<&str> = facts.defs.iter().map(|d| d.fqn.as_str()).collect();

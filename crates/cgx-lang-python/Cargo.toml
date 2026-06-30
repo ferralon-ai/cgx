@@ -1,0 +1,15 @@
+[package]
+name = "cgx-lang-python"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx Python language adapter: tree-sitter-python frontend emitting symbol defs (functions/methods/classes/module constants & variables)."
+
+[dependencies]
+cgx-core.workspace = true
+cgx-frontend.workspace = true
+smallvec.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true

@@ -24,6 +24,17 @@ fn inline_extraction_is_identical_across_runs() {
 }
 
 #[test]
+fn refs_imports_hints_are_identical_across_runs() {
+    // A body with calls under several edge conditions, an import, an entrypoint,
+    // and a cut all share the canonical sort path.
+    let src = "package a.b;\nimport java.util.List;\nclass C {\n  public static void main(String[] a) {\n    g();\n    if (a.length > 0) { new Widget(); }\n    try { risky(); } catch (Exception e) { recover(); }\n    Class.forName(\"x\");\n  }\n}\n";
+    let a = extract("C.java", src);
+    let b = extract("C.java", src);
+    assert_eq!(a, b);
+    assert!(!a.refs.is_empty() && !a.imports.is_empty() && !a.entrypoint_hints.is_empty());
+}
+
+#[test]
 fn fixture_def_set_is_complete_and_stable() {
     let facts = extract_fixture("Shapes.java");
     let fqns = def_fqns(&facts);

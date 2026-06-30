@@ -61,6 +61,21 @@ fn effects_and_concurrency_are_identical_across_runs() {
 }
 
 #[test]
+fn data_flows_are_identical_across_runs() {
+    // A source exercising Cycle-5 dataflow: copy, arith, augmented, projection,
+    // an opaque call, a tuple unpack, and a return — every fact must serialize
+    // byte-stable across extractions.
+    let src = "def g(a, b):\n    c = a + b\n    c += a\n    n = a.field\n    r = h(a)\n    p, q = make()\n    y = c\n    return y\n";
+    let a = extract("app/df.py", src);
+    let b = extract("app/df.py", src);
+    assert_eq!(a.data_flows, b.data_flows);
+    assert!(
+        !a.data_flows.is_empty(),
+        "data_flows must emit for this source"
+    );
+}
+
+#[test]
 fn fixture_def_set_is_complete() {
     let facts = extract_fixture("shapes.py");
     let fqns: Vec<&str> = facts.defs.iter().map(|d| d.fqn.as_str()).collect();

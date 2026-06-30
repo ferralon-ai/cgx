@@ -42,6 +42,22 @@ fn interface_is_type_kind_and_abstract() {
 }
 
 #[test]
+fn annotation_type_is_type_kind_and_abstract() {
+    // `@interface` (annotation type) is a type declaration; like an interface it
+    // is implicitly abstract. Its elements surface as abstract methods.
+    let facts = extract(
+        "Audited.java",
+        &format!("{PKG}@interface Audited {{ String value(); }}"),
+    );
+    let anno = def(&facts, "com::example::shapes::Audited");
+    assert_eq!(anno.kind, SymbolKind::Type);
+    assert!(anno.is_abstract, "annotation types are always abstract");
+    let value = def(&facts, "com::example::shapes::Audited::value");
+    assert_eq!(value.kind, SymbolKind::Method);
+    assert!(value.is_abstract);
+}
+
+#[test]
 fn enum_is_type_kind() {
     let facts = extract("Color.java", &format!("{PKG}enum Color {{ RED, GREEN }}"));
     let color = def(&facts, "com::example::shapes::Color");

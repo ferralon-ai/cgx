@@ -351,8 +351,10 @@ impl<'a> Builder<'a> {
     fn walk(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         match node.kind() {
             "class_declaration" | "interface_declaration" | "enum_declaration"
-            | "record_declaration" => self.walk_type(node, ctx),
-            "method_declaration" => self.walk_method(node, ctx),
+            | "record_declaration" | "annotation_type_declaration" => self.walk_type(node, ctx),
+            "method_declaration" | "annotation_type_element_declaration" => {
+                self.walk_method(node, ctx)
+            }
             "constructor_declaration" => self.walk_constructor(node, ctx),
             "field_declaration" => self.walk_field(node, ctx),
             "enum_constant" => self.walk_enum_constant(node, ctx),
@@ -380,16 +382,20 @@ impl<'a> Builder<'a> {
 
     // --- definitions ---
 
-    /// Class, interface, enum, or record. Emits a `Type` def, opens a child scope,
-    /// then walks the type body so members and nested types nest under its FQN.
+    /// Class, interface, enum, record, or annotation type. Emits a `Type` def,
+    /// opens a child scope, then walks the type body so members and nested types
+    /// nest under its FQN.
     fn walk_type(&mut self, node: Node<'_>, ctx: &Ctx) {
         let Some(name) = self.field_text(node, "name") else {
             return;
         };
         let fqn = join(&ctx.fqn_prefix, &name);
-        // An interface is always abstract; a class is abstract iff it carries the
-        // `abstract` modifier; enums and records never are.
-        let is_abstract = node.kind() == "interface_declaration" || has_modifier(node, "abstract");
+        // An interface or annotation type is always abstract; a class is abstract
+        // iff it carries the `abstract` modifier; enums and records never are.
+        let is_abstract = matches!(
+            node.kind(),
+            "interface_declaration" | "annotation_type_declaration"
+        ) || has_modifier(node, "abstract");
         let vis = vis_from_modifiers(node);
         let scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
         self.facts.defs.push(SymbolDef {

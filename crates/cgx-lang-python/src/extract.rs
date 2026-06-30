@@ -23,6 +23,7 @@ use cgx_core::cut::CutMarker;
 use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
+use cgx_core::transform::Transform;
 use cgx_frontend::{
     CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts,
     FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef,
@@ -376,9 +377,14 @@ impl<'a> Builder<'a> {
         // class body, so nested functions are `Function`s. A body opens a fresh
         // condition chain and a new statement index.
         if let Some(body) = node.child_by_field_name("body") {
-            let body_ctx = ctx.enter_body(fqn, scope, false);
+            let body_ctx = ctx.enter_body(fqn.clone(), scope, false);
             let mut inner = 0u32;
             self.walk_block(body, &body_ctx, &mut inner);
+            // Second, dataflow-only pass: SSA value nodes + intraprocedural
+            // `DerivesFrom` facts for this function's body (Cycle 5 / SC2).
+            // Parameters seed the SSA roots; the walk versions every plain-name
+            // binding and lowers each production site into a `DataFlowFact`.
+            self.walk_function_ssa(node, body, &body_ctx, &fqn);
         }
     }
 
@@ -1211,6 +1217,572 @@ impl<'a> Builder<'a> {
             });
         }
     }
+
+    // --- intraprocedural SSA dataflow (Cycle 5 / SC2) ---
+
+    /// A second, dataflow-only traversal of a function body that lowers each
+    /// production site (assignment / augmented-assignment / walrus / return) into a
+    /// [`DataFlowFact`](cgx_frontend::DataFlowFact). Re-assignment (`x = a; x = b;`)
+    /// bumps the per-name SSA version so the resolver mints distinct value nodes
+    /// (flow-sensitivity). A call result (`r = f(a)`) is an opaque source carrying an
+    /// `OpaqueCall` cut + the callee name + per-arg access-paths so the
+    /// interprocedural IFDS pass can ground it (SC3/SC4).
+    ///
+    /// `DerivesFrom` direction is **derived → source** (`y#1 → x#0`); the source
+    /// operands stay as bare name-paths so the resolver's span-ordered canonical view
+    /// grounds them to the live SSA version (avoids the dead-phantom-`#0` bug, v0.3
+    /// Gap A). Parameters are the SSA roots — never pre-seeded as facts.
+    fn walk_function_ssa(&mut self, _fn_node: Node<'_>, body: Node<'_>, ctx: &Ctx, fn_fqn: &str) {
+        let mut versions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        self.ssa_walk(body, ctx, fn_fqn, &mut versions);
+    }
+
+    fn ssa_walk(
+        &mut self,
+        node: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        match node.kind() {
+            // A `function_definition` / `class_definition` opens a fresh binding
+            // world; its own SSA pass runs when `walk_function` reaches it. Do not
+            // descend (nested-fn dataflow is that fn's own intraproc scope).
+            "function_definition" | "class_definition" | "decorated_definition" | "lambda" => {}
+            "expression_statement" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "assignment" => self.ssa_assignment_stmt(child, ctx, fn_fqn, versions),
+                        "augmented_assignment" => {
+                            self.ssa_augmented(child, ctx, fn_fqn, versions)
+                        }
+                        _ => self.ssa_walk(child, ctx, fn_fqn, versions),
+                    }
+                }
+            }
+            "return_statement" => {
+                let cond = ctx.condition();
+                if let Some(expr) = node.named_child(0) {
+                    self.ssa_return(expr, ctx, fn_fqn, cond, versions);
+                    self.ssa_walk(expr, ctx, fn_fqn, versions);
+                }
+            }
+            // Control flow lowers an edge condition exactly like the call walk.
+            "if_statement" => {
+                if let Some(c) = node.child_by_field_name("condition") {
+                    self.ssa_walk(c, ctx, fn_fqn, versions);
+                }
+                let inner = ctx.with_condition(EdgeCondition::Conditional);
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if matches!(child.kind(), "block" | "elif_clause" | "else_clause") {
+                        self.ssa_walk(child, &inner, fn_fqn, versions);
+                    }
+                }
+            }
+            "for_statement" | "while_statement" => {
+                let inner = ctx.with_condition(EdgeCondition::Loop);
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.ssa_walk(body, &inner, fn_fqn, versions);
+                }
+            }
+            "try_statement" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "except_clause" | "except_group_clause" => {
+                            let inner = ctx.with_condition(EdgeCondition::Exception);
+                            self.ssa_walk(child, &inner, fn_fqn, versions);
+                        }
+                        _ => self.ssa_walk(child, ctx, fn_fqn, versions),
+                    }
+                }
+            }
+            "match_statement" => {
+                let inner = ctx.with_condition(EdgeCondition::Conditional);
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.ssa_walk(child, &inner, fn_fqn, versions);
+                }
+            }
+            // A walrus (`(v := h(a))`) binds `v` anywhere an expression may appear;
+            // version it as a regular assignment, then descend into its value.
+            "named_expression" => {
+                if let (Some(name_node), Some(value)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("value"),
+                ) {
+                    if name_node.kind() == "identifier" {
+                        let cond = ctx.condition();
+                        self.ssa_emit_binding(&self.text(name_node), value, ctx, fn_fqn, cond, versions);
+                    }
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.ssa_walk(child, ctx, fn_fqn, versions);
+                }
+            }
+        }
+    }
+
+    /// Lower an `assignment` (`y = x`, `a, b = f()`, `n = a.field`). The LHS is the
+    /// `left` field, the RHS the `right` field. Tuple targets (`a, b = f()`) emit
+    /// one fact per target, each deriving (best-effort) from the whole RHS.
+    fn ssa_assignment_stmt(
+        &mut self,
+        node: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let cond = ctx.condition();
+        if let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) {
+            let mut targets: Vec<(String, Node<'_>)> = Vec::new();
+            self.collect_binding_names(left, &mut targets);
+            for (name, _) in &targets {
+                self.ssa_emit_binding(name, right, ctx, fn_fqn, cond, versions);
+            }
+            // The RHS may itself contain a walrus binding (`y = (v := f())`).
+            self.ssa_walk(right, ctx, fn_fqn, versions);
+        }
+    }
+
+    /// Lower an `augmented_assignment` (`x += y`): the new SSA version of `x`
+    /// derives from BOTH the prior `x` (read-modify-write) and the RHS operand(s).
+    /// The transform is `Arith` (the augment operator combines the two values).
+    fn ssa_augmented(
+        &mut self,
+        node: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let cond = ctx.condition();
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return;
+        };
+        if left.kind() != "identifier" {
+            // `obj.x += 1` / `d[k] += 1` are not plain-name SSA targets; skip
+            // (under-approximate rather than emit a wrong base binding).
+            self.ssa_walk(right, ctx, fn_fqn, versions);
+            return;
+        }
+        let name = self.text(left);
+        // Sources: the prior version of `x` (a bare self-reference) plus every
+        // operand read on the RHS.
+        let mut sources: Vec<SmallVec<[String; 2]>> = vec![smallvec_one(name.clone())];
+        sources.extend(self.operand_sources(right));
+        let version = bump(versions, &name);
+        let derived = smallvec_one(name);
+        let span = self.span(node);
+        for source in sources {
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                Transform::Arith,
+                cond,
+                SmallVec::new(),
+                None,
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+        self.ssa_walk(right, ctx, fn_fqn, versions);
+    }
+
+    /// Emit the `DataFlowFact`(s) for `name = <value>`: bump the SSA version of
+    /// `name`, classify the RHS into a [`Transform`], and emit one fact per source
+    /// operand (`derived --derives-from(transform)--> source`). A call-result RHS is
+    /// opaque (no intraprocedural source; carries the `OpaqueCall` cut + callee + args).
+    fn ssa_emit_binding(
+        &mut self,
+        name: &str,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = bump(versions, name);
+        let derived = smallvec_one(name.to_string());
+        let span = self.span(value);
+        let (transform, sources, cut) = self.classify_rhs(value);
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                callee,
+                args,
+                span,
+            );
+            return;
+        }
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                callee.clone(),
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Emit the return dataflow fact: `<fn>::return --derives-from(copy)--> <expr>`.
+    fn ssa_return(
+        &mut self,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = bump(versions, "return");
+        let derived: SmallVec<[String; 2]> = name_path_two(fn_fqn, "return");
+        let span = self.span(value);
+        let (_t, sources, cut) = self.classify_rhs(value);
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                ctx.scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                callee,
+                args,
+                span,
+            );
+            return;
+        }
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                callee.clone(),
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Classify a RHS expression into `(transform, source access-paths, cut)`.
+    fn classify_rhs(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        match value.kind() {
+            "identifier" => (Transform::Copy, vec![smallvec_one(self.text(value))], None),
+            "attribute" | "subscript" => self.classify_projection(value),
+            "binary_operator" | "boolean_operator" | "comparison_operator" => {
+                (Transform::Arith, self.operand_sources(value), None)
+            }
+            "unary_operator" | "not_operator" => {
+                let sources = value
+                    .child_by_field_name("argument")
+                    .map(|n| self.operand_sources(n))
+                    .unwrap_or_else(|| self.operand_sources(value));
+                (Transform::Arith, sources, None)
+            }
+            // List/tuple/set/dict assembly (`p = (a, b)`, `[a, b]`).
+            "list" | "tuple" | "set" | "dictionary" => {
+                (Transform::Composed, self.composed_sources(value), None)
+            }
+            // A call result is opaque — no intraprocedural source (SC4 grounds it).
+            "call" => (Transform::Other, Vec::new(), Some(CutMarker::OpaqueCall)),
+            "parenthesized_expression" => value
+                .named_child(0)
+                .map(|n| self.classify_rhs(n))
+                .unwrap_or((Transform::Other, Vec::new(), None)),
+            // `(v := f())` as a whole RHS forwards to its value.
+            "named_expression" => value
+                .child_by_field_name("value")
+                .map(|n| self.classify_rhs(n))
+                .unwrap_or((Transform::Other, Vec::new(), None)),
+            _ => (Transform::Other, Vec::new(), None),
+        }
+    }
+
+    /// Classify an `attribute`/`subscript` RHS: depth-1 (`a.field`, `a[i]`) is a
+    /// clean `Projection` bound to the BASE local (NOT the field name — v0.3 Gap 2);
+    /// depth-2+ (`a.b.c`) truncates to the base local with a `TruncatedAccessPath`
+    /// cut.
+    fn classify_projection(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        let base = match value.kind() {
+            "attribute" => value.child_by_field_name("object"),
+            "subscript" => value.child_by_field_name("value"),
+            _ => None,
+        };
+        let Some(base) = base else {
+            return (Transform::Projection, Vec::new(), None);
+        };
+        if base.kind() == "identifier" {
+            // Depth-1: bind to the base local. The field/index is the projection
+            // label, not a source binding.
+            let field = match value.kind() {
+                "attribute" => value
+                    .child_by_field_name("attribute")
+                    .map(|f| self.text(f)),
+                _ => None,
+            };
+            let mut path: SmallVec<[String; 2]> = SmallVec::new();
+            path.push(self.text(base));
+            if let Some(f) = field {
+                path.push(f);
+            }
+            (Transform::Projection, vec![path], None)
+        } else {
+            // Depth-2+: truncate to the deepest base local.
+            let base_id = self.deepest_base_ident(base);
+            let sources = base_id.map(|b| vec![smallvec_one(b)]).unwrap_or_default();
+            (
+                Transform::Projection,
+                sources,
+                Some(CutMarker::TruncatedAccessPath),
+            )
+        }
+    }
+
+    /// The deepest base identifier of a nested access chain (`a.b.c` → `a`,
+    /// `a[i].b` → `a`). `None` if the base is not a plain name.
+    fn deepest_base_ident(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "identifier" => Some(self.text(node)),
+            "attribute" => node
+                .child_by_field_name("object")
+                .and_then(|v| self.deepest_base_ident(v)),
+            "subscript" => node
+                .child_by_field_name("value")
+                .and_then(|v| self.deepest_base_ident(v)),
+            "parenthesized_expression" => {
+                node.named_child(0).and_then(|v| self.deepest_base_ident(v))
+            }
+            _ => None,
+        }
+    }
+
+    /// The source bindings read by one operand of an arith/composed expression.
+    /// Calls and literals contribute nothing (an opaque call's result is not an
+    /// intraprocedural source); a depth-1+ projection reduces to its base local.
+    fn operand_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        match node.kind() {
+            "identifier" => vec![smallvec_one(self.text(node))],
+            "attribute" | "subscript" => {
+                let (_t, sources, _c) = self.classify_projection(node);
+                sources
+            }
+            "binary_operator" | "boolean_operator" | "comparison_operator" => {
+                let mut out = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.is_named() {
+                        out.extend(self.operand_sources(child));
+                    }
+                }
+                out
+            }
+            "unary_operator" | "not_operator" => node
+                .child_by_field_name("argument")
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            "parenthesized_expression" => node
+                .named_child(0)
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            "named_expression" => node
+                .child_by_field_name("value")
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Source bindings assembled by a list/tuple/set/dict literal (`(a, b)` →
+    /// `[a, b]`): every named identifier operand, not descending into calls/lambdas.
+    fn composed_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        let mut out: Vec<String> = Vec::new();
+        self.collect_idents(node, true, &mut out);
+        out.into_iter().map(smallvec_one).collect()
+    }
+
+    fn collect_idents(&self, node: Node<'_>, is_root: bool, out: &mut Vec<String>) {
+        if !is_root && matches!(node.kind(), "lambda" | "call") {
+            return;
+        }
+        if node.kind() == "identifier" {
+            let t = self.text(node);
+            if !out.contains(&t) {
+                out.push(t);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_idents(child, false, out);
+        }
+    }
+
+    /// Per-positional-argument source access-paths of an opaque-call RHS
+    /// (`f(a, b.x, 1)` → `[["a"], ["b","x"], []]`): each named argument reduced
+    /// through `operand_sources`, taking its first access-path; a literal/nested
+    /// call contributes an empty inner vec to keep positional alignment. Keyword
+    /// arguments (`f(k=a)`) reduce to the value's path.
+    fn opaque_call_arg_paths(&self, value: Node<'_>) -> SmallVec<[SmallVec<[String; 2]>; 4]> {
+        let call = match value.kind() {
+            "parenthesized_expression" => {
+                return value
+                    .named_child(0)
+                    .map(|n| self.opaque_call_arg_paths(n))
+                    .unwrap_or_default();
+            }
+            "call" => value,
+            _ => return SmallVec::new(),
+        };
+        let Some(args) = call.child_by_field_name("arguments") else {
+            return SmallVec::new();
+        };
+        let mut out: SmallVec<[SmallVec<[String; 2]>; 4]> = SmallVec::new();
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if !arg.is_named() {
+                continue;
+            }
+            let operand = if arg.kind() == "keyword_argument" {
+                arg.child_by_field_name("value").unwrap_or(arg)
+            } else {
+                arg
+            };
+            let path = self
+                .operand_sources(operand)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            out.push(path);
+        }
+        out
+    }
+
+    /// The syntactic callee name path of a call-result RHS, `::`-joined (`f`,
+    /// `pkg::helper`). `None` for a virtual/method call on a receiver (`x.m()` —
+    /// recorded as a wildcard summary dep by the resolver instead).
+    fn opaque_callee_name(&self, value: Node<'_>) -> Option<String> {
+        let call = match value.kind() {
+            "parenthesized_expression" => {
+                return value
+                    .named_child(0)
+                    .and_then(|n| self.opaque_callee_name(n));
+            }
+            "call" => value,
+            _ => return None,
+        };
+        let func = call.child_by_field_name("function")?;
+        let (name_path, kind) = self.classify_callee(func);
+        if name_path.is_empty() || kind == RefKind::CallVirtualReceiver {
+            None
+        } else {
+            Some(name_path.join("::"))
+        }
+    }
+
+    /// Push one `DataFlowFact` into the per-function accumulator (flushed in
+    /// [`Builder::finish`]).
+    #[allow(clippy::too_many_arguments)]
+    fn push_data_flow(
+        &mut self,
+        fn_fqn: &str,
+        derived: SmallVec<[String; 2]>,
+        derived_version: u32,
+        source: SmallVec<[String; 2]>,
+        scope: ScopeId,
+        transform: Transform,
+        edge_condition: EdgeCondition,
+        cut_markers: SmallVec<[CutMarker; 1]>,
+        callee_fqn: Option<String>,
+        args: SmallVec<[SmallVec<[Name; 2]>; 4]>,
+        span: Span,
+    ) {
+        self.data_flows
+            .entry(fn_fqn.to_string())
+            .or_default()
+            .push(DataFlowFact {
+                derived,
+                source,
+                derived_version,
+                scope,
+                transform,
+                edge_condition,
+                cut_markers,
+                callee_fqn,
+                args,
+                span,
+            });
+    }
 }
 
 // === free functions ===
@@ -1227,6 +1799,14 @@ fn smallvec_one(s: String) -> SmallVec<[String; 2]> {
     let mut v = SmallVec::new();
     v.push(s);
     v
+}
+
+/// Bump and return the SSA version of `name` (first write is `#1`; the resolver
+/// grounds an unwritten read against the `#0` root, e.g. a parameter).
+fn bump(versions: &mut std::collections::HashMap<String, u32>, name: &str) -> u32 {
+    let v = versions.entry(name.to_string()).or_insert(0);
+    *v += 1;
+    *v
 }
 
 /// A two-segment name path `[a, b]` (an `Overrides` object: `[Base, method]`).

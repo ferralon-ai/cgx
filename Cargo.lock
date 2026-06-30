@@ -270,6 +270,7 @@ dependencies = [
  "cgx-frontend",
  "cgx-lang-go",
  "cgx-lang-java",
+ "cgx-lang-python",
  "cgx-lang-rust",
  "cgx-lang-ts",
  "cgx-resolve",
@@ -302,6 +303,17 @@ dependencies = [
  "smallvec",
  "tree-sitter",
  "tree-sitter-java",
+]
+
+[[package]]
+name = "cgx-lang-python"
+version = "0.3.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "smallvec",
+ "tree-sitter",
+ "tree-sitter-python",
 ]
 
 [[package]]

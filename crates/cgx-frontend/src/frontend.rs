@@ -21,6 +21,7 @@ pub enum Lang {
     JavaScript,
     Go,
     Java,
+    Python,
     /// A language handled only by the Tier-0 generic fallback (the `lang` string
     /// is the detected grammar name, e.g. `"python"`, `"go"`).
     Fallback(String),
@@ -38,6 +39,7 @@ impl Lang {
             Lang::JavaScript => "javascript",
             Lang::Go => "go",
             Lang::Java => "java",
+            Lang::Python => "python",
             Lang::Fallback(name) | Lang::Other(name) => name.as_str(),
         }
     }

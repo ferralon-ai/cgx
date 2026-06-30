@@ -40,9 +40,15 @@ optional language-specific deep parser augments the tree-sitter AST.
 **Tier 1 at launch: Rust, TypeScript, JavaScript** (TypeScript and JavaScript
 share one adapter family).
 
-**Tier 1 planned (in order):** Python, Go, Java, C#. Rows for planned languages
-in LS-7 and LS-8 are specification-ahead-of-implementation (`Status: roadmap` for
-those rows); only Rust and TypeScript/JavaScript rows are Phase-1 commitments.
+**Tier 1 implemented since launch: Go, Python.** Both adapters extract symbols,
+call refs, imports/exports, inheritance/overrides, entrypoint and cut hints,
+own-effects, intraprocedural SSA dataflow, and concurrency hints. See
+[14 — Implementation Status Matrix](14-implementation-status-matrix.md) for the
+per-capability `✓`/`~` breakdown.
+
+**Tier 1 planned (in order):** Java, C#. Rows for these planned languages in LS-7
+and LS-8 are specification-ahead-of-implementation (`Status: roadmap` for those
+rows).
 
 Characteristic capabilities at Tier 1:
 - Callee resolution at `certain` or `probable` confidence for most call sites.
@@ -235,10 +241,13 @@ catalogued per-language now so that GM-9, GM-10, GM-11, and GM-12 schema
 reservations are grounded in concrete language surface; the full concurrency
 query surface (Q-24) follows.
 
-**Scope note:** rows for Rust and TypeScript/JavaScript are Phase-1 implementation
-commitments. Rows for Python, Go, Java, C/C++, Kotlin, Swift, C# are
-specification-ahead-of-implementation (`Status: roadmap`) — they ground the schema
-reservation but are not implemented until their language's Tier-1 adapter ships.
+**Scope note:** rows for Rust, TypeScript/JavaScript, Go, and Python are
+implemented (spawn and lock constructs land as `spawns` / `blocking`; the `.await`
+suspension edge is partial — see the Concurrency `~` cell in
+[14 — Implementation Status Matrix](14-implementation-status-matrix.md)). Rows for
+Java, C/C++, Kotlin, Swift, C# are specification-ahead-of-implementation
+(`Status: roadmap`) — they ground the schema reservation but are not implemented
+until their language's Tier-1 adapter ships.
 
 This section specifies the per-language mapping of concurrency constructs to
 the graph attributes defined in docs/03-code-graph-model.md: `spawns` edge kind
@@ -329,10 +338,15 @@ FW-1). Per-language packs for resource-pair syntax (column 3) harvest into GM-13
 without requiring user configuration.
 
 **Scope note:** rows for Rust (LS-8.1) and TypeScript/JavaScript (LS-8.4) are
-Phase-1 implementation commitments. Rows for Go, Python, Java, C# are
-specification-ahead-of-implementation (`Status: roadmap`) — they ground the
-schema reservation but are not implemented until the language's Tier-1 adapter
-ships.
+Phase-1 implementation commitments. The Go adapter (LS-8.2) implements the
+channel / non-call-dataflow row (DF-20 `ch <-` / `<- ch` send-receive pedigree);
+its remaining LS-8.2 rows and **all** Python (LS-8.3), Java (LS-8.5), and C#
+(LS-8.6) rows are specification-ahead-of-implementation (`Status: roadmap`) —
+they ground the schema reservation but are not implemented until that adapter
+harvests the primitive. The Python adapter ships the LS-1 capability set
+(symbols, refs, imports, inheritance, effects, intraprocedural dataflow,
+concurrency hints) but does **not** yet harvest the LS-8.3 implicit-call,
+resource-pair, metadata-carrier, or channel-dataflow primitives.
 
 This table maps the concrete surface syntax of each Tier 1 language (plus C#,
 which is covered in LS-2 and LS-3) to the `cgx` primitive types defined in

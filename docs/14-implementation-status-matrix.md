@@ -8,16 +8,16 @@
 
 | Capability | Rust | TS/JS | Go | Python | Java | C# |
 |---|---|---|---|---|---|---|
-| Parse (tree-sitter) | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Symbol extraction (defs) | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Call refs | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Imports / exports | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Inheritance / overrides | ✓ | — | ~ | planned | ✓ | planned |
-| Entrypoint hints | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Cut hints | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| Own-effects | ✓ | — | ✓ | planned | ✓ | planned |
-| Intraprocedural dataflow (SSA) | ✓ | — | ✓ | planned | ✓ | planned |
-| Concurrency / async hints | ~ | ~ | ~ | planned | ~ | planned |
+| Parse (tree-sitter) | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Symbol extraction (defs) | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Call refs | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Imports / exports | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Inheritance / overrides | ✓ | — | ~ | ✓ | ✓ | planned |
+| Entrypoint hints | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Cut hints | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Own-effects | ✓ | — | ✓ | ✓ | ✓ | planned |
+| Intraprocedural dataflow (SSA) | ✓ | — | ✓ | ✓ | ✓ | planned |
+| Concurrency / async hints | ~ | ~ | ~ | ~ | ~ | planned |
 | SCIP enrichment | ✓ | ~ | planned | planned | planned | planned |
 | Framework packs | ~ | ~ | planned | planned | planned | planned |
 
@@ -25,15 +25,15 @@
 
 | Query | Rust | TS/JS | Go | Python | Java | C# |
 |---|---|---|---|---|---|---|
-| `callers` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `callees` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `reaches` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `paths` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `unused` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `search` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `explain` | ✓ | ✓ | ✓ | planned | ✓ | planned |
-| `flows-to` / `flows-from` | ✓ | — | ✓ | planned | ✓ | planned |
-| effects queries | ✓ | — | ✓ | planned | ✓ | planned |
-| `diff` | ✓ | ✓ | ✓ | planned | ✓ | planned |
+| `callers` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `callees` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `reaches` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `paths` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `unused` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `search` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `explain` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| `flows-to` / `flows-from` | ✓ | — | ✓ | ✓ | ✓ | planned |
+| effects queries | ✓ | — | ✓ | ✓ | ✓ | planned |
+| `diff` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 
 A query works for a language iff the facts it needs exist (Section 1). Update both sections together when an adapter changes.

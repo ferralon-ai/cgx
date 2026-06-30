@@ -12,6 +12,7 @@ cgx-core.workspace = true
 cgx-frontend.workspace = true
 cgx-lang-go = { path = "../cgx-lang-go" }
 cgx-lang-java = { path = "../cgx-lang-java" }
+cgx-lang-python = { path = "../cgx-lang-python" }
 cgx-lang-rust = { path = "../cgx-lang-rust" }
 cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }

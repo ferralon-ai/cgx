@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use cgx_core::condition::EdgeCondition;
-use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RefKind, SymbolDef};
+use cgx_frontend::{FileCtx, FileFacts, LanguageFrontend, RefKind, RelationKind, SymbolDef};
 use cgx_lang_python::PythonFrontend;
 use std::path::PathBuf;
 
@@ -51,4 +51,33 @@ pub fn has_ref(facts: &FileFacts, callee_last: &str, kind: RefKind, cond: EdgeCo
             && r.kind == kind
             && r.edge_condition == cond
     })
+}
+
+/// Whether an `Inherits`/`Implements` relation exists with the given subject and
+/// object (each compared by `::`-joined name path).
+pub fn has_relation(facts: &FileFacts, kind: RelationKind, subject: &str, object: &str) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == kind
+            && r.subject.join("::") == subject
+            && r.object.join("::") == object
+    })
+}
+
+/// Whether an `Overrides` relation exists whose subject FQN and object `[Base,
+/// method]` path match (object compared by `::`-joined name path).
+pub fn has_override(facts: &FileFacts, subject_fqn: &str, object: &str) -> bool {
+    facts.impl_relations.iter().any(|r| {
+        r.kind == RelationKind::Overrides
+            && r.subject.join("::") == subject_fqn
+            && r.object.join("::") == object
+    })
+}
+
+/// Count of `Overrides` relations whose subject FQN matches.
+pub fn override_count(facts: &FileFacts, subject_fqn: &str) -> usize {
+    facts
+        .impl_relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::Overrides && r.subject.join("::") == subject_fqn)
+        .count()
 }

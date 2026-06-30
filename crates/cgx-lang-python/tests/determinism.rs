@@ -37,6 +37,17 @@ fn refs_imports_hints_are_identical_across_runs() {
 }
 
 #[test]
+fn inheritance_relations_are_identical_across_runs() {
+    let a = extract_fixture("lattice.py");
+    let b = extract_fixture("lattice.py");
+    assert_eq!(a.impl_relations, b.impl_relations);
+    assert!(
+        !a.impl_relations.is_empty(),
+        "lattice fixture must emit inherits/override relations"
+    );
+}
+
+#[test]
 fn fixture_def_set_is_complete() {
     let facts = extract_fixture("shapes.py");
     let fqns: Vec<&str> = facts.defs.iter().map(|d| d.fqn.as_str()).collect();

@@ -23,24 +23,35 @@
 //!   `@Override` annotation (authoritative, cross-file capable) or, when
 //!   unannotated, name+arity matching against an in-file supertype.
 //!
-//! Effects and dataflow remain stubs (Cycles 4–5).
+//! **Cycle 4** adds syntactic own-effects ([`EffectFact`]) and concurrency/async
+//! hints, both folded into the same [`EffectSet`]:
+//! - per-call effects from [`effects_of_call`] (I/O, nondeterminism, reflection),
+//!   recorded against the enclosing method/constructor and flushed in
+//!   [`Builder::finish`];
+//! - concurrency: `Spawns` at thread/executor/async launch sites
+//!   (`start`/`submit`/`execute`/`*Async`), `Blocking` at lock/sleep/await/join
+//!   sites and on `synchronized` methods and `synchronized` statement blocks.
+//!
+//! Intraprocedural dataflow (SSA) remains a stub (Cycle 5).
 //!
 //! Unlike the Go adapter, the FQN prefix comes from the source
 //! `package_declaration` node (see [`crate::module`]), not the file path.
 
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
+use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImplRelation,
-    ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, RelationKind,
-    ScopeId, SymbolDef,
+    CutHint, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError,
+    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath,
+    RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
+use crate::effects::effects_of_call;
 use crate::module::module_path_from_package;
 
 /// The Java language adapter. Stateless; one instance handles every `.java` file.
@@ -168,6 +179,11 @@ struct Builder<'a> {
     /// In-file `(method name, arity)` sets keyed by a type's *simple* name, so a
     /// subtype method can be name+arity matched against an in-file supertype.
     type_method_sigs: BTreeMap<String, BTreeSet<(String, usize)>>,
+    /// Cycle 4: accumulated syntactic own-effects (incl. concurrency `Spawns`/
+    /// `Blocking`) keyed by the enclosing callable's FQN. Flushed into
+    /// `facts.effects` in [`Builder::finish`]. `BTreeMap` keeps the flush order
+    /// deterministic.
+    effects: BTreeMap<String, EffectSet>,
 }
 
 impl<'a> Builder<'a> {
@@ -179,17 +195,50 @@ impl<'a> Builder<'a> {
             type_supertypes: BTreeMap::new(),
             type_methods: BTreeMap::new(),
             type_method_sigs: BTreeMap::new(),
+            effects: BTreeMap::new(),
         }
     }
 
     fn finish(mut self) -> FileFacts {
         // Cycle 3: flush the in-file `Overrides` relations accumulated during the
         // walk. `Inherits`/`Implements` are emitted eagerly in `walk_type` (the
-        // supertype clause is local to the declaration). effects / dataflow are
-        // flushed here once Cycles 4–5 accumulate them. Canonicalization is the
-        // registry's job.
+        // supertype clause is local to the declaration). Dataflow (Cycle 5) still
+        // slots in here. Canonicalization is the registry's job.
         self.flush_overrides();
+        // Cycle 4: flush accumulated own-effects (incl. concurrency).
+        for (fqn, set) in std::mem::take(&mut self.effects) {
+            if !set.is_empty() {
+                self.facts.effects.push(EffectFact { fqn, effects: set });
+            }
+        }
         self.facts
+    }
+
+    /// Record an own-effect set against the enclosing callable. Inside a body
+    /// `ctx.fqn_prefix` is the callable's FQN (set by [`Ctx::enter_body`]); a
+    /// site reached outside any body (e.g. a field initializer) attributes to its
+    /// enclosing prefix, matching the Go adapter.
+    fn record_effects(&mut self, ctx: &Ctx, set: EffectSet) {
+        if set.is_empty() {
+            return;
+        }
+        self.effects
+            .entry(ctx.fqn_prefix.clone())
+            .or_default()
+            .union_with(set);
+    }
+
+    /// Record an own-effect set directly against a callable's FQN (used for the
+    /// `synchronized` *method* modifier, whose `Blocking` attaches to the method
+    /// itself rather than to a call site inside it).
+    fn record_effect_for(&mut self, fqn: &str, set: EffectSet) {
+        if set.is_empty() {
+            return;
+        }
+        self.effects
+            .entry(fqn.to_string())
+            .or_default()
+            .union_with(set);
     }
 
     /// Emit an `Overrides` relation for every directly-declared method that
@@ -302,6 +351,7 @@ impl<'a> Builder<'a> {
             }
             "switch_expression" => self.walk_switch(node, ctx, stmt_index),
             "try_statement" | "try_with_resources_statement" => self.walk_try(node, ctx, stmt_index),
+            "synchronized_statement" => self.walk_synchronized(node, ctx, stmt_index),
             _ => self.walk_children(node, ctx, stmt_index),
         }
     }
@@ -521,6 +571,13 @@ impl<'a> Builder<'a> {
         // enclosing type's FQN (set by `enter_body` in `walk_type`), so methods
         // are grouped under the type that declares them.
         self.record_method(&ctx.fqn_prefix, &name, &fqn, node);
+        // A `synchronized` method acquires its monitor on entry — a `Blocking`
+        // own-effect on the method itself (the Java analogue of holding a lock for
+        // the whole body). Attach it to the method FQN directly: `ctx.fqn_prefix`
+        // here is still the enclosing type, not the method.
+        if has_modifier(node, "synchronized") {
+            self.record_effect_for(&fqn, EffectSet::single(Effect::Blocking));
+        }
         // A `native` method's body lives across the JNI boundary the call graph
         // cannot see into — the Java analogue of Go's `import "C"` FFI cut.
         if has_modifier(node, "native") {
@@ -722,6 +779,7 @@ impl<'a> Builder<'a> {
                 None => (smallvec_one(name), RefKind::Call),
             };
             if !name_path.is_empty() {
+                self.record_effects(ctx, effects_of_call(&name_path.join("::")));
                 self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index);
                 *stmt_index += 1;
             }
@@ -736,6 +794,10 @@ impl<'a> Builder<'a> {
         if let Some(ty) = node.child_by_field_name("type") {
             let name = type_name(&self.text(ty));
             if !name.is_empty() {
+                // A constructor of an effectful I/O type (`new FileReader(..)`,
+                // `new Socket(..)`, `new ProcessBuilder(..)`) carries that type's
+                // effect even before any method is called on it.
+                self.record_effects(ctx, effects_of_call(&name));
                 self.push_ref(
                     smallvec_one(name),
                     RefKind::Instantiate,
@@ -913,6 +975,14 @@ impl<'a> Builder<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// A `synchronized (lock) { … }` block acquires `lock`'s monitor — a
+    /// `Blocking` own-effect on the enclosing callable. The guarded body is then
+    /// walked normally for nested calls/effects.
+    fn walk_synchronized(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        self.record_effects(ctx, EffectSet::single(Effect::Blocking));
+        self.walk_children(node, ctx, stmt_index);
     }
 
     /// The last-segment names of the annotations on a declaration (`@org.junit.Test`

@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod effects;
 mod extract;
 mod module;
 

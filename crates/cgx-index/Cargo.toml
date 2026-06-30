@@ -11,6 +11,7 @@ description = "cgx indexing pipeline: enumerates source blobs from a git tree or
 cgx-core.workspace = true
 cgx-frontend.workspace = true
 cgx-lang-go = { path = "../cgx-lang-go" }
+cgx-lang-java = { path = "../cgx-lang-java" }
 cgx-lang-rust = { path = "../cgx-lang-rust" }
 cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }

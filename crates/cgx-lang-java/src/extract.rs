@@ -2,22 +2,33 @@
 //! that builds [`FileFacts`].
 //!
 //! ## Cycle scope
-//! This is **Cycle 1** of the Java adapter: it emits **defs only**
-//! ([`SymbolDef`]) for classes, interfaces, enums, records, methods,
-//! constructors, and fields, plus the lexical [`ScopeTree`](cgx_frontend) that
-//! nests them. Every other [`FileFacts`] channel — refs, imports/exports,
-//! entrypoint/cut hints, effects, dataflow, and `impl_relations` — is left as
-//! the empty default; later cycles fill them in. The `// Cycle N` markers below
-//! flag the hook points.
+//! Cycle 1 emitted **defs + scopes** only. **Cycle 2** adds the
+//! reference/import/hint channels:
+//! - **call refs** ([`RawRef`]) for `method_invocation` and
+//!   `object_creation_expression`, with the ADR-03 edge condition lowered from
+//!   the enclosing `if`/loop/`catch`/`finally`/`switch`/ternary chain;
+//! - **imports** ([`ImportFact`]) for `import_declaration` (static + `.*`
+//!   wildcard); **exports** ([`ExportFact`]) for `public` declarations;
+//! - **entrypoint hints** for `public static void main` and JUnit `@Test`
+//!   (plus name-based JUnit3 `testXxx`);
+//! - **cut hints** for `native` methods (JNI/FFI boundary), `Class.forName`
+//!   (reflective) and `ClassLoader.loadClass` (dynamic);
+//! - the Cycle-1 leftovers **record components** and **enum constants** as defs.
+//!
+//! Inheritance/overrides, effects, and dataflow remain stubs (Cycles 3–5).
 //!
 //! Unlike the Go adapter, the FQN prefix comes from the source
 //! `package_declaration` node (see [`crate::module`]), not the file path.
 
-use cgx_core::node::{SymbolKind, Visibility};
+use cgx_core::condition::EdgeCondition;
+use cgx_core::cut::CutMarker;
+use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    FileCtx, FileFacts, FrontendError, Lang, LanguageFrontend, RelPath, ScopeId, SymbolDef,
+    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImportFact,
+    ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, ScopeId, SymbolDef,
 };
+use smallvec::SmallVec;
 use tree_sitter::{Node, Parser};
 
 use crate::module::module_path_from_package;
@@ -70,20 +81,23 @@ impl LanguageFrontend for JavaFrontend {
         let pkg_prefix = builder.read_package_prefix(root).unwrap_or_default();
 
         let root_ctx = Ctx::root(pkg_prefix);
+        let mut stmt_index = 0u32;
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
-            builder.walk(child, &root_ctx);
+            builder.walk(child, &root_ctx, &mut stmt_index);
         }
         Ok(builder.finish())
     }
 }
 
-/// Walk context threaded down the tree: the FQN prefix a def lives under and the
-/// lexical scope id it is recorded in.
+/// Walk context threaded down the tree: the FQN prefix a def lives under, the
+/// lexical scope id refs/defs are recorded in, and the ordered chain of enclosing
+/// guarding constructs whose ADR-03 maximum is a call site's edge condition.
 #[derive(Clone)]
 struct Ctx {
     fqn_prefix: String,
     scope: ScopeId,
+    conditions: SmallVec<[EdgeCondition; 4]>,
 }
 
 impl Ctx {
@@ -91,13 +105,34 @@ impl Ctx {
         Ctx {
             fqn_prefix: prefix,
             scope: ScopeId::ROOT,
+            conditions: SmallVec::new(),
         }
     }
 
-    /// Enter a type body: the type's FQN becomes the prefix for its members, and
-    /// the type's scope becomes their parent scope.
-    fn enter(&self, fqn_prefix: String, scope: ScopeId) -> Self {
-        Ctx { fqn_prefix, scope }
+    /// Enter a type/callable body: the body's FQN becomes the prefix for its
+    /// members, the body's scope becomes their parent scope, and the condition
+    /// chain resets (a body root is unguarded).
+    fn enter_body(&self, fqn_prefix: String, scope: ScopeId) -> Self {
+        Ctx {
+            fqn_prefix,
+            scope,
+            conditions: SmallVec::new(),
+        }
+    }
+
+    fn with_condition(&self, cond: EdgeCondition) -> Self {
+        let mut conditions = self.conditions.clone();
+        conditions.push(cond);
+        Ctx {
+            fqn_prefix: self.fqn_prefix.clone(),
+            scope: self.scope,
+            conditions,
+        }
+    }
+
+    /// The single ADR-03 edge condition for a call site under this chain.
+    fn condition(&self) -> EdgeCondition {
+        EdgeCondition::resolve(self.conditions.iter().copied())
     }
 }
 
@@ -117,8 +152,8 @@ impl<'a> Builder<'a> {
     }
 
     fn finish(self) -> FileFacts {
-        // Cycle N: refs/imports/exports/effects/dataflow/impl_relations are flushed
-        // here once later cycles accumulate them. Cycle 1 emits defs + scopes only.
+        // Cycle 3+: impl_relations / effects / dataflow are flushed here once
+        // those cycles accumulate them. Canonicalization is the registry's job.
         self.facts
     }
 
@@ -171,23 +206,32 @@ impl<'a> Builder<'a> {
 
     // --- dispatch ---
 
-    fn walk(&mut self, node: Node<'_>, ctx: &Ctx) {
+    fn walk(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         match node.kind() {
             "class_declaration" | "interface_declaration" | "enum_declaration"
             | "record_declaration" => self.walk_type(node, ctx),
             "method_declaration" => self.walk_method(node, ctx),
             "constructor_declaration" => self.walk_constructor(node, ctx),
             "field_declaration" => self.walk_field(node, ctx),
-            // Cycle N: import_declaration, method_invocation, object_creation_expression,
-            // entrypoint/cut hints, effects, and dataflow dispatch land here.
-            _ => self.walk_children(node, ctx),
+            "enum_constant" => self.walk_enum_constant(node, ctx),
+            "import_declaration" => self.walk_import(node, ctx),
+            "method_invocation" => self.walk_invocation(node, ctx, stmt_index),
+            "object_creation_expression" => self.walk_object_creation(node, ctx, stmt_index),
+            "if_statement" => self.walk_if(node, ctx, stmt_index),
+            "ternary_expression" => self.walk_ternary(node, ctx, stmt_index),
+            "while_statement" | "for_statement" | "enhanced_for_statement" | "do_statement" => {
+                self.walk_loop(node, ctx, stmt_index)
+            }
+            "switch_expression" => self.walk_switch(node, ctx, stmt_index),
+            "try_statement" | "try_with_resources_statement" => self.walk_try(node, ctx, stmt_index),
+            _ => self.walk_children(node, ctx, stmt_index),
         }
     }
 
-    fn walk_children(&mut self, node: Node<'_>, ctx: &Ctx) {
+    fn walk_children(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.walk(child, ctx);
+            self.walk(child, ctx, stmt_index);
         }
     }
 
@@ -202,25 +246,60 @@ impl<'a> Builder<'a> {
         let fqn = join(&ctx.fqn_prefix, &name);
         // An interface is always abstract; a class is abstract iff it carries the
         // `abstract` modifier; enums and records never are.
-        let is_abstract =
-            node.kind() == "interface_declaration" || has_modifier(node, "abstract");
+        let is_abstract = node.kind() == "interface_declaration" || has_modifier(node, "abstract");
+        let vis = vis_from_modifiers(node);
         let scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
         self.facts.defs.push(SymbolDef {
             fqn: fqn.clone(),
             kind: SymbolKind::Type,
-            visibility: vis_from_modifiers(node),
+            visibility: vis,
             scope: ctx.scope,
             span: self.def_span(node, "name"),
             line_end: self.end_line(node),
             is_abstract,
             signature: None,
         });
+        self.maybe_export(&name, self.def_span(node, "name"), vis);
 
-        if let Some(body) = node.child_by_field_name("body") {
-            let body_ctx = ctx.enter(fqn, scope);
-            self.walk_children(body, &body_ctx);
+        let body_ctx = ctx.enter_body(fqn, scope);
+        // Record components (`record P(int x, int y)`) live in the `parameters`
+        // field, not the body; surface each as a (private backing) Field def.
+        if node.kind() == "record_declaration" {
+            self.emit_record_components(node, &body_ctx);
         }
-        // Cycle N: superclass/super_interfaces/extends_interfaces → ImplRelation.
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut inner = 0u32;
+            self.walk(body, &body_ctx, &mut inner);
+        }
+        // Cycle 3: superclass/super_interfaces/extends_interfaces → ImplRelation.
+    }
+
+    /// Each `formal_parameter` of a record header → a `Field` def (the synthesized
+    /// private final backing field). The public canonical accessor methods are
+    /// deferred (Cycle 3+).
+    fn emit_record_components(&mut self, node: Node<'_>, body_ctx: &Ctx) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        for p in params.children(&mut cursor) {
+            if p.kind() != "formal_parameter" {
+                continue;
+            }
+            let Some(name_node) = p.child_by_field_name("name") else {
+                continue;
+            };
+            self.facts.defs.push(SymbolDef {
+                fqn: join(&body_ctx.fqn_prefix, &self.text(name_node)),
+                kind: SymbolKind::Field,
+                visibility: Visibility::Private,
+                scope: body_ctx.scope,
+                span: self.span(name_node),
+                line_end: self.end_line(p),
+                is_abstract: false,
+                signature: None,
+            });
+        }
     }
 
     fn walk_method(&mut self, node: Node<'_>, ctx: &Ctx) {
@@ -232,19 +311,35 @@ impl<'a> Builder<'a> {
         // (non-default) and `abstract` methods.
         let is_abstract =
             node.child_by_field_name("body").is_none() || has_modifier(node, "abstract");
-        // Open the method's own scope (its body is not walked in Cycle 1; local and
-        // anonymous classes are deferred).
-        let _scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
+        let vis = vis_from_modifiers(node);
+        let scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
         self.facts.defs.push(SymbolDef {
-            fqn,
+            fqn: fqn.clone(),
             kind: SymbolKind::Method,
-            visibility: vis_from_modifiers(node),
+            visibility: vis,
             scope: ctx.scope,
             span: self.def_span(node, "name"),
             line_end: self.end_line(node),
             is_abstract,
             signature: None,
         });
+        self.maybe_export(&name, self.def_span(node, "name"), vis);
+        self.record_entrypoints(node, &name, &fqn);
+        // A `native` method's body lives across the JNI boundary the call graph
+        // cannot see into — the Java analogue of Go's `import "C"` FFI cut.
+        if has_modifier(node, "native") {
+            self.facts.cut_hints.push(CutHint {
+                marker: CutMarker::ViaFfi,
+                span: self.def_span(node, "name"),
+                macro_origin: None,
+            });
+        }
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let body_ctx = ctx.enter_body(fqn, scope);
+            let mut inner = 0u32;
+            self.walk(body, &body_ctx, &mut inner);
+        }
     }
 
     fn walk_constructor(&mut self, node: Node<'_>, ctx: &Ctx) {
@@ -252,17 +347,25 @@ impl<'a> Builder<'a> {
             return;
         };
         let fqn = join(&ctx.fqn_prefix, &name);
-        let _scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
+        let vis = vis_from_modifiers(node);
+        let scope = self.facts.scopes.push(ctx.scope, Some(fqn.clone()));
         self.facts.defs.push(SymbolDef {
-            fqn,
+            fqn: fqn.clone(),
             kind: SymbolKind::Function,
-            visibility: vis_from_modifiers(node),
+            visibility: vis,
             scope: ctx.scope,
             span: self.def_span(node, "name"),
             line_end: self.end_line(node),
             is_abstract: false,
             signature: None,
         });
+        self.maybe_export(&name, self.def_span(node, "name"), vis);
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let body_ctx = ctx.enter_body(fqn, scope);
+            let mut inner = 0u32;
+            self.walk(body, &body_ctx, &mut inner);
+        }
     }
 
     /// A `field_declaration` may declare several variables (`int a, b;`); emit one
@@ -287,6 +390,337 @@ impl<'a> Builder<'a> {
                 is_abstract: false,
                 signature: None,
             });
+            self.maybe_export(&name, self.span(name_node), vis);
+        }
+    }
+
+    /// An `enum_constant` (`RED`, `GREEN`) is an implicit `public static final`
+    /// member — emit it as a `Constant` def.
+    fn walk_enum_constant(&mut self, node: Node<'_>, ctx: &Ctx) {
+        let Some(name) = self.field_text(node, "name") else {
+            return;
+        };
+        self.facts.defs.push(SymbolDef {
+            fqn: join(&ctx.fqn_prefix, &name),
+            kind: SymbolKind::Constant,
+            visibility: Visibility::Public,
+            scope: ctx.scope,
+            span: self.def_span(node, "name"),
+            line_end: self.end_line(node),
+            is_abstract: false,
+            signature: None,
+        });
+        self.maybe_export(&name, self.def_span(node, "name"), Visibility::Public);
+    }
+
+    fn maybe_export(&mut self, name: &str, span: Span, vis: Visibility) {
+        if vis == Visibility::Public {
+            self.facts.exports.push(ExportFact {
+                name: name.to_string(),
+                alias: None,
+                from: None,
+                span,
+            });
+        }
+    }
+
+    // --- imports / exports ---
+
+    /// `import [static] a.b.C [.*];` → one [`ImportFact`]. The specifier is the
+    /// dotted package/type path as written; a `.*` on-demand import is `glob`; a
+    /// single-type/static import contributes its last segment as the bound name.
+    /// (Java's static-vs-type distinction is not separately modelled — `ImportFact`
+    /// has no such field; both record the dotted specifier.)
+    fn walk_import(&mut self, node: Node<'_>, ctx: &Ctx) {
+        let mut glob = false;
+        let mut name_node = None;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "asterisk" => glob = true,
+                "identifier" | "scoped_identifier" => name_node = Some(child),
+                _ => {}
+            }
+        }
+        let Some(name_node) = name_node else {
+            return;
+        };
+        let specifier = self.text(name_node);
+        let names = if glob {
+            Vec::new()
+        } else {
+            let last = specifier
+                .rsplit('.')
+                .next()
+                .unwrap_or(&specifier)
+                .to_string();
+            vec![ImportedName {
+                name: last,
+                alias: None,
+            }]
+        };
+        self.facts.imports.push(ImportFact {
+            specifier,
+            names,
+            glob,
+            re_export: false,
+            scope: ctx.scope,
+            span: self.span(node),
+        });
+    }
+
+    // --- references (calls) ---
+
+    /// A `method_invocation` `recv.m(args)` / `m(args)`. With an `object`
+    /// (receiver) the callee is a [`RefKind::CallVirtualReceiver`] whose
+    /// `name_path` is the receiver segments plus the method name; a bare call is a
+    /// [`RefKind::Call`]. The receiver/arguments are then walked for nested calls.
+    fn walk_invocation(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        self.emit_call_cut_hints(node);
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let name = self.text(name_node);
+            let (name_path, kind) = match node.child_by_field_name("object") {
+                Some(obj) => {
+                    let mut segs = self.receiver_segments(obj);
+                    segs.push(name);
+                    (segs, RefKind::CallVirtualReceiver)
+                }
+                None => (smallvec_one(name), RefKind::Call),
+            };
+            if !name_path.is_empty() {
+                self.push_ref(name_path, kind, ctx, self.span(node), *stmt_index);
+                *stmt_index += 1;
+            }
+        }
+        self.walk_children(node, ctx, stmt_index);
+    }
+
+    /// A `new T(args)` construction → [`RefKind::Instantiate`] keyed by the simple
+    /// type name. Arguments (and any anonymous-class body, deferred) are walked for
+    /// nested calls.
+    fn walk_object_creation(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(ty) = node.child_by_field_name("type") {
+            let name = type_name(&self.text(ty));
+            if !name.is_empty() {
+                self.push_ref(
+                    smallvec_one(name),
+                    RefKind::Instantiate,
+                    ctx,
+                    self.span(node),
+                    *stmt_index,
+                );
+                *stmt_index += 1;
+            }
+        }
+        self.walk_children(node, ctx, stmt_index);
+    }
+
+    /// The segment path of a `method_invocation` receiver (`a.b.c` → `[a, b, c]`),
+    /// recursing through field-access / chained-call / scoped operands.
+    fn receiver_segments(&self, node: Node<'_>) -> SmallVec<[Name; 2]> {
+        match node.kind() {
+            "identifier" | "type_identifier" => smallvec_one(self.text(node)),
+            "this" => smallvec_one("this".to_string()),
+            "super" => smallvec_one("super".to_string()),
+            "field_access" => {
+                let mut out = node
+                    .child_by_field_name("object")
+                    .map(|o| self.receiver_segments(o))
+                    .unwrap_or_default();
+                if let Some(field) = node.child_by_field_name("field") {
+                    out.push(self.text(field));
+                }
+                out
+            }
+            "method_invocation" => {
+                let mut out = node
+                    .child_by_field_name("object")
+                    .map(|o| self.receiver_segments(o))
+                    .unwrap_or_default();
+                if let Some(name) = node.child_by_field_name("name") {
+                    out.push(self.text(name));
+                }
+                out
+            }
+            "scoped_identifier" => self.text(node).split('.').map(str::to_string).collect(),
+            "parenthesized_expression" => node
+                .named_child(0)
+                .map(|n| self.receiver_segments(n))
+                .unwrap_or_default(),
+            _ => SmallVec::new(),
+        }
+    }
+
+    /// `Class.forName(..)` → reflective cut; `*.loadClass(..)` → dynamic cut. The
+    /// single-file Java analogues of Go's `reflect.*` / `plugin.*` package cuts
+    /// (no import resolution here, so keyed off well-known reflective/dynamic API
+    /// method names).
+    fn emit_call_cut_hints(&mut self, node: Node<'_>) {
+        let Some(name) = self.field_text(node, "name") else {
+            return;
+        };
+        let marker = match name.as_str() {
+            "forName"
+                if node
+                    .child_by_field_name("object")
+                    .map(|o| self.receiver_segments(o).last() == Some(&"Class".to_string()))
+                    .unwrap_or(false) =>
+            {
+                Some(CutMarker::Reflective)
+            }
+            "loadClass" => Some(CutMarker::Dynamic),
+            _ => None,
+        };
+        if let Some(marker) = marker {
+            self.facts.cut_hints.push(CutHint {
+                marker,
+                span: self.span(node),
+                macro_origin: None,
+            });
+        }
+    }
+
+    fn push_ref(
+        &mut self,
+        name_path: SmallVec<[Name; 2]>,
+        kind: RefKind,
+        ctx: &Ctx,
+        span: Span,
+        stmt_index: u32,
+    ) {
+        self.facts.refs.push(RawRef {
+            name_path,
+            scope: ctx.scope,
+            kind,
+            edge_condition: ctx.condition(),
+            implicit: None,
+            span,
+            stmt_index,
+            arity: None,
+            cut_markers: SmallVec::new(),
+        });
+    }
+
+    // --- edge conditions ---
+
+    fn walk_if(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(c) = node.child_by_field_name("condition") {
+            self.walk(c, ctx, stmt_index);
+        }
+        let inner = ctx.with_condition(EdgeCondition::Conditional);
+        if let Some(c) = node.child_by_field_name("consequence") {
+            self.walk(c, &inner, stmt_index);
+        }
+        if let Some(a) = node.child_by_field_name("alternative") {
+            self.walk(a, &inner, stmt_index);
+        }
+    }
+
+    fn walk_ternary(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(c) = node.child_by_field_name("condition") {
+            self.walk(c, ctx, stmt_index);
+        }
+        let inner = ctx.with_condition(EdgeCondition::Conditional);
+        for field in ["consequence", "alternative"] {
+            if let Some(b) = node.child_by_field_name(field) {
+                self.walk(b, &inner, stmt_index);
+            }
+        }
+    }
+
+    fn walk_loop(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        let body = node.child_by_field_name("body");
+        if let Some(body) = body {
+            let inner = ctx.with_condition(EdgeCondition::Loop);
+            self.walk(body, &inner, stmt_index);
+        }
+        // Walk any non-body children (init/condition/update/range value) unguarded.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if Some(child) == body {
+                continue;
+            }
+            self.walk(child, ctx, stmt_index);
+        }
+    }
+
+    fn walk_switch(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        // The scrutinee (`condition`) is unguarded; every case body is conditional.
+        if let Some(c) = node.child_by_field_name("condition") {
+            self.walk(c, ctx, stmt_index);
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            let inner = ctx.with_condition(EdgeCondition::Conditional);
+            self.walk(body, &inner, stmt_index);
+        }
+    }
+
+    /// `try`/`try`-with-resources. The try block (and resources) are unguarded;
+    /// each `catch` body is [`EdgeCondition::Exception`]; the `finally` block is
+    /// **always** (GM-3.1 carve-out — a finally edge is taken on entry regardless
+    /// of how the protected block exits), so it gets no extra condition.
+    fn walk_try(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        if let Some(res) = node.child_by_field_name("resources") {
+            self.walk(res, ctx, stmt_index);
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            self.walk(body, ctx, stmt_index);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "catch_clause" => {
+                    if let Some(cb) = child.child_by_field_name("body") {
+                        let inner = ctx.with_condition(EdgeCondition::Exception);
+                        self.walk(cb, &inner, stmt_index);
+                    }
+                }
+                "finally_clause" => self.walk_children(child, ctx, stmt_index),
+                _ => {}
+            }
+        }
+    }
+
+    /// The last-segment names of the annotations on a declaration (`@org.junit.Test`
+    /// → `"Test"`). Annotations sit as `marker_annotation`/`annotation` children of
+    /// the `modifiers` node, each with a `name` field
+    /// (`identifier`/`scoped_identifier`).
+    fn annotation_names(&self, node: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != "modifiers" {
+                continue;
+            }
+            let mut inner = child.walk();
+            for m in child.children(&mut inner) {
+                if matches!(m.kind(), "marker_annotation" | "annotation") {
+                    if let Some(name) = m.child_by_field_name("name") {
+                        let text = self.text(name);
+                        let last = text.rsplit('.').next().unwrap_or(&text).to_string();
+                        out.push(last);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // --- entrypoints ---
+
+    fn record_entrypoints(&mut self, node: Node<'_>, name: &str, fqn: &str) {
+        let kind = if name == "main" && has_modifier(node, "static") {
+            Some(EntrypointKind::Main)
+        } else if self.annotation_names(node).iter().any(|a| a == "Test") || is_junit3_test(name) {
+            Some(EntrypointKind::Test)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            self.facts.entrypoint_hints.push(EntrypointHint {
+                fqn: fqn.to_string(),
+                kind,
+            });
         }
     }
 }
@@ -301,10 +735,23 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
+fn smallvec_one(s: String) -> SmallVec<[Name; 2]> {
+    let mut v = SmallVec::new();
+    v.push(s);
+    v
+}
+
+/// The simple type name of a `new`-expression type operand: drop any generic
+/// arguments (`Foo<T>` → `Foo`) and package qualification (`a.b.Foo` → `Foo`).
+fn type_name(text: &str) -> String {
+    let base = text.split('<').next().unwrap_or(text).trim();
+    base.rsplit('.').next().unwrap_or(base).trim().to_string()
+}
+
 /// The modifier-keyword kinds on a declaration. Java groups every leading
-/// keyword/annotation (`public`, `static`, `abstract`, `@Override`, …) under a
-/// single `modifiers` node; the keyword tokens are its anonymous children, whose
-/// `kind` is the keyword itself. Returned owned so no parse-tree cursor escapes.
+/// keyword/annotation (`public`, `static`, `abstract`, `native`, `@Override`, …)
+/// under a single `modifiers` node; the keyword tokens are its anonymous
+/// children, whose `kind` is the keyword itself.
 fn modifier_kinds(node: Node<'_>) -> Vec<&str> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -338,4 +785,13 @@ fn vis_from_modifiers(node: Node<'_>) -> Visibility {
     } else {
         Visibility::Package
     }
+}
+
+/// JUnit3 name-based test convention: an instance method whose name starts with
+/// `test` followed by an uppercase letter (`testFoo`). The analogue of Go's
+/// name-based `TestXxx` detection.
+fn is_junit3_test(name: &str) -> bool {
+    name.strip_prefix("test")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_uppercase())
 }

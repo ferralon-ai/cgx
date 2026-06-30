@@ -23,11 +23,12 @@ use cgx_core::cut::CutMarker;
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImportFact,
-    ImportedName, Lang, LanguageFrontend, RawRef, RefKind, RelPath, ScopeId, SymbolDef,
+    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImplRelation,
+    ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, RelationKind,
+    ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 use crate::module::module_path_for;
@@ -150,6 +151,35 @@ struct Builder<'a> {
     /// Public module-level defs (name + span) collected during the walk; flushed to
     /// `ExportFact`s in [`Builder::emit_module_exports`] per the `__all__`-or-convention rule.
     module_defs: Vec<(String, Span)>,
+    /// Per-class inheritance state collected during the walk, keyed by the class's
+    /// simple name. Flushed to `Overrides` relations in [`Builder::finish`] (so that
+    /// a method overriding a base declared *later* in the file still matches —
+    /// declaration order is irrelevant, mirroring Java's `flush_overrides`).
+    classes: BTreeMap<String, ClassRec>,
+}
+
+/// Dedup key for an `Overrides` relation: `(subject FQN segments, [Base, method])`.
+type OverrideKey = (SmallVec<[Name; 2]>, SmallVec<[Name; 2]>);
+
+/// Per-class data gathered during the walk to resolve in-file overrides at flush.
+#[derive(Default)]
+struct ClassRec {
+    /// In-file base classes by simple name, as written in `superclasses`
+    /// (`keyword_argument`s like `metaclass=` already filtered out; dotted bases
+    /// reduced to their last segment via `attribute_segments`).
+    bases: Vec<String>,
+    /// The class's methods: simple name → (full FQN, has-`@override`-decorator).
+    methods: BTreeMap<String, MethodRec>,
+}
+
+struct MethodRec {
+    fqn: String,
+    /// Span of the method's `def` (anchored at the name), used for the `Overrides`
+    /// relation's source span.
+    span: Span,
+    /// PEP 698 `@override` / `typing.override` decorator — authoritative (treated
+    /// like Java's `@Override`): emit against every declared in-file base.
+    explicit_override: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -160,11 +190,56 @@ impl<'a> Builder<'a> {
             facts: FileFacts::empty(),
             dunder_all: None,
             module_defs: Vec::new(),
+            classes: BTreeMap::new(),
         }
     }
 
-    fn finish(self) -> FileFacts {
+    fn finish(mut self) -> FileFacts {
+        self.flush_overrides();
         self.facts
+    }
+
+    /// Emit `Overrides` relations now that every class/method in the file is known.
+    ///
+    /// A method overrides when it shares a name with a method on an **in-file**
+    /// declared supertype. Python has no `@Override` annotation, so name-match
+    /// against in-file supertypes is the only single-file signal (transitive /
+    /// external override resolution is the CHA/resolve layer's job, exactly the
+    /// call Rust/Java made). A PEP 698 `@override` decorator is authoritative:
+    /// emit against every declared in-file base regardless of whether that base's
+    /// method set is visible here.
+    ///
+    /// `subject` is the overriding method's **full FQN segments** (REQUIRED: the
+    /// resolver looks the override source up by exact `def_to_node` join).
+    /// `object` is `[BaseSimpleName, method]`, grounded by `resolve_trait_method`.
+    /// We emit against *every* candidate base; an `object` that doesn't exist
+    /// simply grounds no edge. Dedup via a `BTreeSet`.
+    fn flush_overrides(&mut self) {
+        let mut rels: BTreeMap<OverrideKey, Span> = BTreeMap::new();
+        for class in self.classes.values() {
+            for (mname, mrec) in &class.methods {
+                for base in &class.bases {
+                    let base_defines = self
+                        .classes
+                        .get(base)
+                        .map(|b| b.methods.contains_key(mname))
+                        .unwrap_or(false);
+                    if !mrec.explicit_override && !base_defines {
+                        continue;
+                    }
+                    rels.entry((fqn_segments(&mrec.fqn), name_path_two(base, mname)))
+                        .or_insert_with(|| mrec.span.clone());
+                }
+            }
+        }
+        for ((subject, object), span) in rels {
+            self.facts.impl_relations.push(ImplRelation {
+                kind: RelationKind::Overrides,
+                subject,
+                object,
+                span,
+            });
+        }
     }
 
     // --- span/text helpers ---
@@ -259,6 +334,7 @@ impl<'a> Builder<'a> {
         });
         self.note_module_def(&name, ctx, node);
         self.record_fn_entrypoints(&name, &fqn, ctx);
+        self.note_class_method(&name, &fqn, ctx, node);
 
         // Recurse into the body for nested defs and call refs. The body is not a
         // class body, so nested functions are `Function`s. A body opens a fresh
@@ -288,12 +364,66 @@ impl<'a> Builder<'a> {
         });
         self.note_module_def(&name, ctx, node);
         self.record_class_entrypoint(node, &name, &fqn, ctx);
+        self.emit_inheritance(node, &name);
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope, true);
             let mut inner = 0u32;
             self.walk_block(body, &body_ctx, &mut inner);
         }
+    }
+
+    /// Emit one `Inherits` relation per base class and register the class's
+    /// declared in-file base names for later override resolution.
+    ///
+    /// Bases live in the `class_definition`'s `superclasses` `argument_list`; its
+    /// named children are `identifier` (bare base) / `attribute` (dotted `pkg.Base`)
+    /// nodes, plus `keyword_argument`s (`metaclass=`, `total=False`) which are NOT
+    /// bases and are filtered out. A dotted base reduces to its last segment
+    /// (best-name); the resolver's `resolve_type_node` short-name fallback grounds
+    /// it, and an unresolved external base (`Exception`, `unittest.TestCase`) simply
+    /// grounds no edge — honest, never invented.
+    fn emit_inheritance(&mut self, node: Node<'_>, name: &str) {
+        let bases = self.base_names(node);
+        let span = self.def_span(node, "name");
+        for base in &bases {
+            self.facts.impl_relations.push(ImplRelation {
+                kind: RelationKind::Inherits,
+                subject: smallvec_one(name.to_string()),
+                object: smallvec_one(base.clone()),
+                span: span.clone(),
+            });
+        }
+        self.classes.entry(name.to_string()).or_default().bases = bases;
+    }
+
+    /// The base-class simple names declared in a `class_definition`'s `superclasses`
+    /// list, in source order. `keyword_argument`s are skipped; a dotted base
+    /// (`attribute`) reduces to its last segment.
+    fn base_names(&self, node: Node<'_>) -> Vec<String> {
+        let Some(supers) = node.child_by_field_name("superclasses") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cursor = supers.walk();
+        for c in supers.children(&mut cursor) {
+            if !c.is_named() {
+                continue;
+            }
+            match c.kind() {
+                "identifier" => out.push(self.text(c)),
+                "attribute" => {
+                    if let Some(last) = self.attribute_segments(c).last() {
+                        out.push(last.clone());
+                    }
+                }
+                // `keyword_argument` (metaclass=…, total=False) and any other form
+                // (a dynamic `get_base()` call, a subscript `Generic[T]`) are not
+                // nominal in-file bases — skip.
+                _ => {}
+            }
+        }
+        out
     }
 
     /// A `decorated_definition` wraps a `function_definition` or `class_definition`
@@ -314,6 +444,28 @@ impl<'a> Builder<'a> {
         {
             if let Some(def) = self.facts.defs.last_mut() {
                 def.is_abstract = true;
+            }
+        }
+        // PEP 698 `@override` / `typing.override`: authoritative override marker on
+        // a class method (treated like Java's `@Override`). Flag the just-recorded
+        // method so `flush_overrides` emits against every declared base.
+        if ctx.in_class
+            && inner.kind() == "function_definition"
+            && decorators
+                .iter()
+                .any(|d| d.rsplit('.').next() == Some("override"))
+        {
+            if let (Some(class), Some(mname)) = (
+                ctx.fqn_prefix.rsplit("::").next(),
+                self.field_text(inner, "name"),
+            ) {
+                if let Some(rec) = self
+                    .classes
+                    .get_mut(class)
+                    .and_then(|c| c.methods.get_mut(&mname))
+                {
+                    rec.explicit_override = true;
+                }
             }
         }
     }
@@ -788,6 +940,32 @@ impl<'a> Builder<'a> {
         content
     }
 
+    /// Record a class method for later `Overrides` resolution. Only a *direct*
+    /// member of a class body counts (`ctx.in_class`); the enclosing class's simple
+    /// name is the last segment of `ctx.fqn_prefix`. Nested functions inside a
+    /// method have `in_class == false` and are skipped (not overridable members).
+    fn note_class_method(&mut self, name: &str, fqn: &str, ctx: &Ctx, node: Node<'_>) {
+        if !ctx.in_class {
+            return;
+        }
+        let Some(class) = ctx.fqn_prefix.rsplit("::").next() else {
+            return;
+        };
+        let span = self.def_span(node, "name");
+        self.classes
+            .entry(class.to_string())
+            .or_default()
+            .methods
+            .insert(
+                name.to_string(),
+                MethodRec {
+                    fqn: fqn.to_string(),
+                    span,
+                    explicit_override: false,
+                },
+            );
+    }
+
     /// Record a public module-level def for later export emission. Only top-level
     /// (`!in_class`, root scope) defs are candidates; the `__all__`-vs-convention
     /// decision happens in [`Builder::emit_module_exports`].
@@ -930,6 +1108,20 @@ fn smallvec_one(s: String) -> SmallVec<[String; 2]> {
     let mut v = SmallVec::new();
     v.push(s);
     v
+}
+
+/// A two-segment name path `[a, b]` (an `Overrides` object: `[Base, method]`).
+fn name_path_two(a: &str, b: &str) -> SmallVec<[Name; 2]> {
+    let mut v = SmallVec::new();
+    v.push(a.to_string());
+    v.push(b.to_string());
+    v
+}
+
+/// Split a `::`-joined FQN into its segments (the `Overrides` subject the resolver
+/// rejoins for an exact `def_to_node` lookup).
+fn fqn_segments(fqn: &str) -> SmallVec<[Name; 2]> {
+    fqn.split("::").map(str::to_string).collect()
 }
 
 /// Python has no access modifiers; PEP-8 leading-underscore convention is the

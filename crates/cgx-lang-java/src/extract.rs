@@ -15,7 +15,15 @@
 //!   (reflective) and `ClassLoader.loadClass` (dynamic);
 //! - the Cycle-1 leftovers **record components** and **enum constants** as defs.
 //!
-//! Inheritance/overrides, effects, and dataflow remain stubs (Cycles 3–5).
+//! **Cycle 3** adds the inheritance lattice ([`ImplRelation`]):
+//! - `Inherits` for a class `extends` superclass and an interface `extends`
+//!   super-interfaces; `Implements` for a class/enum/record `implements`
+//!   interfaces;
+//! - `Overrides` for a method that overrides a supertype method — driven by the
+//!   `@Override` annotation (authoritative, cross-file capable) or, when
+//!   unannotated, name+arity matching against an in-file supertype.
+//!
+//! Effects and dataflow remain stubs (Cycles 4–5).
 //!
 //! Unlike the Go adapter, the FQN prefix comes from the source
 //! `package_declaration` node (see [`crate::module`]), not the file path.
@@ -25,10 +33,12 @@ use cgx_core::cut::CutMarker;
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_frontend::{
-    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImportFact,
-    ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, ScopeId, SymbolDef,
+    CutHint, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError, ImplRelation,
+    ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath, RelationKind,
+    ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 use crate::module::module_path_from_package;
@@ -136,10 +146,28 @@ impl Ctx {
     }
 }
 
+/// A directly-declared method recorded while walking a type body, replayed in
+/// [`Builder::flush_overrides`] to emit `Overrides` relations.
+struct MethodRec {
+    name: String,
+    fqn: String,
+    arity: usize,
+    has_override: bool,
+    span: Span,
+}
+
 struct Builder<'a> {
     src: &'a [u8],
     file: String,
     facts: FileFacts,
+    /// Per-type declared supertype simple names (superclass + interfaces +
+    /// super-interfaces), keyed by the type's FQN. Drives override candidacy.
+    type_supertypes: BTreeMap<String, Vec<String>>,
+    /// Methods declared directly in each type body, keyed by the type's FQN.
+    type_methods: BTreeMap<String, Vec<MethodRec>>,
+    /// In-file `(method name, arity)` sets keyed by a type's *simple* name, so a
+    /// subtype method can be name+arity matched against an in-file supertype.
+    type_method_sigs: BTreeMap<String, BTreeSet<(String, usize)>>,
 }
 
 impl<'a> Builder<'a> {
@@ -148,13 +176,63 @@ impl<'a> Builder<'a> {
             src,
             file: file.to_string(),
             facts: FileFacts::empty(),
+            type_supertypes: BTreeMap::new(),
+            type_methods: BTreeMap::new(),
+            type_method_sigs: BTreeMap::new(),
         }
     }
 
-    fn finish(self) -> FileFacts {
-        // Cycle 3+: impl_relations / effects / dataflow are flushed here once
-        // those cycles accumulate them. Canonicalization is the registry's job.
+    fn finish(mut self) -> FileFacts {
+        // Cycle 3: flush the in-file `Overrides` relations accumulated during the
+        // walk. `Inherits`/`Implements` are emitted eagerly in `walk_type` (the
+        // supertype clause is local to the declaration). effects / dataflow are
+        // flushed here once Cycles 4–5 accumulate them. Canonicalization is the
+        // registry's job.
+        self.flush_overrides();
         self.facts
+    }
+
+    /// Emit an `Overrides` relation for every directly-declared method that
+    /// overrides a supertype method. `@Override` is authoritative and emits
+    /// against *every* declared supertype (cross-file linking is the resolver's
+    /// job — a `Super::method` that does not exist simply grounds no edge). A
+    /// method *without* `@Override` is matched by name + arity against the method
+    /// set of any supertype declared **in this file** (the cross-file
+    /// non-annotated case has no local signal and is left to a later CHA pass).
+    fn flush_overrides(&mut self) {
+        let type_methods = std::mem::take(&mut self.type_methods);
+        let type_supertypes = std::mem::take(&mut self.type_supertypes);
+        let type_method_sigs = std::mem::take(&mut self.type_method_sigs);
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for (type_fqn, methods) in &type_methods {
+            let Some(supers) = type_supertypes.get(type_fqn) else {
+                continue;
+            };
+            for m in methods {
+                for s in supers {
+                    let matched = if m.has_override {
+                        true
+                    } else {
+                        type_method_sigs
+                            .get(s)
+                            .is_some_and(|sigs| sigs.contains(&(m.name.clone(), m.arity)))
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    let object = format!("{s}::{}", m.name);
+                    if !seen.insert((m.fqn.clone(), object)) {
+                        continue;
+                    }
+                    self.facts.impl_relations.push(ImplRelation {
+                        kind: RelationKind::Overrides,
+                        subject: fqn_segments(&m.fqn),
+                        object: name_path_two(s, &m.name),
+                        span: m.span.clone(),
+                    });
+                }
+            }
+        }
     }
 
     // --- span/text helpers ---
@@ -261,6 +339,14 @@ impl<'a> Builder<'a> {
         });
         self.maybe_export(&name, self.def_span(node, "name"), vis);
 
+        // Inheritance lattice (GM-2.2): emit `Inherits`/`Implements` from the
+        // `extends`/`implements` clauses and stash the supertype names so the
+        // override pass (finish) can ground per-method `Overrides`.
+        let supers = self.emit_inheritance(node, &fqn);
+        if !supers.is_empty() {
+            self.type_supertypes.insert(fqn.clone(), supers);
+        }
+
         let body_ctx = ctx.enter_body(fqn, scope);
         // Record components (`record P(int x, int y)`) live in the `parameters`
         // field, not the body; surface each as a (private backing) Field def.
@@ -271,7 +357,113 @@ impl<'a> Builder<'a> {
             let mut inner = 0u32;
             self.walk(body, &body_ctx, &mut inner);
         }
-        // Cycle 3: superclass/super_interfaces/extends_interfaces → ImplRelation.
+    }
+
+    /// Emit the `Inherits`/`Implements` lattice edges declared by a type's
+    /// `extends`/`implements` clauses and return the flat list of supertype
+    /// simple names (used for override candidacy). The `subject` is the type's
+    /// full FQN segments (the resolver prefers an exact-FQN match, falling back
+    /// to a unique short name); the `object` is the supertype's simple name as
+    /// written — an unresolved external/JDK supertype simply grounds no edge.
+    fn emit_inheritance(&mut self, node: Node<'_>, type_fqn: &str) -> Vec<String> {
+        let span = self.def_span(node, "name");
+        let mut supers = Vec::new();
+        match node.kind() {
+            "class_declaration" => {
+                if let Some(sc) = self.superclass_name(node) {
+                    self.push_relation(RelationKind::Inherits, type_fqn, &sc, &span);
+                    supers.push(sc);
+                }
+                for iface in self.interface_names(node) {
+                    self.push_relation(RelationKind::Implements, type_fqn, &iface, &span);
+                    supers.push(iface);
+                }
+            }
+            "enum_declaration" | "record_declaration" => {
+                for iface in self.interface_names(node) {
+                    self.push_relation(RelationKind::Implements, type_fqn, &iface, &span);
+                    supers.push(iface);
+                }
+            }
+            "interface_declaration" => {
+                for sup in self.extends_interface_names(node) {
+                    self.push_relation(RelationKind::Inherits, type_fqn, &sup, &span);
+                    supers.push(sup);
+                }
+            }
+            _ => {}
+        }
+        supers
+    }
+
+    /// The superclass simple name from a `class_declaration`'s `superclass` field
+    /// (`extends B` → `B`; generics/qualification stripped).
+    fn superclass_name(&self, node: Node<'_>) -> Option<String> {
+        let sc = node.child_by_field_name("superclass")?;
+        let mut cursor = sc.walk();
+        for c in sc.children(&mut cursor) {
+            if c.is_named() {
+                let n = type_name(&self.text(c));
+                if !n.is_empty() {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// The `implements` interface simple names from a class/enum/record's
+    /// `interfaces` field (a `super_interfaces` node wrapping a `type_list`).
+    fn interface_names(&self, node: Node<'_>) -> Vec<String> {
+        node.child_by_field_name("interfaces")
+            .map(|si| self.type_list_names(si))
+            .unwrap_or_default()
+    }
+
+    /// The `extends` interface simple names from an `interface_declaration`'s
+    /// `extends_interfaces` child (a child node, not a field, wrapping a
+    /// `type_list`).
+    fn extends_interface_names(&self, node: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = node.walk();
+        for c in node.children(&mut cursor) {
+            if c.kind() == "extends_interfaces" {
+                out.extend(self.type_list_names(c));
+            }
+        }
+        out
+    }
+
+    /// The simple names of every `_type` in the `type_list` wrapped by `container`
+    /// (a `super_interfaces`/`extends_interfaces` node).
+    fn type_list_names(&self, container: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = container.walk();
+        for c in container.children(&mut cursor) {
+            if c.kind() != "type_list" {
+                continue;
+            }
+            let mut inner = c.walk();
+            for t in c.children(&mut inner) {
+                if !t.is_named() {
+                    continue;
+                }
+                let n = type_name(&self.text(t));
+                if !n.is_empty() {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    fn push_relation(&mut self, kind: RelationKind, subject_fqn: &str, object: &str, span: &Span) {
+        self.facts.impl_relations.push(ImplRelation {
+            kind,
+            subject: fqn_segments(subject_fqn),
+            object: smallvec_one(object.to_string()),
+            span: span.clone(),
+        });
     }
 
     /// Each `formal_parameter` of a record header → a `Field` def (the synthesized
@@ -325,6 +517,10 @@ impl<'a> Builder<'a> {
         });
         self.maybe_export(&name, self.def_span(node, "name"), vis);
         self.record_entrypoints(node, &name, &fqn);
+        // Record this method for the override pass. `ctx.fqn_prefix` is the
+        // enclosing type's FQN (set by `enter_body` in `walk_type`), so methods
+        // are grouped under the type that declares them.
+        self.record_method(&ctx.fqn_prefix, &name, &fqn, node);
         // A `native` method's body lives across the JNI boundary the call graph
         // cannot see into — the Java analogue of Go's `import "C"` FFI cut.
         if has_modifier(node, "native") {
@@ -340,6 +536,44 @@ impl<'a> Builder<'a> {
             let mut inner = 0u32;
             self.walk(body, &body_ctx, &mut inner);
         }
+    }
+
+    /// Stash a directly-declared method for the override pass: its arity (formal
+    /// parameter count) and whether it carries `@Override`. Also index its
+    /// `(name, arity)` under the enclosing type's simple name so subtypes can
+    /// name+arity match against it in-file.
+    fn record_method(&mut self, type_fqn: &str, name: &str, method_fqn: &str, node: Node<'_>) {
+        let arity = self.method_arity(node);
+        let has_override = self.annotation_names(node).iter().any(|a| a == "Override");
+        let span = self.def_span(node, "name");
+        self.type_methods
+            .entry(type_fqn.to_string())
+            .or_default()
+            .push(MethodRec {
+                name: name.to_string(),
+                fqn: method_fqn.to_string(),
+                arity,
+                has_override,
+                span,
+            });
+        let simple = type_fqn.rsplit("::").next().unwrap_or(type_fqn).to_string();
+        self.type_method_sigs
+            .entry(simple)
+            .or_default()
+            .insert((name.to_string(), arity));
+    }
+
+    /// The number of formal parameters of a `method_declaration` (varargs counts
+    /// as one). Used for name+arity override matching.
+    fn method_arity(&self, node: Node<'_>) -> usize {
+        node.child_by_field_name("parameters")
+            .map(|p| {
+                let mut cursor = p.walk();
+                p.children(&mut cursor)
+                    .filter(|c| matches!(c.kind(), "formal_parameter" | "spread_parameter"))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn walk_constructor(&mut self, node: Node<'_>, ctx: &Ctx) {
@@ -738,6 +972,22 @@ fn join(prefix: &str, name: &str) -> String {
 fn smallvec_one(s: String) -> SmallVec<[Name; 2]> {
     let mut v = SmallVec::new();
     v.push(s);
+    v
+}
+
+/// Split a `::`-joined FQN into its segments (`a::B::m` → `[a, B, m]`). The
+/// resolver re-joins them for an exact-FQN lookup.
+fn fqn_segments(fqn: &str) -> SmallVec<[Name; 2]> {
+    fqn.split("::").map(str::to_string).collect()
+}
+
+/// A two-segment `[type, member]` name path (`("Shape", "area")` →
+/// `["Shape", "area"]`). The override `object`: a supertype's simple name plus
+/// the overridden method name, which the resolver grounds via `Shape::area`.
+fn name_path_two(type_name: &str, member: &str) -> SmallVec<[Name; 2]> {
+    let mut v = SmallVec::new();
+    v.push(type_name.to_string());
+    v.push(member.to_string());
     v
 }
 

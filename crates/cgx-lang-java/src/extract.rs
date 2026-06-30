@@ -32,7 +32,12 @@
 //!   (`start`/`submit`/`execute`/`*Async`), `Blocking` at lock/sleep/await/join
 //!   sites and on `synchronized` methods and `synchronized` statement blocks.
 //!
-//! Intraprocedural dataflow (SSA) remains a stub (Cycle 5).
+//! **Cycle 5** adds intraprocedural dataflow ([`DataFlowFact`]): a second,
+//! dataflow-only walk of each method/constructor body lowers each production
+//! site (local-var initializer, assignment, return, for-each binding) into SSA
+//! value nodes + `DerivesFrom` edges (derived→source), mirroring the Go adapter's
+//! model exactly (same fact shape, same SSA versioning, same `OpaqueCall`/
+//! `TruncatedAccessPath` under-approximation posture).
 //!
 //! Unlike the Go adapter, the FQN prefix comes from the source
 //! `package_declaration` node (see [`crate::module`]), not the file path.
@@ -42,13 +47,14 @@ use cgx_core::cut::CutMarker;
 use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
+use cgx_core::transform::Transform;
 use cgx_frontend::{
-    CutHint, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError,
-    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef, RefKind, RelPath,
-    RelationKind, ScopeId, SymbolDef,
+    CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts,
+    FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef,
+    RefKind, RelPath, RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::{Node, Parser};
 
 use crate::effects::effects_of_call;
@@ -184,6 +190,10 @@ struct Builder<'a> {
     /// `facts.effects` in [`Builder::finish`]. `BTreeMap` keeps the flush order
     /// deterministic.
     effects: BTreeMap<String, EffectSet>,
+    /// Cycle 5: accumulated intraprocedural dataflow facts keyed by the owning
+    /// callable's FQN. Flushed into `facts.data_flows` in [`Builder::finish`]
+    /// (canonicalization sorts them, so the key only organizes the walk).
+    data_flows: BTreeMap<String, Vec<DataFlowFact>>,
 }
 
 impl<'a> Builder<'a> {
@@ -196,6 +206,7 @@ impl<'a> Builder<'a> {
             type_methods: BTreeMap::new(),
             type_method_sigs: BTreeMap::new(),
             effects: BTreeMap::new(),
+            data_flows: BTreeMap::new(),
         }
     }
 
@@ -210,6 +221,10 @@ impl<'a> Builder<'a> {
             if !set.is_empty() {
                 self.facts.effects.push(EffectFact { fqn, effects: set });
             }
+        }
+        // Cycle 5: flush accumulated intraprocedural dataflow facts.
+        for (_fqn, facts) in std::mem::take(&mut self.data_flows) {
+            self.facts.data_flows.extend(facts);
         }
         self.facts
     }
@@ -592,6 +607,8 @@ impl<'a> Builder<'a> {
             let body_ctx = ctx.enter_body(fqn, scope);
             let mut inner = 0u32;
             self.walk(body, &body_ctx, &mut inner);
+            let fn_fqn = body_ctx.fqn_prefix.clone();
+            self.walk_body_ssa(body, &body_ctx, &fn_fqn);
         }
     }
 
@@ -656,6 +673,8 @@ impl<'a> Builder<'a> {
             let body_ctx = ctx.enter_body(fqn, scope);
             let mut inner = 0u32;
             self.walk(body, &body_ctx, &mut inner);
+            let fn_fqn = body_ctx.fqn_prefix.clone();
+            self.walk_body_ssa(body, &body_ctx, &fn_fqn);
         }
     }
 
@@ -1027,6 +1046,525 @@ impl<'a> Builder<'a> {
             });
         }
     }
+
+    // --- intraprocedural SSA dataflow (Cycle 5) ---
+
+    /// A second, dataflow-only traversal of a method/constructor body that lowers
+    /// each production site (local-var initializer, assignment, return, for-each
+    /// binding) into a [`DataFlowFact`] (`derived --derives-from(transform)-->
+    /// source`). Re-assignment (`x = a; x = b;`) bumps the per-name SSA version so
+    /// the resolver mints distinct value nodes (flow-sensitivity). A call/`new`
+    /// result is an opaque source: it carries an `OpaqueCall` cut plus the callee
+    /// name and per-arg access-paths so the interprocedural IFDS pass can ground
+    /// it. This is the structural mirror of the Go adapter's `walk_function_ssa`.
+    fn walk_body_ssa(&mut self, body: Node<'_>, ctx: &Ctx, fn_fqn: &str) {
+        let mut versions: HashMap<String, u32> = HashMap::new();
+        self.ssa_walk(body, ctx, fn_fqn, &mut versions);
+    }
+
+    fn ssa_walk(
+        &mut self,
+        node: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        versions: &mut HashMap<String, u32>,
+    ) {
+        match node.kind() {
+            // `T a = <init>, b = <init>;` — one assignment per initialized
+            // declarator (an uninitialized declarator produces no flow).
+            "local_variable_declaration" => {
+                let cond = ctx.condition();
+                let mut cursor = node.walk();
+                let declarators: Vec<Node<'_>> = node
+                    .children_by_field_name("declarator", &mut cursor)
+                    .collect();
+                for decl in declarators {
+                    let Some(value) = decl.child_by_field_name("value") else {
+                        continue;
+                    };
+                    if let Some(name) = decl
+                        .child_by_field_name("name")
+                        .and_then(|n| self.binding_name(n))
+                    {
+                        self.ssa_assignment(&name, value, ctx, fn_fqn, cond, versions);
+                    }
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+            }
+            // `x = <rhs>` / `x += <rhs>` — only a plain-identifier target is
+            // versioned (a field/array target is not a tracked local). Compound
+            // operators under-approximate to the RHS shape, matching Go.
+            "assignment_expression" => {
+                let cond = ctx.condition();
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if let Some(name) = self.binding_name(left) {
+                        self.ssa_assignment(&name, right, ctx, fn_fqn, cond, versions);
+                    }
+                    self.ssa_walk(right, ctx, fn_fqn, versions);
+                }
+            }
+            "return_statement" => {
+                let cond = ctx.condition();
+                if let Some(expr) = node.named_child(0) {
+                    self.ssa_return(expr, ctx, fn_fqn, cond, versions);
+                    self.ssa_walk(expr, ctx, fn_fqn, versions);
+                }
+            }
+            // Control flow lowers the same edge condition as the call walk, so a
+            // flow inside an `if`/case/loop body carries the matching condition.
+            "if_statement" => {
+                if let Some(c) = node.child_by_field_name("condition") {
+                    self.ssa_walk(c, ctx, fn_fqn, versions);
+                }
+                let inner = ctx.with_condition(EdgeCondition::Conditional);
+                if let Some(c) = node.child_by_field_name("consequence") {
+                    self.ssa_walk(c, &inner, fn_fqn, versions);
+                }
+                if let Some(a) = node.child_by_field_name("alternative") {
+                    self.ssa_walk(a, &inner, fn_fqn, versions);
+                }
+            }
+            "while_statement" | "for_statement" | "do_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let inner = ctx.with_condition(EdgeCondition::Loop);
+                    self.ssa_walk(body, &inner, fn_fqn, versions);
+                }
+                // Walk non-body children (init/condition/update) unguarded.
+                let body = node.child_by_field_name("body");
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if Some(child) == body {
+                        continue;
+                    }
+                    self.ssa_walk(child, ctx, fn_fqn, versions);
+                }
+            }
+            // `for (E e : iterable)` binds the loop var from each element of the
+            // iterable — a Java-specific lowering with no Go analogue. The element
+            // shape is unknown (no `Transform` variant captures "element-of"), so
+            // the edge is tagged `Other` (under-approximate, but the derived→source
+            // reachability `e ⇝ iterable` is recorded). A non-name iterable (a call
+            // result) contributes no source, matching the opaque posture.
+            "enhanced_for_statement" => {
+                let loop_cond = ctx.with_condition(EdgeCondition::Loop).condition();
+                if let (Some(name_node), Some(value)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("value"),
+                ) {
+                    if let Some(name) = self.binding_name(name_node) {
+                        let version = bump(versions, &name);
+                        let derived = smallvec_one(name);
+                        let span = self.span(value);
+                        for source in self.operand_sources(value) {
+                            self.push_data_flow(
+                                fn_fqn,
+                                derived.clone(),
+                                version,
+                                source,
+                                ctx.scope,
+                                Transform::Other,
+                                loop_cond,
+                                SmallVec::new(),
+                                None,
+                                SmallVec::new(),
+                                span.clone(),
+                            );
+                        }
+                    }
+                    self.ssa_walk(value, ctx, fn_fqn, versions);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    let inner = ctx.with_condition(EdgeCondition::Loop);
+                    self.ssa_walk(body, &inner, fn_fqn, versions);
+                }
+            }
+            "switch_expression" => {
+                if let Some(c) = node.child_by_field_name("condition") {
+                    self.ssa_walk(c, ctx, fn_fqn, versions);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    let inner = ctx.with_condition(EdgeCondition::Conditional);
+                    self.ssa_walk(body, &inner, fn_fqn, versions);
+                }
+            }
+            // A lambda/anonymous-class body opens a new binding world; Cycle 5 does
+            // not descend into it for SSA (closure-capture dataflow is deferred,
+            // matching the Go adapter's `func_literal` skip).
+            "lambda_expression" => {}
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.ssa_walk(child, ctx, fn_fqn, versions);
+                }
+            }
+        }
+    }
+
+    /// Emit the `DataFlowFact`(s) for `name = <value>`: bump the SSA version of
+    /// `name`, classify the RHS into a [`Transform`], and emit one fact per source
+    /// operand (`derived --derives-from(transform)--> source`).
+    fn ssa_assignment(
+        &mut self,
+        name: &str,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut HashMap<String, u32>,
+    ) {
+        let version = bump(versions, name);
+        let derived: SmallVec<[Name; 2]> = smallvec_one(name.to_string());
+        let span = self.span(value);
+        let (transform, sources, cut) = self.classify_rhs(value);
+        self.emit_flows(
+            fn_fqn, derived, version, sources, cut, transform, ctx, cond, value, span,
+        );
+    }
+
+    /// Emit the return dataflow fact: `<fn>::return --derives-from(copy)--> <expr>`
+    /// for the syntactic operand of a `return`.
+    fn ssa_return(
+        &mut self,
+        value: Node<'_>,
+        ctx: &Ctx,
+        fn_fqn: &str,
+        cond: EdgeCondition,
+        versions: &mut HashMap<String, u32>,
+    ) {
+        let version = bump(versions, "return");
+        let mut derived: SmallVec<[Name; 2]> = SmallVec::new();
+        derived.push(fn_fqn.to_string());
+        derived.push("return".to_string());
+        let span = self.span(value);
+        let (_t, sources, cut) = self.classify_rhs(value);
+        self.emit_flows(
+            fn_fqn,
+            derived,
+            version,
+            sources,
+            cut,
+            Transform::Copy,
+            ctx,
+            cond,
+            value,
+            span,
+        );
+    }
+
+    /// Shared tail of [`Self::ssa_assignment`]/[`Self::ssa_return`]: push one fact
+    /// per source operand, or a single source-less `OpaqueCall` fact (carrying the
+    /// callee + per-arg access-paths) when the RHS is an opaque call/`new`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flows(
+        &mut self,
+        fn_fqn: &str,
+        derived: SmallVec<[Name; 2]>,
+        version: u32,
+        sources: Vec<SmallVec<[Name; 2]>>,
+        cut: Option<CutMarker>,
+        transform: Transform,
+        ctx: &Ctx,
+        cond: EdgeCondition,
+        value: Node<'_>,
+        span: Span,
+    ) {
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        if sources.is_empty() && is_opaque_call {
+            let args = self.opaque_call_arg_paths(value);
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                callee,
+                args,
+                span,
+            );
+            return;
+        }
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                ctx.scope,
+                transform,
+                cond,
+                cut_markers,
+                callee.clone(),
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Classify a RHS expression into `(transform, source access-paths, cut)`.
+    /// Mirrors the Go adapter's `classify_rhs`: a call/`new` result is opaque (no
+    /// intraprocedural source), a binary op is `Arith` over both operands, a
+    /// ternary is a `Branched` φ-join over both branches.
+    fn classify_rhs(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[Name; 2]>>, Option<CutMarker>) {
+        match value.kind() {
+            "identifier" => (Transform::Copy, vec![smallvec_one(self.text(value))], None),
+            "field_access" => self.classify_field(value),
+            "binary_expression" => {
+                let mut sources = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = value.child_by_field_name(field) {
+                        sources.extend(self.operand_sources(n));
+                    }
+                }
+                (Transform::Arith, sources, None)
+            }
+            "unary_expression" => {
+                let sources = value
+                    .child_by_field_name("operand")
+                    .map(|n| self.operand_sources(n))
+                    .unwrap_or_default();
+                (Transform::Arith, sources, None)
+            }
+            // `c ? a : b` selects from both branches (φ-join).
+            "ternary_expression" => {
+                let mut sources = Vec::new();
+                for field in ["consequence", "alternative"] {
+                    if let Some(n) = value.child_by_field_name(field) {
+                        sources.extend(self.operand_sources(n));
+                    }
+                }
+                (Transform::Branched, sources, None)
+            }
+            "cast_expression" => value
+                .child_by_field_name("value")
+                .map(|n| self.classify_rhs(n))
+                .unwrap_or((Transform::Other, Vec::new(), None)),
+            "parenthesized_expression" => value
+                .named_child(0)
+                .map(|n| self.classify_rhs(n))
+                .unwrap_or((Transform::Other, Vec::new(), None)),
+            // A method call or `new T(..)` runs opaque code (the resolver grounds
+            // it interprocedurally via the callee + arg access-paths).
+            "method_invocation" | "object_creation_expression" => {
+                (Transform::Other, Vec::new(), Some(CutMarker::OpaqueCall))
+            }
+            _ => (Transform::Other, Vec::new(), None),
+        }
+    }
+
+    /// Classify a `field_access` RHS: depth-1 (`u.name`) is a clean `Projection`;
+    /// depth-2+ (`u.cfg.timeout`) truncates to the base local with a
+    /// `TruncatedAccessPath` cut.
+    fn classify_field(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[Name; 2]>>, Option<CutMarker>) {
+        let Some(base) = value.child_by_field_name("object") else {
+            return (Transform::Projection, Vec::new(), None);
+        };
+        let field = value
+            .child_by_field_name("field")
+            .map(|f| self.text(f))
+            .unwrap_or_default();
+        if base.kind() == "identifier" {
+            let mut path: SmallVec<[Name; 2]> = SmallVec::new();
+            path.push(self.text(base));
+            path.push(field);
+            (Transform::Projection, vec![path], None)
+        } else {
+            let base_id = self.deepest_base_ident(base);
+            let sources = base_id.map(|b| vec![smallvec_one(b)]).unwrap_or_default();
+            (
+                Transform::Projection,
+                sources,
+                Some(CutMarker::TruncatedAccessPath),
+            )
+        }
+    }
+
+    /// The deepest base identifier of a nested `field_access` chain (`u.cfg.timeout`
+    /// → `u`). `None` if the base is not a plain name.
+    fn deepest_base_ident(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "identifier" => Some(self.text(node)),
+            "field_access" => node
+                .child_by_field_name("object")
+                .and_then(|v| self.deepest_base_ident(v)),
+            "parenthesized_expression" => node
+                .named_child(0)
+                .and_then(|v| self.deepest_base_ident(v)),
+            _ => None,
+        }
+    }
+
+    /// The source bindings of one operand of an arith/ternary expression.
+    fn operand_sources(&self, node: Node<'_>) -> Vec<SmallVec<[Name; 2]>> {
+        match node.kind() {
+            "identifier" => vec![smallvec_one(self.text(node))],
+            "field_access" => {
+                let (_t, sources, _c) = self.classify_field(node);
+                sources
+            }
+            "binary_expression" => {
+                let mut out = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = node.child_by_field_name(field) {
+                        out.extend(self.operand_sources(n));
+                    }
+                }
+                out
+            }
+            "ternary_expression" => {
+                let mut out = Vec::new();
+                for field in ["consequence", "alternative"] {
+                    if let Some(n) = node.child_by_field_name(field) {
+                        out.extend(self.operand_sources(n));
+                    }
+                }
+                out
+            }
+            "unary_expression" => node
+                .child_by_field_name("operand")
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            "cast_expression" => node
+                .child_by_field_name("value")
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            "parenthesized_expression" => node
+                .named_child(0)
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The bound name of an assignment/declaration target, when it is a plain
+    /// identifier. Underscore patterns, field-access and array-access targets are
+    /// not versioned (they are not tracked locals), matching the Go adapter.
+    fn binding_name(&self, lhs: Node<'_>) -> Option<String> {
+        match lhs.kind() {
+            "identifier" => Some(self.text(lhs)),
+            _ => None,
+        }
+    }
+
+    /// Per-positional-argument source access-paths of an opaque-call RHS
+    /// (`g(a, b.x, 1)` → `[["a"], ["b","x"], []]`): each named argument reduced
+    /// through `operand_sources`, taking its first access-path; a literal/nested
+    /// call contributes an empty inner vec to keep positional alignment.
+    fn opaque_call_arg_paths(&self, value: Node<'_>) -> SmallVec<[SmallVec<[Name; 2]>; 4]> {
+        let call = match value.kind() {
+            "parenthesized_expression" => {
+                return value
+                    .named_child(0)
+                    .map(|n| self.opaque_call_arg_paths(n))
+                    .unwrap_or_default();
+            }
+            "cast_expression" => {
+                return value
+                    .child_by_field_name("value")
+                    .map(|n| self.opaque_call_arg_paths(n))
+                    .unwrap_or_default();
+            }
+            "method_invocation" | "object_creation_expression" => value,
+            _ => return SmallVec::new(),
+        };
+        let Some(args) = call.child_by_field_name("arguments") else {
+            return SmallVec::new();
+        };
+        let mut out: SmallVec<[SmallVec<[Name; 2]>; 4]> = SmallVec::new();
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if !arg.is_named() {
+                continue;
+            }
+            let path = self
+                .operand_sources(arg)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            out.push(path);
+        }
+        out
+    }
+
+    /// The syntactic callee name path of an opaque-call RHS, `::`-joined. A bare
+    /// `m(..)` yields `m`; a `new T(..)` yields the simple type name; a virtual
+    /// `recv.m(..)` yields `None` (the resolver records a wildcard summary dep).
+    fn opaque_callee_name(&self, value: Node<'_>) -> Option<String> {
+        match value.kind() {
+            "parenthesized_expression" => {
+                value.named_child(0).and_then(|n| self.opaque_callee_name(n))
+            }
+            "cast_expression" => value
+                .child_by_field_name("value")
+                .and_then(|n| self.opaque_callee_name(n)),
+            "method_invocation" => {
+                if value.child_by_field_name("object").is_some() {
+                    None
+                } else {
+                    value.child_by_field_name("name").map(|n| self.text(n))
+                }
+            }
+            "object_creation_expression" => value
+                .child_by_field_name("type")
+                .map(|t| type_name(&self.text(t)))
+                .filter(|n| !n.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// Push one `DataFlowFact` into the per-callable accumulator (flushed in
+    /// [`Builder::finish`]).
+    #[allow(clippy::too_many_arguments)]
+    fn push_data_flow(
+        &mut self,
+        fn_fqn: &str,
+        derived: SmallVec<[Name; 2]>,
+        derived_version: u32,
+        source: SmallVec<[Name; 2]>,
+        scope: ScopeId,
+        transform: Transform,
+        edge_condition: EdgeCondition,
+        cut_markers: SmallVec<[CutMarker; 1]>,
+        callee_fqn: Option<String>,
+        args: SmallVec<[SmallVec<[Name; 2]>; 4]>,
+        span: Span,
+    ) {
+        self.data_flows
+            .entry(fn_fqn.to_string())
+            .or_default()
+            .push(DataFlowFact {
+                derived,
+                source,
+                derived_version,
+                scope,
+                transform,
+                edge_condition,
+                cut_markers,
+                callee_fqn,
+                args,
+                span,
+            });
+    }
 }
 
 // === free functions ===
@@ -1043,6 +1581,13 @@ fn smallvec_one(s: String) -> SmallVec<[Name; 2]> {
     let mut v = SmallVec::new();
     v.push(s);
     v
+}
+
+/// Increment and return the SSA version of `name` in `versions` (1 on first use).
+fn bump(versions: &mut HashMap<String, u32>, name: &str) -> u32 {
+    let v = versions.entry(name.to_string()).or_insert(0);
+    *v += 1;
+    *v
 }
 
 /// Split a `::`-joined FQN into its segments (`a::B::m` → `[a, B, m]`). The

@@ -63,6 +63,56 @@ fn effect_facts_are_identical_across_runs() {
 }
 
 #[test]
+fn data_flow_facts_are_identical_across_runs() {
+    // The dataflow fixture exercises every lowered construct (copy chain, arith,
+    // projection, deep-field truncation, opaque call, ternary, reassignment,
+    // for-each binding); the BTreeMap-keyed accumulator flushed in finish + the
+    // canonical sort must produce a byte-identical fact vector across runs.
+    let a = extract_fixture("Dataflow.java");
+    let b = extract_fixture("Dataflow.java");
+    assert_eq!(a, b, "canonical dataflow facts must be stable");
+    assert!(
+        !a.data_flows.is_empty(),
+        "the dataflow fixture must emit data_flow facts"
+    );
+}
+
+#[test]
+fn full_extraction_is_byte_identical_across_runs() {
+    // The whole channel set in one source: defs, refs/conditions, imports,
+    // entrypoints, cuts, inheritance, effects AND intraprocedural dataflow. The
+    // canonicalized facts (every Vec sorted, scope ids stable) must be equal
+    // across two independent extractions of the same bytes.
+    let src = "package a.b;\n\
+        import java.util.List;\n\
+        class C extends Base implements Runnable {\n\
+        \x20 private int total;\n\
+        \x20 public synchronized void run() {\n\
+        \x20   int a = total;\n\
+        \x20   int b = a + 1;\n\
+        \x20   int c = b > 0 ? a : b;\n\
+        \x20   int r = helper(c);\n\
+        \x20   for (String s : names()) { System.out.println(s); }\n\
+        \x20   try { risky(); } catch (Exception e) { recover(); }\n\
+        \x20 }\n\
+        \x20 int helper(int x) { return x; }\n\
+        \x20 List<String> names() { return null; }\n\
+        \x20 void risky() {}\n\
+        \x20 void recover() {}\n\
+        }\n";
+    let a = extract("C.java", src);
+    let b = extract("C.java", src);
+    assert_eq!(a, b, "full canonical extraction must be byte-identical");
+    assert!(
+        !a.defs.is_empty()
+            && !a.refs.is_empty()
+            && !a.data_flows.is_empty()
+            && !a.effects.is_empty(),
+        "the full-channel source must populate defs, refs, dataflow and effects"
+    );
+}
+
+#[test]
 fn fixture_def_set_is_complete_and_stable() {
     let facts = extract_fixture("Shapes.java");
     let fqns = def_fqns(&facts);

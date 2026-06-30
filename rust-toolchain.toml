@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact patch release, not "stable" — "stable" drifts under us
+# and a build reproduced next month must resolve to the exact same rustc.
+# Bump this deliberately (its own PR) when the toolchain needs to move.
+# Confirmed against workspace.package.rust-version = "1.96" (Cargo.toml).
+channel = "1.96.0"
 components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu"]

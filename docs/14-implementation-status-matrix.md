@@ -15,8 +15,8 @@
 | Inheritance / overrides | ✓ | — | ~ | ✓ | ✓ | planned |
 | Entrypoint hints | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 | Cut hints | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
-| Own-effects | ✓ | — | ✓ | ✓ | ✓ | planned |
-| Intraprocedural dataflow (SSA) | ✓ | — | ✓ | ✓ | ✓ | planned |
+| Own-effects | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| Intraprocedural dataflow (SSA) | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 | Concurrency / async hints | ~ | ~ | ~ | ~ | ~ | planned |
 | SCIP enrichment | ✓ | ~ | planned | planned | planned | planned |
 | Framework packs | ~ | ~ | planned | planned | planned | planned |
@@ -32,8 +32,8 @@
 | `unused` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 | `search` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 | `explain` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
-| `flows-to` / `flows-from` | ✓ | — | ✓ | ✓ | ✓ | planned |
-| effects queries | ✓ | — | ✓ | ✓ | ✓ | planned |
+| `flows-to` / `flows-from` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
+| effects queries | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 | `diff` | ✓ | ✓ | ✓ | ✓ | ✓ | planned |
 
 A query works for a language iff the facts it needs exist (Section 1). Update both sections together when an adapter changes.

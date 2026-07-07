@@ -19,25 +19,28 @@
 //! /exports, then recurses into children. On exit from a scope/condition frame the
 //! stack is popped.
 
+use crate::effects::{effects_of_call, is_spawn_launcher};
 use crate::module::module_path_for;
 use crate::query;
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
+use cgx_core::effect::{Effect, EffectSet};
 use cgx_core::node::{EntrypointKind, SymbolKind, Visibility};
 use cgx_core::provenance::Span;
 use cgx_core::signature::{Param, Signature};
+use cgx_core::transform::Transform;
 use cgx_frontend::facts::{
-    CutHint, EntrypointHint, ExportFact, FileFacts, ImportFact, ImportedName, RawRef, RefKind,
-    ScopeId, ScopeTree, SymbolDef,
+    CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileFacts, ImportFact,
+    ImportedName, RawRef, RefKind, ScopeId, ScopeTree, SymbolDef,
 };
 use cgx_frontend::frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
 use smallvec::SmallVec;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tree_sitter::{Language, Node, Parser};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 1;
+const TS_FRAGMENT_VERSION: u32 = 2;
 
 /// The TypeScript/JavaScript language frontend.
 ///
@@ -141,6 +144,13 @@ struct Builder<'a> {
     /// FQNs of callable parameter bindings (function-typed parameters). Calls
     /// to these emit `RefKind::CallCallback`.
     callback_names: HashSet<String>,
+    /// Accumulated syntactic own-effects (GM-12) keyed by the enclosing
+    /// definition's local FQN. Flushed into `facts.effects` in [`Builder::finish`].
+    effects: BTreeMap<String, EffectSet>,
+    /// Accumulated intraprocedural SSA dataflow facts (v0.3 DATA_FLOW) keyed by
+    /// the owning function's local FQN. Flushed into `facts.data_flows` in
+    /// [`Builder::finish`].
+    data_flows: BTreeMap<String, Vec<DataFlowFact>>,
 }
 
 impl<'a> Builder<'a> {
@@ -157,11 +167,32 @@ impl<'a> Builder<'a> {
             stmt_index: 0,
             lambda_names: HashSet::new(),
             callback_names: HashSet::new(),
+            effects: BTreeMap::new(),
+            data_flows: BTreeMap::new(),
         }
     }
 
-    fn finish(self) -> FileFacts {
+    fn finish(mut self) -> FileFacts {
+        for (fqn, set) in std::mem::take(&mut self.effects) {
+            if !set.is_empty() {
+                self.facts.effects.push(EffectFact { fqn, effects: set });
+            }
+        }
+        for (_fqn, facts) in std::mem::take(&mut self.data_flows) {
+            self.facts.data_flows.extend(facts);
+        }
         self.facts
+    }
+
+    /// Attribute `set` to the enclosing definition of `scope` (the nearest
+    /// ancestor scope with an `owner_fqn`). No owner or empty set ⇒ no-op.
+    fn record_effects(&mut self, scope: ScopeId, set: EffectSet) {
+        if set.is_empty() {
+            return;
+        }
+        if let Some(fqn) = self.scope_owner_fqn(scope) {
+            self.effects.entry(fqn).or_default().union_with(set);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -536,6 +567,7 @@ impl<'a> Builder<'a> {
             // (await expressions inside push CallAsync refs)
             let _ = is_async;
             self.walk_body(body, new_scope);
+            self.walk_function_ssa(body, new_scope, &fqn);
         }
     }
 
@@ -743,6 +775,7 @@ impl<'a> Builder<'a> {
         // Walk the method body
         if let Some(body) = node.child_by_field_name("body") {
             self.walk_body(body, new_scope);
+            self.walk_function_ssa(body, new_scope, &fqn);
         }
     }
 
@@ -978,6 +1011,13 @@ impl<'a> Builder<'a> {
 
             if let Some(body) = lambda_node.child_by_field_name("body") {
                 self.walk_body(body, new_scope);
+                // SSA dataflow only for block-body arrows (`const f = () => { … }`).
+                // Expression-body arrows and closure captures are a documented
+                // under-approximation (matches Go's func-literal / Python's lambda
+                // posture — closure-capture dataflow is deferred).
+                if body.kind() == "statement_block" {
+                    self.walk_function_ssa(body, new_scope, &fqn);
+                }
             }
         } else {
             // Plain constant/variable
@@ -1333,6 +1373,7 @@ impl<'a> Builder<'a> {
         // Detect eval() and new Function()
         if callee_text == "eval" {
             self.emit_reflective_cut(node, scope);
+            self.record_effects(scope, EffectSet::single(Effect::DynamicCode));
             // Walk args
             if let Some(args) = args_node {
                 self.walk_args(args, scope);
@@ -1348,6 +1389,15 @@ impl<'a> Builder<'a> {
                 self.walk_args(args, scope);
             }
             return;
+        }
+
+        // Record own-effects for the enclosing definition (GM-12): the name-based
+        // effect table plus the syntactic `spawns` launchers (`setTimeout`,
+        // `queueMicrotask`, …), mirroring Go's `go`-statement handling.
+        let joined = name_path.join("::");
+        self.record_effects(scope, effects_of_call(&joined));
+        if is_spawn_launcher(&joined) {
+            self.record_effects(scope, EffectSet::single(Effect::Spawns));
         }
 
         // Check for loop-method callbacks (map, forEach, etc.) — inside callback
@@ -1392,11 +1442,12 @@ impl<'a> Builder<'a> {
             None => return,
         };
 
-        let callee_text = self.text(callee);
+        let callee_text = self.text(callee).to_string();
 
         // new Function(...) — reflective
         if callee_text == "Function" {
             self.emit_reflective_cut(node, scope);
+            self.record_effects(scope, EffectSet::single(Effect::DynamicCode));
             let args = node.child_by_field_name("arguments");
             if let Some(args) = args {
                 self.walk_args(args, scope);
@@ -1404,8 +1455,15 @@ impl<'a> Builder<'a> {
             return;
         }
 
+        // Constructor own-effects: `new Worker(...)` spawns, `new Date()` is
+        // nondeterministic (the effect table keys on the constructor name).
+        self.record_effects(scope, effects_of_call(&callee_text));
+        if is_spawn_launcher(&callee_text) {
+            self.record_effects(scope, EffectSet::single(Effect::Spawns));
+        }
+
         // Normal new expression — emit as Instantiate ref
-        let name: SmallVec<[String; 2]> = SmallVec::from_vec(vec![callee_text.to_string()]);
+        let name: SmallVec<[String; 2]> = SmallVec::from_vec(vec![callee_text.clone()]);
         let args_node = node.child_by_field_name("arguments");
         let arity = args_node.map(|a| self.count_args(a));
         let condition = self.current_condition();
@@ -1460,6 +1518,7 @@ impl<'a> Builder<'a> {
 
                     let (name_path, _) = self.classify_callee(callee_node, scope);
                     if !name_path.is_empty() {
+                        self.record_effects(scope, effects_of_call(&name_path.join("::")));
                         let condition = self.current_condition();
                         self.facts.refs.push(RawRef {
                             name_path,
@@ -1855,4 +1914,583 @@ impl<'a> Builder<'a> {
             macro_origin: None,
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Intraprocedural SSA dataflow (v0.3 DATA_FLOW SC2)
+    // -----------------------------------------------------------------------
+    //
+    // A second, dataflow-only traversal of a function body — mirroring Go's
+    // `walk_function_ssa` and Python's — that lowers each production site
+    // (declaration / assignment / augmented / return) into a `DataFlowFact` with
+    // the `DerivesFrom` orientation `derived → source`. Re-assignment bumps the
+    // per-name SSA version so the resolver mints distinct value nodes. A call
+    // result is opaque (an `OpaqueCall` cut + callee name + per-arg access-paths
+    // for the interprocedural IFDS pass). The pass does NOT descend into nested
+    // functions/arrows (each gets its own pass) — closure-capture dataflow is a
+    // documented under-approximation, matching Go/Python.
+
+    fn walk_function_ssa(&mut self, body: Node<'_>, scope: ScopeId, fn_fqn: &str) {
+        let mut versions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        self.ssa_walk(body, scope, EdgeCondition::Always, fn_fqn, &mut versions);
+    }
+
+    fn ssa_walk(
+        &mut self,
+        node: Node<'_>,
+        scope: ScopeId,
+        cond: EdgeCondition,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        match node.kind() {
+            "lexical_declaration" | "variable_declaration" => {
+                let mut cursor = node.walk();
+                for decl in node.children(&mut cursor) {
+                    if decl.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let (Some(name_node), Some(value)) = (
+                        decl.child_by_field_name("name"),
+                        decl.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    match name_node.kind() {
+                        "identifier" => {
+                            let name = self.text(name_node).to_string();
+                            self.ssa_assignment(&name, value, scope, cond, fn_fqn, versions);
+                        }
+                        "array_pattern" | "object_pattern" => {
+                            // Destructuring: best-effort — each bound identifier
+                            // derives from the RHS (typically an opaque call).
+                            for name in self.pattern_idents(name_node) {
+                                self.ssa_assignment(&name, value, scope, cond, fn_fqn, versions);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.ssa_walk(value, scope, cond, fn_fqn, versions);
+                }
+            }
+            "assignment_expression" => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if left.kind() == "identifier" {
+                        let name = self.text(left).to_string();
+                        self.ssa_assignment(&name, right, scope, cond, fn_fqn, versions);
+                    }
+                    self.ssa_walk(right, scope, cond, fn_fqn, versions);
+                }
+            }
+            "augmented_assignment_expression" => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if left.kind() == "identifier" {
+                        let name = self.text(left).to_string();
+                        self.ssa_augmented(&name, right, scope, cond, fn_fqn, versions);
+                    }
+                    self.ssa_walk(right, scope, cond, fn_fqn, versions);
+                }
+            }
+            "return_statement" => {
+                if let Some(expr) = node.named_child(0) {
+                    self.ssa_return(expr, scope, cond, fn_fqn, versions);
+                    self.ssa_walk(expr, scope, cond, fn_fqn, versions);
+                }
+            }
+            "if_statement" => {
+                if let Some(c) = node.child_by_field_name("condition") {
+                    self.ssa_walk(c, scope, cond, fn_fqn, versions);
+                }
+                let branch = EdgeCondition::Conditional;
+                if let Some(c) = node.child_by_field_name("consequence") {
+                    self.ssa_walk(c, scope, branch, fn_fqn, versions);
+                }
+                if let Some(a) = node.child_by_field_name("alternative") {
+                    self.ssa_walk(a, scope, branch, fn_fqn, versions);
+                }
+            }
+            "for_statement" | "for_in_statement" | "while_statement" | "do_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.ssa_walk(body, scope, EdgeCondition::Loop, fn_fqn, versions);
+                }
+            }
+            "switch_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for child in body.children(&mut cursor) {
+                        if matches!(child.kind(), "switch_case" | "switch_default") {
+                            self.ssa_walk(
+                                child,
+                                scope,
+                                EdgeCondition::Conditional,
+                                fn_fqn,
+                                versions,
+                            );
+                        }
+                    }
+                }
+            }
+            "try_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.ssa_walk(body, scope, cond, fn_fqn, versions);
+                }
+                if let Some(handler) = node.child_by_field_name("handler") {
+                    self.ssa_walk(handler, scope, EdgeCondition::Exception, fn_fqn, versions);
+                }
+                if let Some(fin) = node.child_by_field_name("finalizer") {
+                    // `finally` runs on every path (GM-3.1 carve-out) → Always.
+                    self.ssa_walk(fin, scope, EdgeCondition::Always, fn_fqn, versions);
+                }
+            }
+            // Nested functions/arrows open a fresh binding world; SC2 does not
+            // descend (each gets its own SSA pass) — closure-capture is deferred.
+            "function_declaration"
+            | "generator_function_declaration"
+            | "arrow_function"
+            | "function_expression"
+            | "class_declaration"
+            | "abstract_class_declaration" => {}
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.ssa_walk(child, scope, cond, fn_fqn, versions);
+                }
+            }
+        }
+    }
+
+    /// Emit the `DataFlowFact`(s) for `name = <value>`: bump the SSA version of
+    /// `name`, classify the RHS into a `Transform`, and emit one fact per source
+    /// operand (`derived --derives-from(transform)--> source`).
+    fn ssa_assignment(
+        &mut self,
+        name: &str,
+        value: Node<'_>,
+        scope: ScopeId,
+        cond: EdgeCondition,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = bump(versions, name);
+        let derived = smallvec_one(name.to_string());
+        let span = self.span(value);
+        let (transform, sources, cut) = self.classify_rhs(value);
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                scope,
+                transform,
+                cond,
+                cut_markers,
+                callee,
+                args,
+                span,
+            );
+            return;
+        }
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                scope,
+                transform,
+                cond,
+                cut_markers,
+                callee.clone(),
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Emit the facts for `name <op>= <value>` (`x += y`): the new `x` derives
+    /// from BOTH the prior `x` and every operand of `value`, all `Arith`.
+    fn ssa_augmented(
+        &mut self,
+        name: &str,
+        value: Node<'_>,
+        scope: ScopeId,
+        cond: EdgeCondition,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = bump(versions, name);
+        let derived = smallvec_one(name.to_string());
+        let span = self.span(value);
+        let mut sources = vec![smallvec_one(name.to_string())];
+        sources.extend(self.operand_sources(value));
+        for source in sources {
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                scope,
+                Transform::Arith,
+                cond,
+                SmallVec::new(),
+                None,
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Emit the return dataflow fact: `<fn>::return --derives-from--> <expr>`.
+    fn ssa_return(
+        &mut self,
+        value: Node<'_>,
+        scope: ScopeId,
+        cond: EdgeCondition,
+        fn_fqn: &str,
+        versions: &mut std::collections::HashMap<String, u32>,
+    ) {
+        let version = bump(versions, "return");
+        let mut derived: SmallVec<[String; 2]> = SmallVec::new();
+        derived.push(fn_fqn.to_string());
+        derived.push("return".to_string());
+        let span = self.span(value);
+        let (_t, sources, cut) = self.classify_rhs(value);
+        let is_opaque_call = cut == Some(CutMarker::OpaqueCall);
+        let callee = is_opaque_call
+            .then(|| self.opaque_callee_name(value))
+            .flatten();
+        let args = if is_opaque_call {
+            self.opaque_call_arg_paths(value)
+        } else {
+            SmallVec::new()
+        };
+        if sources.is_empty() && is_opaque_call {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            cut_markers.push(CutMarker::OpaqueCall);
+            self.push_data_flow(
+                fn_fqn,
+                derived,
+                version,
+                SmallVec::new(),
+                scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                callee,
+                args,
+                span,
+            );
+            return;
+        }
+        for source in sources {
+            let mut cut_markers: SmallVec<[CutMarker; 1]> = SmallVec::new();
+            if let Some(c) = cut {
+                cut_markers.push(c);
+            }
+            self.push_data_flow(
+                fn_fqn,
+                derived.clone(),
+                version,
+                source,
+                scope,
+                Transform::Copy,
+                cond,
+                cut_markers,
+                callee.clone(),
+                SmallVec::new(),
+                span.clone(),
+            );
+        }
+    }
+
+    /// Classify a RHS expression into `(transform, source access-paths, cut)`.
+    /// TS type-coercion wrappers (`x as T`, `x!`, `x satisfies T`, `(x)`,
+    /// `await x`) are transparent and unwrapped first.
+    fn classify_rhs(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        let value = self.unwrap_expr(value);
+        match value.kind() {
+            "identifier" => (
+                Transform::Copy,
+                vec![smallvec_one(self.text(value).to_string())],
+                None,
+            ),
+            "member_expression" | "subscript_expression" => self.classify_projection(value),
+            "binary_expression" => {
+                let mut sources = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = value.child_by_field_name(field) {
+                        sources.extend(self.operand_sources(n));
+                    }
+                }
+                (Transform::Arith, sources, None)
+            }
+            "unary_expression" => {
+                let sources = value
+                    .child_by_field_name("argument")
+                    .map(|n| self.operand_sources(n))
+                    .unwrap_or_default();
+                (Transform::Arith, sources, None)
+            }
+            "array" | "object" => (Transform::Composed, self.composed_sources(value), None),
+            "call_expression" | "new_expression" => {
+                (Transform::Other, Vec::new(), Some(CutMarker::OpaqueCall))
+            }
+            _ => (Transform::Other, Vec::new(), None),
+        }
+    }
+
+    /// Classify a `member_expression`/`subscript_expression` RHS. Depth-1
+    /// (`a.b`, `a[i]`) binds to the BASE local `a` as a clean `Projection`;
+    /// depth-2+ (`a.b.c`) truncates to the base with a `TruncatedAccessPath` cut.
+    fn classify_projection(
+        &self,
+        value: Node<'_>,
+    ) -> (Transform, Vec<SmallVec<[String; 2]>>, Option<CutMarker>) {
+        let Some(object) = value.child_by_field_name("object") else {
+            return (Transform::Projection, Vec::new(), None);
+        };
+        if object.kind() == "identifier" {
+            (
+                Transform::Projection,
+                vec![smallvec_one(self.text(object).to_string())],
+                None,
+            )
+        } else {
+            let base = self.deepest_base_ident(object);
+            let sources = base.map(|b| vec![smallvec_one(b)]).unwrap_or_default();
+            (
+                Transform::Projection,
+                sources,
+                Some(CutMarker::TruncatedAccessPath),
+            )
+        }
+    }
+
+    /// The deepest base identifier of a nested member/subscript chain
+    /// (`a.b.c` → `a`). `None` if the base is not a plain name.
+    fn deepest_base_ident(&self, node: Node<'_>) -> Option<String> {
+        let node = self.unwrap_expr(node);
+        match node.kind() {
+            "identifier" => Some(self.text(node).to_string()),
+            "member_expression" | "subscript_expression" => node
+                .child_by_field_name("object")
+                .and_then(|o| self.deepest_base_ident(o)),
+            _ => None,
+        }
+    }
+
+    /// The source bindings of one operand of an arith/composed expression.
+    fn operand_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        let node = self.unwrap_expr(node);
+        match node.kind() {
+            "identifier" => vec![smallvec_one(self.text(node).to_string())],
+            "member_expression" | "subscript_expression" => {
+                let (_t, sources, _c) = self.classify_projection(node);
+                sources
+            }
+            "binary_expression" => {
+                let mut out = Vec::new();
+                for field in ["left", "right"] {
+                    if let Some(n) = node.child_by_field_name(field) {
+                        out.extend(self.operand_sources(n));
+                    }
+                }
+                out
+            }
+            "unary_expression" => node
+                .child_by_field_name("argument")
+                .map(|n| self.operand_sources(n))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Source bindings assembled by an array/object literal (`[a, b]` →
+    /// `[a, b]`): every named identifier operand, not descending into
+    /// nested calls or functions.
+    fn composed_sources(&self, node: Node<'_>) -> Vec<SmallVec<[String; 2]>> {
+        let mut out: Vec<String> = Vec::new();
+        self.collect_idents(node, true, &mut out);
+        out.into_iter().map(smallvec_one).collect()
+    }
+
+    fn collect_idents(&self, node: Node<'_>, is_root: bool, out: &mut Vec<String>) {
+        if !is_root
+            && matches!(
+                node.kind(),
+                "call_expression" | "new_expression" | "arrow_function" | "function_expression"
+            )
+        {
+            return;
+        }
+        if node.kind() == "identifier" {
+            let t = self.text(node).to_string();
+            if !out.contains(&t) {
+                out.push(t);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_idents(child, false, out);
+        }
+    }
+
+    /// Strip transparent TS wrapper expressions (`(x)`, `x as T`, `x!`,
+    /// `x satisfies T`, `<T>x`, `await x`) to the underlying value expression.
+    fn unwrap_expr<'t>(&self, node: Node<'t>) -> Node<'t> {
+        match node.kind() {
+            "parenthesized_expression"
+            | "non_null_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "await_expression" => node
+                .named_child(0)
+                .map(|n| self.unwrap_expr(n))
+                .unwrap_or(node),
+            _ => node,
+        }
+    }
+
+    /// The identifiers bound by a destructuring `array_pattern`/`object_pattern`.
+    fn pattern_idents(&self, node: Node<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_pattern_idents(node, &mut out);
+        out
+    }
+
+    fn collect_pattern_idents(&self, node: Node<'_>, out: &mut Vec<String>) {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                out.push(self.text(node).to_string());
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    // The `key` of an object-pattern pair is not a binding; only
+                    // its `value` (the local) is. Skip `property_identifier` keys.
+                    if child.kind() == "property_identifier" {
+                        continue;
+                    }
+                    self.collect_pattern_idents(child, out);
+                }
+            }
+        }
+    }
+
+    /// The syntactic callee name path of a call/`new` RHS, `::`-joined (`h`,
+    /// `pkg::Foo`). `None` for a virtual/method call on a receiver.
+    fn opaque_callee_name(&self, value: Node<'_>) -> Option<String> {
+        let value = self.unwrap_expr(value);
+        let callee = match value.kind() {
+            "call_expression" => value.child_by_field_name("function")?,
+            "new_expression" => value.child_by_field_name("constructor")?,
+            _ => return None,
+        };
+        let (name_path, kind) = self.classify_callee(callee, ScopeId::ROOT);
+        if name_path.is_empty() || kind == RefKind::CallVirtualReceiver {
+            None
+        } else {
+            Some(name_path.join("::"))
+        }
+    }
+
+    /// Per-positional-argument source access-paths of an opaque-call RHS
+    /// (`g(a, b.x, 1)` → `[["a"], ["b"], []]`): each named argument reduced
+    /// through `operand_sources`, taking its first access-path; a literal or
+    /// nested call contributes an empty inner vec to keep positional alignment.
+    fn opaque_call_arg_paths(&self, value: Node<'_>) -> SmallVec<[SmallVec<[String; 2]>; 4]> {
+        let value = self.unwrap_expr(value);
+        let Some(args) = value.child_by_field_name("arguments") else {
+            return SmallVec::new();
+        };
+        let mut out: SmallVec<[SmallVec<[String; 2]>; 4]> = SmallVec::new();
+        let mut cursor = args.walk();
+        for arg in args.children(&mut cursor) {
+            if !arg.is_named() {
+                continue;
+            }
+            let path = self
+                .operand_sources(arg)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            out.push(path);
+        }
+        out
+    }
+
+    /// Push one `DataFlowFact` into the per-function accumulator (flushed in
+    /// [`Builder::finish`]).
+    #[allow(clippy::too_many_arguments)]
+    fn push_data_flow(
+        &mut self,
+        fn_fqn: &str,
+        derived: SmallVec<[String; 2]>,
+        derived_version: u32,
+        source: SmallVec<[String; 2]>,
+        scope: ScopeId,
+        transform: Transform,
+        edge_condition: EdgeCondition,
+        cut_markers: SmallVec<[CutMarker; 1]>,
+        callee_fqn: Option<String>,
+        args: SmallVec<[SmallVec<[String; 2]>; 4]>,
+        span: Span,
+    ) {
+        self.data_flows
+            .entry(fn_fqn.to_string())
+            .or_default()
+            .push(DataFlowFact {
+                derived,
+                source,
+                derived_version,
+                scope,
+                transform,
+                edge_condition,
+                cut_markers,
+                callee_fqn,
+                args,
+                span,
+            });
+    }
+}
+
+/// Bump and return the SSA version of `name` (first write ⇒ 1; params stay the
+/// implicit `#0` roots the resolver mints).
+fn bump(versions: &mut std::collections::HashMap<String, u32>, name: &str) -> u32 {
+    let v = versions.entry(name.to_string()).or_insert(0);
+    *v += 1;
+    *v
+}
+
+/// A one-element access path.
+fn smallvec_one(s: String) -> SmallVec<[String; 2]> {
+    let mut v = SmallVec::new();
+    v.push(s);
+    v
 }

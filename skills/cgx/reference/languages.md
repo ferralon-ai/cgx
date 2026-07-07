@@ -1,7 +1,7 @@
 ---
 title: Language Support
 audience: agents and engineers using cgx
-Last Updated: 2026-06-25
+Last Updated: 2026-07-06
 ---
 
 # Language Support
@@ -108,23 +108,102 @@ resolve at `possible` (sig-compat or cha_rta rule).
 
 ---
 
+### Go — Tier 1 (shipped, PR #24)
+
+The language frontend is `cgx-lang-go`. Go reached Go-column parity as the first of the three
+post-launch Tier-1 adapters.
+
+**Error model — `error` return and `panic`**
+
+Go has no exceptions. Failure takes two forms:
+
+- **`if err != nil` branch** — ordinary data-conditioned failure branch. cgx labels these `exception` on
+  the call edge, for the same cross-language-consistency reason as Rust's `?` operator (see
+  `reference/mental-model.md` for the `exception` label definition).
+- **`panic()`** — non-recoverable abort unless an enclosing `defer` calls `recover()`. cgx labels `panic()`
+  paths `panic`; a `recover()` call inside a `defer` is labeled `exception`.
+
+**Dynamic dispatch — interface satisfaction**
+
+Direct calls resolve at `certain`. Interface-satisfied calls produce a candidate set of all types
+satisfying the interface, labeled `probable` in the Phase-1 syntactic graph (no SCIP). SCIP enrichment
+for Go is **not yet available** (`planned`, not shipped — see `docs/14-implementation-status-matrix.md`).
+
+**Closures and goroutines**
+
+`go func() { … }` produces a `spawns` edge to the goroutine body. Channel send/receive (`ch <-` / `<- ch`)
+are tracked as synchronization points. Concurrency/async hints are partial (`~`) — full lock-set modeling
+is not yet complete.
+
+---
+
+### Java — Tier 1 (shipped, PR #25)
+
+The language frontend is `cgx-lang-java`.
+
+**Error model — checked and unchecked exceptions**
+
+`throw` / `catch`; checked-exception declarations (`throws`) are indexed as metadata on callee edges.
+cgx labels edges reachable only via throw/catch `exception`; `always` otherwise.
+
+**Dynamic dispatch — virtual and interface dispatch**
+
+Static calls resolve at `certain`. Virtual dispatch produces a class-hierarchy-derived (CHA-style)
+candidate set labeled `probable` when the override set is a single implementation; reflection
+(`Class.forName`, `Method.invoke`) resolves at `possible`. SCIP enrichment for Java is **not yet
+available** (`planned`).
+
+**Closures and concurrency**
+
+Lambda and method-reference call edges are tracked as ordinary call edges. `ExecutorService.submit`,
+`CompletableFuture.runAsync`, and `Thread.start()` produce `spawns` edges. Concurrency/async hints are
+partial (`~`).
+
+---
+
+### Python — Tier 1 (shipped, PR #26)
+
+The language frontend is `cgx-lang-python`. Python is the newest adapter and carries the highest test
+count of the three post-launch languages.
+
+**Error model — `raise` / `except`**
+
+cgx labels edges inside `except` blocks (or reachable only via a `raise`) `exception`. Duck typing means
+the callee may not be statically resolvable — see dispatch below.
+
+**Dynamic dispatch — duck typing and attribute lookup**
+
+Unique-name-match calls resolve at `probable`. Attribute calls on a type-annotated variable resolve at
+`probable`; untyped attribute calls, `__call__`, and metaclass-mediated dispatch resolve at `possible`.
+SCIP enrichment for Python is **not yet available** (`planned`).
+
+**Closures and concurrency**
+
+Decorator chains are tracked as call sequences. `asyncio.create_task`, `threading.Thread.start`, and
+`concurrent.futures.submit` produce `spawns` edges. Concurrency/async hints are partial (`~`).
+
+**Known cross-language caveat:** the resolver's tiered name/arity fallback (`cgx-resolve/src/link.rs`)
+can over-report `probable` where `possible` is more honest for ambiguous global name collisions. This
+affects all five shipped languages, not just Python, and is a tracked backlog item, not a Python-specific
+defect.
+
+---
+
 ## Roadmap languages (not runnable today)
 
 The sections below describe the design, not the current implementation. cgx docs/08 defines these tiers
 and semantics ahead of implementation. Tag: not available until the language's Tier-1 adapter ships.
 
-### Tier 1 planned (in order): Python, Go, Java, C#
+### Tier 1 planned: C#
 
-These have full LS-2/LS-3/LS-4/LS-7/LS-8 specifications in docs/08-language-support.md but no
-language-specific crate as of v0.3.
+C# has full LS-2/LS-3/LS-4/LS-7/LS-8 specifications in docs/08-language-support.md but no
+language-specific crate yet. It is the last Tier-1 language on the roadmap — Rust, TypeScript, Go, Java,
+and Python have all shipped.
 
-Key reading caveats for when these ship:
+Key reading caveats for when it ships:
 
 | Language | Error model → cgx label | Dynamic dispatch caveat |
 |----------|------------------------|------------------------|
-| **Python** | `raise`/`except` → `exception`; duck typing means callee may not resolve statically | `probable` with name/type-annotation match; `possible` for untyped attribute calls |
-| **Go** | `if err != nil` → `exception` (data-conditioned; no unwinding); `panic()` → `panic` | Interface satisfaction candidate set → `probable`; direct calls → `certain` |
-| **Java** | `throw`/`catch` → `exception`; checked exception declarations indexed on callee edges | Virtual dispatch (CHA-style) → `probable`; static → `certain`; reflection → `possible` |
 | **C#** | `throw`/`catch` → `exception`; `Task` faulted state → `exception` on fault continuations | Properties are implicit method calls; GC-scheduled finalizers → `possible` |
 
 ### Tier 2: C, C++, C#, Kotlin, Swift, Ruby, PHP

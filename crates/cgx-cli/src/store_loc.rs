@@ -42,6 +42,16 @@ pub struct IndexPointer {
     pub graph_key: String,
     /// The stored graph's id; passed to `FactStore::read_graph`.
     pub graph_id: i64,
+    /// Total files seen by the pipeline (supported + unsupported), from
+    /// `IndexStats`. `#[serde(default)]` so a pointer written by a pre-existing
+    /// `.cgx/HEAD.json` (before this field existed) still parses; `cgx doctor`
+    /// then falls back to its "pipeline stats unavailable" placeholder.
+    #[serde(default)]
+    pub total_files: Option<usize>,
+    /// Files skipped because no registered adapter claimed them, from
+    /// `IndexStats`. See `total_files` for the `#[serde(default)]` rationale.
+    #[serde(default)]
+    pub unsupported_files: Option<usize>,
 }
 
 /// The `.cgx/` directory for a repository rooted at `repo_root`.
@@ -153,6 +163,8 @@ mod tests {
             &IndexPointer {
                 graph_key: "deadbeef".into(),
                 graph_id: 1,
+                total_files: None,
+                unsupported_files: None,
             },
         )
         .unwrap();

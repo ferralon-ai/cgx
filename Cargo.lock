@@ -2771,9 +2771,17 @@ name = "xtask"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
+ "cgx-core",
+ "cgx-doctor",
+ "cgx-index",
+ "cgx-query",
+ "cgx-store",
  "clap",
+ "predicates",
  "serde",
  "serde_yaml",
+ "tempfile",
  "walkdir",
 ]
 

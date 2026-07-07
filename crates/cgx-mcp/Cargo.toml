@@ -9,6 +9,7 @@ description = "cgx MCP STDIO server: a deterministic, read-only JSON-RPC 2.0 ser
 
 [dependencies]
 cgx-core.workspace = true
+cgx-cql = { path = "../cgx-cql" }
 cgx-index = { path = "../cgx-index" }
 cgx-query = { path = "../cgx-query" }
 cgx-store = { path = "../cgx-store" }

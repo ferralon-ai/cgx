@@ -246,14 +246,59 @@ fn notification_produces_no_response() {
 }
 
 #[test]
-fn graph_query_is_reserved_and_reports_unimplemented() {
-    let request = req(
-        1,
-        "tools/call",
-        json!({ "name": "graph_query", "arguments": { "query": "MATCH (n)", "root": "/tmp" } }),
+fn graph_query_runs_a_real_cql_query_and_returns_a_table() {
+    let (_t, repo) = init_repo();
+    // A tabular MATCH ... RETURN over the live CQL engine. `main` calls `helper`.
+    let structured = call_tool(
+        &repo,
+        "graph_query",
+        json!({ "query": r#"MATCH (a{name:"main"})-[:CALLS]->(b) RETURN a, b"# }),
     );
+    assert!(
+        structured["columns"].as_array().unwrap().len() == 2,
+        "two RETURN columns: {structured}"
+    );
+    let rows = structured["rows"].as_array().expect("rows array");
+    assert!(!rows.is_empty(), "main->helper produces a row: {structured}");
+    // Node cells resolve to {fqn,file,line,kind} objects (the CLI JSON contract).
+    let first_cell = &rows[0][0];
+    assert!(
+        first_cell["fqn"].as_str().unwrap().ends_with("main"),
+        "first bound node is main: {first_cell}"
+    );
+    assert!(first_cell["file"].is_string() && first_cell["line"].is_number());
+    // ADR-06 honesty metadata still rides along.
+    assert!(structured["graph_version"].is_string());
+}
+
+#[test]
+fn graph_query_plan_reject_is_an_actionable_error_not_a_panic() {
+    let (_t, repo) = init_repo();
+    let mut args = json!({ "query": "MATCH (a) RETURN a UNION MATCH (b) RETURN b" });
+    args.as_object_mut()
+        .unwrap()
+        .insert("root".into(), json!(repo.to_string_lossy()));
+    let request = req(1, "tools/call", json!({ "name": "graph_query", "arguments": args }));
     let resp = dispatch(&ServerConfig::default(), &request).expect("response");
-    assert!(resp.error.is_some(), "graph_query should error in Phase 1");
+    let err = resp.error.expect("plan-time reject surfaces an error");
+    // -32602 (invalid params): a valid-but-unsupported construct, honestly rejected.
+    assert_eq!(err.code, -32602, "actionable invalid-params, got {err:?}");
+}
+
+#[test]
+fn graph_query_return_path_surfaces_the_paths_channel() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(
+        &repo,
+        "graph_query",
+        json!({
+            "query": r#"MATCH path = (a{name:"main"})-[:CALLS*1..5]->(b{name:"leaf"}) RETURN path"#
+        }),
+    );
+    let paths = structured["paths"].as_array().expect("paths channel");
+    assert!(!paths.is_empty(), "main reaches leaf via a path: {structured}");
+    assert!(paths[0]["min_confidence"].is_string());
+    assert!(paths[0]["steps"].is_array());
 }
 
 // --- tool behavior tests ----------------------------------------------------

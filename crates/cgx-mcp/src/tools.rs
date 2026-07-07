@@ -137,7 +137,7 @@ fn explain_tool() -> Value {
 fn graph_query_tool() -> Value {
     json!({
         "name": "graph_query",
-        "description": "Execute a Cypher-subset query expression. Reserved: the query language is a post-Phase-1 deliverable; use callers/callees/paths/unused for now.",
+        "description": "Execute a CQL (Cypher-subset) query against the graph and return a result table (columns + rows). A `RETURN path` query yields a paths channel. Read-only; plan-time rejects of unsupported constructs return an actionable error.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -161,9 +161,7 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
         "paths" => paths_call(args),
         "unused" => unused_call(args),
         "explain" => explain_call(args),
-        "graph_query" => Err(ToolError::unimplemented(
-            "graph_query: the Cypher-subset query language is not implemented in Phase 1; use callers/callees/paths/unused",
-        )),
+        "graph_query" => graph_query_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
 }
@@ -525,4 +523,134 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
         "edges": edges
     });
     Ok(with_session_meta(body, &session))
+}
+
+/// `graph_query` (P8): route to the live CQL engine (`cgx_cql::run`) — the same
+/// engine `cgx query` drives, no fork. A tabular result surfaces `columns`/`rows`;
+/// a `RETURN path` query surfaces a `paths` channel (the `paths`-tool shape).
+/// Parse/plan/eval rejects map to an actionable `invalid_params` error.
+fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
+    let query = req_str(args, "query")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+
+    let table =
+        cgx_cql::run(view, query).map_err(|e| ToolError::invalid_params(e.to_string()))?;
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let truncated = table.truncation.is_some();
+    let truncation_reason = table.truncation.map(|r| r.token());
+
+    // A `RETURN path` query populates the path channel: surface paths (same shape
+    // as the `paths` tool) rather than opaque table cells.
+    if !table.paths.is_empty() {
+        let all: Vec<Value> = table.paths.iter().map(|p| cql_path_json(view, p)).collect();
+        let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
+        let body = json!({
+            "columns": table.columns,
+            "paths": all[start..end].to_vec(),
+            "total_matched": all.len(),
+            "has_more": has_more,
+            "cursor": cursor,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+        });
+        return Ok(with_session_meta(body, &session));
+    }
+
+    let all: Vec<Value> = table
+        .rows
+        .iter()
+        .map(|row| Value::Array(row.iter().map(|v| cql_cell_json(view, v)).collect()))
+        .collect();
+    let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
+    let body = json!({
+        "columns": table.columns,
+        "rows": all[start..end].to_vec(),
+        "total_matched": all.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// Resolve one CQL result-table cell to self-contained JSON (node/edge/path ids
+/// become their record fields) — the same contract `cgx query --format json` emits.
+fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
+    use cgx_cql::Value as V;
+    match v {
+        V::Null => Value::Null,
+        V::Bool(b) => json!(b),
+        V::Int(i) => json!(i),
+        V::Float(f) => json!(f),
+        V::Str(s) => json!(s),
+        V::List(items) => Value::Array(items.iter().map(|i| cql_cell_json(view, i)).collect()),
+        V::Node(id) => match view.try_node(*id) {
+            Some(n) => json!({
+                "fqn": n.fqn,
+                "file": n.file,
+                "line": n.line_start,
+                "kind": format!("{:?}", n.kind).to_lowercase(),
+            }),
+            None => Value::Null,
+        },
+        V::Edge(id) => match view.edge(*id) {
+            Some(e) => json!({
+                "kind": cgx_cql::eval::edge_kind_token(e.kind),
+                "condition": condition_token(e.condition),
+                "confidence": confidence_token(e.confidence),
+            }),
+            None => Value::Null,
+        },
+        V::Path(p) => Value::Array(
+            p.nodes
+                .iter()
+                .map(|n| match view.try_node(*n) {
+                    Some(rec) => json!(rec.fqn),
+                    None => json!(""),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Rebuild a Layer-1 [`PathResult`] from a CQL `RETURN path` binding and render it
+/// through the shared [`path_json`], so a `graph_query` path matches the `paths`
+/// tool byte-for-byte.
+fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
+    use cgx_query::PathStep;
+    let mut steps = Vec::with_capacity(p.nodes.len());
+    let mut min_confidence = Confidence::Certain;
+    let mut crosses_exceptional = false;
+    for (i, node) in p.nodes.iter().enumerate() {
+        let rec = match view.try_node(*node) {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+        let via = if i == 0 {
+            None
+        } else {
+            p.edges.get(i - 1).and_then(|e| view.edge(*e)).cloned()
+        };
+        if let Some(e) = &via {
+            min_confidence = min_confidence.min(e.confidence);
+            if e.condition.is_exceptional() {
+                crosses_exceptional = true;
+            }
+        }
+        let exception_transient = crosses_exceptional;
+        steps.push(PathStep {
+            node: rec,
+            via,
+            exception_transient,
+        });
+    }
+    path_json(&PathResult {
+        steps,
+        min_confidence,
+        crosses_exceptional,
+    })
 }

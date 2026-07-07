@@ -69,35 +69,26 @@ impl WriteLock {
 
         let mut boxed: Box<RwLock<File>> = Box::new(RwLock::new(file));
 
-        // Poll for availability on a short-lived borrow so the loop does not hold
-        // a `'static` borrow across iterations. Once `try_write` succeeds we drop
-        // that guard and take the real one on a fresh `'static` borrow below.
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match boxed.try_write() {
-                Ok(_guard) => break,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(_) => return Err(StoreError::LockTimeout),
-            }
-        }
-
-        // SAFETY: We extend the borrow of `*boxed` from its true lifetime to
-        // `'static`, then store that borrow (`guard`) alongside the `Box` that
-        // owns it inside the returned `WriteLock`. This is sound because every
-        // condition required for the extended borrow to stay valid holds:
+        // Raw pointer to the heap-pinned `RwLock`. We poll for the lock *through*
+        // this pointer and keep the very guard that first succeeds — there is no
+        // intermediate "acquire, release, re-acquire" step, so no window exists in
+        // which another writer can slip in between our success and our commit.
+        //
+        // SAFETY: We produce a `guard: RwLockWriteGuard<'static, File>` that
+        // borrows `*boxed` and store it alongside the `Box` that owns it inside the
+        // returned `WriteLock`. Every condition for the `'static` borrow to stay
+        // valid holds:
         //
         // 1. STABLE ADDRESS. `boxed: Box<RwLock<File>>` is moved into the returned
         //    `WriteLock._lock` and is never reallocated or moved out afterward
         //    (the box, not its pointee, is what moves; the pointee's heap address
         //    is fixed for the box's whole life). So the address `guard` borrows
         //    from is valid for as long as the `WriteLock` lives.
-        // 2. NO ALIASING `&mut`. The only path that creates a `&mut RwLock<File>`
-        //    here is this one. The poll loop above borrowed `boxed` only on
-        //    short-lived `try_write` calls that were fully dropped before this
-        //    line, and after this point `_lock` is never touched again (it is a
-        //    `_`-prefixed field accessed nowhere). So the `&'static mut` is
+        // 2. NO ALIASING `&mut`. `raw` is the only pointer through which
+        //    `*boxed` is accessed. On each failed `try_write` the transient
+        //    reborrow ends before the next iteration; the single reborrow that
+        //    succeeds becomes `guard`, and `_lock` is never touched again (it is a
+        //    `_`-prefixed field accessed nowhere). So the live `&'static mut` is
         //    genuinely unique for the guard's whole life.
         // 3. DROP ORDER. `guard` is declared before `_lock` in `WriteLock`, so it
         //    is dropped first (Rust drops fields in declaration order). The
@@ -109,12 +100,19 @@ impl WriteLock {
         //    (not shared), so no other thread can observe the extended borrow.
         //    Cross-process exclusion is handled by `flock` on the fd, not by this
         //    borrow.
-        //
-        // The re-acquire cannot block meaningfully: this process just observed the
-        // lock free on the same fd, and `flock` is idempotent for the holder.
-        let lock_ref: &'static mut RwLock<File> =
-            unsafe { &mut *(boxed.as_mut() as *mut RwLock<File>) };
-        let guard = lock_ref.try_write().map_err(|_| StoreError::LockTimeout)?;
+        let raw: *mut RwLock<File> = boxed.as_mut();
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        let guard: RwLockWriteGuard<'static, File> = loop {
+            // SAFETY: see the invariants above; `raw` points at the stable, uniquely
+            // owned `*boxed`, and any failed reborrow is dropped before the retry.
+            match unsafe { (*raw).try_write() } {
+                Ok(guard) => break guard,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(_) => return Err(StoreError::LockTimeout),
+            }
+        };
         Ok(WriteLock {
             guard: Some(guard),
             _lock: boxed,

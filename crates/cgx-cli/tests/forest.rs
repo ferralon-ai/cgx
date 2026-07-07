@@ -30,6 +30,7 @@ fn node(id: u32, fqn: &str) -> NodeRecord {
         signature: None,
         own_effects: Default::default(),
         transitive_effects: Default::default(),
+        unresolved_calls: 0,
     }
 }
 

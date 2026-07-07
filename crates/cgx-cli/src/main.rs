@@ -19,8 +19,9 @@ use cgx_diff::BlameRepo;
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
-    callees, callers, neighborhood, paths as query_paths, rank_symbols, reaches, search_symbols,
-    unused, Direction, EdgeFilter, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
+    callees, callers, contract, entrypoint_roots, neighborhood, paths as query_paths, rank_symbols,
+    reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, GraphView,
+    PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
@@ -769,7 +770,16 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
         Some(id) => id,
         // Zero-symbol match under --assert-empty: an empty, vacuous result.
-        None => return emit(subcommand, &args, empty_neighbors(&args), false, 0),
+        None => {
+            return emit(
+                subcommand,
+                &args,
+                empty_neighbors(&args),
+                false,
+                0,
+                ApproximationContract::exact(),
+            )
+        }
     };
 
     let walker = build_forest_walker(&args);
@@ -781,6 +791,7 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
         NeighborDir::Callers => callers(&view, anchor, &walker),
         NeighborDir::Callees => callees(&view, anchor, &walker),
     };
+    let approximation = contract::for_neighbors(&view, &walker, anchor, walk_dir, &results);
     let subgraph = neighborhood(&view, anchor, &walker, walk_dir);
 
     // Vacuity clause (b): re-run with filters stripped to learn the unfiltered count.
@@ -801,6 +812,7 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
         neighbors_with_forest(&view, &args, results, subgraph),
         true,
         unfiltered.len(),
+        approximation,
     )
 }
 
@@ -852,7 +864,16 @@ fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError>
     let view = prepare_view(&args)?;
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
         Some(id) => id,
-        None => return emit(subcommand, &args, empty_neighbors(&args), false, 0),
+        None => {
+            return emit(
+                subcommand,
+                &args,
+                empty_neighbors(&args),
+                false,
+                0,
+                ApproximationContract::exact(),
+            )
+        }
     };
 
     let walker = build_flow_walker(&args);
@@ -862,6 +883,7 @@ fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError>
         FlowDir::Backward => (Direction::Forward, callees(&view, anchor, &walker)),
         FlowDir::Forward => (Direction::Backward, callers(&view, anchor, &walker)),
     };
+    let approximation = contract::for_neighbors(&view, &walker, anchor, walk_dir, &results);
     let subgraph = neighborhood(&view, anchor, &walker, walk_dir);
 
     // Vacuity clause (b): re-run with the confidence/condition filters stripped to
@@ -885,6 +907,7 @@ fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError>
         neighbors_with_forest(&view, &args, results, subgraph),
         true,
         unfiltered.len(),
+        approximation,
     )
 }
 
@@ -922,7 +945,16 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
     let view = prepare_view(&args)?;
     let from_id = match resolve_anchor_lenient(&view, from, args.assert_empty)? {
         Some(id) => id,
-        None => return emit("reaches", &args, empty_neighbors(&args), false, 0),
+        None => {
+            return emit(
+                "reaches",
+                &args,
+                empty_neighbors(&args),
+                false,
+                0,
+                ApproximationContract::exact(),
+            )
+        }
     };
     match to {
         // `from → *`: every reachable symbol (callees machinery), as a forest. Uses
@@ -930,6 +962,8 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
         None => {
             let walker = build_forest_walker(&args);
             let results = callees(&view, from_id, &walker);
+            let approximation =
+                contract::for_neighbors(&view, &walker, from_id, Direction::Forward, &results);
             let subgraph = neighborhood(&view, from_id, &walker, Direction::Forward);
             let unfiltered = callees(
                 &view,
@@ -947,6 +981,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                 neighbors_with_forest(&view, &args, results, subgraph),
                 true,
                 unfiltered.len(),
+                approximation,
             )
         }
         // `from → to`: a single reachability answer, rendered as its witness path.
@@ -960,11 +995,13 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                         ResultSet::Paths(PathSet::default()),
                         false,
                         0,
+                        ApproximationContract::exact(),
                     )
                 }
             };
             let walker = build_walker(&args);
             let result = reaches(&view, from_id, to_id, &walker);
+            let approximation = contract::for_reaches(&view, &walker, from_id, &result);
             let paths = result.witness.into_iter().collect::<Vec<_>>();
             let count = paths.len();
             let matched = true; // both endpoints resolved above
@@ -977,6 +1014,7 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                 }),
                 matched,
                 count,
+                approximation,
             )
         }
     }
@@ -990,10 +1028,20 @@ fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
     ) {
         (Some(f), Some(t)) => (f, t),
         // Either endpoint unresolved under --assert-empty → empty, vacuous.
-        _ => return emit("paths", &args, ResultSet::Paths(PathSet::default()), false, 0),
+        _ => {
+            return emit(
+                "paths",
+                &args,
+                ResultSet::Paths(PathSet::default()),
+                false,
+                0,
+                ApproximationContract::exact(),
+            )
+        }
     };
     let walker = build_paths_walker(&args);
     let results = query_paths(&view, from_id, to_id, &walker);
+    let approximation = contract::for_paths(&view, &walker, from_id, &results);
 
     let unfiltered = query_paths(
         &view,
@@ -1013,6 +1061,7 @@ fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
         ResultSet::Paths(results),
         true,
         unfiltered_len,
+        approximation,
     )
 }
 
@@ -1021,6 +1070,7 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
     let walker = build_walker(&args);
     let kinds: Vec<SymbolKind> = kind.map(SymbolKind::from).into_iter().collect();
     let results = unused(&view, &[], &kinds, &walker);
+    let approximation = contract::for_unused(&view, &walker, &entrypoint_roots(&view, &[]));
     let len = results.len();
     // `unused` has no symbol-pattern argument: clause (a) is "are there any
     // symbols at all"; clause (b) does not apply (no confidence filter changes the
@@ -1031,6 +1081,7 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
         ResultSet::Nodes(results),
         view.node_count() > 0,
         len,
+        approximation,
     )
 }
 
@@ -1086,8 +1137,16 @@ fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
         // marker and JSON `truncated`/`truncation_reason` fields that Layer-1
         // `paths` emits appear when the budget fired.
         set.truncation = table.truncation;
+        let approximation = contract::for_path_set(&set);
         let count = set.len();
-        return emit("query", &args, ResultSet::Paths(set), any_symbol_matched, count);
+        return emit(
+            "query",
+            &args,
+            ResultSet::Paths(set),
+            any_symbol_matched,
+            count,
+            approximation,
+        );
     }
 
     if args.format.is_path_graph() {
@@ -1099,8 +1158,16 @@ fn run_query(query: &str, args: QueryArgs) -> Result<(), CliError> {
     }
 
     let resolved = TableData::resolve(&view, &table);
+    let approximation = contract::over_only(resolved.has_over_approx_edge());
     let count = resolved.rows.len();
-    emit("query", &args, ResultSet::Table(resolved), any_symbol_matched, count)
+    emit(
+        "query",
+        &args,
+        ResultSet::Table(resolved),
+        any_symbol_matched,
+        count,
+        approximation,
+    )
 }
 
 /// Reconstruct a Layer-1 [`PathSet`] from a CQL query's path channel
@@ -1282,6 +1349,7 @@ fn emit(
     results: ResultSet,
     any_symbol_matched: bool,
     unfiltered_count: usize,
+    contract: ApproximationContract,
 ) -> Result<(), CliError> {
     // The dot/mermaid/d2 emitters are path-graph only: reject them for any
     // non-path result (callers/callees/unused/reaches-all, or a tabular query).
@@ -1308,7 +1376,7 @@ fn emit(
 
     print!(
         "{}",
-        render(subcommand, args.format, &results, outcome.vacuous)
+        render(subcommand, args.format, &results, outcome.vacuous, &contract)
     );
 
     if let Some(w) = &outcome.warning {

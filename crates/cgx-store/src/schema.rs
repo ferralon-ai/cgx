@@ -29,7 +29,13 @@
 /// (postcard of `EdgeRecord.transform`, `#[serde(default)]`-additive). A v2 store
 /// opened by a v3 binary is forward-migrated by clear-and-reindex (the Layer-1
 /// `blob_facts` cache is preserved — see [`crate::store`]).
-pub const SCHEMA_VERSION: i64 = 3;
+///
+/// v4 (A3/A4 answer-honesty contract): the node `data` blob gains
+/// `NodeRecord.unresolved_calls` (`#[serde(default)]`-additive; no new SQL
+/// column, so the `--sql` views are unchanged). Bumped so v3 node blobs are
+/// never decoded by a v4 binary — the clear-and-reindex migration repopulates
+/// Layer 2 with stamped counts.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// View-schema version (ADR-05), surfaced via the `cgx_meta` view. Bumped only on
 /// view-breaking changes (renamed/removed columns or views), independently of the

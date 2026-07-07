@@ -130,6 +130,15 @@ pub struct NodeRecord {
     /// reserved now so P8b needs no schema change.
     #[serde(default)]
     pub transitive_effects: EffectSet,
+    /// Number of call references in this symbol's body that resolved to **no**
+    /// target (resolver Step-5 dangling refs, LS-6 — external/unindexed callees
+    /// pre-SCIP). Those refs leave *no edge* in the graph, so this count is the
+    /// only walk-visible trace of the blind spot; the approximation contract
+    /// (A3/A4) reads it so a negative answer whose frontier crosses an external
+    /// call is never emitted as an unqualified `exact`. `#[serde(default)]` so
+    /// existing postcard rows (which predate this field) decode as 0.
+    #[serde(default)]
+    pub unresolved_calls: u32,
 }
 
 /// A call-site node record (GM-1.4 / ADR-01). Subordinate node kind.

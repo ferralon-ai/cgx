@@ -505,6 +505,133 @@ fn confidence_certain_floor_returns_only_certain_edges() {
 }
 
 #[test]
+fn approximation_contract_rides_every_surface() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+
+    // JSON: every positive answer carries a structured `approximation` object
+    // (A3) with a direction in the ladder and a machine-readable reasons array.
+    let (json, code) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    assert_eq!(code, 0, "callees json: {json}");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let approx = &v["approximation"];
+    assert!(
+        matches!(
+            approx["direction"].as_str(),
+            Some("exact") | Some("over") | Some("under") | Some("over_under")
+        ),
+        "direction is in the ladder: {json}"
+    );
+    assert!(approx["reasons"].is_array(), "reasons is an array: {json}");
+
+    // Human: exactly one compact contract line, prefixed `approximation:`.
+    let (human, code) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(code, 0, "callees human: {human}");
+    let contract_lines: Vec<&str> = human
+        .lines()
+        .filter(|l| l.starts_with("approximation:"))
+        .collect();
+    assert_eq!(
+        contract_lines.len(),
+        1,
+        "exactly one compact contract line: {human}"
+    );
+
+    // A4: a *negative* reachability answer states its scope. `beta` is a leaf, so
+    // it cannot reach `alpha`.
+    let (neg, code) = run_cgx(
+        &repo,
+        &["reaches", "beta", "alpha", "--format", "json"],
+    );
+    assert_eq!(code, 0, "negative reaches json: {neg}");
+    let nv: serde_json::Value = serde_json::from_str(&neg).expect("json");
+    let scope = &nv["approximation"]["scope"];
+    assert!(
+        scope["searched_edge_kinds"].is_array(),
+        "negative answer states searched edge kinds: {neg}"
+    );
+    assert!(
+        scope["confidence_floor"].is_string(),
+        "negative answer states its confidence floor: {neg}"
+    );
+
+    // SARIF: the contract rides as a note-level result with structured properties.
+    let (sarif, code) = run_cgx(&repo, &["unused", "--format", "sarif"]);
+    assert_eq!(code, 0, "unused sarif: {sarif}");
+    let sv: serde_json::Value = serde_json::from_str(&sarif).expect("sarif json");
+    let results = sv["runs"][0]["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| r["ruleId"] == serde_json::json!("cgx/approximation-contract")),
+        "a SARIF approximation-contract note is present: {sarif}"
+    );
+}
+
+/// The decisive false-exact case (review of PR #34): a caller whose only call is
+/// **external** produces a resolver Step-5 dangling ref — NO edge exists in the
+/// graph, so an edge-only frontier scan sees a clean frontier. The negative
+/// `reaches` answer must still be `under` (reason `unresolved-external-calls`),
+/// never a bare `exact`: the search could not follow the call out of the modeled
+/// graph. This exercises the real resolver output, not a manufactured edge.
+#[test]
+fn negative_reaches_over_external_call_is_not_bare_exact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/main.rs"),
+        "fn main() {\n    ext_caller();\n}\n\n\
+         fn ext_caller() {\n    std::process::exit(0);\n}\n\n\
+         fn target() {\n    let _ = 1 + 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"extfx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    index(&repo);
+
+    let (out, code) = run_cgx(&repo, &["reaches", "ext_caller", "target", "--format", "json"]);
+    assert_eq!(code, 0, "negative reaches succeeds: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["count"], serde_json::json!(0), "no path exists: {out}");
+    let approx = &v["approximation"];
+    assert_eq!(
+        approx["direction"],
+        serde_json::json!("under"),
+        "external call on the frontier must force `under`, not `exact`: {out}"
+    );
+    assert!(
+        approx["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["code"] == serde_json::json!("unresolved-external-calls")),
+        "the dangling-ref reason must surface: {out}"
+    );
+    assert!(
+        approx["modeled_graph"].is_string(),
+        "the standing modeled-graph carve-out rides every contract: {out}"
+    );
+
+    // Human line: the direction is stated as under-approximate, not exact.
+    let (human, code) = run_cgx(&repo, &["reaches", "ext_caller", "target"]);
+    assert_eq!(code, 0);
+    assert!(
+        human.contains("approximation: under-approximate"),
+        "human line states under-approximation: {human}"
+    );
+}
+
+#[test]
 fn explain_unknown_symbol_is_usage_error_exit_2() {
     let (_tmp, repo) = fixture_repo();
     index(&repo);

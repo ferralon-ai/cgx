@@ -149,6 +149,7 @@ fn build_nodes(
                 own_effects,
                 // P8b populates this via the transitive closure pass; empty here.
                 transitive_effects: cgx_core::EffectSet::new(),
+                unresolved_calls: 0,
             };
             let prov = Provenance::new(
                 def.span.clone(),
@@ -897,6 +898,7 @@ impl ValueNodeStage {
             signature: None,
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         };
         let prov = Provenance::new(self.span, "ssa-value", Tier::ScopeGraph, self.blob_oid);
         NodeWithProvenance {
@@ -1337,12 +1339,35 @@ fn emit_candidate_set(
 
 /// Sort nodes/edges into canonical order, assign dense edge ids, sort candidates.
 fn finalize(
-    nodes: Vec<NodeWithProvenance>,
+    mut nodes: Vec<NodeWithProvenance>,
     edges: Vec<EdgeWithProvenance>,
     candidates: Vec<Candidate>,
     mut unresolved: Vec<UnresolvedRef>,
 ) -> ResolvedGraph {
     unresolved.sort();
+
+    // Stamp each caller's Step-5 dangling-ref count onto its node record
+    // (`NodeRecord.unresolved_calls`). Dangling refs leave *no edge*, so this
+    // count is the only trace of the blind spot a graph walk can see — the
+    // approximation contract (A3/A4) reads it so a negative answer whose
+    // frontier crosses an external/unindexed call is never claimed `exact`.
+    // Keyed by `(caller fqn, file)`: the ref's span lies inside the caller's
+    // body, so its file matches the caller node's file.
+    let mut dangling: std::collections::BTreeMap<(&str, &str), u32> =
+        std::collections::BTreeMap::new();
+    for r in &unresolved {
+        *dangling
+            .entry((r.caller_fqn.as_str(), r.span.file.as_str()))
+            .or_default() += 1;
+    }
+    if !dangling.is_empty() {
+        for n in &mut nodes {
+            if let Some(count) = dangling.get(&(n.node.fqn.as_str(), n.node.file.as_str())) {
+                n.node.unresolved_calls = *count;
+            }
+        }
+    }
+
     let mut graph = ResolvedGraph {
         nodes,
         edges,

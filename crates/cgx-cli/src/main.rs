@@ -674,6 +674,8 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
         &IndexPointer {
             graph_key: outcome.graph_key.clone(),
             graph_id: outcome.graph_id.0,
+            total_files: Some(outcome.stats.blobs_indexed + outcome.stats.blobs_unsupported),
+            unsupported_files: Some(outcome.stats.blobs_unsupported),
         },
     )?;
     Ok(outcome)
@@ -1331,8 +1333,12 @@ fn run_doctor(repo: Option<PathBuf>, format: Format) -> Result<(), CliError> {
     let repo_root = resolve_repo(repo)?;
     let ptr = read_pointer(&repo_root)?;
     let store = open_store(&repo_root)?;
-    let rep = cgx_doctor::report(&store, GraphId(ptr.graph_id))
+    let mut rep = cgx_doctor::report(&store, GraphId(ptr.graph_id))
         .map_err(|e| CliError::graph(format!("reading graph: {e}")))?;
+    if let (Some(total_files), Some(unsupported_files)) = (ptr.total_files, ptr.unsupported_files)
+    {
+        cgx_doctor::report::patch_index_stats(&mut rep, total_files, unsupported_files);
+    }
     match format {
         Format::Json => println!(
             "{}",

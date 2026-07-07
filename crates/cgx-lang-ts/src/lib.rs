@@ -35,6 +35,18 @@
 //! - **Entrypoint hints:** Jest `test()` / `it()` / `describe()` top-level calls,
 //!   named `main()` function.
 //!
+//! - **Own-effects (GM-12 Phase 1):** a name-based syntactic heuristic
+//!   ([`effects`](crate::effects)) attributes `io.net`/`io.file`/`io.proc`,
+//!   `nondeterministic`, `dynamic-code`, `blocking`, and `spawns` effects to the
+//!   enclosing named definition (`possible`-grade — no import/type resolution).
+//!
+//! - **Intraprocedural SSA dataflow (v0.3 DATA_FLOW):** each production site
+//!   (declaration / assignment / `+=` / projection / call / return) lowers into a
+//!   [`DataFlowFact`](cgx_frontend::DataFlowFact) with the `DerivesFrom`
+//!   orientation `derived → source`, powering `flows-to` / `flows-from`. Only
+//!   block-bodied functions/methods/named arrows are covered; closure-capture and
+//!   expression-body-arrow dataflow are deferred (matching Go/Python).
+//!
 //! - **Signatures (ADR-04):** recorded where the surface declares them (parameter
 //!   names + optional type annotations, return type); never inferred.
 //!
@@ -48,6 +60,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod effects;
 mod extract;
 mod module;
 mod query;

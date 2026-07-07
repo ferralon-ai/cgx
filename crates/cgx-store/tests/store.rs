@@ -488,6 +488,7 @@ prop_compose! {
             signature: None,
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         }
     }
 }

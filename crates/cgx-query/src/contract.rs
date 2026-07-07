@@ -94,22 +94,38 @@ pub struct NegativeScope {
     pub max_depth: Option<u32>,
 }
 
+/// The standing modeling boundary every contract is scoped to. `exact` is always
+/// relative to this modeled graph, never an absolute claim about the program:
+/// blind spots that leave no per-answer fact (undescended closure/lambda bodies
+/// deferred by all five adapters, external callees pre-SCIP whose dangling refs
+/// fall outside the searched region) are carved out here so a bare unqualified
+/// `exact` is impossible. Per-answer facts (cut markers, dangling-ref counts,
+/// bounds) *narrow* the claim further via `reasons[]`.
+pub const MODELED_GRAPH: &str = "descended function bodies in the indexed repository; \
+external/unindexed callees, undescended closure bodies, and unexpanded macros are \
+outside the modeled graph";
+
 /// The per-answer approximation contract attached to every query answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApproximationContract {
     pub direction: ApproxDirection,
     pub reasons: Vec<ApproxReason>,
+    /// The standing modeling boundary the whole contract (including `exact`) is
+    /// relative to. Constant per binary; see [`MODELED_GRAPH`].
+    pub modeled_graph: &'static str,
     /// Present only for a *negative*/absence answer (A4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<NegativeScope>,
 }
 
 impl ApproximationContract {
-    /// An `exact`, reason-free contract (no known source of error).
+    /// An `exact`, reason-free contract (no known source of error *within the
+    /// modeled graph* — the standing [`MODELED_GRAPH`] carve-out still applies).
     pub fn exact() -> Self {
         ApproximationContract {
             direction: ApproxDirection::Exact,
             reasons: Vec::new(),
+            modeled_graph: MODELED_GRAPH,
             scope: None,
         }
     }
@@ -130,6 +146,7 @@ impl ApproximationContract {
         ApproximationContract {
             direction,
             reasons,
+            modeled_graph: MODELED_GRAPH,
             scope,
         }
     }
@@ -138,8 +155,10 @@ impl ApproximationContract {
     /// wall: direction, the reason phrases joined by `; `, and (for a negative) a
     /// terse scope tail.
     pub fn human_summary(&self) -> String {
+        // `exact` is always qualified: it claims nothing beyond the modeled
+        // graph (the full statement rides in the JSON `modeled_graph` field).
         let dir = match self.direction {
-            ApproxDirection::Exact => "exact",
+            ApproxDirection::Exact => "exact (within modeled graph)",
             ApproxDirection::Over => "over-approximate",
             ApproxDirection::Under => "under-approximate",
             ApproxDirection::OverUnder => "over- and under-approximate",
@@ -259,6 +278,20 @@ fn depth_limit_reason(depth: u32) -> ApproxReason {
     }
 }
 
+/// Resolver Step-5 dangling refs on touched nodes: calls that resolved to **no**
+/// target and therefore left no edge the walk could follow (the common external/
+/// unindexed-callee case pre-SCIP). Read from `NodeRecord.unresolved_calls`.
+fn dangling_refs_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "unresolved-external-calls",
+        detail: format!(
+            "{count} call(s) in the searched region resolved to no in-repo target \
+             (external/unindexed callee; no SCIP) and could not be followed"
+        ),
+    }
+}
+
 fn truncation_reason(reason: TruncationReason) -> ApproxReason {
     let (code, detail) = match reason {
         TruncationReason::StepBudget => (
@@ -282,6 +315,11 @@ fn truncation_reason(reason: TruncationReason) -> ApproxReason {
 /// The incompleteness facts gathered by scanning the subgraph a walk touched.
 #[derive(Debug, Default)]
 struct FrontierFacts {
+    /// Total resolver Step-5 dangling refs (`NodeRecord.unresolved_calls`) on
+    /// touched nodes — calls that left NO edge and could not be followed. The
+    /// walk-invisible blind spot; without this a negative over an external call
+    /// would be claimed clean.
+    dangling_refs: u64,
     /// Per-marker count of cut-marked edges incident (in the walk direction) to a
     /// reached node — the blind spots on the search frontier.
     cut_counts: BTreeMap<CutMarker, usize>,
@@ -295,6 +333,9 @@ struct FrontierFacts {
 impl FrontierFacts {
     fn into_reasons(self, walker: &PathWalker) -> Vec<ApproxReason> {
         let mut reasons = Vec::new();
+        if self.dangling_refs > 0 {
+            reasons.push(dangling_refs_reason(self.dangling_refs));
+        }
         for (marker, count) in self.cut_counts {
             reasons.push(cut_reason(marker, count));
         }
@@ -311,9 +352,12 @@ impl FrontierFacts {
 }
 
 /// Scan the subgraph reached from `roots` in direction `dir` under `walker`,
-/// collecting the incompleteness facts on its frontier. Bounded to the touched
-/// region: a BFS to gather the reached set, then one incident-edge pass per
-/// reached node. Deterministic (indexes arrays, never iterates a map for order).
+/// collecting the incompleteness facts on its frontier: dangling-ref counts on
+/// the touched nodes (calls that left no edge), cut-marked and below-floor
+/// incident edges, and depth-horizon truncation. Edge/node work is O(touched);
+/// the visited/depth arrays are O(total nodes), the same allocation profile as
+/// every walk in this crate. Deterministic (touched list in BFS order; never
+/// iterates a hash map).
 fn scan_frontier(
     view: &GraphView,
     walker: &PathWalker,
@@ -323,16 +367,23 @@ fn scan_frontier(
     let n = view.node_count();
     let mut reached = vec![false; n];
     let mut depth_of = vec![u32::MAX; n];
+    let mut touched: Vec<NodeId> = Vec::new();
     for &r in roots {
         if let Some(i) = idx(r, n) {
-            reached[i] = true;
-            depth_of[i] = 0;
+            if !reached[i] {
+                reached[i] = true;
+                depth_of[i] = 0;
+                touched.push(r);
+            }
         }
     }
     for &r in roots {
         for d in walker.bfs(view, r, dir) {
             if let Some(i) = idx(d.node, n) {
-                reached[i] = true;
+                if !reached[i] {
+                    reached[i] = true;
+                    touched.push(d.node);
+                }
                 depth_of[i] = depth_of[i].min(d.depth);
             }
         }
@@ -348,12 +399,19 @@ fn scan_frontier(
     };
     let floor = walker.filter.min_confidence;
 
+    // Dangling refs are a fact about a node's *body* (its outgoing calls), so
+    // they witness incompleteness only when the walk follows call-family edges
+    // in the forward direction (callees/reaches/unused frontiers). A backward
+    // (callers) walk or a DerivesFrom-scoped walk does not traverse the missing
+    // out-edge.
+    let count_dangling = dir == Direction::Forward && walker.filter.kinds.is_none();
+
     let mut facts = FrontierFacts::default();
-    for node_ix in 0..n {
-        if !reached[node_ix] {
-            continue;
+    for &node in &touched {
+        let node_ix = node.index();
+        if count_dangling {
+            facts.dangling_refs += u64::from(view.node(node).unresolved_calls);
         }
-        let node = NodeId(node_ix as u32);
         for er in view.neighbors(node, dir, &scan_filter) {
             for marker in er.edge.cut_markers.iter() {
                 *facts.cut_counts.entry(marker).or_default() += 1;
@@ -583,6 +641,7 @@ mod tests {
             signature: None,
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         }
     }
 
@@ -683,6 +742,28 @@ mod tests {
     }
 
     #[test]
+    fn dangling_external_call_blocks_false_exact_on_negative_reaches() {
+        // `a` calls only an external symbol: the resolver's Step-5 leaves NO edge
+        // and stamps `unresolved_calls` on `a` instead. A negative `reaches a b`
+        // must NOT be claimed bare-exact — the search could not follow the call
+        // out of the modeled graph.
+        let mut a = node(0, "a", 10, None);
+        a.unresolved_calls = 1;
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let view = GraphView::new(nodes, Vec::new(), Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+        let result = reaches(&view, NodeId(0), NodeId(1), &w);
+        assert!(!result.reachable);
+        let c = for_reaches(&view, &w, NodeId(0), &result);
+        assert_eq!(c.direction, ApproxDirection::Under);
+        assert!(
+            c.reasons.iter().any(|r| r.code == "unresolved-external-calls"),
+            "dangling refs on the touched frontier must surface: {c:?}"
+        );
+        assert!(c.scope.is_some());
+    }
+
+    #[test]
     fn negative_reaches_carries_scope_and_frontier_caveat() {
         // a -> b (certain) with an unresolved cut on b; c is unreachable from a.
         let nodes = vec![node(0, "a", 10, None), node(1, "b", 20, None), node(2, "c", 30, None)];
@@ -756,7 +837,10 @@ mod tests {
         let w = walker(None, Confidence::Possible);
         let results = callees(&view, NodeId(0), &w);
         let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
-        assert_eq!(c.human_summary(), "approximation: exact");
+        assert_eq!(
+            c.human_summary(),
+            "approximation: exact (within modeled graph)"
+        );
         assert!(!c.human_summary().contains('\n'));
     }
 

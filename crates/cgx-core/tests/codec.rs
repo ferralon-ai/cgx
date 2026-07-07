@@ -33,6 +33,7 @@ fn sample_node() -> NodeRecord {
             cgx_core::Effect::Blocking,
         ]),
         transitive_effects: cgx_core::EffectSet::new(),
+        unresolved_calls: 0,
     }
 }
 

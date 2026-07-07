@@ -29,6 +29,7 @@ pub fn sample_graph() -> LinkedGraph {
             }),
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         },
         NodeRecord {
             id: NodeId(1),
@@ -57,6 +58,7 @@ pub fn sample_graph() -> LinkedGraph {
                 cgx_core::Effect::Nondeterministic,
             ]),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         },
         NodeRecord {
             id: NodeId(2),
@@ -72,6 +74,7 @@ pub fn sample_graph() -> LinkedGraph {
             signature: None,
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
         },
     ];
 

@@ -11,10 +11,10 @@
 
 use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
-    callees, callers, explain, paths as query_paths, rank_symbols, reaches, reaches_all,
-    resolve_anchor, search_symbols, unused, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
-    GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
-    SymbolRank,
+    callees, callers, contract, entrypoint_roots, explain, paths as query_paths, rank_symbols,
+    reaches, reaches_all, resolve_anchor, search_symbols, unused, ApproximationContract,
+    ConditionFilter, Direction, EdgeBreakdown, EdgeFilter, GraphView, NeighborResult, PathResult,
+    PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit, SymbolRank,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -521,6 +521,19 @@ fn paginate(total: usize, offset: usize, limit: usize) -> (usize, usize, bool, O
     (start, end, has_more, cursor)
 }
 
+/// Attach the A3/A4 answer-honesty contract to a result envelope. The contract is
+/// serialized straight off the shared `cgx_query` type, so the MCP tool emits the
+/// same `approximation` schema the CLI `--format json` surface does (the MCP tools
+/// reuse the query layer, so they inherit the contract verbatim).
+fn with_contract(mut body: Value, contract: &ApproximationContract) -> Value {
+    let obj = body.as_object_mut().expect("result body is an object");
+    obj.insert(
+        "approximation".into(),
+        serde_json::to_value(contract).expect("approximation contract serializes"),
+    );
+    body
+}
+
 /// Attach the ADR-06 honesty metadata to a result envelope.
 fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     let obj = body.as_object_mut().expect("result body is an object");
@@ -550,6 +563,7 @@ fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
         Direction::Backward => callers(&session.view, anchor, &walker),
         Direction::Forward => callees(&session.view, anchor, &walker),
     };
+    let approximation = contract::for_neighbors(&session.view, &walker, anchor, dir, &results);
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
@@ -563,7 +577,7 @@ fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
         "has_more": has_more,
         "cursor": cursor
     });
-    Ok(with_session_meta(body, &session))
+    Ok(with_session_meta(with_contract(body, &approximation), &session))
 }
 
 fn paths_call(args: &Value) -> Result<Value, ToolError> {
@@ -589,6 +603,7 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
         max_steps: None,
     };
     let result = query_paths(&session.view, from_id, to_id, &walker);
+    let approximation = contract::for_paths(&session.view, &walker, from_id, &result);
     let results = &result.paths;
 
     let limit = page_size(args, DEFAULT_PATHS_MAX_RESULTS)?;
@@ -608,7 +623,7 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
         "truncated": result.truncated(),
         "truncation_reason": result.truncation.map(|r| r.token())
     });
-    Ok(with_session_meta(body, &session))
+    Ok(with_session_meta(with_contract(body, &approximation), &session))
 }
 
 fn unused_call(args: &Value) -> Result<Value, ToolError> {
@@ -629,6 +644,11 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
 
     let walker = PathWalker::default();
     let results = unused(&session.view, &entrypoints, &kinds, &walker);
+    let approximation = contract::for_unused(
+        &session.view,
+        &walker,
+        &entrypoint_roots(&session.view, &entrypoints),
+    );
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
@@ -651,7 +671,7 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
         "has_more": has_more,
         "cursor": cursor
     });
-    Ok(with_session_meta(body, &session))
+    Ok(with_session_meta(with_contract(body, &approximation), &session))
 }
 
 fn explain_call(args: &Value) -> Result<Value, ToolError> {
@@ -719,13 +739,14 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
                 max_steps: None,
             };
             let result: ReachResult = reaches(view, from_id, to_id, &walker);
+            let approximation = contract::for_reaches(view, &walker, from_id, &result);
             let body = json!({
                 "from": from,
                 "to": to,
                 "reachable": result.reachable,
                 "witness": result.witness.as_ref().map(path_json),
             });
-            Ok(with_session_meta(body, &session))
+            Ok(with_session_meta(with_contract(body, &approximation), &session))
         }
         // `from → *`: every reachable symbol, paginated.
         None => {
@@ -736,6 +757,8 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
                 max_steps: None,
             };
             let results = reaches_all(view, from_id, &walker);
+            let approximation =
+                contract::for_neighbors(view, &walker, from_id, Direction::Forward, &results);
             let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
             let offset = cursor_offset(args)?;
             let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
@@ -747,7 +770,7 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
                 "has_more": has_more,
                 "cursor": cursor,
             });
-            Ok(with_session_meta(body, &session))
+            Ok(with_session_meta(with_contract(body, &approximation), &session))
         }
     }
 }
@@ -848,10 +871,11 @@ fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
         max_paths: None,
         max_steps: None,
     };
-    let results = match dir {
-        FlowDir::To => callers(view, anchor, &walker),
-        FlowDir::From => callees(view, anchor, &walker),
+    let (walk_dir, results) = match dir {
+        FlowDir::To => (Direction::Backward, callers(view, anchor, &walker)),
+        FlowDir::From => (Direction::Forward, callees(view, anchor, &walker)),
     };
+    let approximation = contract::for_neighbors(view, &walker, anchor, walk_dir, &results);
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
@@ -864,7 +888,7 @@ fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
         "has_more": has_more,
         "cursor": cursor,
     });
-    Ok(with_session_meta(body, &session))
+    Ok(with_session_meta(with_contract(body, &approximation), &session))
 }
 
 // --- search/symbols result renderers ------------------------------------------
@@ -920,6 +944,13 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
     // A `RETURN path` query populates the path channel: surface paths (same shape
     // as the `paths` tool) rather than opaque table cells.
     if !table.paths.is_empty() {
+        // Reuse the intrinsic path-set over/truncation reasons (a CQL query carries
+        // its scope intrinsically, so no negative-scope envelope).
+        let set = cgx_query::PathSet {
+            paths: table.paths.iter().map(|p| cql_path_result(view, p)).collect(),
+            truncation: table.truncation,
+        };
+        let approximation = contract::for_path_set(&set);
         let all: Vec<Value> = table.paths.iter().map(|p| cql_path_json(view, p)).collect();
         let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
         let body = json!({
@@ -931,9 +962,10 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
             "truncated": truncated,
             "truncation_reason": truncation_reason,
         });
-        return Ok(with_session_meta(body, &session));
+        return Ok(with_session_meta(with_contract(body, &approximation), &session));
     }
 
+    let approximation = contract::over_only(table_has_over_approx_edge(view, &table));
     let all: Vec<Value> = table
         .rows
         .iter()
@@ -949,7 +981,28 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
         "truncated": truncated,
         "truncation_reason": truncation_reason,
     });
-    Ok(with_session_meta(body, &session))
+    Ok(with_session_meta(with_contract(body, &approximation), &session))
+}
+
+/// Whether any bound edge cell in a CQL result was resolved over an
+/// over-approximated candidate set (`possible` confidence) — the cheaply-derivable
+/// over-approximation signal for a CQL table answer.
+fn table_has_over_approx_edge(view: &GraphView, table: &cgx_cql::ResultTable) -> bool {
+    fn cell_over(view: &GraphView, v: &cgx_cql::Value) -> bool {
+        use cgx_cql::Value as V;
+        match v {
+            V::Edge(id) => view
+                .edge(*id)
+                .is_some_and(|e| e.confidence == Confidence::Possible),
+            V::List(items) => items.iter().any(|i| cell_over(view, i)),
+            _ => false,
+        }
+    }
+    table
+        .rows
+        .iter()
+        .flatten()
+        .any(|v| cell_over(view, v))
 }
 
 /// Resolve one CQL result-table cell to self-contained JSON (node/edge/path ids
@@ -992,10 +1045,10 @@ fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
     }
 }
 
-/// Rebuild a Layer-1 [`PathResult`] from a CQL `RETURN path` binding and render it
-/// through the shared [`path_json`], so a `graph_query` path matches the `paths`
-/// tool byte-for-byte.
-fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
+/// Rebuild a Layer-1 [`PathResult`] from a CQL `RETURN path` binding so a
+/// `graph_query` path reuses the exact Layer-1 shape (rendering *and* the
+/// approximation contract) rather than a fork.
+fn cql_path_result(view: &GraphView, p: &cgx_cql::PathValue) -> PathResult {
     use cgx_query::PathStep;
     let mut steps = Vec::with_capacity(p.nodes.len());
     let mut min_confidence = Confidence::Certain;
@@ -1023,9 +1076,14 @@ fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
             exception_transient,
         });
     }
-    path_json(&PathResult {
+    PathResult {
         steps,
         min_confidence,
         crosses_exceptional,
-    })
+    }
+}
+
+/// Render a CQL path through the shared [`path_json`], matching the `paths` tool.
+fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
+    path_json(&cql_path_result(view, p))
 }

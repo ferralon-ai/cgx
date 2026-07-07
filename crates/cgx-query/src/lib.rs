@@ -54,8 +54,8 @@ pub mod symbols;
 pub mod walk;
 
 pub use contract::{
-    for_neighbors, for_paths, for_reaches, for_unused, ApproxDirection, ApproxReason,
-    ApproximationContract, NegativeScope, ReasonDirection,
+    for_neighbors, for_path_set, for_paths, for_reaches, for_unused, over_only, ApproxDirection,
+    ApproxReason, ApproximationContract, NegativeScope, ReasonDirection,
 };
 pub use engine::{
     callees, callers, entrypoint_roots, explain, neighborhood, paths, reaches, reaches_all,

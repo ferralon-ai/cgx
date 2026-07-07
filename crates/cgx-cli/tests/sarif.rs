@@ -74,7 +74,7 @@ fn sample_neighbors() -> ResultSet {
 
 #[test]
 fn sarif_has_required_top_level_shape() {
-    let doc = sarif_document("callers", &sample_neighbors(), false);
+    let doc = sarif_document("callers", &sample_neighbors(), false, &cgx_query::ApproximationContract::exact());
     assert_eq!(doc["version"], Value::String("2.1.0".into()));
     assert!(doc["$schema"].as_str().unwrap().contains("sarif"));
     let runs = doc["runs"].as_array().expect("runs array");
@@ -86,7 +86,7 @@ fn sarif_has_required_top_level_shape() {
 
 #[test]
 fn sarif_result_has_rule_message_and_physical_location() {
-    let doc = sarif_document("callers", &sample_neighbors(), false);
+    let doc = sarif_document("callers", &sample_neighbors(), false, &cgx_query::ApproximationContract::exact());
     let result = &doc["runs"][0]["results"][0];
     assert_eq!(result["ruleId"], Value::String("cgx/callers".into()));
     assert!(result["message"]["text"].is_string());
@@ -100,7 +100,7 @@ fn sarif_result_has_rule_message_and_physical_location() {
 
 #[test]
 fn sarif_surfaces_confidence_and_condition_properties() {
-    let doc = sarif_document("callers", &sample_neighbors(), false);
+    let doc = sarif_document("callers", &sample_neighbors(), false, &cgx_query::ApproximationContract::exact());
     let props = &doc["runs"][0]["results"][0]["properties"];
     assert_eq!(props["confidence"], Value::String("probable".into()));
     assert_eq!(props["edgeCondition"], Value::String("exception".into()));
@@ -116,21 +116,27 @@ fn vacuous_pass_adds_note_level_result() {
             forest: None,
         },
         true,
+        &cgx_query::ApproximationContract::exact(),
     );
     let results = doc["runs"][0]["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1, "the vacuous note is the only result");
+    // The vacuous note plus the always-present approximation-contract note (A3/A4).
+    assert_eq!(results.len(), 2, "vacuous note + approximation note: {results:?}");
     assert_eq!(
         results[0]["ruleId"],
         Value::String("cgx/vacuous-assertion".into())
     );
     assert_eq!(results[0]["level"], Value::String("note".into()));
+    assert_eq!(
+        results[1]["ruleId"],
+        Value::String("cgx/approximation-contract".into())
+    );
 }
 
 #[test]
 fn sarif_is_valid_json_and_serializes_stably() {
     // Two serializations of the same document are byte-identical (determinism).
-    let a = sarif_document("callees", &sample_neighbors(), false).to_string();
-    let b = sarif_document("callees", &sample_neighbors(), false).to_string();
+    let a = sarif_document("callees", &sample_neighbors(), false, &cgx_query::ApproximationContract::exact()).to_string();
+    let b = sarif_document("callees", &sample_neighbors(), false, &cgx_query::ApproximationContract::exact()).to_string();
     assert_eq!(a, b);
     // And it round-trips as JSON.
     let _: Value = serde_json::from_str(&a).expect("valid json");

@@ -10,7 +10,10 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
-use cgx_query::{Explanation, GraphView, NeighborResult, PathResult, PathSet, TruncationReason};
+use cgx_query::{
+    ApproximationContract, Explanation, GraphView, NeighborResult, PathResult, PathSet,
+    TruncationReason,
+};
 use serde_json::{json, Value};
 
 use crate::forest::{self, ForestData};
@@ -383,6 +386,23 @@ impl ResultSet {
     }
 }
 
+impl TableData {
+    /// Whether any bound edge cell in the result was resolved over an
+    /// over-approximated candidate set (`possible` confidence) — the cheaply
+    /// derivable over-approximation signal for a CQL table answer.
+    pub fn has_over_approx_edge(&self) -> bool {
+        self.rows.iter().flatten().any(|c| {
+            matches!(
+                c,
+                Cell::Edge {
+                    confidence: Confidence::Possible,
+                    ..
+                }
+            )
+        })
+    }
+}
+
 /// The rule id a subcommand's findings are reported under in SARIF.
 pub fn rule_id(subcommand: &str) -> String {
     format!("cgx/{subcommand}")
@@ -392,11 +412,28 @@ pub fn rule_id(subcommand: &str) -> String {
 ///
 /// `vacuous` is threaded into JSON (`"vacuous": <bool>`) and adds a `note`-level
 /// SARIF result, per the ADR-08 vacuity guard.
-pub fn render(subcommand: &str, format: Format, results: &ResultSet, vacuous: bool) -> String {
+pub fn render(
+    subcommand: &str,
+    format: Format,
+    results: &ResultSet,
+    vacuous: bool,
+    contract: &ApproximationContract,
+) -> String {
     match format {
-        Format::Human => render_human(results),
-        Format::Json => render_json(results, vacuous),
-        Format::Sarif => sarif_document(subcommand, results, vacuous).to_string(),
+        // The approximation contract (A3/A4) rides on every human answer as one
+        // compact trailing line; the graph emitters (dot/mermaid/d2) are raw graph
+        // source and carry no prose.
+        Format::Human => {
+            let mut body = render_human(results);
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&contract.human_summary());
+            body.push('\n');
+            body
+        }
+        Format::Json => render_json(results, vacuous, contract),
+        Format::Sarif => sarif_document(subcommand, results, vacuous, contract).to_string(),
         // Path-graph emitters. The CLI gates these to path-shaped results before
         // dispatch (a tabular query + dot/mermaid/d2 is a usage error), so anything
         // other than a `Paths` set here is empty graph source.
@@ -647,9 +684,9 @@ fn render_table_human(t: &TableData) -> String {
     out
 }
 
-fn render_json(results: &ResultSet, vacuous: bool) -> String {
+fn render_json(results: &ResultSet, vacuous: bool, contract: &ApproximationContract) -> String {
     if let ResultSet::Table(t) = results {
-        return render_table_json(t, vacuous);
+        return render_table_json(t, vacuous, contract);
     }
     let items: Vec<Value> = match results {
         ResultSet::Neighbors { results, .. } => {
@@ -663,6 +700,9 @@ fn render_json(results: &ResultSet, vacuous: bool) -> String {
         "results": items,
         "count": results.len(),
         "vacuous": vacuous,
+        // A3/A4 answer-honesty contract: the direction this answer can be wrong,
+        // machine-readable reasons, and (for a negative) the searched scope.
+        "approximation": approximation_json(contract),
     });
     // ADR-06 honesty: a `paths` budget/cap cutoff is surfaced, never silent.
     if let ResultSet::Paths(_) = results {
@@ -680,7 +720,7 @@ fn render_json(results: &ResultSet, vacuous: bool) -> String {
 
 /// Render a tabular CQL result as `{ "columns": [...], "rows": [...] }`, where each
 /// row is an array of cell JSON values in column order (per the dispatch shape).
-fn render_table_json(t: &TableData, vacuous: bool) -> String {
+fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContract) -> String {
     let rows: Vec<Value> = t
         .rows
         .iter()
@@ -691,10 +731,17 @@ fn render_table_json(t: &TableData, vacuous: bool) -> String {
         "rows": rows,
         "count": t.rows.len(),
         "vacuous": vacuous,
+        "approximation": approximation_json(contract),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("table doc serializes");
     s.push('\n');
     s
+}
+
+/// The approximation contract as a JSON object. Serialized straight off the
+/// `cgx_query` type so the CLI and MCP surfaces emit a byte-identical schema.
+fn approximation_json(contract: &ApproximationContract) -> Value {
+    serde_json::to_value(contract).expect("approximation contract serializes")
 }
 
 /// The human-format marker line appended when a `paths` enumeration was cut short.
@@ -741,7 +788,12 @@ fn path_json(p: &PathResult) -> Value {
 }
 
 /// Build a full SARIF 2.1.0 document (`$schema`, `version`, one `run`).
-pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> Value {
+pub fn sarif_document(
+    subcommand: &str,
+    results: &ResultSet,
+    vacuous: bool,
+    contract: &ApproximationContract,
+) -> Value {
     let rid = rule_id(subcommand);
     let mut sarif_results: Vec<Value> = match results {
         ResultSet::Neighbors { results, .. } => results
@@ -776,6 +828,15 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
         }));
     }
 
+    // A3/A4 answer-honesty contract as a SARIF note, with the structured contract
+    // in `properties` so a SARIF consumer can gate on direction/reason codes.
+    sarif_results.push(json!({
+        "ruleId": "cgx/approximation-contract",
+        "level": "note",
+        "message": { "text": contract.human_summary() },
+        "properties": approximation_json(contract),
+    }));
+
     json!({
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
@@ -797,6 +858,10 @@ pub fn sarif_document(subcommand: &str, results: &ResultSet, vacuous: bool) -> V
                         "id": "cgx/truncated",
                         "name": "truncated",
                         "shortDescription": { "text": "A paths enumeration was cut short by the depth/work budget; the result is partial." }
+                    }, {
+                        "id": "cgx/approximation-contract",
+                        "name": "approximation-contract",
+                        "shortDescription": { "text": "The direction this answer can be wrong (over/under/exact) with machine-readable reasons and, for a negative, the searched scope (A3/A4)." }
                     }]
                 }
             },

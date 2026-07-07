@@ -473,6 +473,32 @@ fn unused_reports_uncalled_symbol() {
 }
 
 #[test]
+fn mcp_tools_inherit_the_approximation_contract() {
+    let (_t, repo) = init_repo();
+
+    // A positive neighbor answer carries the A3 contract in structuredContent
+    // (the MCP tools reuse the query layer, so they inherit it verbatim).
+    let callers = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    let approx = &callers["approximation"];
+    assert!(
+        matches!(
+            approx["direction"].as_str(),
+            Some("exact") | Some("over") | Some("under") | Some("over_under")
+        ),
+        "callers carries an approximation direction: {callers}"
+    );
+    assert!(approx["reasons"].is_array(), "reasons array present: {callers}");
+
+    // A negative `unused` answer states its A4 scope.
+    let unused = call_tool(&repo, "unused", json!({ "kind": "function" }));
+    let scope = &unused["approximation"]["scope"];
+    assert!(
+        scope["searched_edge_kinds"].is_array() && scope["confidence_floor"].is_string(),
+        "unused states its searched scope: {unused}"
+    );
+}
+
+#[test]
 fn paths_finds_route_from_main_to_leaf() {
     let (_t, repo) = init_repo();
     let structured = call_tool(&repo, "paths", json!({ "from": "main", "to": "leaf" }));

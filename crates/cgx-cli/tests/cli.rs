@@ -505,6 +505,70 @@ fn confidence_certain_floor_returns_only_certain_edges() {
 }
 
 #[test]
+fn approximation_contract_rides_every_surface() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+
+    // JSON: every positive answer carries a structured `approximation` object
+    // (A3) with a direction in the ladder and a machine-readable reasons array.
+    let (json, code) = run_cgx(&repo, &["callees", "main", "--format", "json"]);
+    assert_eq!(code, 0, "callees json: {json}");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let approx = &v["approximation"];
+    assert!(
+        matches!(
+            approx["direction"].as_str(),
+            Some("exact") | Some("over") | Some("under") | Some("over_under")
+        ),
+        "direction is in the ladder: {json}"
+    );
+    assert!(approx["reasons"].is_array(), "reasons is an array: {json}");
+
+    // Human: exactly one compact contract line, prefixed `approximation:`.
+    let (human, code) = run_cgx(&repo, &["callees", "main"]);
+    assert_eq!(code, 0, "callees human: {human}");
+    let contract_lines: Vec<&str> = human
+        .lines()
+        .filter(|l| l.starts_with("approximation:"))
+        .collect();
+    assert_eq!(
+        contract_lines.len(),
+        1,
+        "exactly one compact contract line: {human}"
+    );
+
+    // A4: a *negative* reachability answer states its scope. `beta` is a leaf, so
+    // it cannot reach `alpha`.
+    let (neg, code) = run_cgx(
+        &repo,
+        &["reaches", "beta", "alpha", "--format", "json"],
+    );
+    assert_eq!(code, 0, "negative reaches json: {neg}");
+    let nv: serde_json::Value = serde_json::from_str(&neg).expect("json");
+    let scope = &nv["approximation"]["scope"];
+    assert!(
+        scope["searched_edge_kinds"].is_array(),
+        "negative answer states searched edge kinds: {neg}"
+    );
+    assert!(
+        scope["confidence_floor"].is_string(),
+        "negative answer states its confidence floor: {neg}"
+    );
+
+    // SARIF: the contract rides as a note-level result with structured properties.
+    let (sarif, code) = run_cgx(&repo, &["unused", "--format", "sarif"]);
+    assert_eq!(code, 0, "unused sarif: {sarif}");
+    let sv: serde_json::Value = serde_json::from_str(&sarif).expect("sarif json");
+    let results = sv["runs"][0]["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| r["ruleId"] == serde_json::json!("cgx/approximation-contract")),
+        "a SARIF approximation-contract note is present: {sarif}"
+    );
+}
+
+#[test]
 fn explain_unknown_symbol_is_usage_error_exit_2() {
     let (_tmp, repo) = fixture_repo();
     index(&repo);

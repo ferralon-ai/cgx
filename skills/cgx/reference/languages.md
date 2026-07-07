@@ -126,8 +126,9 @@ Go has no exceptions. Failure takes two forms:
 **Dynamic dispatch — interface satisfaction**
 
 Direct calls resolve at `certain`. Interface-satisfied calls produce a candidate set of all types
-satisfying the interface, labeled `probable` in the Phase-1 syntactic graph (no SCIP). SCIP enrichment
-for Go is **not yet available** (`planned`, not shipped — see `docs/14-implementation-status-matrix.md`).
+satisfying the interface: `probable` when the set resolves to a single candidate, `possible` when
+multiple candidates remain (same single/multi banding as Java and Python). SCIP enrichment for Go is
+**not yet available** (`planned`, not shipped — see `docs/14-implementation-status-matrix.md`).
 
 **Closures and goroutines**
 

@@ -1,7 +1,5 @@
 # cgx Documentation
 
-> **Naming note:** `cgx` is a placeholder. The final tool name is not yet decided.
-
 ## Product Statement
 
 `cgx` is a static call-graph CLI for Rust (Go fallback) that answers structural and

@@ -1296,6 +1296,18 @@ fn emit_candidate_set(
     } else {
         Tier::ScopeGraph
     };
+    // A Tier-0 name(+arity) fallback is a bare-name match with no scope/type/import
+    // corroboration; a lone surviving def is a name *collision* that happens to have
+    // one hit, not a resolution. Honour the documented `Tier::NameSyntactic` band
+    // (`possible`) even for a singleton — `canonicalize_candidate_dsts` would
+    // otherwise hand back `probable`, which over-claims. Scope-graph tiers (import
+    // path / receiver-scoped method) keep `probable` for a singleton: they carry
+    // the corroboration the bare-name fallback lacks.
+    let confidence = if tier == Tier::NameSyntactic {
+        confidence.min(Confidence::Possible)
+    } else {
+        confidence
+    };
 
     for (rank, dst) in dsts.iter().enumerate() {
         if let Some(g) = group {

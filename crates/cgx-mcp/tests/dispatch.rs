@@ -202,9 +202,14 @@ fn tools_list_exposes_the_phase1_tool_surface() {
     for expected in [
         "callers",
         "callees",
+        "reaches",
         "paths",
         "unused",
         "explain",
+        "search",
+        "symbols",
+        "flows_to",
+        "flows_from",
         "graph_query",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
@@ -299,6 +304,72 @@ fn graph_query_return_path_surfaces_the_paths_channel() {
     assert!(!paths.is_empty(), "main reaches leaf via a path: {structured}");
     assert!(paths[0]["min_confidence"].is_string());
     assert!(paths[0]["steps"].is_array());
+}
+
+#[test]
+fn reaches_from_to_reports_reachable_with_witness() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "reaches", json!({ "from": "main", "to": "leaf" }));
+    assert_eq!(structured["reachable"], json!(true));
+    let witness = &structured["witness"];
+    assert!(witness["steps"].is_array(), "witness path present: {structured}");
+}
+
+#[test]
+fn reaches_from_star_lists_the_reachable_set() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "reaches", json!({ "from": "main", "depth": 5 }));
+    let names = result_names(&structured, "results");
+    assert!(
+        names.iter().any(|n| n.ends_with("helper")) && names.iter().any(|n| n.ends_with("leaf")),
+        "main reaches helper and leaf: {names:?}"
+    );
+}
+
+#[test]
+fn search_pattern_resolves_partial_name_to_definitions() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "search", json!({ "pattern": "help" }));
+    let hits = structured["results"].as_array().expect("results array");
+    assert!(
+        hits.iter().any(|h| h["fqn"].as_str().unwrap().ends_with("helper")),
+        "search 'help' finds helper: {structured}"
+    );
+    assert!(hits[0]["file"].is_string() && hits[0]["kind"].is_string());
+}
+
+#[test]
+fn search_requires_pattern_or_all() {
+    let (_t, repo) = init_repo();
+    let mut args = json!({});
+    args.as_object_mut()
+        .unwrap()
+        .insert("root".into(), json!(repo.to_string_lossy()));
+    let request = req(1, "tools/call", json!({ "name": "search", "arguments": args }));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    assert_eq!(resp.error.expect("usage error").code, -32602);
+}
+
+#[test]
+fn symbols_ranks_by_reference_count_with_breakdown() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "symbols", json!({ "rank": "inbound" }));
+    let ranks = structured["results"].as_array().expect("results array");
+    assert!(!ranks.is_empty(), "graph has ranked symbols: {structured}");
+    let first = &ranks[0];
+    assert!(first["in_degree"].is_number() && first["out_degree"].is_number());
+    assert!(first["inbound"]["total"].is_number(), "breakdown present: {first}");
+}
+
+#[test]
+fn flows_from_returns_a_well_formed_dataflow_result() {
+    // A rich dataflow fixture is heavier to construct; here we assert the tool
+    // accepts its contract end-to-end on the call-graph fixture without error.
+    // The walk is scoped to DerivesFrom edges only.
+    let (_t, repo) = init_repo();
+    let flows = call_tool(&repo, "flows_from", json!({ "symbol": "helper" }));
+    assert!(flows["results"].is_array(), "flows_from returns a result set");
+    assert!(flows["total_matched"].is_number());
 }
 
 // --- tool behavior tests ----------------------------------------------------

@@ -9,10 +9,12 @@
 //! tool performs any network or LLM call; given the same tree, every tool is a
 //! pure function of its arguments.
 
-use cgx_core::{Confidence, EdgeCondition, NodeId, SymbolKind, SymbolPattern, Tier};
+use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
-    callees, callers, explain, paths as query_paths, resolve_anchor, unused, ConditionFilter,
-    Direction, EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker,
+    callees, callers, explain, paths as query_paths, rank_symbols, reaches, reaches_all,
+    resolve_anchor, search_symbols, unused, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
+    GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
+    SymbolRank,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -30,6 +32,9 @@ const DEFAULT_DEPTH: u32 = 1;
 const DEFAULT_PATHS_MAX_DEPTH: u32 = 10;
 /// `paths` default result page size (docs/07 IF-13).
 const DEFAULT_PATHS_MAX_RESULTS: usize = 10;
+/// Forest-shaped default depth for `reaches <from>` and `flows-*` — mirrors the
+/// CLI's `DEFAULT_TREE_DEPTH` (2), the bounded neighborhood the human forest uses.
+const DEFAULT_FOREST_DEPTH: u32 = 2;
 
 /// The tool registrations returned by `tools/list`. Order is fixed for
 /// determinism. Each declares its `inputSchema` per docs/07; the agent-facing
@@ -39,9 +44,14 @@ pub fn tool_list() -> Value {
         "tools": [
             neighbor_tool("callers", "Symbols that (transitively, to `depth`) call the named symbol."),
             neighbor_tool("callees", "Symbols the named symbol (transitively, to `depth`) calls."),
+            reaches_tool(),
             paths_tool(),
             unused_tool(),
             explain_tool(),
+            search_tool(),
+            symbols_tool(),
+            flow_tool("flows_to", "Forward data-flow slice: symbols a value flows into (its DerivesFrom consumers)."),
+            flow_tool("flows_from", "Data-flow pedigree: the symbols a value derives from (its DerivesFrom sources)."),
             graph_query_tool(),
         ]
     })
@@ -70,6 +80,87 @@ fn neighbor_tool(name: &str, description: &str) -> Value {
                 "edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "confidence":     { "type": "string", "enum": ["certain","probable","possible"] },
                 "include_dirty":  include_dirty_prop()
+            },
+            "required": ["symbol", "root"]
+        }
+    })
+}
+
+fn reaches_tool() -> Value {
+    json!({
+        "name": "reaches",
+        "description": "Reachability over call edges: with `to`, whether `from` reaches `to` (with a witness path); without `to`, every symbol `from` reaches.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from":          { "type": "string", "description": "Source symbol (qualified name)" },
+                "to":            { "type": "string", "description": "Optional target symbol; omit for the from→* reachable set" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "depth":         { "type": "integer", "description": "Max traversal depth (from→* form)", "default": DEFAULT_FOREST_DEPTH },
+                "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["from", "root"]
+        }
+    })
+}
+
+fn search_tool() -> Value {
+    json!({
+        "name": "search",
+        "description": "Resolve a partial/half-remembered name to exact symbol definitions: a pure node-table scan (no graph walk).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern":       { "type": "string", "description": "Name predicate over the whole FQN (case-insensitive substring, or regex when `regex` is true)" },
+                "all":           { "type": "boolean", "default": false, "description": "List every symbol (mutually exclusive with `pattern`)" },
+                "regex":         { "type": "boolean", "default": false, "description": "Treat `pattern` as an unanchored regex" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "kind":          { "type": "string", "enum": ["function","method","field","type","module","all"], "default": "all" },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["root"]
+        }
+    })
+}
+
+fn symbols_tool() -> Value {
+    json!({
+        "name": "symbols",
+        "description": "Rank symbols by reference count (the hub/importance lens), each with its inbound/outbound edge breakdown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rank":          { "type": "string", "enum": ["total","inbound","outbound"], "default": "total" },
+                "kind":          { "type": "string", "enum": ["function","method","field","type","module","all"], "default": "all" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["root"]
+        }
+    })
+}
+
+fn flow_tool(name: &str, description: &str) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol":        { "type": "string", "description": "Qualified symbol name" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "depth":         { "type": "integer", "default": DEFAULT_FOREST_DEPTH },
+                "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
             },
             "required": ["symbol", "root"]
         }
@@ -158,9 +249,14 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
     match name {
         "callers" => neighbor_call(args, Direction::Backward),
         "callees" => neighbor_call(args, Direction::Forward),
+        "reaches" => reaches_call(args),
         "paths" => paths_call(args),
         "unused" => unused_call(args),
         "explain" => explain_call(args),
+        "search" => search_call(args),
+        "symbols" => symbols_call(args),
+        "flows_to" => flow_call(args, FlowDir::To),
+        "flows_from" => flow_call(args, FlowDir::From),
         "graph_query" => graph_query_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
@@ -285,6 +381,20 @@ fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
     Ok(filter)
+}
+
+/// Parse the optional `kind` string into a symbol-kind filter (`search`/`symbols`).
+/// `all`/absent means no narrowing.
+fn parse_symbol_kind(args: &Value) -> Result<Option<SymbolKind>, ToolError> {
+    match opt_str(args, "kind").unwrap_or("all") {
+        "all" => Ok(None),
+        "function" => Ok(Some(SymbolKind::Function)),
+        "method" => Ok(Some(SymbolKind::Method)),
+        "field" => Ok(Some(SymbolKind::Field)),
+        "type" => Ok(Some(SymbolKind::Type)),
+        "module" => Ok(Some(SymbolKind::Module)),
+        other => Err(ToolError::invalid_params(format!("unknown kind `{other}`"))),
+    }
 }
 
 /// Resolve `root` to a session (acquires the graph with the dirty overlay).
@@ -523,6 +633,212 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
         "edges": edges
     });
     Ok(with_session_meta(body, &session))
+}
+
+/// `reaches` (Q-19): with `to`, a single reachability answer plus its witness
+/// path; without `to`, the `from → *` reachable set (identical machinery to
+/// `callees`, bounded by the forest depth default). Same engine as `cgx reaches`.
+fn reaches_call(args: &Value) -> Result<Value, ToolError> {
+    let from = req_str(args, "from")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+    let from_id = resolve(view, from)?;
+
+    let mut filter = EdgeFilter::calls();
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+
+    match opt_str(args, "to").filter(|s| !s.is_empty()) {
+        // `from → to`: reachability with a shortest witness path.
+        Some(to) => {
+            let to_id = resolve(view, to)?;
+            let walker = PathWalker {
+                filter,
+                max_depth: opt_u32(args, "depth")?,
+                max_paths: None,
+                max_steps: None,
+            };
+            let result: ReachResult = reaches(view, from_id, to_id, &walker);
+            let body = json!({
+                "from": from,
+                "to": to,
+                "reachable": result.reachable,
+                "witness": result.witness.as_ref().map(path_json),
+            });
+            Ok(with_session_meta(body, &session))
+        }
+        // `from → *`: every reachable symbol, paginated.
+        None => {
+            let walker = PathWalker {
+                filter,
+                max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_FOREST_DEPTH)),
+                max_paths: None,
+                max_steps: None,
+            };
+            let results = reaches_all(view, from_id, &walker);
+            let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+            let offset = cursor_offset(args)?;
+            let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
+            let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
+            let body = json!({
+                "from": from,
+                "results": page,
+                "total_matched": results.len(),
+                "has_more": has_more,
+                "cursor": cursor,
+            });
+            Ok(with_session_meta(body, &session))
+        }
+    }
+}
+
+/// `search` (B-1): a pure node-table scan resolving a name pattern (or `all`) to
+/// exact definitions. Reuses `cgx_query::search_symbols`; empty/invalid patterns
+/// return an actionable `invalid_params` (the CLI's exit-2 usage path).
+fn search_call(args: &Value) -> Result<Value, ToolError> {
+    let session = session_for(args)?;
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
+    let pattern = opt_str(args, "pattern");
+
+    let selector = match (all, pattern) {
+        (true, Some(_)) => {
+            return Err(ToolError::invalid_params(
+                "pass either `pattern` or `all`, not both",
+            ))
+        }
+        (false, None) => {
+            return Err(ToolError::invalid_params(
+                "a `pattern` is required (or set `all` to list every symbol)",
+            ))
+        }
+        (true, None) => SearchMatch::All,
+        (false, Some(p)) => SearchMatch::Pattern { pattern: p, regex },
+    };
+
+    let kind_filter = parse_symbol_kind(args)?;
+    let hits = search_symbols(&session.view, selector, kind_filter)
+        .map_err(|e| ToolError::invalid_params(e.to_string()))?;
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(hits.len(), offset, limit);
+    let page: Vec<Value> = hits[start..end].iter().map(symbol_hit_json).collect();
+    let body = json!({
+        "results": page,
+        "total_matched": hits.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// `symbols` (B-2): rank symbols by reference count with a per-symbol edge
+/// breakdown. Reuses `cgx_query::rank_symbols`; same shape the CLI JSON emits.
+fn symbols_call(args: &Value) -> Result<Value, ToolError> {
+    let session = session_for(args)?;
+    let rank_by = match opt_str(args, "rank").unwrap_or("total") {
+        "total" => RankBy::Total,
+        "inbound" => RankBy::Inbound,
+        "outbound" => RankBy::Outbound,
+        other => return Err(ToolError::invalid_params(format!("unknown rank `{other}`"))),
+    };
+    let kind_filter = parse_symbol_kind(args)?;
+    let ranks = rank_symbols(&session.view, rank_by, kind_filter);
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(ranks.len(), offset, limit);
+    let page: Vec<Value> = ranks[start..end].iter().map(symbol_rank_json).collect();
+    let body = json!({
+        "results": page,
+        "total_matched": ranks.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// Data-flow direction for `flows_to` / `flows_from`.
+enum FlowDir {
+    /// `flows_to`: the forward slice — a value's DerivesFrom consumers, reached by
+    /// walking DerivesFrom **backward** (via `callers`).
+    To,
+    /// `flows_from`: the pedigree — what a value derives from, reached by walking
+    /// DerivesFrom **forward** (via `callees`).
+    From,
+}
+
+/// `flows_to` / `flows_from` (docs/04): the same neighbor walk as
+/// `callers`/`callees` with the edge scope swapped from the call family to
+/// `DerivesFrom` — no second execution path, mirroring `cgx flows-to`/`flows-from`.
+fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
+    let symbol = req_str(args, "symbol")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+    let anchor = resolve(view, symbol)?;
+
+    let mut filter = EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]);
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+    let walker = PathWalker {
+        filter,
+        max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_FOREST_DEPTH)),
+        max_paths: None,
+        max_steps: None,
+    };
+    let results = match dir {
+        FlowDir::To => callers(view, anchor, &walker),
+        FlowDir::From => callees(view, anchor, &walker),
+    };
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
+    let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
+    let body = json!({
+        "symbol": symbol,
+        "results": page,
+        "total_matched": results.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+// --- search/symbols result renderers ------------------------------------------
+
+fn symbol_hit_json(h: &SymbolHit) -> Value {
+    json!({
+        "fqn": h.fqn,
+        "file": h.file,
+        "line": h.line,
+        "kind": format!("{:?}", h.kind).to_lowercase(),
+    })
+}
+
+fn symbol_rank_json(r: &SymbolRank) -> Value {
+    json!({
+        "fqn": r.fqn,
+        "file": r.file,
+        "line": r.line,
+        "kind": format!("{:?}", r.kind).to_lowercase(),
+        "in_degree": r.in_degree,
+        "out_degree": r.out_degree,
+        "inbound": breakdown_json(&r.inbound),
+        "outbound": breakdown_json(&r.outbound),
+    })
+}
+
+fn breakdown_json(b: &EdgeBreakdown) -> Value {
+    json!({
+        "total": b.total,
+        "by_family": b.by_family,
+        "by_condition": b.by_condition,
+        "by_confidence": b.by_confidence,
+    })
 }
 
 /// `graph_query` (P8): route to the live CQL engine (`cgx_cql::run`) — the same

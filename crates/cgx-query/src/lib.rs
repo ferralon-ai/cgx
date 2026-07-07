@@ -44,6 +44,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod contract;
 pub mod engine;
 pub mod filter;
 pub mod result;
@@ -52,8 +53,13 @@ pub mod view;
 pub mod symbols;
 pub mod walk;
 
+pub use contract::{
+    for_neighbors, for_paths, for_reaches, for_unused, ApproxDirection, ApproxReason,
+    ApproximationContract, NegativeScope, ReasonDirection,
+};
 pub use engine::{
-    callees, callers, explain, neighborhood, paths, reaches, reaches_all, resolve_anchor, unused,
+    callees, callers, entrypoint_roots, explain, neighborhood, paths, reaches, reaches_all,
+    resolve_anchor, unused,
 };
 pub use search::{search_symbols, SearchError, SearchMatch, SymbolHit};
 pub use symbols::{rank_symbols, EdgeBreakdown, EdgeFamily, RankBy, SymbolRank};

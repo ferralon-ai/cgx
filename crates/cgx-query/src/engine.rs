@@ -256,15 +256,7 @@ pub fn unused(
     let n = view.node_count();
     let mut reachable = vec![false; n];
 
-    let roots: Vec<NodeId> = if entrypoints.is_empty() {
-        view.nodes()
-            .iter()
-            .filter(|node| node.entrypoint_kind.is_some())
-            .map(|node| node.id)
-            .collect()
-    } else {
-        entrypoints.to_vec()
-    };
+    let roots = entrypoint_roots(view, entrypoints);
 
     for &root in &roots {
         if root.index() < n {
@@ -286,6 +278,23 @@ pub fn unused(
         .collect();
     out.sort_by(|a, b| result_key(a).cmp(&result_key(b)));
     out
+}
+
+/// The resolved entrypoint root set for `unused` (GM-7): the caller's explicit
+/// `entrypoints` when non-empty, otherwise every node tagged with an
+/// `entrypoint_kind` (the declared-entrypoint default). Shared with the
+/// approximation-contract layer so the negative `unused` claim scans the same
+/// used-set frontier the query itself walked (no logic fork).
+pub fn entrypoint_roots(view: &GraphView, entrypoints: &[NodeId]) -> Vec<NodeId> {
+    if entrypoints.is_empty() {
+        view.nodes()
+            .iter()
+            .filter(|node| node.entrypoint_kind.is_some())
+            .map(|node| node.id)
+            .collect()
+    } else {
+        entrypoints.to_vec()
+    }
 }
 
 /// Q-6 `explain`: full provenance for one symbol — its definition record plus

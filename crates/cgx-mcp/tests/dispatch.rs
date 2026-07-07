@@ -372,6 +372,47 @@ fn flows_from_returns_a_well_formed_dataflow_result() {
     assert!(flows["total_matched"].is_number());
 }
 
+#[test]
+fn callees_edge_kind_filter_narrows_traversal() {
+    let (_t, repo) = init_repo();
+    // Restricting to the plain `calls` kind keeps helper's direct call edge; the
+    // response stays well-formed.
+    let filtered = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "helper", "kind": ["calls"] }),
+    );
+    let names = result_names(&filtered, "results");
+    assert!(
+        names.iter().any(|n| n.ends_with("leaf")),
+        "callees(helper) restricted to CALLS still includes leaf: {names:?}"
+    );
+    // Restricting to a kind this fixture has no edges of yields an empty set —
+    // the filter genuinely narrows rather than being ignored.
+    let spawns_only = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "helper", "kind": ["spawns"] }),
+    );
+    assert_eq!(
+        spawns_only["total_matched"],
+        json!(0),
+        "no spawn edges exist in this fixture: {spawns_only}"
+    );
+}
+
+#[test]
+fn callees_edge_kind_filter_rejects_unknown_kind() {
+    let (_t, repo) = init_repo();
+    let mut args = json!({ "symbol": "helper", "kind": ["not_a_kind"] });
+    args.as_object_mut()
+        .unwrap()
+        .insert("root".into(), json!(repo.to_string_lossy()));
+    let request = req(1, "tools/call", json!({ "name": "callees", "arguments": args }));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    assert_eq!(resp.error.expect("bad kind").code, -32602);
+}
+
 // --- tool behavior tests ----------------------------------------------------
 
 #[test]

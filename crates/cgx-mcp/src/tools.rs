@@ -36,6 +36,19 @@ const DEFAULT_PATHS_MAX_RESULTS: usize = 10;
 /// CLI's `DEFAULT_TREE_DEPTH` (2), the bounded neighborhood the human forest uses.
 const DEFAULT_FOREST_DEPTH: u32 = 2;
 
+/// The call-family edge kinds the `kind` filter on `callers`/`callees` accepts.
+/// Restricting to the call family keeps those tools call-graph tools; the tokens
+/// mirror `cgx_core::EdgeKind::is_call`.
+const CALL_EDGE_KINDS: &[(&str, EdgeKind)] = &[
+    ("calls", EdgeKind::Calls),
+    ("calls_virtual", EdgeKind::CallsVirtual),
+    ("calls_closure", EdgeKind::CallsClosure),
+    ("calls_callback", EdgeKind::CallsCallback),
+    ("calls_async", EdgeKind::CallsAsync),
+    ("calls_indirect", EdgeKind::CallsIndirect),
+    ("spawns", EdgeKind::Spawns),
+];
+
 /// The tool registrations returned by `tools/list`. Order is fixed for
 /// determinism. Each declares its `inputSchema` per docs/07; the agent-facing
 /// `include_dirty` default is `true` on every graph-reading tool (ADR-06).
@@ -79,10 +92,23 @@ fn neighbor_tool(name: &str, description: &str) -> Value {
                 "cursor":         { "type": "string" },
                 "edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "confidence":     { "type": "string", "enum": ["certain","probable","possible"] },
+                "kind":           edge_kind_prop(),
                 "include_dirty":  include_dirty_prop()
             },
             "required": ["symbol", "root"]
         }
+    })
+}
+
+/// Schema for the `kind` edge-kind filter: an array of call-family edge-kind
+/// tokens. When present, only edges of these kinds are traversed (default: every
+/// call-family edge).
+fn edge_kind_prop() -> Value {
+    let tokens: Vec<&str> = CALL_EDGE_KINDS.iter().map(|(t, _)| *t).collect();
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": tokens },
+        "description": "Restrict traversal to these call-family edge kinds (default: all call edges)"
     })
 }
 
@@ -371,9 +397,13 @@ fn tier_token(t: Tier) -> &'static str {
     }
 }
 
-/// Build the edge filter from the optional `edge_condition` / `confidence` args.
+/// Build the edge filter from the optional `edge_condition` / `confidence` /
+/// `kind` args. `kind` narrows the traversed call-family edges (Q-11/Q-18).
 fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
     let mut filter = EdgeFilter::calls();
+    if let Some(kinds) = parse_edge_kinds(args)? {
+        filter = filter.with_kinds(kinds);
+    }
     if let Some(c) = opt_str(args, "edge_condition") {
         filter = filter.only_condition(parse_condition(c)?);
     }
@@ -381,6 +411,35 @@ fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
     Ok(filter)
+}
+
+/// Parse the optional `kind` array into a set of call-family [`EdgeKind`]s. `None`
+/// (absent) leaves the default call-family scope; an empty array is also `None`.
+fn parse_edge_kinds(args: &Value) -> Result<Option<Vec<EdgeKind>>, ToolError> {
+    let arr = match args.get("kind") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(ToolError::invalid_params(
+                "`kind` must be an array of edge-kind tokens",
+            ))
+        }
+    };
+    let mut kinds = Vec::with_capacity(arr.len());
+    for v in arr {
+        let token = v.as_str().ok_or_else(|| {
+            ToolError::invalid_params("`kind` entries must be edge-kind strings")
+        })?;
+        let kind = CALL_EDGE_KINDS
+            .iter()
+            .find(|(t, _)| *t == token)
+            .map(|(_, k)| *k)
+            .ok_or_else(|| {
+                ToolError::invalid_params(format!("unknown edge kind `{token}`"))
+            })?;
+        kinds.push(kind);
+    }
+    Ok(if kinds.is_empty() { None } else { Some(kinds) })
 }
 
 /// Parse the optional `kind` string into a symbol-kind filter (`search`/`symbols`).

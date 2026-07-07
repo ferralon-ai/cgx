@@ -613,6 +613,90 @@ fn doctor_without_index_is_graph_error_exit_3() {
     assert_eq!(code, 3, "doctor on un-indexed repo → exit 3");
 }
 
+/// A repo with one supported (`.rs`) source file and three unsupported (`.txt`)
+/// files, so the unsupported share is 3/4 = 75% — comfortably past the
+/// `HighUnsupportedShare` 50% anomaly threshold.
+fn repo_with_unsupported_files() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(repo.join("notes.txt"), "not source\n").unwrap();
+    std::fs::write(repo.join("readme.txt"), "not source either\n").unwrap();
+    std::fs::write(repo.join("data.txt"), "still not source\n").unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+/// Repro for the R2 finding: `patch_index_stats` was implemented and unit-tested
+/// but never wired into `run_doctor`, so the file-coverage section was a
+/// permanent placeholder and `HighUnsupportedShare` could never fire. After
+/// `cgx index` runs, `cgx doctor` must report the real pipeline stats and raise
+/// the anomaly once the unsupported share crosses 50%.
+#[test]
+fn doctor_reports_real_file_coverage_after_index() {
+    let (_tmp, repo) = repo_with_unsupported_files();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor should exit 0: {out}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out).expect("doctor --format json must emit valid JSON");
+
+    assert_eq!(
+        parsed["total_files"], 4,
+        "doctor must see the real total file count: {out}"
+    );
+    assert_eq!(
+        parsed["unsupported_files"], 3,
+        "doctor must see the real unsupported file count: {out}"
+    );
+    let share = parsed["unsupported_share"]
+        .as_f64()
+        .expect("unsupported_share must be populated, not null");
+    assert!(
+        (share - 0.75).abs() < 1e-9,
+        "unsupported_share should be 0.75: {out}"
+    );
+    assert!(
+        parsed["anomalies"]
+            .as_array()
+            .expect("anomalies array")
+            .iter()
+            .any(|a| a == "high_unsupported_share"),
+        "HighUnsupportedShare anomaly must fire past the 50% threshold: {out}"
+    );
+
+    let (text_out, code) = run_cgx(&repo, &["doctor"]);
+    assert_eq!(code, 0);
+    assert!(
+        !text_out.contains("pipeline stats unavailable"),
+        "human report must show real coverage, not the placeholder: {text_out}"
+    );
+    assert!(
+        text_out.contains("unsupported: 3/4"),
+        "human report must show the real unsupported/total counts: {text_out}"
+    );
+}
+
 // --- cgx diff integration tests ---
 
 /// Create a two-commit fixture repo where the second commit adds a new function

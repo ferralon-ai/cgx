@@ -351,6 +351,73 @@ fn name_arity_fallback_emits_possible_candidate_set() {
 }
 
 #[test]
+fn name_arity_fallback_single_hit_is_possible_not_probable() {
+    // A Tier-0 global name(+arity) fallback that happens to narrow to a *single*
+    // surviving def is still a bare-name match with no scope/type/import
+    // corroboration — a name collision that happens to have one hit, not a
+    // resolution. Its honest band is `possible` (the documented `Tier::NameSyntactic`
+    // band), NOT `probable`. Regression guard for the link.rs singleton
+    // over-confidence (probable → possible).
+    let mut a = FileBuilder::new();
+    a.def(
+        "crate::a::process",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let a = a.build();
+
+    let mut caller_file = FileBuilder::new();
+    let run = caller_file.scope(ScopeId::ROOT, Some("crate::b::run"));
+    caller_file.def(
+        "crate::b::run",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    // run() calls process(x) — unknown locally, unimported, and exactly one global
+    // def exists → the fallback fires and narrows to a single hit.
+    caller_file.raw_ref(
+        &["process"],
+        run,
+        2,
+        RefKind::Call,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let b = caller_file.build();
+
+    let inputs = vec![
+        input("src/a.rs", "rust", &a),
+        input("src/b.rs", "rust", &b),
+    ];
+    let g = link(&inputs, &LinkOpts::default());
+
+    let fallback: Vec<_> = g
+        .edge_records()
+        .filter(|e| e.rule == "name-arity")
+        .collect();
+    assert_eq!(fallback.len(), 1, "single surviving candidate");
+    let e = fallback[0];
+    assert_eq!(e.tier, Tier::NameSyntactic);
+    assert_eq!(
+        e.confidence,
+        Confidence::Possible,
+        "a bare-name singleton fallback is possible, never probable"
+    );
+    assert!(
+        e.candidate_group.is_none(),
+        "single-target edge carries no candidate group"
+    );
+}
+
+#[test]
 fn re_export_chain_resolves_to_original_definition() {
     // direct.rs defines add; imports.rs does `pub use crate::direct::add`;
     // consumer.rs imports add *from crate::imports* and calls it. Resolution must

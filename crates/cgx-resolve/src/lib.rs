@@ -30,7 +30,7 @@
 //! | same-file lexical resolution of a direct call | [`Tier::ScopeGraph`] | [`Confidence::Certain`] |
 //! | import binding → unique exported target | [`Tier::ScopeGraph`] | [`Confidence::Probable`] |
 //! | import binding → several candidates | [`Tier::ScopeGraph`] | [`Confidence::Possible`] |
-//! | global name(+arity) match, unique | [`Tier::NameSyntactic`] | [`Confidence::Probable`] |
+//! | global name(+arity) match, unique | [`Tier::NameSyntactic`] | [`Confidence::Possible`] |
 //! | global name(+arity) match, several | [`Tier::NameSyntactic`] | [`Confidence::Possible`] |
 //! | virtual receiver, several same-name methods | [`Tier::ScopeGraph`] | [`Confidence::Possible`] |
 //! | virtual receiver, single same-name method | [`Tier::ScopeGraph`] | [`Confidence::Probable`] |

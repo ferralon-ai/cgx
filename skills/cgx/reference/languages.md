@@ -100,11 +100,33 @@ Since: v0.2 — SCIP enrichment via `scip-typescript` promotes structural-match 
 (heuristic) to `probable` (type-resolved), and cross-file direct calls to `certain` where SCIP gives a
 single precise target.
 
+**Own-effects and dataflow**
+
+The TS/JS adapter emits GM-12 own-effects and intraprocedural SSA dataflow, at Go-column parity. Effects
+are a name-based syntactic heuristic (`possible`-grade, no import/type resolution): `fetch`/`axios`/`http`
+→ `io.net`; `fs.*` → `io.file`; `child_process.*` → `io.proc`; `Math.random`/`Date.now`/`crypto.random*`
+→ `nondeterministic`; `eval`/`new Function` → `dynamic-code`; `Atomics.wait` → `blocking`. Concurrency
+launchers (`setTimeout`/`setInterval`/`queueMicrotask` and `new Worker`) emit a `spawns` effect at the
+launch site (mirroring Go's `go` statement).
+
+Intraprocedural dataflow lowers each production site (declaration, assignment, `+=`, projection, call,
+return) into a `DerivesFrom` fact (`derived → source`), so `flows-to` / `flows-from` resolve end-to-end on
+TS/JS. TS type-coercions (`x as T`, `x!`, `x satisfies T`, `await x`) are transparent (copy). A call result
+is opaque (an `opaque-call` cut plus callee + per-arg access-paths for the interprocedural pass); a
+depth-2+ member access (`a.b.c`) truncates to the base local `a` with a `truncated-access-path` cut.
+
+**Under-approximations (honest scope):** dataflow is only extracted for block-bodied functions, methods,
+and named block-body arrows (`const f = () => { … }`). Expression-body arrows (`a => a + 1`), anonymous
+inline callbacks, and cross-closure captures are NOT tracked — closure-capture dataflow is deferred, the
+same posture Go (func-literal) and Python (lambda) chose. Effects are attributed to the syntactically
+enclosing named definition only; effects performed inside an inline callback attribute to that callback's
+owner, not the callback.
+
 **Closures and captures**
 
-Tagged template literal calls and unhandled async IIFEs produce `spawns`-attribute edges (schema reserved,
-Since: v0.3 for full effect propagation). Closure call edges are present; without SCIP enrichment they
-resolve at `possible` (sig-compat or cha_rta rule).
+Closure call edges are present; without SCIP enrichment they resolve at `possible` (sig-compat or cha_rta
+rule). Unhandled async IIFEs and detached promises are not modeled as `spawns` (only the explicit
+schedulers/`Worker` above are).
 
 ---
 

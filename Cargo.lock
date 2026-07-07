@@ -345,6 +345,7 @@ name = "cgx-mcp"
 version = "0.3.0"
 dependencies = [
  "cgx-core",
+ "cgx-cql",
  "cgx-index",
  "cgx-query",
  "cgx-store",

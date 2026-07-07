@@ -9,10 +9,12 @@
 //! tool performs any network or LLM call; given the same tree, every tool is a
 //! pure function of its arguments.
 
-use cgx_core::{Confidence, EdgeCondition, NodeId, SymbolKind, SymbolPattern, Tier};
+use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
 use cgx_query::{
-    callees, callers, explain, paths as query_paths, resolve_anchor, unused, ConditionFilter,
-    Direction, EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker,
+    callees, callers, explain, paths as query_paths, rank_symbols, reaches, reaches_all,
+    resolve_anchor, search_symbols, unused, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
+    GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
+    SymbolRank,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -30,6 +32,22 @@ const DEFAULT_DEPTH: u32 = 1;
 const DEFAULT_PATHS_MAX_DEPTH: u32 = 10;
 /// `paths` default result page size (docs/07 IF-13).
 const DEFAULT_PATHS_MAX_RESULTS: usize = 10;
+/// Forest-shaped default depth for `reaches <from>` and `flows-*` — mirrors the
+/// CLI's `DEFAULT_TREE_DEPTH` (2), the bounded neighborhood the human forest uses.
+const DEFAULT_FOREST_DEPTH: u32 = 2;
+
+/// The call-family edge kinds the `kind` filter on `callers`/`callees` accepts.
+/// Restricting to the call family keeps those tools call-graph tools; the tokens
+/// mirror `cgx_core::EdgeKind::is_call`.
+const CALL_EDGE_KINDS: &[(&str, EdgeKind)] = &[
+    ("calls", EdgeKind::Calls),
+    ("calls_virtual", EdgeKind::CallsVirtual),
+    ("calls_closure", EdgeKind::CallsClosure),
+    ("calls_callback", EdgeKind::CallsCallback),
+    ("calls_async", EdgeKind::CallsAsync),
+    ("calls_indirect", EdgeKind::CallsIndirect),
+    ("spawns", EdgeKind::Spawns),
+];
 
 /// The tool registrations returned by `tools/list`. Order is fixed for
 /// determinism. Each declares its `inputSchema` per docs/07; the agent-facing
@@ -39,9 +57,14 @@ pub fn tool_list() -> Value {
         "tools": [
             neighbor_tool("callers", "Symbols that (transitively, to `depth`) call the named symbol."),
             neighbor_tool("callees", "Symbols the named symbol (transitively, to `depth`) calls."),
+            reaches_tool(),
             paths_tool(),
             unused_tool(),
             explain_tool(),
+            search_tool(),
+            symbols_tool(),
+            flow_tool("flows_to", "Forward data-flow slice: symbols a value flows into (its DerivesFrom consumers)."),
+            flow_tool("flows_from", "Data-flow pedigree: the symbols a value derives from (its DerivesFrom sources)."),
             graph_query_tool(),
         ]
     })
@@ -69,7 +92,101 @@ fn neighbor_tool(name: &str, description: &str) -> Value {
                 "cursor":         { "type": "string" },
                 "edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "confidence":     { "type": "string", "enum": ["certain","probable","possible"] },
+                "kind":           edge_kind_prop(),
                 "include_dirty":  include_dirty_prop()
+            },
+            "required": ["symbol", "root"]
+        }
+    })
+}
+
+/// Schema for the `kind` edge-kind filter: an array of call-family edge-kind
+/// tokens. When present, only edges of these kinds are traversed (default: every
+/// call-family edge).
+fn edge_kind_prop() -> Value {
+    let tokens: Vec<&str> = CALL_EDGE_KINDS.iter().map(|(t, _)| *t).collect();
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": tokens },
+        "description": "Restrict traversal to these call-family edge kinds (default: all call edges)"
+    })
+}
+
+fn reaches_tool() -> Value {
+    json!({
+        "name": "reaches",
+        "description": "Reachability over call edges: with `to`, whether `from` reaches `to` (with a witness path); without `to`, every symbol `from` reaches.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from":          { "type": "string", "description": "Source symbol (qualified name)" },
+                "to":            { "type": "string", "description": "Optional target symbol; omit for the from→* reachable set" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "depth":         { "type": "integer", "description": "Max traversal depth (from→* form)", "default": DEFAULT_FOREST_DEPTH },
+                "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["from", "root"]
+        }
+    })
+}
+
+fn search_tool() -> Value {
+    json!({
+        "name": "search",
+        "description": "Resolve a partial/half-remembered name to exact symbol definitions: a pure node-table scan (no graph walk).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern":       { "type": "string", "description": "Name predicate over the whole FQN (case-insensitive substring, or regex when `regex` is true)" },
+                "all":           { "type": "boolean", "default": false, "description": "List every symbol (mutually exclusive with `pattern`)" },
+                "regex":         { "type": "boolean", "default": false, "description": "Treat `pattern` as an unanchored regex" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "kind":          { "type": "string", "enum": ["function","method","field","type","module","all"], "default": "all" },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["root"]
+        }
+    })
+}
+
+fn symbols_tool() -> Value {
+    json!({
+        "name": "symbols",
+        "description": "Rank symbols by reference count (the hub/importance lens), each with its inbound/outbound edge breakdown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rank":          { "type": "string", "enum": ["total","inbound","outbound"], "default": "total" },
+                "kind":          { "type": "string", "enum": ["function","method","field","type","module","all"], "default": "all" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["root"]
+        }
+    })
+}
+
+fn flow_tool(name: &str, description: &str) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol":        { "type": "string", "description": "Qualified symbol name" },
+                "root":          { "type": "string", "description": "Repository root path" },
+                "depth":         { "type": "integer", "default": DEFAULT_FOREST_DEPTH },
+                "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
             },
             "required": ["symbol", "root"]
         }
@@ -137,7 +254,7 @@ fn explain_tool() -> Value {
 fn graph_query_tool() -> Value {
     json!({
         "name": "graph_query",
-        "description": "Execute a Cypher-subset query expression. Reserved: the query language is a post-Phase-1 deliverable; use callers/callees/paths/unused for now.",
+        "description": "Execute a CQL (Cypher-subset) query against the graph and return a result table (columns + rows). A `RETURN path` query yields a paths channel. Read-only; plan-time rejects of unsupported constructs return an actionable error.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -158,12 +275,15 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
     match name {
         "callers" => neighbor_call(args, Direction::Backward),
         "callees" => neighbor_call(args, Direction::Forward),
+        "reaches" => reaches_call(args),
         "paths" => paths_call(args),
         "unused" => unused_call(args),
         "explain" => explain_call(args),
-        "graph_query" => Err(ToolError::unimplemented(
-            "graph_query: the Cypher-subset query language is not implemented in Phase 1; use callers/callees/paths/unused",
-        )),
+        "search" => search_call(args),
+        "symbols" => symbols_call(args),
+        "flows_to" => flow_call(args, FlowDir::To),
+        "flows_from" => flow_call(args, FlowDir::From),
+        "graph_query" => graph_query_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
 }
@@ -277,9 +397,13 @@ fn tier_token(t: Tier) -> &'static str {
     }
 }
 
-/// Build the edge filter from the optional `edge_condition` / `confidence` args.
+/// Build the edge filter from the optional `edge_condition` / `confidence` /
+/// `kind` args. `kind` narrows the traversed call-family edges (Q-11/Q-18).
 fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
     let mut filter = EdgeFilter::calls();
+    if let Some(kinds) = parse_edge_kinds(args)? {
+        filter = filter.with_kinds(kinds);
+    }
     if let Some(c) = opt_str(args, "edge_condition") {
         filter = filter.only_condition(parse_condition(c)?);
     }
@@ -287,6 +411,49 @@ fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
     Ok(filter)
+}
+
+/// Parse the optional `kind` array into a set of call-family [`EdgeKind`]s. `None`
+/// (absent) leaves the default call-family scope; an empty array is also `None`.
+fn parse_edge_kinds(args: &Value) -> Result<Option<Vec<EdgeKind>>, ToolError> {
+    let arr = match args.get("kind") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(ToolError::invalid_params(
+                "`kind` must be an array of edge-kind tokens",
+            ))
+        }
+    };
+    let mut kinds = Vec::with_capacity(arr.len());
+    for v in arr {
+        let token = v.as_str().ok_or_else(|| {
+            ToolError::invalid_params("`kind` entries must be edge-kind strings")
+        })?;
+        let kind = CALL_EDGE_KINDS
+            .iter()
+            .find(|(t, _)| *t == token)
+            .map(|(_, k)| *k)
+            .ok_or_else(|| {
+                ToolError::invalid_params(format!("unknown edge kind `{token}`"))
+            })?;
+        kinds.push(kind);
+    }
+    Ok(if kinds.is_empty() { None } else { Some(kinds) })
+}
+
+/// Parse the optional `kind` string into a symbol-kind filter (`search`/`symbols`).
+/// `all`/absent means no narrowing.
+fn parse_symbol_kind(args: &Value) -> Result<Option<SymbolKind>, ToolError> {
+    match opt_str(args, "kind").unwrap_or("all") {
+        "all" => Ok(None),
+        "function" => Ok(Some(SymbolKind::Function)),
+        "method" => Ok(Some(SymbolKind::Method)),
+        "field" => Ok(Some(SymbolKind::Field)),
+        "type" => Ok(Some(SymbolKind::Type)),
+        "module" => Ok(Some(SymbolKind::Module)),
+        other => Err(ToolError::invalid_params(format!("unknown kind `{other}`"))),
+    }
 }
 
 /// Resolve `root` to a session (acquires the graph with the dirty overlay).
@@ -525,4 +692,340 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
         "edges": edges
     });
     Ok(with_session_meta(body, &session))
+}
+
+/// `reaches` (Q-19): with `to`, a single reachability answer plus its witness
+/// path; without `to`, the `from → *` reachable set (identical machinery to
+/// `callees`, bounded by the forest depth default). Same engine as `cgx reaches`.
+fn reaches_call(args: &Value) -> Result<Value, ToolError> {
+    let from = req_str(args, "from")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+    let from_id = resolve(view, from)?;
+
+    let mut filter = EdgeFilter::calls();
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+
+    match opt_str(args, "to").filter(|s| !s.is_empty()) {
+        // `from → to`: reachability with a shortest witness path.
+        Some(to) => {
+            let to_id = resolve(view, to)?;
+            let walker = PathWalker {
+                filter,
+                max_depth: opt_u32(args, "depth")?,
+                max_paths: None,
+                max_steps: None,
+            };
+            let result: ReachResult = reaches(view, from_id, to_id, &walker);
+            let body = json!({
+                "from": from,
+                "to": to,
+                "reachable": result.reachable,
+                "witness": result.witness.as_ref().map(path_json),
+            });
+            Ok(with_session_meta(body, &session))
+        }
+        // `from → *`: every reachable symbol, paginated.
+        None => {
+            let walker = PathWalker {
+                filter,
+                max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_FOREST_DEPTH)),
+                max_paths: None,
+                max_steps: None,
+            };
+            let results = reaches_all(view, from_id, &walker);
+            let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+            let offset = cursor_offset(args)?;
+            let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
+            let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
+            let body = json!({
+                "from": from,
+                "results": page,
+                "total_matched": results.len(),
+                "has_more": has_more,
+                "cursor": cursor,
+            });
+            Ok(with_session_meta(body, &session))
+        }
+    }
+}
+
+/// `search` (B-1): a pure node-table scan resolving a name pattern (or `all`) to
+/// exact definitions. Reuses `cgx_query::search_symbols`; empty/invalid patterns
+/// return an actionable `invalid_params` (the CLI's exit-2 usage path).
+fn search_call(args: &Value) -> Result<Value, ToolError> {
+    let session = session_for(args)?;
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
+    let pattern = opt_str(args, "pattern");
+
+    let selector = match (all, pattern) {
+        (true, Some(_)) => {
+            return Err(ToolError::invalid_params(
+                "pass either `pattern` or `all`, not both",
+            ))
+        }
+        (false, None) => {
+            return Err(ToolError::invalid_params(
+                "a `pattern` is required (or set `all` to list every symbol)",
+            ))
+        }
+        (true, None) => SearchMatch::All,
+        (false, Some(p)) => SearchMatch::Pattern { pattern: p, regex },
+    };
+
+    let kind_filter = parse_symbol_kind(args)?;
+    let hits = search_symbols(&session.view, selector, kind_filter)
+        .map_err(|e| ToolError::invalid_params(e.to_string()))?;
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(hits.len(), offset, limit);
+    let page: Vec<Value> = hits[start..end].iter().map(symbol_hit_json).collect();
+    let body = json!({
+        "results": page,
+        "total_matched": hits.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// `symbols` (B-2): rank symbols by reference count with a per-symbol edge
+/// breakdown. Reuses `cgx_query::rank_symbols`; same shape the CLI JSON emits.
+fn symbols_call(args: &Value) -> Result<Value, ToolError> {
+    let session = session_for(args)?;
+    let rank_by = match opt_str(args, "rank").unwrap_or("total") {
+        "total" => RankBy::Total,
+        "inbound" => RankBy::Inbound,
+        "outbound" => RankBy::Outbound,
+        other => return Err(ToolError::invalid_params(format!("unknown rank `{other}`"))),
+    };
+    let kind_filter = parse_symbol_kind(args)?;
+    let ranks = rank_symbols(&session.view, rank_by, kind_filter);
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(ranks.len(), offset, limit);
+    let page: Vec<Value> = ranks[start..end].iter().map(symbol_rank_json).collect();
+    let body = json!({
+        "results": page,
+        "total_matched": ranks.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// Data-flow direction for `flows_to` / `flows_from`.
+enum FlowDir {
+    /// `flows_to`: the forward slice — a value's DerivesFrom consumers, reached by
+    /// walking DerivesFrom **backward** (via `callers`).
+    To,
+    /// `flows_from`: the pedigree — what a value derives from, reached by walking
+    /// DerivesFrom **forward** (via `callees`).
+    From,
+}
+
+/// `flows_to` / `flows_from` (docs/04): the same neighbor walk as
+/// `callers`/`callees` with the edge scope swapped from the call family to
+/// `DerivesFrom` — no second execution path, mirroring `cgx flows-to`/`flows-from`.
+fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
+    let symbol = req_str(args, "symbol")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+    let anchor = resolve(view, symbol)?;
+
+    let mut filter = EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]);
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+    let walker = PathWalker {
+        filter,
+        max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_FOREST_DEPTH)),
+        max_paths: None,
+        max_steps: None,
+    };
+    let results = match dir {
+        FlowDir::To => callers(view, anchor, &walker),
+        FlowDir::From => callees(view, anchor, &walker),
+    };
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
+    let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
+    let body = json!({
+        "symbol": symbol,
+        "results": page,
+        "total_matched": results.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+// --- search/symbols result renderers ------------------------------------------
+
+fn symbol_hit_json(h: &SymbolHit) -> Value {
+    json!({
+        "fqn": h.fqn,
+        "file": h.file,
+        "line": h.line,
+        "kind": format!("{:?}", h.kind).to_lowercase(),
+    })
+}
+
+fn symbol_rank_json(r: &SymbolRank) -> Value {
+    json!({
+        "fqn": r.fqn,
+        "file": r.file,
+        "line": r.line,
+        "kind": format!("{:?}", r.kind).to_lowercase(),
+        "in_degree": r.in_degree,
+        "out_degree": r.out_degree,
+        "inbound": breakdown_json(&r.inbound),
+        "outbound": breakdown_json(&r.outbound),
+    })
+}
+
+fn breakdown_json(b: &EdgeBreakdown) -> Value {
+    json!({
+        "total": b.total,
+        "by_family": b.by_family,
+        "by_condition": b.by_condition,
+        "by_confidence": b.by_confidence,
+    })
+}
+
+/// `graph_query` (P8): route to the live CQL engine (`cgx_cql::run`) — the same
+/// engine `cgx query` drives, no fork. A tabular result surfaces `columns`/`rows`;
+/// a `RETURN path` query surfaces a `paths` channel (the `paths`-tool shape).
+/// Parse/plan/eval rejects map to an actionable `invalid_params` error.
+fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
+    let query = req_str(args, "query")?;
+    let session = session_for(args)?;
+    let view = &session.view;
+
+    let table =
+        cgx_cql::run(view, query).map_err(|e| ToolError::invalid_params(e.to_string()))?;
+
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let truncated = table.truncation.is_some();
+    let truncation_reason = table.truncation.map(|r| r.token());
+
+    // A `RETURN path` query populates the path channel: surface paths (same shape
+    // as the `paths` tool) rather than opaque table cells.
+    if !table.paths.is_empty() {
+        let all: Vec<Value> = table.paths.iter().map(|p| cql_path_json(view, p)).collect();
+        let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
+        let body = json!({
+            "columns": table.columns,
+            "paths": all[start..end].to_vec(),
+            "total_matched": all.len(),
+            "has_more": has_more,
+            "cursor": cursor,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+        });
+        return Ok(with_session_meta(body, &session));
+    }
+
+    let all: Vec<Value> = table
+        .rows
+        .iter()
+        .map(|row| Value::Array(row.iter().map(|v| cql_cell_json(view, v)).collect()))
+        .collect();
+    let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
+    let body = json!({
+        "columns": table.columns,
+        "rows": all[start..end].to_vec(),
+        "total_matched": all.len(),
+        "has_more": has_more,
+        "cursor": cursor,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    });
+    Ok(with_session_meta(body, &session))
+}
+
+/// Resolve one CQL result-table cell to self-contained JSON (node/edge/path ids
+/// become their record fields) — the same contract `cgx query --format json` emits.
+fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
+    use cgx_cql::Value as V;
+    match v {
+        V::Null => Value::Null,
+        V::Bool(b) => json!(b),
+        V::Int(i) => json!(i),
+        V::Float(f) => json!(f),
+        V::Str(s) => json!(s),
+        V::List(items) => Value::Array(items.iter().map(|i| cql_cell_json(view, i)).collect()),
+        V::Node(id) => match view.try_node(*id) {
+            Some(n) => json!({
+                "fqn": n.fqn,
+                "file": n.file,
+                "line": n.line_start,
+                "kind": format!("{:?}", n.kind).to_lowercase(),
+            }),
+            None => Value::Null,
+        },
+        V::Edge(id) => match view.edge(*id) {
+            Some(e) => json!({
+                "kind": cgx_cql::eval::edge_kind_token(e.kind),
+                "condition": condition_token(e.condition),
+                "confidence": confidence_token(e.confidence),
+            }),
+            None => Value::Null,
+        },
+        V::Path(p) => Value::Array(
+            p.nodes
+                .iter()
+                .map(|n| match view.try_node(*n) {
+                    Some(rec) => json!(rec.fqn),
+                    None => json!(""),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Rebuild a Layer-1 [`PathResult`] from a CQL `RETURN path` binding and render it
+/// through the shared [`path_json`], so a `graph_query` path matches the `paths`
+/// tool byte-for-byte.
+fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
+    use cgx_query::PathStep;
+    let mut steps = Vec::with_capacity(p.nodes.len());
+    let mut min_confidence = Confidence::Certain;
+    let mut crosses_exceptional = false;
+    for (i, node) in p.nodes.iter().enumerate() {
+        let rec = match view.try_node(*node) {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+        let via = if i == 0 {
+            None
+        } else {
+            p.edges.get(i - 1).and_then(|e| view.edge(*e)).cloned()
+        };
+        if let Some(e) = &via {
+            min_confidence = min_confidence.min(e.confidence);
+            if e.condition.is_exceptional() {
+                crosses_exceptional = true;
+            }
+        }
+        let exception_transient = crosses_exceptional;
+        steps.push(PathStep {
+            node: rec,
+            via,
+            exception_transient,
+        });
+    }
+    path_json(&PathResult {
+        steps,
+        min_confidence,
+        crosses_exceptional,
+    })
 }

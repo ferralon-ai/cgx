@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "cgx MCP STDIO server: a deterministic, read-only JSON-RPC 2.0 server (initialize/tools/list/tools/call) exposing the cgx-query callers/callees/paths/unused/explain tools to AI agents, with a per-call include_dirty working-tree overlay (ADR-06)."
+description = "cgx MCP STDIO server: a deterministic, read-only JSON-RPC 2.0 server (initialize/tools/list/tools/call) exposing the cgx-query callers/callees/reaches/paths/unused/explain/search/symbols/flows_to/flows_from tools plus the cgx-cql graph_query engine to AI agents, with a per-call include_dirty working-tree overlay (ADR-06)."
 
 [dependencies]
 cgx-core.workspace = true
+cgx-cql = { path = "../cgx-cql" }
 cgx-index = { path = "../cgx-index" }
 cgx-query = { path = "../cgx-query" }
 cgx-store = { path = "../cgx-store" }

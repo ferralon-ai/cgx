@@ -47,6 +47,7 @@
 pub mod contract;
 pub mod engine;
 pub mod filter;
+pub mod impacted;
 pub mod result;
 pub mod search;
 pub mod view;
@@ -58,8 +59,11 @@ pub use contract::{
     ApproxReason, ApproximationContract, NegativeScope, ReasonDirection,
 };
 pub use engine::{
-    callees, callers, entrypoint_roots, explain, neighborhood, paths, reaches, reaches_all,
-    resolve_anchor, unused,
+    callees, callers, entrypoint_roots, explain, impacted_tests, neighborhood, paths, reaches,
+    reaches_all, resolve_anchor, unused,
+};
+pub use impacted::{
+    contract_for, lambda_owner_fqn, DiffFacts, ImpactedTests, ImpactedWitness, SUPPORTED_LANGS,
 };
 pub use search::{search_symbols, SearchError, SearchMatch, SymbolHit};
 pub use symbols::{rank_symbols, EdgeBreakdown, EdgeFamily, RankBy, SymbolRank};

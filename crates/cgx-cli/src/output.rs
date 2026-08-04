@@ -445,8 +445,9 @@ pub fn render(
 
 /// A directed graph distilled from a path-shaped result: a deduped, ordered node
 /// list and the directed edges between consecutive path steps. This is the single
-/// shape every path-graph emitter (dot/mermaid/d2) renders, so Layer-1 `paths` and
-/// a CQL `RETURN path` query produce identical graph source.
+/// shape every path-graph emitter (dot/mermaid/d2) renders, so Layer-1 `paths`, a
+/// CQL `RETURN path` query, and `cgx diff --path-added` produce identical graph
+/// source.
 struct GraphData {
     /// Node fqns in first-seen order (stable: paths arrive in deterministic order).
     nodes: Vec<String>,
@@ -454,39 +455,101 @@ struct GraphData {
     edges: Vec<(String, String, String)>,
 }
 
+/// Accumulates a [`GraphData`] over a sequence of walks, keeping first-seen order.
+///
+/// The two hash sets exist **only** to dedup and are never iterated; every byte of
+/// emission order comes from the `Vec`s, which are appended in exactly the order the
+/// caller pushes. That is what makes the graph source byte-stable for a fixed input
+/// (AR-10) — a caller that pushes in a deterministic order gets deterministic output.
+#[derive(Default)]
+struct GraphBuilder {
+    nodes: Vec<String>,
+    edges: Vec<(String, String, String)>,
+    seen_node: std::collections::HashSet<String>,
+    seen_edge: std::collections::HashSet<(String, String, String)>,
+}
+
+impl GraphBuilder {
+    fn push_node(&mut self, fqn: &str) {
+        if self.seen_node.insert(fqn.to_string()) {
+            self.nodes.push(fqn.to_string());
+        }
+    }
+
+    fn push_edge(&mut self, src: &str, dst: &str, label: &str) {
+        let edge = (src.to_string(), dst.to_string(), label.to_string());
+        if self.seen_edge.insert(edge.clone()) {
+            self.edges.push(edge);
+        }
+    }
+
+    fn finish(self) -> GraphData {
+        GraphData {
+            nodes: self.nodes,
+            edges: self.edges,
+        }
+    }
+}
+
 /// Build [`GraphData`] from a result set's path channel. A non-path result yields
 /// an empty graph (the CLI never reaches this with a tabular result).
 fn graph_data(results: &ResultSet) -> GraphData {
-    let mut nodes: Vec<String> = Vec::new();
-    let mut edges: Vec<(String, String, String)> = Vec::new();
-    let mut seen_node: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_edge: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
+    let mut g = GraphBuilder::default();
 
     if let ResultSet::Paths(set) = results {
         for p in &set.paths {
             for step in &p.steps {
-                let fqn = step.node.fqn.clone();
-                if seen_node.insert(fqn.clone()) {
-                    nodes.push(fqn);
-                }
+                g.push_node(&step.node.fqn);
             }
             for pair in p.steps.windows(2) {
-                let src = pair[0].node.fqn.clone();
-                let dst = pair[1].node.fqn.clone();
                 let label = pair[1]
                     .via
                     .as_ref()
                     .map(|e| condition_str(e.condition).to_string())
                     .unwrap_or_default();
-                let edge = (src, dst, label);
-                if seen_edge.insert(edge.clone()) {
-                    edges.push(edge);
-                }
+                g.push_edge(&pair[0].node.fqn, &pair[1].node.fqn, &label);
             }
         }
     }
-    GraphData { nodes, edges }
+    g.finish()
+}
+
+/// Render node-FQN walks as path-graph source (`dot`/`mermaid`/`d2`).
+///
+/// `cgx diff --path-added` carries its own result shape (`cgx_diff::AddedPath`, a
+/// witness path of FQNs) rather than a [`ResultSet`], but the graph it wants is
+/// exactly the one `cgx paths` emits — so it goes through the same [`GraphData`] and
+/// the same emitters instead of a second renderer. Each walk is one path's node FQNs
+/// in path order; nodes and edges are deduped across walks in first-seen order.
+///
+/// Edges are **unlabeled**: an added path's witness is FQNs only and carries no
+/// `EdgeCondition`, and inventing one from the head graph would be ambiguous (a node
+/// pair may have several edges with differing conditions). The emitters already
+/// render an empty label as an unlabeled edge, which also matches the house
+/// convention of omitting `always`.
+///
+/// **Precondition:** `format` must satisfy [`Format::is_path_graph`]; the CLI rejects
+/// every other format for this mode before dispatch.
+pub fn render_path_walks(format: Format, walks: &[&[String]]) -> String {
+    let mut g = GraphBuilder::default();
+    for walk in walks {
+        for fqn in walk.iter() {
+            g.push_node(fqn);
+        }
+        for pair in walk.windows(2) {
+            g.push_edge(&pair[0], &pair[1], "");
+        }
+    }
+    let data = g.finish();
+
+    match format {
+        Format::Dot => render_dot(data),
+        Format::Mermaid => render_mermaid(data),
+        Format::D2 => render_d2(data),
+        Format::Human | Format::Json | Format::Sarif => panic!(
+            "render_path_walks requires a path-graph format (dot|mermaid|d2), got {format:?}"
+        ),
+    }
 }
 
 /// A stable identifier for a node in graph source: `n0`, `n1`, … assigned in the

@@ -29,7 +29,8 @@ use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{
-    render, render_explanation, render_search, render_symbols, Format, ResultSet, TableData,
+    render, render_explanation, render_path_walks, render_search, render_symbols, Format,
+    ResultSet, TableData,
 };
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
@@ -1496,7 +1497,18 @@ struct DiffArgs {
 const DIFF_FULL_FORMATS: &[Format] = &[Format::Human, Format::Json];
 
 /// The `--format` values `cgx diff --path-added` actually implements.
-const PATH_ADDED_FORMATS: &[Format] = &[Format::Human, Format::Json];
+///
+/// The path-graph three are here and not in [`DIFF_FULL_FORMATS`] because only this
+/// mode is path-shaped: an added path is a walk of node FQNs, which is the same
+/// graph shape `cgx paths` emits. A full `cgx diff` is an edge/node bucket set, not
+/// a graph walk, so dot/mermaid/d2 stay rejected there.
+const PATH_ADDED_FORMATS: &[Format] = &[
+    Format::Human,
+    Format::Json,
+    Format::Dot,
+    Format::Mermaid,
+    Format::D2,
+];
 
 /// Reject a `--format` the selected diff mode does not implement.
 ///
@@ -1748,10 +1760,19 @@ fn print_path_added(
                 println!("+ path  {route}  [{commit}]");
             }
         }
-        // Rejected by `check_diff_format` before any work happens. Spelling the
-        // variants out instead of `_` is what makes a future `Format` a compile
-        // error here rather than another silent fallthrough to human text.
-        Format::Sarif | Format::Dot | Format::Mermaid | Format::D2 => {
+        // Graph source for the added-path set. Each path's `via` witness is a walk
+        // of node FQNs, so it renders through the same emitters `cgx paths` uses
+        // rather than a second renderer. Edges carry no label: `AddedPath` has no
+        // `EdgeCondition`. Node labels are the FQN, matching `cgx paths` exactly.
+        Format::Dot | Format::Mermaid | Format::D2 => {
+            let walks: Vec<&[String]> = paths.iter().map(|(p, _)| p.via.as_slice()).collect();
+            print!("{}", render_path_walks(format, &walks));
+        }
+        // Rejected by `check_diff_format` before any work happens (D1: a diff-mode
+        // SARIF result would have no `physicalLocation`). Spelling the variant out
+        // instead of `_` is what makes a future `Format` a compile error here rather
+        // than another silent fallthrough to human text.
+        Format::Sarif => {
             unreachable!("{format:?} is rejected for --path-added by check_diff_format")
         }
     }

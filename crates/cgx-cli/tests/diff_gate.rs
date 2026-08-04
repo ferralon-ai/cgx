@@ -372,6 +372,17 @@ fn diff_argv(path_added: bool) -> Vec<&'static str> {
     v
 }
 
+/// The `--format` values each diff mode supports, as the rejection message spells
+/// them. `--path-added` is path-shaped, so it also implements the three path-graph
+/// emitters; full `cgx diff` is an edge/node bucket set and does not.
+fn supported_formats(path_added: bool) -> &'static str {
+    if path_added {
+        "human|json|dot|mermaid|d2"
+    } else {
+        "human|json"
+    }
+}
+
 /// The C2 check: every `Format` variant against every diff mode, asserting no run
 /// both exits 0 and emits human prose for a non-human format.
 ///
@@ -410,6 +421,19 @@ fn every_format_x_every_diff_mode_never_emits_human_prose_with_exit_0() {
                         .unwrap_or_else(|e| panic!("{ctx}: stdout is JSON ({e}): {stdout}"));
                     assert!(!contains_human_prose(&stdout), "{ctx}: no human prose: {stdout}");
                 }
+                // `--path-added` implements the path-graph emitters. `diff_argv`
+                // picks the unreachable direction, so the gate is clean and the
+                // graph is empty — but it must still be *valid, empty* graph source,
+                // never prose and never a stray marker.
+                Format::Dot | Format::Mermaid | Format::D2 if path_added => {
+                    assert_eq!(code, 0, "{ctx}: path-graph format is supported: {stdout}{stderr}");
+                    assert!(!contains_human_prose(&stdout), "{ctx}: no human prose: {stdout}");
+                    let g = parse_graph(format, &stdout);
+                    assert!(
+                        g.nodes.is_empty() && g.edges.is_empty(),
+                        "{ctx}: a clean gate emits an empty graph: {g:?}"
+                    );
+                }
                 Format::Sarif | Format::Dot | Format::Mermaid | Format::D2 => {
                     assert_eq!(code, 2, "{ctx}: unimplemented format is a usage error: {stdout}");
                     assert!(
@@ -417,7 +441,7 @@ fn every_format_x_every_diff_mode_never_emits_human_prose_with_exit_0() {
                         "{ctx}: the error names the requested format: {stderr}"
                     );
                     assert!(
-                        stderr.contains("use --format human|json"),
+                        stderr.contains(&format!("use --format {}", supported_formats(path_added))),
                         "{ctx}: the error says what is supported: {stderr}"
                     );
                     assert!(
@@ -444,13 +468,319 @@ fn sarif_is_rejected_loudly_by_both_diff_modes() {
         argv.extend(["--format", "sarif"]);
         let (stdout, stderr, code) = run_cgx(&repo, &argv);
 
-        let expected =
-            format!("sarif format is not supported by `{mode}` — use --format human|json");
+        let expected = format!(
+            "sarif format is not supported by `{mode}` — use --format {}",
+            supported_formats(path_added)
+        );
         assert_eq!(code, 2, "{mode}: sarif is a usage error, not exit 0: {stdout}");
         assert!(stdout.is_empty(), "{mode}: nothing on stdout: {stdout}");
         assert!(
             stderr.contains(&expected),
             "{mode}: expected {expected:?} on stderr, got: {stderr}"
+        );
+    }
+}
+
+/// The plain `cgx diff` mode is not path-shaped, so it keeps rejecting all three
+/// path-graph formats even though `--path-added` now implements them. The
+/// narrowing is per-mode, not global.
+#[test]
+fn path_graph_formats_stay_rejected_by_plain_diff() {
+    let (_tmp, repo) = gate_fixture();
+
+    for fmt in ["dot", "mermaid", "d2"] {
+        let mut argv: Vec<&str> = diff_argv(false);
+        argv.extend(["--format", fmt]);
+        let (stdout, stderr, code) = run_cgx(&repo, &argv);
+
+        let expected =
+            format!("{fmt} format is not supported by `cgx diff` — use --format human|json");
+        assert_eq!(code, 2, "{fmt}: plain diff rejects it: {stdout}");
+        assert!(stdout.is_empty(), "{fmt}: nothing on stdout: {stdout}");
+        assert!(
+            stderr.contains(&expected),
+            "{fmt}: expected {expected:?} on stderr, got: {stderr}"
+        );
+    }
+}
+
+// --- `--path-added` graph output (dot/mermaid/d2) ---------------------------
+//
+// The added-path witnesses render through the same emitters `cgx paths` uses.
+// These tests parse the emitted source back into (nodes, edges) and assert
+// structural validity plus correspondence to the fixture's actual added path —
+// no eyeballing, no golden string, no external toolchain.
+
+/// A graph parsed back out of emitted source: `(node_id, label)` declarations in
+/// emission order and `(src_id, dst_id)` edges in emission order.
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedGraph {
+    nodes: Vec<(String, String)>,
+    edges: Vec<(String, String)>,
+}
+
+/// Parse graph source for `format`, asserting the format's structural rules on the
+/// way, then the rules common to all three (ids are `n0..nk` in declaration order;
+/// every edge endpoint is a declared id).
+fn parse_graph(format: cgx_cli::output::Format, src: &str) -> ParsedGraph {
+    use cgx_cli::output::Format;
+    let g = match format {
+        Format::Dot => parse_dot(src),
+        Format::Mermaid => parse_mermaid(src),
+        Format::D2 => parse_d2(src),
+        other => panic!("{other:?} is not a path-graph format"),
+    };
+
+    for (i, (id, _)) in g.nodes.iter().enumerate() {
+        assert_eq!(
+            id,
+            &format!("n{i}"),
+            "{format:?}: node ids are n0..nk in order: {src}"
+        );
+    }
+    let ids: Vec<&str> = g.nodes.iter().map(|(id, _)| id.as_str()).collect();
+    for (s, d) in &g.edges {
+        assert!(
+            ids.contains(&s.as_str()),
+            "{format:?}: edge source {s} is declared: {src}"
+        );
+        assert!(
+            ids.contains(&d.as_str()),
+            "{format:?}: edge target {d} is declared: {src}"
+        );
+    }
+    g
+}
+
+/// Graphviz: a `digraph` header, one matching brace pair, one `label=` per node,
+/// and `->` edges.
+fn parse_dot(src: &str) -> ParsedGraph {
+    let lines: Vec<&str> = src.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("digraph cgx {"),
+        "dot header: {src}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some("}"),
+        "dot closes its block: {src}"
+    );
+    assert_eq!(
+        src.matches('{').count(),
+        1,
+        "exactly one opening brace: {src}"
+    );
+    assert_eq!(
+        src.matches('}').count(),
+        1,
+        "exactly one closing brace: {src}"
+    );
+
+    let mut g = ParsedGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    };
+    for line in &lines[1..lines.len() - 1] {
+        let t = line.trim();
+        if t == "rankdir=LR;" {
+            continue;
+        }
+        // Edges first: a labeled edge would otherwise parse as a node declaration.
+        if let Some((s, rest)) = t.split_once(" -> ") {
+            let d = rest
+                .strip_suffix(';')
+                .unwrap_or_else(|| panic!("dot edge ends in ;: {t}"));
+            assert!(
+                !d.contains("[label="),
+                "path-added edges carry no label (D3): {t}"
+            );
+            g.edges.push((s.to_string(), d.to_string()));
+        } else if let Some((id, rest)) = t.split_once(" [label=\"") {
+            let label = rest
+                .strip_suffix("\"];")
+                .expect("dot node line ends [label=\"…\"];");
+            g.nodes.push((id.to_string(), label.to_string()));
+        } else {
+            panic!("dot line is neither a node declaration nor an edge: {t}");
+        }
+    }
+    assert_eq!(
+        src.matches("label=").count(),
+        g.nodes.len(),
+        "exactly one label= per node, and none anywhere else: {src}"
+    );
+    g
+}
+
+/// Mermaid: a `graph TD` header, `id["label"]` nodes and `-->` edges.
+fn parse_mermaid(src: &str) -> ParsedGraph {
+    let lines: Vec<&str> = src.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("graph TD"),
+        "mermaid header: {src}"
+    );
+
+    let mut g = ParsedGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    };
+    for line in &lines[1..] {
+        let t = line.trim();
+        // A labeled mermaid edge is `a -->|label| b`, which fails this split — so
+        // the panic below is the D3 check as well as the syntax check.
+        if t.contains("-->") {
+            let (s, d) = t
+                .split_once(" --> ")
+                .unwrap_or_else(|| panic!("mermaid edge is unlabeled `a --> b` (D3): {t}"));
+            g.edges.push((s.to_string(), d.to_string()));
+        } else if let Some((id, rest)) = t.split_once("[\"") {
+            let label = rest
+                .strip_suffix("\"]")
+                .expect("mermaid node line ends \"]");
+            g.nodes.push((id.to_string(), label.to_string()));
+        } else {
+            panic!("mermaid line is neither a node declaration nor an edge: {t}");
+        }
+    }
+    g
+}
+
+/// D2: `id: "label"` declarations and `->` edges. Unlabeled edges carry no `:`.
+fn parse_d2(src: &str) -> ParsedGraph {
+    let mut g = ParsedGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    };
+    for line in src.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((s, d)) = t.split_once(" -> ") {
+            assert!(
+                !d.contains(':'),
+                "path-added edges carry no label (D3): {t}"
+            );
+            g.edges.push((s.to_string(), d.to_string()));
+        } else {
+            let (id, rest) = t
+                .split_once(": \"")
+                .unwrap_or_else(|| panic!("d2 declaration: {t}"));
+            let label = rest
+                .strip_suffix('"')
+                .expect("d2 declaration ends in a quote");
+            g.nodes.push((id.to_string(), label.to_string()));
+        }
+    }
+    g
+}
+
+/// The added path this fixture introduces, read out of the JSON mode of the *same*
+/// command, so the graph assertions compare against what the gate actually found
+/// rather than a hand-copied golden.
+fn added_path_via(repo: &Path) -> Vec<String> {
+    let (stdout, _e, code) = run_cgx(repo, &path_graph_argv("json"));
+    assert_eq!(code, 1, "the fixture introduces one new path: {stdout}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let paths = doc["added_paths"].as_array().expect("added_paths array");
+    assert_eq!(paths.len(), 1, "exactly one added path: {stdout}");
+    paths[0]["via"]
+        .as_array()
+        .expect("via array")
+        .iter()
+        .map(|v| v.as_str().expect("via entry is a string").to_string())
+        .collect()
+}
+
+/// `--path-added` argv in the direction that *does* find a new path, so the graph
+/// under test is non-empty.
+fn path_graph_argv(format: &'static str) -> Vec<&'static str> {
+    vec![
+        "diff",
+        "HEAD~1",
+        "HEAD",
+        "--path-added",
+        "--from",
+        "**::handler::*",
+        "--to",
+        "**::Command::*",
+        "--format",
+        format,
+    ]
+}
+
+/// C3: each path-graph format emits structurally valid source whose node and edge
+/// set is exactly the fixture's added path — node labels are the FQNs (D2: no
+/// `file:line` anchors) and edges are unlabeled (D3).
+#[test]
+fn path_added_emits_valid_graph_source_for_every_path_graph_format() {
+    use cgx_cli::output::Format;
+
+    let (_tmp, repo) = gate_fixture();
+    let via = added_path_via(&repo);
+    assert!(
+        via.len() >= 2,
+        "the witness spans at least source and sink: {via:?}"
+    );
+
+    let expected_nodes: Vec<(String, String)> = via
+        .iter()
+        .enumerate()
+        .map(|(i, fqn)| (format!("n{i}"), fqn.clone()))
+        .collect();
+    let expected_edges: Vec<(String, String)> = (0..via.len() - 1)
+        .map(|i| (format!("n{i}"), format!("n{}", i + 1)))
+        .collect();
+
+    for (name, format) in [
+        ("dot", Format::Dot),
+        ("mermaid", Format::Mermaid),
+        ("d2", Format::D2),
+    ] {
+        let (stdout, _stderr, code) = run_cgx(&repo, &path_graph_argv(name));
+        assert_eq!(
+            code, 1,
+            "{name}: the gate still fires on a new path: {stdout}"
+        );
+        assert!(
+            !contains_human_prose(&stdout),
+            "{name}: graph source only, no prose: {stdout}"
+        );
+
+        let g = parse_graph(format, &stdout);
+        assert_eq!(
+            g.nodes, expected_nodes,
+            "{name}: nodes are the witness FQNs: {stdout}"
+        );
+        assert_eq!(
+            g.edges, expected_edges,
+            "{name}: edges follow the witness: {stdout}"
+        );
+    }
+}
+
+/// C4: the same command run twice against the same index produces byte-identical
+/// stdout. This is the AR-10 determinism claim, and it is deliberately a
+/// repeat-run comparison rather than a golden-string check — a golden would pass
+/// on a renderer that happened to be stable for one input and not for the order it
+/// derives from.
+#[test]
+fn path_added_graph_output_is_byte_identical_across_runs() {
+    let (_tmp, repo) = gate_fixture();
+
+    for name in ["dot", "mermaid", "d2"] {
+        let argv = path_graph_argv(name);
+        let (first, _e1, c1) = run_cgx(&repo, &argv);
+        let (second, _e2, c2) = run_cgx(&repo, &argv);
+        assert_eq!(c1, 1, "{name}: first run fires the gate: {first}");
+        assert_eq!(c2, c1, "{name}: repeated runs agree on the exit code");
+        assert!(!first.is_empty(), "{name}: the run emitted graph source");
+        assert_eq!(
+            first.as_bytes(),
+            second.as_bytes(),
+            "{name}: repeated runs over the same index are byte-identical"
         );
     }
 }

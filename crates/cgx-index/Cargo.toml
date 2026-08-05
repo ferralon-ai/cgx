@@ -18,7 +18,7 @@ cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }
 cgx-scip.workspace = true
 cgx-store = { path = "../cgx-store" }
-gix = { version = "0.80", default-features = false, features = ["blob-diff"] }
+gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
 rayon = "1"
 thiserror.workspace = true
 tree-sitter-json.workspace = true

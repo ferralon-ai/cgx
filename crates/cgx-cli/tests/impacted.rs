@@ -489,3 +489,163 @@ fn an_unchanged_working_tree_is_not_degenerate() {
         "cgx's own store is not a changed source file: {stdout}"
     );
 }
+
+// --- the `--assert-empty` gate ------------------------------------------------
+
+/// A library symbol reached by **no** test. The repo's one test reaches `add`
+/// through `mid`; `lonely` is called by nothing, so editing it is the shape a CI
+/// gate exists for — a real, non-degenerate, empty answer.
+const LONELY_BASE: &str = "pub fn lonely() -> i32 { 7 }\n";
+const LONELY_HEAD: &str = "pub fn lonely() -> i32 { 8 }\n";
+
+/// [`rust_fixture`] plus `lonely`, with the working-tree edit moved onto
+/// `lonely.rs` so the changed set is non-empty and reaches no test.
+fn unreached_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(
+        &path,
+        "src/lib.rs",
+        "pub mod api;\npub mod check;\npub mod lonely;\n",
+    );
+    write(&path, "src/api.rs", API_BASE);
+    write(&path, "src/check.rs", CHECK);
+    write(&path, "src/lonely.rs", LONELY_BASE);
+    commit(&path, "base");
+    write(&path, "src/lonely.rs", LONELY_HEAD);
+    (tmp, path)
+}
+
+/// A repo whose only working-tree edit is a tracked file no adapter claims.
+fn no_symbol_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(&path, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+    write(&path, "NOTES.md", "first\n");
+    commit(&path, "base");
+    write(&path, "NOTES.md", "second\n");
+    (tmp, path)
+}
+
+/// **The gate must be able to pass.** A change that reaches no test at all is the
+/// success case `--assert-empty` was added for, and it has to exit 0 on its own —
+/// not via `--allow-vacuous`, which also suppresses genuine vacuity and would
+/// silently disable the safety property the gate provides.
+///
+/// The regression it guards: ADR-08 clause (b) fires on `unfiltered_count > 0`,
+/// meaning "candidates existed and the user's filters removed them all". Feeding
+/// it the reverse walk's reached-node count made it true on every run — seeds are
+/// marked reached at seeding — so an honest empty answer always read as vacuous
+/// and blamed confidence filters the user never set.
+#[test]
+fn an_empty_impacted_set_with_no_filters_passes_assert_empty() {
+    let (_tmp, repo) = unreached_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--assert-empty",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(
+        code, 0,
+        "no test reaches the change: the gate passes. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("vacuous"),
+        "nothing was filtered, so nothing may be blamed on a filter: {stderr}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(doc["count"].as_u64(), Some(0));
+    assert_eq!(
+        doc["vacuous"].as_bool(),
+        Some(false),
+        "an honest pass is not flagged vacuous: {stdout}"
+    );
+}
+
+/// The assertion still fires. Fixing the vacuity misfire must not turn the gate
+/// into a no-op.
+#[test]
+fn a_non_empty_impacted_set_fails_assert_empty() {
+    let (_tmp, repo) = rust_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("assertion failed"),
+        "the failure names itself: {stderr}"
+    );
+}
+
+/// A degenerate answer keeps its exit 4 under the gate. The empty list is not a
+/// clean bill of health, and `--assert-empty` must not launder it into one.
+#[test]
+fn a_typescript_only_diff_still_exits_4_under_assert_empty() {
+    let (_tmp, repo) = typescript_only_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(code, 4, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("typescript") && stderr.contains("not a clean bill of health"),
+        "the degenerate reason survives the gate: {stderr}"
+    );
+}
+
+/// The other degenerate shape: everything that changed is a file no adapter
+/// claims, so the changed set is empty and clause (a) — the zero-symbol match —
+/// is the honest verdict.
+#[test]
+fn a_changed_file_contributing_no_symbols_still_exits_4_under_assert_empty() {
+    let (_tmp, repo) = no_symbol_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(code, 4, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("matched zero symbols"),
+        "clause (a) is the reason, and says so: {stderr}"
+    );
+}
+
+/// Clause (b) must still fire when it is actually true. `--confidence certain`
+/// excludes the `probable` hop between `test_mid` and the change, so the one
+/// candidate the query would otherwise return is removed **by a filter** — the
+/// exact condition ADR-08 clause (b) is defined over.
+#[test]
+fn a_confidence_floor_that_excludes_every_candidate_is_still_vacuous() {
+    let (_tmp, repo) = rust_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--assert-empty",
+            "--confidence",
+            "certain",
+        ],
+    );
+    assert_eq!(
+        code, 4,
+        "a filter removed the only candidate: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("confidence/edge-condition filters excluded every candidate result"),
+        "and clause (b) is the reason given: {stderr}"
+    );
+
+    // The control: same repo, same query, no floor — the candidate is there, so
+    // the gate fails rather than passing vacuously.
+    let (_stdout, _stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(code, 1, "without the floor the candidate is reported");
+}

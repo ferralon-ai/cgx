@@ -80,8 +80,14 @@ pub struct ImpactedTests {
 }
 
 impl ImpactedTests {
-    /// Nodes reached by the walk *before* the test filter — the ADR-08
-    /// `unfiltered_count` a surface reports alongside the filtered answer.
+    /// How many nodes the backward walk reached, seeds included.
+    ///
+    /// **Not** the ADR-08 `unfiltered_count`. That field means "results this
+    /// query returns with the confidence/edge-condition filters removed", and is
+    /// used to attribute an empty answer to a filter; this is a walk-size
+    /// statistic that is non-zero whenever anything changed, because seeds are
+    /// marked reached at seeding. Passing it as `unfiltered_count` makes every
+    /// honestly-empty `--assert-empty` gate read as vacuous.
     pub fn reached_count(&self) -> usize {
         self.reached.iter().filter(|r| **r).count()
     }

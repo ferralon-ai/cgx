@@ -1223,12 +1223,31 @@ fn run_impacted_tests(
     // under-approximation the contract does not report.
     let forest = ForestData::resolve(&answer.view, &subgraph, args.tree, None);
 
-    // ADR-08: clause (a) is "did anything change at all" (the analogue of an
-    // anchor resolving); `unfiltered_count` is everything the reverse walk
-    // reached before the test filter, so `--assert-empty` over a change that
-    // reached only non-test symbols is an honest, non-vacuous pass.
+    // ADR-08. Clause (a) is "did anything change at all", the analogue of an
+    // anchor resolving. Clause (b) is a *filter-attribution* test — it fires when
+    // the confidence/edge-condition filters removed every candidate — so
+    // `unfiltered_count` must be the number of tests this same query reports with
+    // those filters removed, and nothing else. The test-node predicate is not
+    // such a filter: "which of the reached nodes are tests" is the question, so a
+    // reached non-test node is a correct negative, not an excluded candidate.
+    // Feeding the reached-node count in here made clause (b) fire on every
+    // honestly-empty answer, because the seeds are always reached.
+    //
+    // With no confidence floor in force the counterfactual run *is* this run, so
+    // the two counts are equal and clause (b) cannot fire at all. When there is
+    // one, the counterfactual is a second walk over the same in-memory head view
+    // — no re-index, and `evaluate` reads the count only for a *passing*
+    // `--assert-empty` gate, so nothing else pays for it.
     let any_symbol_matched = !answer.changed.is_empty();
-    let unfiltered_count = answer.tests.reached_count();
+    let filtered_count = answer.tests.tests.len();
+    let unfiltered_count = if args.assert_empty && filtered_count == 0 && args.confidence.is_some()
+    {
+        cgx_query::impacted_tests(&answer.view, &answer.changed, &unfiltered_walker(&args))
+            .tests
+            .len()
+    } else {
+        filtered_count
+    };
     let degenerate = answer.degenerate;
     let degenerate_reason = answer.degenerate_reason;
 
@@ -2039,6 +2058,21 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
         max_depth: args.max_depth,
         max_paths: None,
         max_steps: None,
+    }
+}
+
+/// [`build_walker`] with the confidence floor lifted: the ADR-08 clause-(b)
+/// counterfactual, "what this query returns with the confidence/edge-condition
+/// filters removed".
+///
+/// `--depth` is deliberately preserved. A depth bound is not a confidence or
+/// edge-condition filter — it narrows the question rather than discarding
+/// candidates the question admits, and the contract reports it separately as
+/// `depth-limit`.
+fn unfiltered_walker(args: &QueryArgs) -> PathWalker {
+    PathWalker {
+        filter: EdgeFilter::calls(),
+        ..build_walker(args)
     }
 }
 

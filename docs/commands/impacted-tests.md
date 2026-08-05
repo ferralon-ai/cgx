@@ -59,7 +59,7 @@ The command does not run tests, does not read a coverage database, and does not 
 | `--format` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. `dot`, `mermaid`, and `d2` are path-shaped renderers and are rejected with exit 2 on this subcommand. |
 | `--depth` | integer | unbounded | Maximum backward traversal depth from each changed symbol. Omitting it is the intended default: a test three hops from the change is still impacted. A bound fires the `depth-limit` under-reason. |
 | `--confidence` | `possible\|probable\|certain` | `possible` | Minimum confidence floor; edges below this level are excluded from the walk. Excluding any edge fires the `below-confidence-floor` under-reason. |
-| `--assert-empty` | — | off | CI assertion: exit 1 if any impacted test is found. A *passing* gate exits 4, not 0 — see [`--assert-empty` and the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
+| `--assert-empty` | — | off | CI assertion: exit 1 if any impacted test is found, 0 if none is, 4 if the empty answer proves nothing — see [`--assert-empty` and the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
 | `--allow-vacuous` | — | off | Suppress the `--assert-empty` vacuity guard, converting its exit 4 to exit 0. It does **not** suppress the degenerate-answer exit 4. |
 | `--at` | git ref | — | Rejected (exit 2): `--at` pins a query to a single ref's graph and conflicts with a two-sided comparison. Pass the refs positionally instead. |
 | `--no-auto-index` | — | off | Inherited from the shared query flags; inert on this subcommand, which indexes both sides itself. |
@@ -154,29 +154,25 @@ The degenerate exit 4 is **not** suppressed by `--allow-vacuous`; that flag gove
 
 ## `--assert-empty` and the vacuity guard
 
-`--assert-empty` asserts that the change impacts no test. The assertion itself behaves as expected: any impacted test exits 1.
+`--assert-empty` asserts that the change impacts no test: any impacted test exits 1, and a change that genuinely reaches no test exits **0**. No extra flag is needed for the ordinary passing gate.
 
-A *passing* assertion, however, exits **4**, not 0 — under either clause of the shared ADR-08 vacuity guard:
+The shared ADR-08 vacuity guard exists to separate that honest pass from an empty answer that proves nothing, and exits **4** under either of its two clauses:
 
-- **Nothing changed.** The changed set is empty, which the guard reads as a zero-symbol match: `--assert-empty passed vacuously (the symbol pattern matched zero symbols)`.
-- **Something changed and no test reached it.** The guard's second clause compares the filtered result count against an unfiltered count, which on this subcommand is *every node the backward walk reached*, not the pre-confidence-filter result set. Any non-empty changed set makes that count non-zero, so the guard reports `--assert-empty passed vacuously (confidence/edge-condition filters excluded every candidate result)` even when no confidence filter is in play.
+- **Nothing changed.** The changed set is empty, which the guard reads as a zero-symbol match: `--assert-empty passed vacuously (the symbol pattern matched zero symbols)`. Assert on a diff that contains nothing and the assertion has established nothing.
+- **A filter removed every candidate.** With `--confidence probable|certain`, the walk may drop the only edges by which a test reached the change. The answer is then empty because of the floor, not because of the code: `--assert-empty passed vacuously (confidence/edge-condition filters excluded every candidate result)`. Without such a flag this clause cannot fire — being reached and not being a test is a correct negative, not a candidate a filter removed.
 
-**Pair `--assert-empty` with `--allow-vacuous` to gate on this subcommand.** That combination exits 0 on a pass and 1 on a failure, still prints the warning to stderr, and still sets `"vacuous": true` in JSON and a SARIF `note` — so the vacuity is downgraded, not lost:
+A [degenerate answer](#degenerate-answers) also exits 4, on its own signal, and `--allow-vacuous` does not suppress it.
 
-```
-warning: --assert-empty passed vacuously (confidence/edge-condition filters excluded every candidate result); allowed by --allow-vacuous
-```
-
-Without `--allow-vacuous`, a green gate is indistinguishable from a degenerate one at the exit code.
+`--allow-vacuous` downgrades the guard's exit 4 to 0. It still prints the warning to stderr and still sets `"vacuous": true` in JSON and a SARIF `note` — so the vacuity is recorded, not lost. Reach for it only when the vacuous case is one you have decided to tolerate; on a gate that runs per-PR it disables the guard on every future PR too.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success. Impacted tests were found, or the answer is empty and non-degenerate (nothing changed). With `--assert-empty`, only reachable via `--allow-vacuous`. |
+| 0 | Success. Impacted tests were found, or the answer is empty and non-degenerate — including a `--assert-empty` gate that passed because the change reaches no test. |
 | 1 | `--assert-empty` failed: at least one impacted test was found. |
 | 2 | Usage error: `--uncommitted` combined with positional refs, neither side given, `--at` passed, or a path-graph `--format`. |
-| 4 | Either the answer is degenerate (see above), or `--assert-empty` passed vacuously. The second is suppressed by `--allow-vacuous`; the first is not. |
+| 4 | Either the answer is degenerate (see above), or `--assert-empty` passed vacuously: nothing changed, or a `--confidence` floor excluded every candidate. The second is suppressed by `--allow-vacuous`; the first is not. |
 
 Exit code 3 (missing index) is not reachable: the command indexes both sides itself.
 
@@ -190,10 +186,10 @@ git -C /tmp/demo-go init -q -b main
 git -C /tmp/demo-go add -A && git -C /tmp/demo-go commit -q -m seed
 ```
 
-The `demo-conf` repository used for the confidence example is a small Rust crate:
+The `demo-conf` repository used for the confidence and `--assert-empty` examples is a small Rust crate:
 
 ```
-src/lib.rs      pub mod api;  pub mod check;
+src/lib.rs      pub mod api;  pub mod check;  pub mod lonely;
 src/api.rs      pub fn add(a: i32, b: i32) -> i32 { a + b }
 src/check.rs    use crate::api::add;
                 pub fn mid(x: i32) -> i32 { add(x, 1) }
@@ -201,7 +197,10 @@ src/check.rs    use crate::api::add;
                     use super::*;
                     #[test] fn test_mid() { let got = mid(1); assert_eq!(got, 2); }
                 }
+src/lonely.rs   pub fn lonely() -> i32 { 7 }
 ```
+
+`add` is reached by `test_mid` through `mid`; `lonely` is called by nothing, so editing each of them gives the two answers a gate has to tell apart.
 
 ## Examples
 
@@ -355,19 +354,35 @@ base is the ref tip, not the merge-base of base and head; symbols that landed on
 ### CI gate: assert no test is impacted
 
 ```
-cgx impacted-tests main HEAD --repo /tmp/demo-go --assert-empty --allow-vacuous
+cgx impacted-tests main HEAD --repo /tmp/demo-go --assert-empty
 ```
 
 ```
 cgx: assertion failed: results found when none expected
 ```
 
-Exit 1 — this branch does impact tests. On a branch that impacts none, the same command exits 0. Drop `--allow-vacuous` and a *passing* gate exits 4 instead, for the reasons in [`--assert-empty` and the vacuity guard](#--assert-empty-and-the-vacuity-guard):
+Exit 1 — this branch does impact tests.
+
+The passing case, on `demo-conf` with only `lonely` edited — a public function no test reaches:
+
+```
+cgx impacted-tests --uncommitted --repo /tmp/demo-conf --assert-empty
+```
+
+Exit 0, stderr empty. The gate needs no `--allow-vacuous`: the answer is empty because no test reaches the change, which is the fact being asserted.
+
+A `--confidence` floor is the case the guard is for. Editing `add` — which `test_mid` *does* reach, over a `probable` hop — under a `certain` floor leaves the answer empty for a reason that has nothing to do with the code:
+
+```
+cgx impacted-tests --uncommitted --repo /tmp/demo-conf --assert-empty --confidence certain
+```
 
 ```
 warning: --assert-empty passed vacuously (confidence/edge-condition filters excluded every candidate result); exit 4 (suppress with --allow-vacuous)
 cgx: assertion passed vacuously (exit 4)
 ```
+
+Exit 4. Without the floor, the same command exits 1.
 
 ### A diff in an unsupported language
 

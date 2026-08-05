@@ -38,7 +38,9 @@ The command does not run tests, does not read a coverage database, and does not 
 
 ### Index requirement
 
-`impacted-tests` indexes both sides itself and does not read the `.cgx/` pointer. It therefore does not require a pre-built index, and `--no-auto-index` is inert on this subcommand — exit code 3 is not reachable. Running the command in a repository does create a `.cgx/` store, which the CLI uses as a warm blob cache so unchanged files re-extract nothing on the next run.
+`impacted-tests` indexes both sides itself and does not read the `.cgx/` pointer. It therefore does not require a pre-built index, and `--no-auto-index` is inert on this subcommand. Running the command in a repository does create a `.cgx/` store, which the CLI uses as a warm blob cache so unchanged files re-extract nothing on the next run.
+
+Exit code 3 is still reachable, but on this subcommand it means *the repository or the ref could not be read*, not "no index — go build one". See [Exit codes](#exit-codes).
 
 ## Arguments
 
@@ -182,9 +184,23 @@ A [degenerate answer](#degenerate-answers) also exits 4, on its own signal, and 
 | 0 | Success. Impacted tests were found, or the answer is empty and non-degenerate — including a `--assert-empty` gate that passed because the change reaches no test. |
 | 1 | `--assert-empty` failed: at least one impacted test was found. |
 | 2 | Usage error: `--uncommitted` combined with positional refs, neither side given, `--at` passed, or a path-graph `--format`. |
+| 3 | The repository or a ref could not be read: an unparseable ref, a repository with no commits, or a `--repo` path that is not a git repository. **Not** "missing index" — see the note below the table. |
 | 4 | Either the answer is degenerate (see above), or `--assert-empty` passed vacuously: nothing changed, a `--confidence` floor excluded every candidate, or a `--depth` bound truncated the only route to a test. The vacuous-pass cases are suppressed by `--allow-vacuous`; the degenerate one is not. |
 
-Exit code 3 (missing index) is not reachable: the command indexes both sides itself.
+**Exit 3 does not mean "no index" here.** The generic meaning of exit 3 is "the index is missing, corrupt, or could not be built", and a CI wrapper that special-cases it as *run `cgx index` and retry* will loop forever on this subcommand — `impacted-tests` indexes both sides itself, so there is nothing to go and build. Every exit 3 it produces comes from git, and all three of these were reproduced:
+
+```
+$ cgx impacted-tests nosuchref HEAD --repo .
+cgx: impacted-tests: git error: couldn't parse revision: "nosuchref"
+
+$ cgx impacted-tests --uncommitted --repo <repository with no commits>
+cgx: impacted-tests: git error: Branch 'refs/heads/main' does not have any commits
+
+$ cgx impacted-tests --uncommitted --repo <directory that is not a git repository>
+cgx: impacted-tests: git error: Could not find a git repository in …
+```
+
+Treat exit 3 from `impacted-tests` as a bad ref or a bad `--repo`: fix the invocation, do not retry.
 
 ## Reproducing the examples
 

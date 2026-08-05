@@ -1158,3 +1158,34 @@ fn binding_the_call_to_a_local_makes_the_same_test_visible() {
     let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
     assert_eq!(doc["count"].as_u64(), Some(1), "{stdout}");
 }
+
+// --- exit 3 is reachable, and does not mean "missing index" -------------------
+//
+// The page used to assert exit 3 was unreachable because the command indexes
+// both sides itself. That is true of the *index*, and false of git: every one of
+// these produces exit 3. A CI wrapper that special-cases 3 as "no index — go
+// index and retry" would loop forever on a typo'd ref.
+
+#[test]
+fn an_unparseable_base_ref_exits_three() {
+    let (_tmp, repo) = rust_fixture();
+    let (_stdout, stderr, code) = run_cgx(&repo, &["impacted-tests", "nosuchref", "HEAD"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(stderr.contains("git error"), "{stderr}");
+}
+
+#[test]
+fn a_repository_with_no_commits_exits_three() {
+    let (_tmp, path) = repo();
+    let (_stdout, stderr, code) = run_cgx(&path, &["impacted-tests", "--uncommitted"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(stderr.contains("git error"), "{stderr}");
+}
+
+#[test]
+fn a_directory_that_is_not_a_git_repository_exits_three() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) = run_cgx(tmp.path(), &["impacted-tests", "--uncommitted"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(stderr.contains("git error"), "{stderr}");
+}

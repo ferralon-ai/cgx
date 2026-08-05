@@ -425,6 +425,231 @@ fn sarif_is_parseable_and_carries_the_approximation_contract() {
     );
 }
 
+// --- two changed symbols on one witness chain --------------------------------
+//
+// The trigger is one edited file holding a caller and its callee — the ordinary
+// case, and the shape every earlier fixture missed by putting one changed symbol
+// per file. Both seeds are marked reached before any expansion, so the seed
+// lying *between* the expanding root and the test gets no `via_of` entry while
+// the walk runs past it. Stamping the witness root forward from the expanding
+// root then put a node in `Subgraph.roots` that never entered `Subgraph.nodes`:
+// the human forest silently dropped the row whose chain was orphaned (exit 0, no
+// truncation marker, no contract reason) or panicked in `Forest::node`.
+//
+// The invariant these tests hold is **cross-surface agreement on the row count**:
+// human, JSON and SARIF must report the same tests, because that is what was
+// violated and it is the only signal a reader of the default format has.
+
+/// `add ← mid` in one file, `top ← test_top` in a second, `test_add → add` in a
+/// third. Editing `core.rs` puts both `add` and `mid` in the changed set, with
+/// `mid` sitting strictly between `add` and `test_top`.
+fn rust_seed_on_chain_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(
+        &path,
+        "src/lib.rs",
+        "pub mod core;\npub mod util;\npub mod direct;\n",
+    );
+    write(
+        &path,
+        "src/core.rs",
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn mid(x: i32) -> i32 { add(x, 1) }\n",
+    );
+    write(
+        &path,
+        "src/util.rs",
+        "use crate::core::mid;\n\
+         pub fn top(x: i32) -> i32 { mid(x) }\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+         use super::*;\n\
+         #[test]\n\
+         fn test_top() { let got = top(1); assert_eq!(got, 2); }\n\
+         }\n",
+    );
+    write(
+        &path,
+        "src/direct.rs",
+        "use crate::core::add;\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+         use super::*;\n\
+         #[test]\n\
+         fn test_add() { let got = add(1, 1); assert_eq!(got, 2); }\n\
+         }\n",
+    );
+    commit(&path, "base");
+    write(
+        &path,
+        "src/core.rs",
+        "pub fn add(a: i32, b: i32) -> i32 { b + a }\npub fn mid(x: i32) -> i32 { add(x, 1) }\n",
+    );
+    (tmp, path)
+}
+
+/// The same shape in Go: `core.go` holds `Add` and its caller `Mid`, `top.go`
+/// holds `Top`, and the test reaches the change only through both seeds.
+fn go_seed_on_chain_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(&path, "go.mod", "module demo\n\ngo 1.21\n");
+    write(
+        &path,
+        "core.go",
+        "package demo\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Mid(x int) int { return Add(x, 1) }\n",
+    );
+    write(
+        &path,
+        "top.go",
+        "package demo\n\nfunc Top(x int) int { return Mid(x) }\n",
+    );
+    write(
+        &path,
+        "core_test.go",
+        "package demo\n\nimport \"testing\"\n\nfunc TestTop(t *testing.T) {\n\tgot := Top(1)\n\tif got != 2 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+    );
+    commit(&path, "base");
+    write(
+        &path,
+        "core.go",
+        "package demo\n\nfunc Add(a, b int) int { return b + a }\n\nfunc Mid(x int) int { return Add(x, 1) }\n",
+    );
+    (tmp, path)
+}
+
+/// The FQNs each surface reports, for one invocation of the same query. The
+/// human set is the forest lines whose leading token is a reported test — the
+/// forest also renders the intermediate call chain, so it is intersected with
+/// the JSON row set rather than counted blind.
+fn rows_on_every_surface(repo: &Path, extra: &[&str]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut human_args = vec!["impacted-tests", "--uncommitted"];
+    human_args.extend_from_slice(extra);
+    let (human, h_err, h_code) = run_cgx(repo, &human_args);
+    assert_eq!(h_code, 0, "human render must not panic or fail: {h_err}");
+
+    let mut json_args = human_args.clone();
+    json_args.extend_from_slice(&["--format", "json"]);
+    let (j_out, j_err, j_code) = run_cgx(repo, &json_args);
+    assert_eq!(j_code, 0, "{j_err}");
+    let doc: serde_json::Value = serde_json::from_str(&j_out).expect("json");
+    let mut json_rows: Vec<String> = doc["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap_or_default().to_string())
+        .collect();
+    json_rows.sort();
+
+    let mut sarif_args = human_args.clone();
+    sarif_args.extend_from_slice(&["--format", "sarif"]);
+    let (s_out, s_err, s_code) = run_cgx(repo, &sarif_args);
+    assert_eq!(s_code, 0, "{s_err}");
+    let sarif: serde_json::Value = serde_json::from_str(&s_out).expect("sarif");
+    let mut sarif_rows: Vec<String> = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter(|r| r["ruleId"] == "cgx/impacted-tests")
+        .map(|r| {
+            r["message"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    sarif_rows.sort();
+
+    let mut human_rows: Vec<String> = human
+        .lines()
+        .filter(|l| !l.starts_with("approximation:"))
+        .filter_map(|l| {
+            l.replace('└', " ")
+                .replace('├', " ")
+                .replace('│', " ")
+                .replace('─', " ")
+                .split_whitespace()
+                .next()
+                .map(|s| s.to_string())
+        })
+        .filter(|fqn| json_rows.contains(fqn))
+        .collect();
+    human_rows.sort();
+    human_rows.dedup();
+
+    (human_rows, json_rows, sarif_rows)
+}
+
+#[test]
+fn a_caller_and_its_callee_in_one_edited_file_agree_on_every_surface_rust() {
+    let (_tmp, repo) = rust_seed_on_chain_fixture();
+    let (human, json, sarif) = rows_on_every_surface(&repo, &[]);
+    assert_eq!(json.len(), 2, "both tests are impacted: {json:?}");
+    assert_eq!(human, json, "the human forest dropped a reported test");
+    assert_eq!(sarif, json, "SARIF and JSON disagree");
+    assert!(
+        json.iter().any(|f| f.ends_with("::test_top")),
+        "the test reached only through the interior seed is present: {json:?}"
+    );
+}
+
+#[test]
+fn a_caller_and_its_callee_in_one_edited_file_agree_on_every_surface_go() {
+    let (_tmp, repo) = go_seed_on_chain_fixture();
+    let (human, json, sarif) = rows_on_every_surface(&repo, &[]);
+    assert_eq!(json.len(), 1, "the Go test is impacted: {json:?}");
+    assert_eq!(human, json, "the human forest dropped a reported test");
+    assert_eq!(sarif, json, "SARIF and JSON disagree");
+}
+
+#[test]
+fn the_orphaned_chain_shape_renders_in_both_tree_modes() {
+    // The panic manifestation: the bogus root was on no other row's chain, so it
+    // was absent from the node map entirely and `Forest::node` indexed a missing
+    // key — on the default format, in both `--tree` modes, and in CI mode.
+    let (_tmp, repo) = rust_seed_on_chain_fixture();
+    for mode in ["full", "spanning"] {
+        let (human, json, _) = rows_on_every_surface(&repo, &["--tree", mode]);
+        assert_eq!(human, json, "--tree {mode} dropped a reported test");
+    }
+}
+
+#[test]
+fn ci_mode_over_two_refs_survives_a_seed_on_the_chain() {
+    let (_tmp, repo) = rust_seed_on_chain_fixture();
+    commit(&repo, "head: reorder the addends");
+    let (stdout, stderr, code) = run_cgx(&repo, &["impacted-tests", "HEAD~1", "HEAD"]);
+    assert_eq!(code, 0, "the PR-gate mode must not panic: {stderr}");
+    assert!(
+        stdout.contains("::test_top") && stdout.contains("::test_add"),
+        "both tests render in CI mode: {stdout}"
+    );
+}
+
+/// Every rendered witness root must be a node the forest can resolve. Asserted
+/// through the observable consequence: the roots of the forest are exactly the
+/// changed symbols that actually reached a test, each with its own subtree.
+#[test]
+fn the_forest_roots_at_the_nearest_changed_symbol_on_each_chain() {
+    let (_tmp, repo) = rust_seed_on_chain_fixture();
+    let (stdout, stderr, code) = run_cgx(&repo, &["impacted-tests", "--uncommitted"]);
+    assert_eq!(code, 0, "{stderr}");
+    let roots: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("approximation:"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert!(
+        roots.iter().any(|r| r.ends_with("::mid")),
+        "`test_top`'s chain terminates at `mid`, so `mid` is a root: {stdout}"
+    );
+    assert!(
+        roots.iter().any(|r| r.ends_with("::add")),
+        "`test_add`'s chain terminates at `add`: {stdout}"
+    );
+}
+
 // --- argument validation -----------------------------------------------------
 
 #[test]

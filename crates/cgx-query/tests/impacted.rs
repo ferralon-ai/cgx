@@ -311,6 +311,134 @@ fn the_lift_is_a_fixpoint_not_a_single_pass() {
     assert!(a.witnesses[0].via_containment_lift);
 }
 
+// --- the witness root comes off the chain -----------------------------------
+//
+// The shape no fixture had: a **second seed lying strictly between the expanding
+// root and the reported test**. Two seeds in a graph is not this shape; two
+// seeds on one path to a reported row is. Every seed is marked `reached` before
+// any expansion, so the bookkeeping loop skips the interior seed while
+// `walker.bfs` walks straight past it — a forward `root_of` stamp then names the
+// expanding root while the backward chain reconstruction terminates at the
+// interior seed. `root ∉ chain`, and the CLI's human forest either dropped the
+// row silently or panicked indexing a root that never entered `Subgraph.nodes`.
+
+/// `add ← mid ← top ← test_top`, with **both** `add` and `mid` in the changed
+/// set (one edited file holding a caller and its callee — the ordinary case),
+/// plus `test_add` calling `add` directly so a second, correctly-rooted row is
+/// present alongside.
+///
+/// Ids ascend with insertion and the seed set is walked in ascending id order,
+/// so `add` expands first and its backward BFS runs past `mid` to `top` and
+/// `test_top`.
+fn seed_on_the_chain_graph() -> (GraphView, Vec<NodeId>, [NodeId; 5]) {
+    let mut g = G::new();
+    let add = g.node_at(
+        "core::add",
+        "src/core.rs",
+        1,
+        SymbolKind::Function,
+        "rust",
+        None,
+    );
+    let mid = g.node_at(
+        "core::mid",
+        "src/core.rs",
+        5,
+        SymbolKind::Function,
+        "rust",
+        None,
+    );
+    let top = g.node_at(
+        "util::top",
+        "src/util.rs",
+        1,
+        SymbolKind::Function,
+        "rust",
+        None,
+    );
+    let test_top = g.node_at(
+        "util::tests::test_top",
+        "src/util.rs",
+        7,
+        SymbolKind::Function,
+        "rust",
+        Some(EntrypointKind::Test),
+    );
+    let test_add = g.node_at(
+        "direct::tests::test_add",
+        "src/direct.rs",
+        7,
+        SymbolKind::Function,
+        "rust",
+        Some(EntrypointKind::Test),
+    );
+    g.calls(mid, add);
+    g.calls(top, mid);
+    g.calls(test_top, top);
+    g.calls(test_add, add);
+    (
+        g.view(),
+        vec![add, mid],
+        [add, mid, top, test_top, test_add],
+    )
+}
+
+#[test]
+fn a_seed_between_the_root_and_the_test_still_reports_both_tests() {
+    let (v, changed, [_add, _mid, _top, test_top, test_add]) = seed_on_the_chain_graph();
+    let a = impacted_tests(&v, &changed, &unbounded());
+    let mut ids: Vec<NodeId> = a.tests.iter().map(|r| r.node.id).collect();
+    ids.sort_unstable_by_key(|n| n.0);
+    assert_eq!(ids, vec![test_top, test_add], "got {}", render(&a));
+}
+
+#[test]
+fn the_witness_root_of_a_row_is_the_last_node_of_its_own_chain() {
+    // The invariant the old `debug_assert_eq!` guarded and no fixture could
+    // reach. It is now true by construction — the root IS `chain.last()` — and
+    // this test is what proves the construction, in a normal (debug) test build
+    // and identically in the release binary the CLI ships.
+    let (v, changed, _) = seed_on_the_chain_graph();
+    let a = impacted_tests(&v, &changed, &unbounded());
+    assert_eq!(a.tests.len(), 2, "got {}", render(&a));
+    for w in &a.witnesses {
+        assert_eq!(
+            w.chain.last().copied(),
+            Some(w.root),
+            "root must lie on the chain it is reported with: {}",
+            render(&a)
+        );
+        assert!(
+            changed.contains(&w.root),
+            "the witness root must be a changed symbol: {}",
+            render(&a)
+        );
+    }
+}
+
+#[test]
+fn the_reported_root_is_the_nearest_seed_not_the_expanding_one() {
+    // `add` expands first and discovers `top`/`test_top` past `mid`. The row for
+    // `test_top` must be attributed to `mid` — the seed its chain actually
+    // terminates at — not to `add`, which is not on its chain at all.
+    let (v, changed, [add, mid, top, test_top, test_add]) = seed_on_the_chain_graph();
+    let a = impacted_tests(&v, &changed, &unbounded());
+    let by_id: std::collections::HashMap<NodeId, &cgx_query::impacted::ImpactedWitness> = a
+        .tests
+        .iter()
+        .map(|r| r.node.id)
+        .zip(a.witnesses.iter())
+        .collect();
+
+    let w_top = by_id[&test_top];
+    assert_eq!(w_top.chain, vec![test_top, top, mid]);
+    assert_eq!(w_top.root, mid, "got {}", render(&a));
+
+    let w_add = by_id[&test_add];
+    assert_eq!(w_add.chain, vec![test_add, add]);
+    assert_eq!(w_add.root, add, "got {}", render(&a));
+}
+
 // --- determinism (criterion 5) ----------------------------------------------
 
 /// A graph with several roots, a shared interior node, and two tests, so the

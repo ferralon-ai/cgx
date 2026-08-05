@@ -430,7 +430,6 @@ pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker)
     let mut expanded = vec![false; n];
     let mut via_of: Vec<Option<Discovered>> = vec![None; n];
     let mut lift_from: Vec<Option<NodeId>> = vec![None; n];
-    let mut root_of: Vec<Option<NodeId>> = vec![None; n];
 
     // FQN → node id, lowest id winning a duplicate FQN. `BTreeMap` fed in
     // canonical node order, so the lift target never depends on hash order.
@@ -445,7 +444,6 @@ pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker)
     seeds.dedup();
     for &r in &seeds {
         reached[r.index()] = true;
-        root_of[r.index()] = Some(r);
         langs_in_play.insert(view.node(r).lang.clone());
     }
 
@@ -471,7 +469,6 @@ pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker)
                 }
                 reached[di] = true;
                 walk_reached[di] = true;
-                root_of[di] = root_of[ri];
                 via_of[di] = Some(d);
                 round_new.push(node);
             }
@@ -497,7 +494,6 @@ pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker)
                 continue;
             }
             reached[oi] = true;
-            root_of[oi] = root_of[x.index()];
             lift_from[oi] = Some(x);
             next.insert(owner);
         }
@@ -557,8 +553,26 @@ pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker)
             }
         };
 
-        let root = root_of[i].unwrap_or(node.id);
-        debug_assert_eq!(chain.last().copied(), Some(root));
+        // The witness root is READ OFF THE CHAIN, never stamped forward from the
+        // root whose `walker.bfs` happened to discover this node. The seeds are
+        // all marked `reached` before any expansion, so when a second seed `S`
+        // lies on the path from the expanding root `R` to this test, the
+        // bookkeeping loop skips `S` (already reached) while `bfs` walks straight
+        // past it. A forward stamp then says `R` while the backward
+        // reconstruction above terminates at `S` — `root ∉ chain`, and every
+        // consumer that treats the pair as one structure breaks (the human
+        // forest silently dropped rows, or panicked indexing a root that is in
+        // `Subgraph.roots` but not in `Subgraph.nodes`).
+        //
+        // `chain` is seeded with `node.id` and only ever grown, and the walk
+        // above stops exactly at a node with neither a `via_of` nor a
+        // `lift_from` entry — which, since every non-seed reached node gets one
+        // or the other, is a seed. So `chain.last()` is a changed symbol, is in
+        // `chain` by construction, and the old `debug_assert_eq!` here is now a
+        // tautology rather than a check that a release build compiles out.
+        let root = *chain
+            .last()
+            .expect("witness chain is seeded with the test node and never emptied");
         rows.push((
             NeighborResult {
                 node: node.clone(),

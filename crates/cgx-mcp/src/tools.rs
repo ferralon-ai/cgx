@@ -66,6 +66,7 @@ pub fn tool_list() -> Value {
             flow_tool("flows_to", "Forward data-flow slice: symbols a value flows into (its DerivesFrom consumers)."),
             flow_tool("flows_from", "Data-flow pedigree: the symbols a value derives from (its DerivesFrom sources)."),
             graph_query_tool(),
+            coupling_tool(),
         ]
     })
 }
@@ -269,6 +270,29 @@ fn graph_query_tool() -> Value {
     })
 }
 
+/// The one tool on this surface that is **not** a graph tool: it reads committed
+/// git history and never opens the call graph, so it declares no `include_dirty`
+/// property. `include_dirty` describes the ADR-06 working-tree overlay *on the
+/// graph*; advertising it here would promise something this answer never consults.
+fn coupling_tool() -> Value {
+    json!({
+        "name": "coupling",
+        "description": "Which files historically change together: for every pair of files changed in the same commit within an explicit commit range, the co-change count and each file's own change count. Reads committed git history only — no index, no working tree.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root":                 { "type": "string",  "description": "Repository root path" },
+                "base":                 { "type": "string",  "description": "Range start, exclusive (rev/ref/SHA)" },
+                "head":                 { "type": "string",  "description": "Range end, inclusive (rev/ref/SHA)" },
+                "min_cochanges":        { "type": "integer", "default": 2 },
+                "max_files_per_commit": { "type": "integer", "default": 50 },
+                "limit":                { "type": "integer", "default": 50 }
+            },
+            "required": ["root", "base", "head"]
+        }
+    })
+}
+
 /// Dispatch a `tools/call` by tool name. Returns the `structuredContent` body
 /// (without the surrounding `content`/`isError` wrapper, which the server adds).
 pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
@@ -284,6 +308,7 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
         "flows_to" => flow_call(args, FlowDir::To),
         "flows_from" => flow_call(args, FlowDir::From),
         "graph_query" => graph_query_call(args),
+        "coupling" => coupling_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
 }
@@ -993,6 +1018,44 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
         "truncation_reason": truncation_reason,
     });
     Ok(with_session_meta(with_contract(body, &approximation), &session))
+}
+
+/// `coupling`: co-change over an explicit commit range, straight off
+/// [`cgx_diff::coupling`] — the same typed report `cgx coupling --format json`
+/// serializes, so both surfaces emit one schema from one type.
+///
+/// **Two deliberate departures from every other handler here, both decisions:**
+///
+/// 1. **No `with_contract(..)`.** The approximation contract already *is* a field
+///    of `CouplingReport`, and it serializes through `serde_json::to_value` to the
+///    same bytes `with_contract` would insert; calling it would emit the
+///    `approximation` key twice.
+/// 2. **No `session_for(..)`/`with_session_meta(..)`.** `graph_version`/`dirty`/
+///    `dirty_files_analyzed` describe the ADR-06 working-tree overlay on the call
+///    graph. Coupling never opens the graph and needs no index to exist at all, so
+///    `session_for` would trigger an unnecessary — possibly failing — index for an
+///    answer that does not use it, and `dirty: false` would assert something about
+///    a graph this answer never consulted.
+fn coupling_call(args: &Value) -> Result<Value, ToolError> {
+    let root = req_str(args, "root")?;
+    let base = req_str(args, "base")?;
+    let head = req_str(args, "head")?;
+
+    let defaults = cgx_diff::CouplingOptions::default();
+    let options = cgx_diff::CouplingOptions {
+        max_files_per_commit: opt_usize(args, "max_files_per_commit")?
+            .unwrap_or(defaults.max_files_per_commit),
+        min_cochanges: opt_u32(args, "min_cochanges")?.unwrap_or(defaults.min_cochanges),
+        limit: opt_usize(args, "limit")?.unwrap_or(defaults.limit),
+    };
+
+    let repo = cgx_diff::BlameRepo::discover(std::path::Path::new(root))
+        .map_err(|e| ToolError::invalid_params(format!("discovering repo {root:?}: {e}")))?;
+    let report = cgx_diff::coupling(&repo, base, head, &options)
+        .map_err(|e| ToolError::invalid_params(format!("coupling {base:?}..{head:?}: {e}")))?;
+
+    serde_json::to_value(&report)
+        .map_err(|e| ToolError::invalid_params(format!("serializing coupling report: {e}")))
 }
 
 /// Whether any bound edge cell in a CQL result was resolved over an

@@ -228,12 +228,21 @@ fn tools_list_exposes_the_phase1_tool_surface() {
     }
 }
 
+/// Tools that read something other than the call graph, so `include_dirty` (the
+/// ADR-06 working-tree overlay **on the graph**) is meaningless for them and is
+/// deliberately absent from their schema. `coupling` reads committed git history
+/// and never opens the graph. Every other tool must still default it to `true`.
+const NON_GRAPH_TOOLS: &[&str] = &["coupling"];
+
 #[test]
 fn every_graph_tool_defaults_include_dirty_to_true() {
     let request = req(1, "tools/list", json!({}));
     let resp = dispatch(&ServerConfig::default(), &request).expect("response");
     let tools = resp.result.expect("result")["tools"].clone();
     for t in tools.as_array().unwrap() {
+        if NON_GRAPH_TOOLS.contains(&t["name"].as_str().unwrap()) {
+            continue;
+        }
         let prop = &t["inputSchema"]["properties"]["include_dirty"];
         assert_eq!(
             prop["default"],
@@ -1488,5 +1497,127 @@ fn the_freshness_envelope_is_byte_identical_across_runs() {
     assert_eq!(
         serde_json::to_string(&a["freshness"]).unwrap(),
         serde_json::to_string(&b["freshness"]).unwrap()
+    );
+}
+
+// --- coupling (committed git history, never the call graph) ------------------
+
+/// A repo with a hand-computed co-change history. Never indexed — `coupling` reads
+/// committed history only, so no `.cgx/` store should ever appear.
+///
+/// ```text
+/// c0  seed.rs        (the range base; HEAD~3)
+/// c1  a.rs b.rs
+/// c2  b.rs c.rs
+/// c3  a.rs b.rs c.rs
+/// ```
+fn init_coupling_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "cgx-test"]);
+    run_git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    for (n, files) in [
+        &["seed.rs"][..],
+        &["a.rs", "b.rs"][..],
+        &["b.rs", "c.rs"][..],
+        &["a.rs", "b.rs", "c.rs"][..],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for f in files.iter() {
+            std::fs::write(repo.join(f), format!("// {f} revision {n}\n")).unwrap();
+        }
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "author.name=cgx-test",
+                "-c",
+                "author.email=cgx@test.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "step",
+                "--date=2020-01-01T00:00:00Z",
+            ],
+        );
+    }
+    (tmp, repo)
+}
+
+#[test]
+fn mcp_coupling_tool_is_registered() {
+    let request = req(1, "tools/list", json!({}));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    let tools = resp.result.expect("result")["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    let coupling = tools
+        .iter()
+        .find(|t| t["name"] == json!("coupling"))
+        .expect("coupling tool registered");
+
+    let schema = &coupling["inputSchema"];
+    assert_eq!(schema["required"], json!(["root", "base", "head"]));
+    // C2 at the MCP surface: both endpoints are required, and there is no
+    // wall-clock-shaped alternative to reach for.
+    let props = schema["properties"].as_object().expect("properties");
+    for absent in ["since", "last", "days", "window", "recent"] {
+        assert!(
+            !props.contains_key(absent),
+            "wall-clock property `{absent}`"
+        );
+    }
+    assert_eq!(props["min_cochanges"]["default"], json!(2));
+    assert_eq!(props["max_files_per_commit"]["default"], json!(50));
+    assert_eq!(props["limit"]["default"], json!(50));
+    // Deliberately absent: `include_dirty` describes the working-tree overlay on
+    // the *call graph*, which a history answer never consults.
+    assert!(!props.contains_key("include_dirty"));
+}
+
+#[test]
+fn mcp_coupling_answer_carries_the_contract() {
+    let (_tmp, repo) = init_coupling_repo();
+    let answer = call_tool(
+        &repo,
+        "coupling",
+        json!({ "base": "HEAD~3", "head": "HEAD" }),
+    );
+
+    assert_eq!(answer["base_rev"], json!("HEAD~3"));
+    assert_eq!(answer["head_rev"], json!("HEAD"));
+    assert_eq!(answer["commits_considered"], json!(3));
+
+    let approx = &answer["approximation"];
+    assert!(approx.is_object(), "contract present: {answer}");
+    assert_eq!(approx["direction"], json!("over_under"));
+    assert_eq!(
+        approx["modeled_graph"],
+        json!(cgx_diff::MODELED_HISTORY),
+        "scoped to the modeled history, not the call graph"
+    );
+    assert!(approx["reasons"].as_array().expect("reasons").len() >= 3);
+
+    // The two deliberate deviations, asserted rather than assumed: no session
+    // metadata (this answer never opened the graph) …
+    for absent in ["graph_version", "dirty", "dirty_files_analyzed"] {
+        assert!(
+            answer.get(absent).is_none(),
+            "`{absent}` describes a graph this answer never consulted"
+        );
+    }
+    // … and no index was built as a side effect of answering.
+    assert!(
+        !repo.join(".cgx").exists(),
+        "coupling must not trigger an index"
     );
 }

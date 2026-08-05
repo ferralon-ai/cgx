@@ -1941,3 +1941,265 @@ fn an_at_ref_query_reports_the_pinned_tree() {
     );
     assert_eq!(f["stale"], json!(true));
 }
+
+// --- coupling (co-change over an explicit commit range) ----------------------
+
+/// A repo with a hand-computed co-change history, four commits deep. The tree is
+/// never indexed: `coupling` reads committed git history only, so a `.cgx/` store
+/// never appears — which is itself part of what these tests pin down.
+///
+/// ```text
+/// c0  seed.rs              (the range base; HEAD~3)
+/// c1  a.rs b.rs
+/// c2  b.rs c.rs
+/// c3  a.rs b.rs c.rs
+/// ```
+///
+/// Over `HEAD~3..HEAD`: `(a,b)` co-change 2, `(b,c)` 2, `(a,c)` 1.
+fn coupling_fixture_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "cgx-test"]);
+    git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    let commit = |files: &[&str], n: usize| {
+        for f in files {
+            std::fs::write(repo.join(f), format!("// {f} revision {n}\n")).unwrap();
+        }
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "author.name=cgx-test",
+                "-c",
+                "author.email=cgx@test.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "step",
+                "--date=2020-01-01T00:00:00Z",
+            ],
+        );
+    };
+    commit(&["seed.rs"], 0);
+    commit(&["a.rs", "b.rs"], 1);
+    commit(&["b.rs", "c.rs"], 2);
+    commit(&["a.rs", "b.rs", "c.rs"], 3);
+
+    (tmp, repo)
+}
+
+#[test]
+fn coupling_output_is_byte_identical_across_two_runs() {
+    let (_tmp, repo) = coupling_fixture_repo();
+    let args = ["coupling", "HEAD~3", "HEAD", "--min-cochanges", "1"];
+
+    let (a, code_a) = run_cgx(&repo, &args);
+    let (b, code_b) = run_cgx(&repo, &args);
+    assert_eq!(code_a, 0, "coupling succeeds without an index: {a}");
+    assert_eq!(code_b, 0);
+    assert_eq!(a, b, "two coupling runs must be byte-identical");
+    assert!(a.contains("a.rs  b.rs"), "the (a,b) pair is reported: {a}");
+
+    let json_args = [
+        "coupling",
+        "HEAD~3",
+        "HEAD",
+        "--min-cochanges",
+        "1",
+        "--format",
+        "json",
+    ];
+    let (ja, _) = run_cgx(&repo, &json_args);
+    let (jb, _) = run_cgx(&repo, &json_args);
+    assert_eq!(ja, jb, "two json coupling runs must be byte-identical");
+
+    assert!(
+        !repo.join(".cgx").exists(),
+        "coupling must not build or touch an index"
+    );
+}
+
+#[test]
+fn coupling_json_carries_the_approximation_contract() {
+    let (_tmp, repo) = coupling_fixture_repo();
+    let (out, code) = run_cgx(&repo, &["coupling", "HEAD~3", "HEAD", "--format", "json"]);
+    assert_eq!(code, 0);
+    let doc: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+
+    // The rev range is echoed both as typed and as resolved (C2 is checkable only
+    // if the answer says which commits it actually walked).
+    assert_eq!(doc["base_rev"], serde_json::json!("HEAD~3"));
+    assert_eq!(doc["head_rev"], serde_json::json!("HEAD"));
+    assert_eq!(doc["base_commit"].as_str().unwrap().len(), 40);
+    assert_eq!(doc["head_commit"].as_str().unwrap().len(), 40);
+    assert_eq!(doc["commits_considered"], serde_json::json!(3));
+
+    let approx = &doc["approximation"];
+    assert!(approx.is_object(), "contract present: {out}");
+    assert_eq!(approx["direction"], serde_json::json!("over_under"));
+    assert!(approx["scope"].is_null(), "coupling has no negative scope");
+    assert_eq!(
+        approx["modeled_graph"],
+        serde_json::json!(cgx_diff::MODELED_HISTORY),
+        "the contract is scoped to the modeled *history*, not the call graph"
+    );
+    let codes: Vec<&str> = approx["reasons"]
+        .as_array()
+        .expect("reasons array")
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            "file-level-granularity",
+            "bounded-rev-range",
+            "renames-not-tracked",
+            "cochange-threshold",
+        ],
+        "reason codes are stable and ordered: {out}"
+    );
+
+    // Only counts — no fused score anywhere in the answer (C3).
+    for pair in doc["pairs"].as_array().unwrap() {
+        for (key, value) in pair.as_object().unwrap() {
+            assert!(
+                !value.is_f64() || value.as_f64() == value.as_u64().map(|n| n as f64),
+                "pair field `{key}` is a float: {pair}"
+            );
+        }
+        assert!(pair.get("support").is_none(), "no support float: {pair}");
+        assert!(
+            pair.get("confidence").is_none(),
+            "no confidence float: {pair}"
+        );
+        assert!(pair.get("strength").is_none(), "no strength float: {pair}");
+    }
+}
+
+/// A shallow checkout is the `actions/checkout` default, so the human surface has to
+/// say why the table is empty — otherwise a CI user sees "(no co-changed pairs)" and
+/// reads it as "these files never co-change". Exit 0 with a stated degradation is the
+/// product's posture; exit 2 would be calling absent history a usage error.
+#[test]
+fn coupling_human_surfaces_shallow_and_truncated_degradation() {
+    let (tmp, repo) = coupling_fixture_repo();
+
+    // `--depth` needs a transport; a plain path clone hardlinks everything and
+    // ignores it.
+    let shallow = tmp.path().join("shallow");
+    let url = format!("file://{}", repo.display());
+    let out = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "2", &url])
+        .arg(&shallow)
+        .output()
+        .expect("git clone --depth");
+    assert!(
+        out.status.success(),
+        "shallow clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let (out, code) = run_cgx(&shallow, &["coupling", "HEAD~1", "HEAD"]);
+    assert_eq!(code, 0, "a shallow clone degrades, it does not fail: {out}");
+    assert!(out.contains("degraded:"), "degradation line missing: {out}");
+    assert!(out.contains("shallow clone"), "{out}");
+    assert!(out.contains("history boundary"), "{out}");
+
+    let (json, code) = run_cgx(
+        &shallow,
+        &["coupling", "HEAD~1", "HEAD", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{json}");
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(doc["shallow_repository"], serde_json::json!(true));
+    assert_eq!(doc["truncated_at_history_boundary"], serde_json::json!(true));
+    let codes: Vec<&str> = doc["approximation"]["reasons"]
+        .as_array()
+        .expect("reasons")
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"shallow-repository"), "{codes:?}");
+    assert!(codes.contains(&"history-boundary"), "{codes:?}");
+    assert!(!codes.contains(&"empty-rev-range"), "{codes:?}");
+}
+
+#[test]
+fn coupling_requires_both_range_endpoints() {
+    let (_tmp, repo) = coupling_fixture_repo();
+    // C2's enforcement: neither endpoint has a default, so a one-argument invocation
+    // is a clap usage error rather than an implicit `..HEAD` window.
+    let (_out, code) = run_cgx(&repo, &["coupling", "HEAD"]);
+    assert_eq!(code, 2, "a missing range endpoint is a usage error");
+    let (_out, code) = run_cgx(&repo, &["coupling"]);
+    assert_eq!(code, 2, "no range at all is a usage error");
+}
+
+#[test]
+fn coupling_unsupported_format_exits_2() {
+    let (_tmp, repo) = coupling_fixture_repo();
+    for fmt in ["sarif", "dot", "mermaid", "d2"] {
+        let (_out, code) = run_cgx(&repo, &["coupling", "HEAD~3", "HEAD", "--format", fmt]);
+        assert_eq!(code, 2, "--format {fmt} unsupported by coupling → exit 2");
+    }
+}
+
+/// **The C6 proof.** The CLI's `--format json` and the MCP `coupling` tool must
+/// carry the *same contract bytes* for the same range — not merely the same field
+/// names. Both serialize one `CouplingReport`, so this is a real byte comparison of
+/// the two surfaces' `approximation` sub-documents.
+///
+/// It lives here rather than in `cgx-mcp`'s `dispatch.rs` because only this test
+/// binary can reach both surfaces: `cargo test -p cgx-mcp` does not build the `cgx`
+/// binary, while `cgx-cli` depends on `cgx-mcp` and so has both.
+#[test]
+fn coupling_cli_and_mcp_emit_identical_contract_bytes() {
+    let (_tmp, repo) = coupling_fixture_repo();
+
+    let (out, code) = run_cgx(&repo, &["coupling", "HEAD~3", "HEAD", "--format", "json"]);
+    assert_eq!(code, 0);
+    let cli: serde_json::Value = serde_json::from_str(&out).expect("valid cli json");
+
+    let request: cgx_mcp::Request = serde_json::from_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "coupling",
+            "arguments": {
+                "root": repo.to_string_lossy(),
+                "base": "HEAD~3",
+                "head": "HEAD"
+            }
+        }
+    }))
+    .expect("request");
+    let resp = cgx_mcp::dispatch(&cgx_mcp::ServerConfig::default(), &request).expect("response");
+    assert!(resp.error.is_none(), "mcp tool error: {:?}", resp.error);
+    let mcp = resp.result.expect("result")["structuredContent"].clone();
+
+    let cli_bytes = serde_json::to_string(&cli["approximation"]).unwrap();
+    let mcp_bytes = serde_json::to_string(&mcp["approximation"]).unwrap();
+    assert_eq!(
+        cli_bytes, mcp_bytes,
+        "CLI and MCP approximation contracts differ"
+    );
+    assert!(
+        cli_bytes.contains("\"direction\""),
+        "the compared bytes are a real contract, not an empty object"
+    );
+
+    // The whole answer, not just the contract, is one schema from one type.
+    assert_eq!(
+        serde_json::to_string(&cli).unwrap(),
+        serde_json::to_string(&mcp).unwrap(),
+        "CLI and MCP coupling answers are not the same document"
+    );
+}

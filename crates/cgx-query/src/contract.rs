@@ -94,7 +94,9 @@ pub struct NegativeScope {
     pub max_depth: Option<u32>,
 }
 
-/// The standing modeling boundary every contract is scoped to. `exact` is always
+/// The standing modeling boundary every **call-graph** contract is scoped to (an
+/// answer derived from something other than the call graph states its own — see
+/// [`for_history`]). `exact` is always
 /// relative to this modeled graph, never an absolute claim about the program:
 /// blind spots that leave no per-answer fact (undescended closure/lambda bodies
 /// deferred by all five adapters, external callees pre-SCIP whose dangling refs
@@ -110,8 +112,12 @@ outside the modeled graph";
 pub struct ApproximationContract {
     pub direction: ApproxDirection,
     pub reasons: Vec<ApproxReason>,
-    /// The standing modeling boundary the whole contract (including `exact`) is
-    /// relative to. Constant per binary; see [`MODELED_GRAPH`].
+    /// The modeling boundary the whole contract (including `exact`) is relative
+    /// to. A property of *this answer*, not of the binary: every call-graph
+    /// answer carries [`MODELED_GRAPH`], while an answer derived from git
+    /// history supplies its own boundary via [`for_history`]. The field name is
+    /// historical — it is the answer's modeled domain, which is the call graph
+    /// only for the call-graph builders.
     pub modeled_graph: &'static str,
     /// Present only for a *negative*/absence answer (A4).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +137,17 @@ impl ApproximationContract {
     }
 
     fn assemble(reasons: Vec<ApproxReason>, scope: Option<NegativeScope>) -> Self {
+        Self::assemble_with(reasons, scope, MODELED_GRAPH)
+    }
+
+    /// The one direction fold in the codebase, with the modeling boundary as a
+    /// parameter so an answer derived from something other than the call graph
+    /// (see [`for_history`]) can state its own boundary without copying the fold.
+    fn assemble_with(
+        reasons: Vec<ApproxReason>,
+        scope: Option<NegativeScope>,
+        modeled_graph: &'static str,
+    ) -> Self {
         let over = reasons
             .iter()
             .any(|r| r.direction == ReasonDirection::Over);
@@ -146,7 +163,7 @@ impl ApproximationContract {
         ApproximationContract {
             direction,
             reasons,
-            modeled_graph: MODELED_GRAPH,
+            modeled_graph,
             scope,
         }
     }
@@ -590,6 +607,20 @@ pub fn for_unused(
     ApproximationContract::assemble(reasons, Some(scope_of(walker, Direction::Forward)))
 }
 
+/// The contract for an answer derived from **git history** rather than from the
+/// indexed call graph. The modeling boundary is supplied by the caller because it
+/// is a property of the answer, not of the binary — a commit-walk answer is scoped
+/// to a rev range and models no call edges at all.
+///
+/// No [`NegativeScope`] is attached: its fields (searched edge kinds, confidence
+/// floor, depth) are call-graph concepts and would be a lie on a history answer.
+pub fn for_history(
+    reasons: Vec<ApproxReason>,
+    modeled_history: &'static str,
+) -> ApproximationContract {
+    ApproximationContract::assemble_with(reasons, None, modeled_history)
+}
+
 // --- tokens -----------------------------------------------------------------
 
 fn confidence_token(c: Confidence) -> &'static str {
@@ -859,5 +890,52 @@ mod tests {
         let c = for_paths(&view, &w, NodeId(0), &set);
         assert!(c.reasons.iter().any(|r| r.code == "truncated-path-cap"));
         assert_eq!(c.direction, ApproxDirection::Under);
+    }
+
+    const TEST_HISTORY: &str = "commits in the given rev range; nothing outside it is modeled";
+
+    fn history_reason(direction: ReasonDirection, code: &'static str) -> ApproxReason {
+        ApproxReason {
+            direction,
+            code,
+            detail: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn for_history_carries_the_supplied_boundary_not_the_call_graph_one() {
+        let c = for_history(
+            vec![history_reason(ReasonDirection::Under, "bounded-rev-range")],
+            TEST_HISTORY,
+        );
+        assert_eq!(c.modeled_graph, TEST_HISTORY);
+        assert_ne!(c.modeled_graph, MODELED_GRAPH);
+        // A history answer models no call edges, so it can carry no negative scope.
+        assert!(c.scope.is_none());
+    }
+
+    #[test]
+    fn for_history_folds_direction_exactly_like_the_call_graph_builders() {
+        let over = history_reason(ReasonDirection::Over, "file-level-granularity");
+        let under = history_reason(ReasonDirection::Under, "bounded-rev-range");
+        let cases: Vec<(&str, Vec<ApproxReason>, ApproxDirection)> = vec![
+            ("no reasons", vec![], ApproxDirection::Exact),
+            ("over only", vec![over.clone()], ApproxDirection::Over),
+            ("under only", vec![under.clone()], ApproxDirection::Under),
+            (
+                "both",
+                vec![over.clone(), under.clone()],
+                ApproxDirection::OverUnder,
+            ),
+        ];
+        for (name, reasons, want) in cases {
+            let history = for_history(reasons.clone(), TEST_HISTORY);
+            let graph = ApproximationContract::assemble(reasons, None);
+            assert_eq!(history.direction, want, "{name}");
+            assert_eq!(
+                history.direction, graph.direction,
+                "{name}: for_history diverged from the call-graph fold"
+            );
+        }
     }
 }

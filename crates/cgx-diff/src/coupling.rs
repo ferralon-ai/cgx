@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
-use cgx_query::{ApproxDirection, ApproxReason, ApproximationContract, ReasonDirection};
+use cgx_query::{ApproxReason, ApproximationContract, ReasonDirection};
 use gix::bstr::{BString, ByteSlice};
 
 use crate::age::BlameRepo;
@@ -350,9 +350,10 @@ fn resolve_to_commit(g: &gix::Repository, rev: &str) -> Result<gix::ObjectId> {
     Ok(commit.id)
 }
 
-/// The single construction site for coupling's [`ApproximationContract`]. If a
-/// `cgx_query::contract::for_coupling(..)` builder later lands, replace this body
-/// with a call to it and nothing else changes.
+/// The single construction site for coupling's [`ApproximationContract`]. The
+/// reasons are coupling's, and so is the [`MODELED_HISTORY`] boundary text; the
+/// direction fold belongs to `cgx_query::contract::for_history`, which is the only
+/// fold in the workspace.
 ///
 /// The reason vector is built by an explicit `if` sequence — never by iterating a
 /// map — so the emitted order is fixed and a CI consumer can gate on the `code`
@@ -486,26 +487,7 @@ fn coupling_contract(r: &CouplingReport) -> ApproximationContract {
         });
     }
 
-    // The same fold `cgx_query::contract::assemble()` applies; that fn is private,
-    // so the ~8 lines are duplicated here (the acknowledged cost of constructing
-    // the contract outside cgx-query).
-    let over = reasons.iter().any(|x| x.direction == ReasonDirection::Over);
-    let under = reasons
-        .iter()
-        .any(|x| x.direction == ReasonDirection::Under);
-    let direction = match (over, under) {
-        (false, false) => ApproxDirection::Exact,
-        (true, false) => ApproxDirection::Over,
-        (false, true) => ApproxDirection::Under,
-        (true, true) => ApproxDirection::OverUnder,
-    };
-
-    ApproximationContract {
-        direction,
-        reasons,
-        modeled_graph: MODELED_HISTORY,
-        // The `NegativeScope` fields (searched_edge_kinds, confidence_floor,
-        // max_depth) are call-graph concepts and would be a lie here.
-        scope: None,
-    }
+    // The direction fold and the `scope: None` decision both live in
+    // `cgx_query::contract`; only the boundary text is coupling's to own.
+    cgx_query::contract::for_history(reasons, MODELED_HISTORY)
 }

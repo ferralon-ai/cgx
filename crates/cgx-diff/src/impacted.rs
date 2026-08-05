@@ -23,6 +23,7 @@
 //! `impacted-changed-file-unindexed` (`under`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use cgx_core::NodeId;
@@ -179,19 +180,25 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
     // `under` reason must still fire.
     //
     // What the narrowing drops is not free, though: a genuinely new untracked
-    // `migration.sql` is dropped by exactly the same rule as `target/`. That is
-    // survivable while *something else* changed, and is disclosed on the answer
-    // when the changed set comes out empty — see `dropped_unclaimed_paths`.
+    // `migration.sql` is dropped by exactly the same rule as `target/`. Which of
+    // the two it is is not a judgement call — git's exclude rules already answer
+    // it — so the dropped set is classified with `git check-ignore` and only the
+    // paths git would *not* ignore are disclosed. This changes nothing about
+    // what gets indexed; it decides what the approximation contract says when
+    // the changed set comes out empty — see `dropped_unclaimed_paths`.
     let mut dropped_unclaimed_paths = 0usize;
     let changed_paths: BTreeSet<String> = if req.sides.head_is_workdir() {
         let (kept, dropped): (BTreeSet<String>, BTreeSet<String>) =
             changed_paths.into_iter().partition(|p| {
                 base.manifest.contains_key(p) || files_with_symbols.contains(p.as_str())
             });
-        dropped_unclaimed_paths = dropped
+        let candidates: Vec<&str> = dropped
             .iter()
+            .map(String::as_str)
             .filter(|p| !p.starts_with(CGX_STORE_DIR))
-            .count();
+            .collect();
+        let ignored = git_ignored(root, &candidates);
+        dropped_unclaimed_paths = candidates.iter().filter(|p| !ignored.contains(**p)).count();
         kept
     } else {
         changed_paths
@@ -271,6 +278,72 @@ impl Sides {
     fn head_is_workdir(&self) -> bool {
         matches!(self, Sides::RefToWorkdir { .. } | Sides::Workdir)
     }
+}
+
+/// The subset of `paths` that git's exclude rules ignore, asked in **one**
+/// `git check-ignore --stdin -z` — build output is thousands of paths and a
+/// process per path is not a cost this command can carry.
+///
+/// **Determinism (AR-10).** `.gitignore` is repo content, so it is the same on
+/// every machine; a global `core.excludesFile` is not, and neither is its
+/// `$XDG_CONFIG_HOME/git/ignore` default, which git consults even with no
+/// config set. Honouring either would let one machine call a path ignored and
+/// another call it a change, from identical repository content. A command-line
+/// `-c` outranks every config level, so `-c core.excludesFile=/dev/null`
+/// suppresses both (an unreadable path is read as no patterns, so this is not
+/// Unix-only). `.git/info/exclude` is still honoured: git offers no switch for
+/// it, it is per-clone rather than per-user, and git's default template leaves
+/// it comments-only.
+///
+/// **Fail-safe.** A missing `git`, a repository with no commits or no config, a
+/// non-zero-and-non-1 exit, or unreadable output all yield the empty set —
+/// every path then reads as not-ignored, which is exactly the behaviour this
+/// classification replaces. Exit 1 means "nothing matched" and is not an error.
+/// Shelling out to `git` is already how [`index_ref`] materialises a tree.
+fn git_ignored(repo_root: &Path, paths: &[&str]) -> BTreeSet<String> {
+    if paths.is_empty() {
+        return BTreeSet::new();
+    }
+    (|| -> Option<BTreeSet<String>> {
+        let mut payload: Vec<u8> = Vec::new();
+        for p in paths {
+            payload.extend_from_slice(p.as_bytes());
+            payload.push(0);
+        }
+        // stdin from a file rather than a pipe: git can fill its stdout buffer
+        // before it has drained our input, and a piped writer on this thread
+        // would then deadlock against the reader.
+        let mut input = tempfile::tempfile().ok()?;
+        input.write_all(&payload).ok()?;
+        input.rewind().ok()?;
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args([
+                "-c",
+                "core.excludesFile=/dev/null",
+                "check-ignore",
+                "--stdin",
+                "-z",
+            ])
+            .stdin(std::process::Stdio::from(input))
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if out.status.code() != Some(0) {
+            return None;
+        }
+        Some(
+            out.stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .map(str::to_string)
+                .collect(),
+        )
+    })()
+    .unwrap_or_default()
 }
 
 /// One indexed side: its graph, its Layer-2 key, and its `path → blob OID`
@@ -420,4 +493,102 @@ fn manifest_of(sources: Vec<cgx_index::SourceFile>) -> BTreeMap<String, String> 
         .into_iter()
         .map(|s| (s.rel_path, s.blob_oid))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn the_exclude_rules_classify_the_dropped_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+
+        let got = git_ignored(
+            root,
+            &[
+                "target/debug/app.bin",
+                "build.log",
+                "migration.sql",
+                "src/lib.rs",
+            ],
+        );
+        assert_eq!(
+            got,
+            ["build.log", "target/debug/app.bin"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// A repository with no commits still answers, and an empty request never
+    /// spawns anything.
+    #[test]
+    fn a_repo_with_no_commits_classifies_without_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+
+        assert_eq!(
+            git_ignored(root, &["target/x"]),
+            ["target/x".to_string()].into_iter().collect()
+        );
+        assert!(git_ignored(root, &[]).is_empty());
+    }
+
+    /// The fail-safe: `check-ignore` exits 128 outside a repository, and the
+    /// degraded answer is "nothing is ignored" — the behaviour this
+    /// classification replaces, never a crash.
+    #[test]
+    fn a_non_repository_degrades_to_nothing_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(git_ignored(tmp.path(), &["target/debug/app.bin"]).is_empty());
+    }
+
+    /// AR-10: a `core.excludesFile` is machine state, and two machines must not
+    /// answer differently from identical repository content. The control asserts
+    /// the setting really would have taken effect, so the suppression is proven
+    /// rather than assumed. Local config stands in for the global file here: the
+    /// command-line `-c` that suppresses it outranks *every* config level, and a
+    /// test may not write the developer's `~/.gitconfig`.
+    #[test]
+    fn a_configured_excludes_file_does_not_reach_the_classification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        let excludes = root.join("machine-ignore");
+        std::fs::write(&excludes, "notes.txt\n").unwrap();
+        git(
+            root,
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
+
+        let control = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["check-ignore", "notes.txt"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run git");
+        assert!(
+            control.success(),
+            "the control must show the setting would otherwise apply"
+        );
+
+        assert!(git_ignored(root, &["notes.txt"]).is_empty());
+    }
 }

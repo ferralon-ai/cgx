@@ -413,21 +413,18 @@ fn a_changed_file_that_yields_no_symbols_is_carried_as_an_under_reason() {
 /// predicate is keyed on the changed *path* set — reports an unedited tree as
 /// degenerate. All three of those consequences are what this test holds.
 ///
-/// What it deliberately **no longer** holds is the absence of the contract
-/// reason. A dropped `target/debug/build.log` and a dropped, genuinely new
-/// `migration.sql` are the same state to cgx — untracked, unclaimed, and
-/// indistinguishable to a manifest that reads no gitignore — so an answer that
-/// discards one and calls itself `exact` discards the other on identical terms.
-/// With the changed-symbol set empty the disclosure therefore fires for both,
-/// and this fixture pays a false positive so that the migration case cannot be
-/// silently lost. The cost is bounded: `the_narrowing_leaves_a_real_edit_alone`
-/// holds every run where anything else changed, the counted variant
-/// (`unindexed_changed_files`) still sees tracked paths only, and no exit code
-/// moves. Removing the false-positive half needs git's exclude rules, which
-/// `enumerate_workdir` does not consult.
+/// It holds the **absence** of the contract reason too, which is the whole
+/// point: this is the state of every developer's checkout between builds, and a
+/// paragraph of `under` disclosure on it trains users to skip the reason list.
+/// The dropped `target/debug/build.log` and a dropped, genuinely new
+/// `migration.sql` are no longer the same state — `git check-ignore` separates
+/// them — so the disclosure fires for the migration
+/// (`a_dropped_path_git_does_not_ignore_is_still_disclosed`) and not for this.
 #[test]
 fn untracked_files_that_yield_no_symbols_are_not_changes() {
     let repo = fixture_repo("go");
+    repo.write(".gitignore", "target/\n");
+    repo.commit("ignore build output", "2020-01-02T00:00:00Z");
     repo.write(".cgx/index.db", "not a source file\n");
     repo.write("target/debug/build.log", "not a source file\n");
 
@@ -437,6 +434,45 @@ fn untracked_files_that_yield_no_symbols_are_not_changes() {
     assert!(
         !a.degenerate,
         "a clean tree is a real answer, not a vacuous one"
+    );
+    assert!(
+        !codes(&a).contains(&"impacted-changed-file-unindexed"),
+        "gitignored build output is not a dropped user change: {:?}",
+        codes(&a)
+    );
+}
+
+/// The other half of the same classification, and the reason it is safe: an
+/// untracked path git's exclude rules do **not** cover is a genuinely new
+/// unmodeled file, and dropping it silently is the failure the disclosure
+/// exists for. Same fixture as above, one path renamed out of `target/`.
+#[test]
+fn a_dropped_path_git_does_not_ignore_is_still_disclosed() {
+    let repo = fixture_repo("go");
+    repo.write(".gitignore", "target/\n");
+    repo.commit("ignore build output", "2020-01-02T00:00:00Z");
+    repo.write(".cgx/index.db", "not a source file\n");
+    repo.write("target/debug/build.log", "not a source file\n");
+    repo.write("migration.sql", "CREATE TABLE t (id int);\n");
+
+    let (_store, a) = run_workdir(&repo);
+    assert_eq!(a.dirty_files, 0, "the migration yields no symbols either");
+    assert!(
+        codes(&a).contains(&"impacted-changed-file-unindexed"),
+        "an unignored new file must not be discarded silently: {:?}",
+        codes(&a)
+    );
+    assert_eq!(a.contract.direction, cgx_query::ApproxDirection::Under);
+    let disclosure = a
+        .contract
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-changed-file-unindexed")
+        .expect("the disclosure");
+    assert!(
+        disclosure.detail.contains("1 working-tree path(s)"),
+        "the two ignored paths must not inflate the count: {}",
+        disclosure.detail
     );
 }
 

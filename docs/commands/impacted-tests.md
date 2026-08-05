@@ -225,6 +225,8 @@ git -C /tmp/demo-go init -q -b main
 git -C /tmp/demo-go add -A && git -C /tmp/demo-go commit -q -m seed
 ```
 
+`demo-rust` and `demo-py` are the same recipe over `fixtures/rust-sample/` and `fixtures/python-app/`.
+
 The `demo-conf` repository used for the confidence and `--assert-empty` examples is a small Rust crate:
 
 ```
@@ -455,7 +457,9 @@ cgx: no changed file contributed an indexed symbol; the empty result is vacuous,
 
 Exit 4. cgx cannot tell whether that file drives behaviour, so it refuses to call the empty answer a clean bill of health.
 
-Untracked files that no adapter claims — cgx's own `.cgx/` store, `target/`, `node_modules/` — are excluded from the changed set under `--uncommitted` and do not trigger this. Without it the working-directory manifest, which consults no gitignore, would report a clean tree as degenerate on every run.
+Untracked files that no adapter claims — cgx's own `.cgx/` store, `target/`, `node_modules/` — are excluded from the changed set under `--uncommitted` and do not trigger this. Without that the working-directory manifest, which consults no gitignore, would report a clean tree as degenerate on every run.
+
+Whether a dropped path was build output or a genuinely new file is not a guess: the dropped set is classified in one batched `git check-ignore`, and only paths git's exclude rules do **not** cover are disclosed. An ignored `target/` therefore adds no reason to a clean tree's answer, while an unignored `migration.sql` in the same tree makes it `under`.
 
 **What each changed-path shape does to the contract:**
 
@@ -463,18 +467,17 @@ Untracked files that no adapter claims — cgx's own `.cgx/` store, `target/`, `
 |---|---|
 | tracked file with no symbols edited | `impacted-changed-file-unindexed` |
 | new **untracked** file an adapter claims (e.g. `src/newmod.rs`) | kept and walked |
-| new **untracked** file no adapter claims (e.g. `migration.sql`), **and nothing else changed** | `impacted-changed-file-unindexed`, direction `under` |
-| new **untracked** file no adapter claims, **alongside another change** | **none** — dropped silently |
+| new **untracked**, **unignored** file no adapter claims (e.g. `migration.sql`), **and nothing else changed** | `impacted-changed-file-unindexed`, direction `under` |
+| new **untracked**, **unignored** file no adapter claims, **alongside another change** | **none** — dropped silently |
+| untracked file git's exclude rules ignore (`target/`, `node_modules/`) | **none** — not a change |
 | tracked source file deleted | `impacted-removed-symbols-not-walked` |
 | tracked file with no symbols deleted | **none** |
 
-Row 3 is the case that must never read `exact`: the changed-symbol set comes out empty, the walk is seeded with nothing, and an empty answer labelled complete is a user told they are covered when cgx discarded the only thing that changed. The reason fires on the empty changed set alone — it names *that a path was dropped*, which needs no exclude rules, rather than *which* paths mattered, which does.
+Row 3 is the case that must never read `exact`: the changed-symbol set comes out empty, the walk is seeded with nothing, and an empty answer labelled complete is a user told they are covered when cgx discarded the only thing that changed.
 
-Row 4 is the price of that gating. While anything else changed, cgx cannot distinguish the dropped `migration.sql` from the `target/` and `node_modules/` entries dropped beside it, and putting build output back onto every ordinary answer is the more damaging error. Row 6 is the mirror on the delete side: a deleted path contributes nothing at head, and a deleted file that defined no symbols leaves no trace on either side.
+Row 4 is the price of gating that disclosure on an empty changed set: beside a real edit, one dropped unignored path is a rounding error, and the reason list is worth more kept short. Row 7 is the mirror on the delete side: a deleted path contributes nothing at head, and a deleted file that defined no symbols leaves no trace on either side. In both cases the file has no call graph, so no impacted test can be lost through it — what is lost is the disclosure that something changed there. Both close when `Repo::enumerate_workdir` learns git's exclude rules itself, which is also what would retire the working-tree traversal of `target/`.
 
-Both close when `Repo::enumerate_workdir` learns git's exclude rules; neither can be *counted* honestly before then. In both cases the file has no call graph, so no impacted test can be lost through it — what is lost is the disclosure that something changed there.
-
-**One residual, in the safe direction.** Because the reason fires on any dropped path once the changed set is empty, a clean working tree carrying untracked build output that git ignores (`target/`, `node_modules/`) reports `under` rather than `exact`, naming a dropped path that is not a user change. cgx's own `.cgx/` store is excluded by name and does not do this, so a clean checkout with no other untracked content still reads `exact`. Exit codes are unaffected either way. This too closes with git's exclude rules.
+**What the classification does and does not read.** `.gitignore` files are repository content, so the answer is the same on every machine — an AR-10 requirement, not a nicety. A global `core.excludesFile`, and the `$XDG_CONFIG_HOME/git/ignore` git falls back to with no config at all, are *machine* state and are suppressed: honouring them would let two developers get different answers from identical repository content. `.git/info/exclude` is honoured — git offers no switch to suppress it — so a per-clone rule there does move the disclosure; git's default template leaves that file comments-only. If `git` cannot be run at all, nothing is treated as ignored and the disclosure degrades to firing on every dropped path, which is the safe direction.
 
 ### Bounding the walk
 

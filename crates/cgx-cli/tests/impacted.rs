@@ -1339,6 +1339,79 @@ fn a_clean_tree_carrying_only_cgxs_own_store_is_still_exact() {
     );
 }
 
+/// **The state every developer's checkout is in between builds**: nothing
+/// modified, a gitignored `target/` on disk. `enumerate_workdir` reads no
+/// gitignore, so those paths reach the narrowing and are dropped — and until the
+/// dropped set was classified with `git check-ignore`, that drop cost a
+/// paragraph of `under` disclosure on the single most common invocation there
+/// is. A contract that cries wolf here trains users to skip the reason list,
+/// which is where this command's real disclosures live.
+#[test]
+fn a_clean_tree_carrying_gitignored_build_output_is_still_exact() {
+    let (_tmp, repo) = repo();
+    write(&repo, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+    write(&repo, ".gitignore", "target/\n");
+    commit(&repo, "base");
+    write(&repo, "target/debug/app.bin", "binary junk\n");
+    write(&repo, "target/debug/build/x/out.txt", "more junk\n");
+
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        doc["approximation"]["direction"].as_str(),
+        Some("exact"),
+        "gitignored build output is not a change cgx dropped: {stdout}"
+    );
+    assert!(
+        reason_codes(&doc).is_empty(),
+        "a clean tree earns an empty reason list: {stdout}"
+    );
+}
+
+/// The same tree, one path moved out from under the ignore rule. The two states
+/// differ only in git's exclude rules, and that is exactly the difference the
+/// contract now reports.
+#[test]
+fn an_unignored_new_file_in_the_same_tree_is_disclosed() {
+    let (_tmp, repo) = repo();
+    write(&repo, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+    write(&repo, ".gitignore", "target/\n");
+    commit(&repo, "base");
+    write(&repo, "target/debug/app.bin", "binary junk\n");
+    write(&repo, "migration.sql", "CREATE TABLE t (id int);\n");
+
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(doc["approximation"]["direction"].as_str(), Some("under"));
+    assert!(
+        reason_codes(&doc).contains(&"impacted-changed-file-unindexed".to_string()),
+        "{stdout}"
+    );
+}
+
+/// `git check-ignore` can fail — no commits, no repository, no `git` on `PATH`.
+/// The classification degrades to "nothing is ignored"; it never aborts the
+/// command. Here the run fails earlier, on the empty branch, and the point is
+/// that it fails as a diagnosed exit 3 rather than a panic.
+#[test]
+fn a_repository_with_no_commits_exits_cleanly() {
+    let (_tmp, repo) = repo();
+    write(&repo, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+
+    let (stdout, stderr, code) = run_cgx(&repo, &["impacted-tests", "--uncommitted"]);
+    assert_eq!(code, 3, "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("git error"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 // --- the widened test-recognition lists, end to end ---------------------------
 //
 // The adapter tests assert the `EntrypointHint`. These assert the thing a user

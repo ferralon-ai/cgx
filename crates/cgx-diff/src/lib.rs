@@ -41,12 +41,14 @@
 #![forbid(unsafe_code)]
 
 mod age;
+mod coupling;
 mod diff;
 mod error;
 mod filter;
 mod path_diff;
 
 pub use age::{BlameRepo, EdgeAge, Warning};
+pub use coupling::{coupling, CouplingOptions, CouplingPair, CouplingReport, MODELED_HISTORY};
 pub use diff::{diff_graphs, ChangedEdge, DiffEdge, DiffNode, EdgeChanges, GraphDiff};
 pub use error::{DiffError, Result};
 pub use filter::{BucketSelect, DiffFilter};

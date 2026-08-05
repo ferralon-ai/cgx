@@ -1066,3 +1066,95 @@ fn a_format_usage_error_outranks_the_degenerate_reason() {
         "no answer body on a usage error: {stdout}"
     );
 }
+
+// --- the Rust assertion-macro gap is disclosed truthfully ---------------------
+
+/// A `#[test]` whose only call to the changed symbol sits inside `assert_eq!` /
+/// `assert!`. The call is an unexpanded macro argument, so it produces no graph
+/// edge and no backward walk reaches the test — the dominant Rust unit-test
+/// idiom, dropped. Closing that gap is adapter/resolver work and is not this
+/// command's; what *is* this command's is that the reason carrying the omission
+/// describes it correctly. It used to say the missing route ran through an
+/// "external/unindexed callee; no SCIP", while `add` is in-repo, indexed and one
+/// hop away.
+fn assertion_macro_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(&path, "src/lib.rs", "pub mod api;\npub mod check;\n");
+    write(&path, "src/api.rs", API_BASE);
+    write(
+        &path,
+        "src/check.rs",
+        "use crate::api::add;\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+         use super::*;\n\
+         #[test]\n\
+         fn test_macro_eq() { assert_eq!(add(1, 1), 2); }\n\
+         #[test]\n\
+         fn test_macro_bool() { assert!(add(1, 1) == 2); }\n\
+         }\n",
+    );
+    commit(&path, "base");
+    write(&path, "src/api.rs", API_HEAD);
+    (tmp, path)
+}
+
+#[test]
+fn the_assertion_macro_gap_is_disclosed_as_itself_not_as_a_missing_external() {
+    let (_tmp, repo) = assertion_macro_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+
+    // The premise: the tests really are dropped. If a future adapter change
+    // makes them resolve, this test should be revisited, not silently pass.
+    assert_eq!(
+        doc["count"].as_u64(),
+        Some(0),
+        "premise: a macro-argument call yields no edge: {stdout}"
+    );
+
+    let reasons = doc["approximation"]["reasons"].as_array().expect("reasons");
+    let rust_gap = reasons
+        .iter()
+        .find(|r| r["code"] == "impacted-test-recognition-incomplete-rust")
+        .expect("the Rust recognition gap fires");
+    let detail = rust_gap["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("assertion macro") && detail.contains("no call edge"),
+        "the reason names the cause that actually applies: {detail}"
+    );
+
+    let dangling = reasons
+        .iter()
+        .find(|r| r["code"] == "impacted-unresolved-external-calls")
+        .expect("the dangling reason fires on this shape");
+    let detail = dangling["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("unexpanded macro"),
+        "and it no longer claims the callee must be external: {detail}"
+    );
+
+    assert_ne!(
+        doc["approximation"]["direction"].as_str(),
+        Some("exact"),
+        "an answer missing both tests can never be exact: {stdout}"
+    );
+}
+
+/// The counterpart: bind the call to a local and the same test is reported. This
+/// is what makes the reason's advice checkable rather than decorative.
+#[test]
+fn binding_the_call_to_a_local_makes_the_same_test_visible() {
+    let (_tmp, repo) = rust_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(doc["count"].as_u64(), Some(1), "{stdout}");
+}

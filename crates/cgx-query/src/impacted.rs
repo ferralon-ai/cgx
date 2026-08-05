@@ -255,12 +255,21 @@ pub fn contract_for(
     // --- under: the frontier scan -------------------------------------------
     let frontier = scan_frontier(view, walker, &tests.reached);
     if frontier.dangling_refs > 0 {
+        // `unresolved_calls` counts every call site the resolver could not bind
+        // to an in-repo node, and an external/unindexed callee is only one way
+        // to get there. A call written inside an unexpanded macro argument
+        // lands here too, with the callee sitting in the same crate one hop
+        // away — naming only the external case tells a user with no external
+        // dependency on that path that the reason does not apply to them, and
+        // they would be wrong. The per-language reasons name the concrete
+        // shapes; this one must not narrow the cause it cannot distinguish.
         reasons.push(under(
             "impacted-unresolved-external-calls",
             format!(
-                "{} call(s) in symbols outside the walked region resolved to no in-repo target \
-                 (external/unindexed callee; no SCIP). A test reaching your change only through \
-                 such a call is not in this answer.",
+                "{} call(s) in symbols outside the walked region resolved to no in-repo target — \
+                 an external or unindexed callee (no SCIP), or a call site the frontend does not \
+                 model as an edge, such as one written inside an unexpanded macro. A test \
+                 reaching your change only through such a call is not in this answer.",
                 frontier.dangling_refs
             ),
         ));
@@ -446,10 +455,20 @@ fn recognition_gap(lang: &str) -> Option<(&'static str, &'static str)> {
              python_files/python_functions config, and TestCase chains through an unindexed \
              third-party base are not recognised as tests.",
         )),
+        // The assertion-macro clause leads because it is by far the most common
+        // shape: `assert_eq!(add(1, 1), 2)` is the idiomatic Rust unit test, and
+        // the call inside it is an unexpanded macro argument that produces no
+        // graph edge at all, so a reverse walk never reaches the test. Verified
+        // Rust-only — the equivalent Python `assert`, Java `assertEquals` and Go
+        // `if` forms all resolve and all report their test.
         "rust" => Some((
             "impacted-test-recognition-incomplete-rust",
-            "rust: #[tokio::test], #[async_std::test], #[rstest], #[wasm_bindgen_test] and \
-             #[test_log::test] are not recognised as tests; doc-tests have no node identity at all.",
+            "rust: a call written inside an assertion macro (assert!, assert_eq!, assert_ne!, \
+             matches! and friends) is an unexpanded macro argument and yields no call edge, so a \
+             #[test] whose only use of the changed symbol is inside one is not in this answer — \
+             bind the call to a local first to make it visible; #[tokio::test], #[async_std::test], \
+             #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; \
+             doc-tests have no node identity at all.",
         )),
         _ => None,
     }

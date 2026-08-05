@@ -839,3 +839,76 @@ fn reason_order_is_stable_across_runs() {
         .unwrap();
     assert!(java < python);
 }
+
+// --- the disclosure names the right cause ------------------------------------
+
+/// The detail string of one language's recognition-gap reason, read off a real
+/// contract rather than the private table that produces it.
+fn gap_detail(lang: &str) -> String {
+    let mut g = G::new();
+    let t = g.node("t", SymbolKind::Function, lang, Some(EntrypointKind::Test));
+    let target = g.node("target", SymbolKind::Function, lang, None);
+    g.calls(t, target);
+    let v = g.view();
+    let (_, c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    c.reasons
+        .iter()
+        .find(|r| r.code.starts_with("impacted-test-recognition-incomplete-"))
+        .map(|r| r.detail.clone())
+        .unwrap_or_else(|| panic!("{lang} has a recognition-gap reason"))
+}
+
+#[test]
+fn the_rust_recognition_gap_names_the_assertion_macro_case() {
+    // The dominant Rust unit-test idiom, `assert_eq!(add(1, 1), 2)`, puts the
+    // call in an unexpanded macro argument, so it produces no graph edge and no
+    // backward walk reaches the test. That is the far more common gap than the
+    // attribute list, and it was the one the reason did not mention.
+    let detail = gap_detail("rust");
+    assert!(
+        detail.contains("assert_eq!") && detail.contains("no call edge"),
+        "the assertion-macro gap must be named: {detail}"
+    );
+}
+
+#[test]
+fn only_rust_claims_the_assertion_macro_gap() {
+    // Verified against the release binary: the equivalent Python `assert`, Java
+    // `assertEquals` and Go `if` forms all resolve and all report their test, so
+    // generalising the clause would disclose a gap those languages do not have.
+    for lang in ["go", "java", "python"] {
+        let detail = gap_detail(lang);
+        assert!(
+            !detail.contains("macro"),
+            "{lang} must not inherit the Rust macro clause: {detail}"
+        );
+    }
+}
+
+#[test]
+fn the_dangling_reason_does_not_claim_the_callee_is_external() {
+    // The reason fires on any call the resolver could not bind, and an
+    // external/unindexed callee is only one way to get there. Asserting the
+    // single cause told a user with no external dependency on that path that
+    // the reason did not apply to them, and they would have been wrong.
+    let mut g = G::new();
+    let t = g.test("t");
+    let caller = g.func("caller");
+    let target = g.func("target");
+    g.calls(caller, target);
+    g.dangling(t, 2);
+    let v = g.view();
+
+    let a = impacted_tests(&v, &[target], &unbounded());
+    let c = contract_for(&v, &unbounded(), &[target], &a, &DiffFacts::default());
+    let detail = c
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-unresolved-external-calls")
+        .map(|r| r.detail.as_str())
+        .expect("the dangling reason fires");
+    assert!(
+        detail.contains("unexpanded macro"),
+        "the unmodelled-call-site cause is named too: {detail}"
+    );
+}

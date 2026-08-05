@@ -77,7 +77,7 @@ Within the four supported languages, test recognition is incomplete in named way
 
 | Language | Not recognised as a test |
 |----------|--------------------------|
-| Rust | `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[wasm_bindgen_test]`, `#[test_log::test]`. Doc-tests have no node identity at all. |
+| Rust | A `#[test]` whose only call to the changed symbol sits **inside an assertion macro** — `assert_eq!(add(1, 1), 2)`, `assert!(add(1, 1) == 2)`, and friends. The call is an unexpanded macro argument and produces no call edge at all, so no backward walk reaches the test. Bind the call to a local first (`let got = add(1, 1); assert_eq!(got, 2);`) and it is reported. Plus `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[wasm_bindgen_test]`, `#[test_log::test]`. Doc-tests have no node identity at all. |
 | Go | `FuzzXxx` fuzz targets. `t.Run` subtest closures carry no call edge and are recovered by containment only (see below). |
 | Java | JUnit 5 `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate`; TestNG class-level `@Test`. |
 | Python | `unittest` camelCase `testFoo` methods; non-default pytest `python_files`/`python_functions` configuration; `TestCase` chains through an unindexed third-party base. |
@@ -113,7 +113,7 @@ When the result set is empty, the contract also carries a `scope` object — the
 
 | Code | Meaning |
 |------|---------|
-| `impacted-unresolved-external-calls` | N calls in symbols on the searched frontier resolved to no in-repo target (external or unindexed callee; no SCIP data). A test that reaches the change only through such a call is not in this answer. |
+| `impacted-unresolved-external-calls` | N calls in symbols on the searched frontier resolved to no in-repo target. The callee may be external or unindexed (no SCIP data), **or** the call site may be one the frontend does not model as an edge — a call inside an unexpanded macro is the common Rust case, and its callee can be in-repo and one hop away. A test that reaches the change only through such a call is not in this answer. |
 | `impacted-test-recognition-incomplete-rust` | The Rust gaps in the table above. |
 | `impacted-test-recognition-incomplete-go` | The Go gaps in the table above. |
 | `impacted-test-recognition-incomplete-java` | The Java gaps in the table above. |
@@ -222,7 +222,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-rust
 
 ```
 (no results)
-approximation: under-approximate — 109 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer. | scope: call edges, confidence>=possible, depth=unbounded
+approximation: under-approximate — 109 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer. | scope: call edges, confidence>=possible, depth=unbounded
 ```
 
 Exit 0. Nothing changed, so nothing is impacted. The `scope` tail states the terms the negative was established under. The under-reason is still present and is still true: it names what a *non*-empty answer on this repository would have been missing.
@@ -240,7 +240,7 @@ go_sample::Transform  dataflow.go:3
 ├─ go_sample::TestPlain  impacted_test.go:7  [possible]
 └─ go_sample::TestSub::{func@19:16}  impacted_test.go:19  [possible]
    └─ go_sample::TestSub  impacted_test.go:18  [possible]
-approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.; go: FuzzXxx is not recognised as a test; t.Run subtest closures are recovered by containment only (see over-reasons), not by a call edge.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.; 1 test(s) were reached by walking from a closure body to its lexically enclosing function. Containment is not invocation: the closure may never be invoked by that test.; resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.; go: FuzzXxx is not recognised as a test; t.Run subtest closures are recovered by containment only (see over-reasons), not by a call edge.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.; 1 test(s) were reached by walking from a closure body to its lexically enclosing function. Containment is not invocation: the closure may never be invoked by that test.; resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
 ```
 
 Exit 0. The human view is a **witness forest** rooted at the changed symbol and descending to each test, so the reason a test is listed is visible on the page. `go_sample::TestSub::{func@19:16}` is the `t.Run` closure node — an intermediate on the witness path, not a reported test. Only `TestPlain` and `TestSub` are results.
@@ -259,7 +259,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-go --format json
     "reasons": [
       {
         "code": "impacted-unresolved-external-calls",
-        "detail": "1 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.",
+        "detail": "1 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.",
         "direction": "under"
       },
       {
@@ -321,7 +321,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-conf
 demo::api::add  src/api.rs:1
 └─ demo::check::mid  src/check.rs:2  [probable]
    └─ demo::check::tests::test_mid  src/check.rs:7
-approximation: over- and under-approximate — rust: #[tokio::test], #[async_std::test], #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; doc-tests have no node identity at all.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.
+approximation: over- and under-approximate — rust: a call written inside an assertion macro (assert!, assert_eq!, assert_ne!, matches! and friends) is an unexpanded macro argument and yields no call edge, so a #[test] whose only use of the changed symbol is inside one is not in this answer — bind the call to a local first to make it visible; #[tokio::test], #[async_std::test], #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; doc-tests have no node identity at all.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.
 ```
 
 ```json
@@ -352,7 +352,7 @@ go_sample::Transform  dataflow.go:3
 ├─ go_sample::TestPlain  impacted_test.go:7  [possible]
 └─ go_sample::TestSub::{func@19:16}  impacted_test.go:19  [possible]
    └─ go_sample::TestSub  impacted_test.go:18  [possible]
-approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.; go: FuzzXxx is not recognised as a test; t.Run subtest closures are recovered by containment only (see over-reasons), not by a call edge.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.; 1 test(s) were reached by walking from a closure body to its lexically enclosing function. Containment is not invocation: the closure may never be invoked by that test.; resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.; go: FuzzXxx is not recognised as a test; t.Run subtest closures are recovered by containment only (see over-reasons), not by a call edge.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit.; 1 test(s) were reached by walking from a closure body to its lexically enclosing function. Containment is not invocation: the closure may never be invoked by that test.; resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
 ```
 
 Exit 0. The base is `merge-base(main, HEAD)`, so commits that landed on `main` after the branch point are not counted as changed. Adding `--no-merge-base` compares against `main`'s tip instead and adds one more reason to the contract:
@@ -404,7 +404,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-ts
 
 ```
 (no results)
-approximation: over- and under-approximate — 2 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.; 3 changed symbol(s) are in typescript, for which cgx cannot identify tests at all (EntrypointHint FQNs are built from the test's string label and never match a symbol FQN; calls inside inline test callbacks produce no graph edge). No typescript test appears in this answer.; 3 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit. | scope: call edges, confidence>=possible, depth=unbounded
+approximation: over- and under-approximate — 2 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.; 3 changed symbol(s) are in typescript, for which cgx cannot identify tests at all (EntrypointHint FQNs are built from the test's string label and never match a symbol FQN; calls inside inline test callbacks produce no graph edge). No typescript test appears in this answer.; 3 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit. | scope: call edges, confidence>=possible, depth=unbounded
 cgx: no supported language in the changed set (typescript); the empty result is vacuous, not a clean bill of health
 ```
 
@@ -420,7 +420,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-py
 
 ```
 (no results)
-approximation: under-approximate — 4 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.; 1 changed file(s) contributed no symbols (no adapter claims the extension, or the file defines none); edits there are not represented in the changed set. | scope: call edges, confidence>=possible, depth=unbounded
+approximation: under-approximate — 4 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.; 1 changed file(s) contributed no symbols (no adapter claims the extension, or the file defines none); edits there are not represented in the changed set. | scope: call edges, confidence>=possible, depth=unbounded
 cgx: no changed file contributed an indexed symbol; the empty result is vacuous, not a clean bill of health
 ```
 
@@ -436,7 +436,7 @@ cgx impacted-tests --uncommitted --repo /tmp/demo-conf --depth 1
 
 ```
 (no results)
-approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.; search stopped at depth 1; deeper edges were not explored; rust: #[tokio::test], #[async_std::test], #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; doc-tests have no node identity at all.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit. | scope: call edges, confidence>=possible, depth<=1
+approximation: over- and under-approximate — 1 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.; search stopped at depth 1; deeper edges were not explored; rust: a call written inside an assertion macro (assert!, assert_eq!, assert_ne!, matches! and friends) is an unexpanded macro argument and yields no call edge, so a #[test] whose only use of the changed symbol is inside one is not in this answer — bind the call to a local first to make it visible; #[tokio::test], #[async_std::test], #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; doc-tests have no node identity at all.; 1 symbol(s) entered the changed set because their defining file changed, not because their call graph changed; some may be unaffected by the edit. | scope: call edges, confidence>=possible, depth<=1
 ```
 
 Exit 0. The test is two hops from the change, so a depth of 1 loses it — and the `depth-limit` reason and the `depth<=1` scope both say so. Leave `--depth` unset unless the walk is too slow.

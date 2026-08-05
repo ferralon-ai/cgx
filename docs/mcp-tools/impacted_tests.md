@@ -118,8 +118,8 @@ carries no `scope`.
 
 | Code | Meaning |
 |------|---------|
-| `impacted-unresolved-external-calls` | N calls on the searched frontier resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching the change only through such a call is absent. |
-| `impacted-test-recognition-incomplete-rust` | `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[wasm_bindgen_test]`, `#[test_log::test]` are not recognised as tests; doc-tests have no node identity at all. |
+| `impacted-unresolved-external-calls` | N calls on the searched frontier resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one inside an unexpanded macro. A test reaching the change only through such a call is absent. |
+| `impacted-test-recognition-incomplete-rust` | A call inside an assertion macro (`assert!`, `assert_eq!`, …) is an unexpanded macro argument and yields no call edge, so a `#[test]` whose only use of the changed symbol is inside one is absent. Plus `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[wasm_bindgen_test]`, `#[test_log::test]` are not recognised as tests; doc-tests have no node identity at all. |
 | `impacted-test-recognition-incomplete-go` | `FuzzXxx` is not recognised as a test; `t.Run` subtest closures carry no call edge and are recovered by containment only. |
 | `impacted-test-recognition-incomplete-java` | JUnit 5 `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate` and TestNG class-level `@Test` are not recognised as tests. |
 | `impacted-test-recognition-incomplete-python` | `unittest` camelCase `testFoo` methods, non-default pytest `python_files`/`python_functions` config, and `TestCase` chains through an unindexed third-party base are not recognised as tests. |
@@ -190,7 +190,7 @@ degenerate answer means the question was not answered.
     "reasons": [
       {
         "code": "impacted-unresolved-external-calls",
-        "detail": "1 call(s) in symbols outside the walked region resolved to no in-repo target (external/unindexed callee; no SCIP). A test reaching your change only through such a call is not in this answer.",
+        "detail": "1 call(s) in symbols outside the walked region resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one written inside an unexpanded macro. A test reaching your change only through such a call is not in this answer.",
         "direction": "under"
       },
       {

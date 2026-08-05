@@ -212,8 +212,19 @@ impl Repo {
             matched: 0,
         };
         walk.visit(&workdir, "")?;
-        // Every indexed path we never saw on disk is a removal.
-        Ok(walk.dirty + (indexed.len() - walk.matched))
+        // Every indexed path we never saw on disk is a removal. `matched` counts
+        // distinct indexed paths found on disk, so it can never exceed the map —
+        // except through a lossy path conversion collapsing two indexed paths onto
+        // one string, which would count one of them twice. Saturating rather than
+        // wrapping: a count is a report, and the honest failure of an over-count is
+        // "zero removals", not a panic in debug and ~1.8e19 in release.
+        debug_assert!(
+            walk.matched <= indexed.len(),
+            "matched {} exceeds the {} indexed paths",
+            walk.matched,
+            indexed.len()
+        );
+        Ok(walk.dirty + indexed.len().saturating_sub(walk.matched))
     }
 
     /// The absolute base directories of all linked worktrees (IX-6). The main

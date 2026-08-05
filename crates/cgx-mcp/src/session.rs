@@ -80,7 +80,10 @@ pub struct GraphSession {
     /// - `freshness.dirty_files` is a property of the **checkout**: how many paths
     ///   git would call divergent, from `Repo::dirty_file_count` (the function the
     ///   CLI calls), ignore rules applied and submodules not descended. It answers
-    ///   "is this answer still true of my working tree?".
+    ///   "is this answer still true of my working tree?". Its base is named beside
+    ///   it in `freshness.dirty_files_base` — `HEAD`'s tree here, the index
+    ///   pointer's tree on the CLI, which is the same question asked of the tree
+    ///   each surface actually answered over.
     ///
     /// Because the two counts apply different ignore rules, they can also disagree
     /// about whether the graph is `HEAD`'s tree at all; `freshness.matches_head` is
@@ -161,8 +164,14 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     // so `freshness.dirty_files` answers the same question on both surfaces. It is
     // deliberately not `overlay.len()` — see `GraphSession::freshness` for why the
     // two are different questions. `null` where the count could not be established,
-    // never a `0`.
-    let dirty_files = repo.dirty_file_count(&committed).ok();
+    // never a `0`. The base travels with it: this count is measured from HEAD's
+    // tree, where the CLI's is measured from its index pointer's tree, and the two
+    // coincide only when the index is at HEAD.
+    let dirty = repo
+        .dirty_file_count(&committed)
+        .ok()
+        .map(|n| (head_tree_oid.clone(), n));
+    let dirty_files = dirty.as_ref().map(|(_, n)| *n);
 
     // Whether the graph is HEAD's tree is **three-valued**, because neither view of
     // the working tree is authoritative alone:
@@ -204,13 +213,11 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     let freshness = match matches_head {
         // The `workdir:` key is never HEAD's tree OID, so `new` derives exactly the
         // `matches_head` computed above for both `Some` arms.
-        Some(_) => {
-            FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty_files)
-        }
+        Some(_) => FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty),
         None => FreshnessEnvelope::indeterminate_head(
             Some(indexed_tree),
             Some(head_tree_oid.clone()),
-            dirty_files,
+            dirty,
         ),
     };
     debug_assert_eq!(freshness.matches_head, matches_head);

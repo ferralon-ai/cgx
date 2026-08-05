@@ -72,9 +72,21 @@ pub struct FreshnessEnvelope {
     /// `false`, which would assert a divergence nobody established, and never
     /// `true`, which would be a clean bill nobody established.
     pub matches_head: Option<bool>,
-    /// How many working-tree files diverge from the indexed tree (content differs,
-    /// or the file was added/removed). `null` when the surface did not inspect the
-    /// working tree; `0` when it did and found none.
+    /// The tree [`dirty_files`](Self::dirty_files) was measured against — the
+    /// base of that count, and `null` exactly when the count is.
+    ///
+    /// It is **not** always [`indexed_tree`](Self::indexed_tree), which is why it
+    /// is reported rather than inferred: the CLI measures divergence from the tree
+    /// its index pointer names, while a working-directory MCP query measures it
+    /// from `HEAD`'s tree even though the graph it answered over is a synthetic
+    /// `workdir:` key that names no tree at all. Both are the right base for their
+    /// own question; a count whose base a reader has to guess is not a
+    /// self-describing account of an answer's limits.
+    pub dirty_files_base: Option<String>,
+    /// How many working-tree files diverge from
+    /// [`dirty_files_base`](Self::dirty_files_base) (content differs, or the file
+    /// was added/removed). `null` when the surface did not inspect the working
+    /// tree; `0` when it did and found none.
     ///
     /// Ignored paths are excluded and nested repositories (submodules) are not
     /// descended into, matching what the index itself covers. The exclude rules
@@ -95,18 +107,21 @@ pub struct FreshnessEnvelope {
 impl FreshnessEnvelope {
     /// Build an envelope from the facts, deriving `matches_head` and `stale`.
     ///
-    /// `head_tree`/`dirty_files` are `None` where the caller could not resolve
-    /// `HEAD` / did not inspect the working tree (see the module docs).
+    /// `head_tree` is `None` where the caller could not resolve `HEAD`. `dirty`
+    /// carries the count **with the tree it was measured against**, or `None` where
+    /// the surface did not inspect the working tree (see the module docs) — the
+    /// pairing is a tuple rather than two parameters so a count can never reach the
+    /// envelope without its base.
     pub fn new(
         indexed_tree: Option<String>,
         head_tree: Option<String>,
-        dirty_files: Option<usize>,
+        dirty: Option<(String, usize)>,
     ) -> Self {
         let matches_head = match (&indexed_tree, &head_tree) {
             (Some(i), Some(h)) => Some(i == h),
             _ => None,
         };
-        Self::build(indexed_tree, head_tree, matches_head, dirty_files)
+        Self::build(indexed_tree, head_tree, matches_head, dirty)
     }
 
     /// An envelope whose `matches_head` the surface **could not establish**, though
@@ -125,29 +140,35 @@ impl FreshnessEnvelope {
     pub fn indeterminate_head(
         indexed_tree: Option<String>,
         head_tree: Option<String>,
-        dirty_files: Option<usize>,
+        dirty: Option<(String, usize)>,
     ) -> Self {
-        Self::build(indexed_tree, head_tree, None, dirty_files)
+        Self::build(indexed_tree, head_tree, None, dirty)
     }
 
     fn build(
         indexed_tree: Option<String>,
         head_tree: Option<String>,
         matches_head: Option<bool>,
-        dirty_files: Option<usize>,
+        dirty: Option<(String, usize)>,
     ) -> Self {
+        let (dirty_files_base, dirty_files) = match dirty {
+            Some((base, n)) => (Some(base), Some(n)),
+            None => (None, None),
+        };
         let stale = matches_head == Some(false) || dirty_files.is_some_and(|n| n > 0);
         FreshnessEnvelope {
             indexed_tree,
             head_tree,
             matches_head,
+            dirty_files_base,
             dirty_files,
             stale,
         }
     }
 
     /// The envelope for an output shape that carries no freshness signal at all —
-    /// the path-graph emitters, and the `search`/`symbols` bare JSON arrays.
+    /// the path-graph emitters (`dot`/`mermaid`/`d2`), which are diagram *source*
+    /// rather than answer documents.
     ///
     /// Every field is "not established", which is the literal truth for a surface
     /// that never looked: the caller must not pay for a working-tree walk whose
@@ -301,10 +322,16 @@ mod tests {
             let env = FreshnessEnvelope::new(
                 Some(c.indexed.to_owned()),
                 c.head.map(str::to_owned),
-                c.dirty,
+                c.dirty.map(|n| ("base".to_owned(), n)),
             );
             assert_eq!(env.matches_head, c.want_matches_head, "{}", c.name);
             assert_eq!(env.stale, c.want_stale, "{}", c.name);
+            assert_eq!(
+                env.dirty_files_base.is_some(),
+                env.dirty_files.is_some(),
+                "{}: a count and its base are reported together or not at all",
+                c.name
+            );
         }
     }
 
@@ -316,7 +343,7 @@ mod tests {
         let env = FreshnessEnvelope::indeterminate_head(
             Some("workdir:abcdef".into()),
             Some("aaaa".into()),
-            Some(0),
+            Some(("aaaa".to_owned(), 0)),
         );
         assert_eq!(env.matches_head, None);
         assert!(!env.stale, "nothing established a divergence");
@@ -330,7 +357,7 @@ mod tests {
         let env = FreshnessEnvelope::indeterminate_head(
             Some("workdir:abcdef".into()),
             Some("aaaa".into()),
-            Some(2),
+            Some(("aaaa".to_owned(), 2)),
         );
         assert_eq!(env.matches_head, None);
         assert!(env.stale);
@@ -339,15 +366,21 @@ mod tests {
 
     #[test]
     fn json_shape_is_stable_and_distinguishes_null_from_zero() {
-        let clean = FreshnessEnvelope::new(Some("aaaa".into()), Some("aaaa".into()), Some(0));
+        let clean = FreshnessEnvelope::new(
+            Some("aaaa".into()),
+            Some("aaaa".into()),
+            Some(("aaaa".to_owned(), 0)),
+        );
         let v = serde_json::to_value(&clean).unwrap();
         assert_eq!(v["dirty_files"], serde_json::json!(0));
+        assert_eq!(v["dirty_files_base"], serde_json::json!("aaaa"));
         assert_eq!(v["matches_head"], serde_json::json!(true));
         assert_eq!(v["stale"], serde_json::json!(false));
 
         let uninspected = FreshnessEnvelope::new(None, None, None);
         let v = serde_json::to_value(&uninspected).unwrap();
         assert!(v["dirty_files"].is_null());
+        assert!(v["dirty_files_base"].is_null());
         assert!(v["head_tree"].is_null());
         assert!(v["matches_head"].is_null());
     }
@@ -357,7 +390,7 @@ mod tests {
         let s = FreshnessEnvelope::new(
             Some("abc1234def".into()),
             Some("abc1234def".into()),
-            Some(0),
+            Some(("abc1234def".to_owned(), 0)),
         )
         .human_summary();
         assert_eq!(
@@ -368,7 +401,7 @@ mod tests {
         let s = FreshnessEnvelope::new(
             Some("abc1234def".into()),
             Some("ffff567aaa".into()),
-            Some(1),
+            Some(("abc1234def".to_owned(), 1)),
         )
         .human_summary();
         assert_eq!(
@@ -429,8 +462,12 @@ mod tests {
         ];
 
         for c in cases {
-            let s = FreshnessEnvelope::new(Some("aaaa".into()), c.head.map(str::to_owned), c.dirty)
-                .human_summary();
+            let s = FreshnessEnvelope::new(
+                Some("aaaa".into()),
+                c.head.map(str::to_owned),
+                c.dirty.map(|n| ("aaaa".to_owned(), n)),
+            )
+            .human_summary();
             assert!(
                 s.starts_with(c.want),
                 "{}: wanted {:?}, got {s:?}",

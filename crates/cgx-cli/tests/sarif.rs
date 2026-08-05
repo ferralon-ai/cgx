@@ -18,7 +18,11 @@ use cgx_cli::output::{sarif_document, ResultSet};
 /// A fixed, fully-populated freshness envelope: these tests assert SARIF
 /// structure, not freshness semantics (that lives in `freshness.rs`/`cli.rs`).
 fn fresh() -> FreshnessEnvelope {
-    FreshnessEnvelope::new(Some("aaaa1111".into()), Some("aaaa1111".into()), Some(0))
+    FreshnessEnvelope::new(
+        Some("aaaa1111".into()),
+        Some("aaaa1111".into()),
+        Some(("aaaa1111".to_owned(), 0)),
+    )
 }
 
 fn node(id: u32, fqn: &str, file: &str, line: u32) -> NodeRecord {

@@ -39,18 +39,25 @@ pub fn envelope(repo_root: Option<&Path>, at: Option<&str>) -> FreshnessEnvelope
         None => read_pointer(root).ok().map(|p| p.graph_key),
     };
 
+    // Measured against the tree the *answer* came from, not against `HEAD`: the CLI
+    // answers over its index pointer's tree, so "is this answer still true of my
+    // working tree?" is a question about that tree. The base travels with the count
+    // in the envelope, because MCP's working-directory path measures the same field
+    // from `HEAD` and a reader must not have to guess which.
+    //
     // A synthetic `workdir:<digest>` key names no git tree, so there is nothing to
     // diff against: `tree_blob_oids` fails and the count stays `null` rather than
     // becoming a fabricated zero.
-    let dirty_files = match (&repo, &indexed_tree) {
+    let dirty = match (&repo, &indexed_tree) {
         (Some(r), Some(key)) => r
             .tree_blob_oids(key)
             .and_then(|indexed| r.dirty_file_count(&indexed))
-            .ok(),
+            .ok()
+            .map(|n| (key.clone(), n)),
         _ => None,
     };
 
-    FreshnessEnvelope::new(indexed_tree, head_tree, dirty_files)
+    FreshnessEnvelope::new(indexed_tree, head_tree, dirty)
 }
 
 /// The tree OID behind a `--at <ref>` pin. Resolving the ref a second time (the

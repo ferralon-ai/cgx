@@ -877,6 +877,7 @@ fn the_freshness_envelope_carries_no_timestamp() {
         keys,
         vec![
             "dirty_files",
+            "dirty_files_base",
             "head_tree",
             "indexed_tree",
             "matches_head",
@@ -1021,76 +1022,6 @@ fn a_deletion_only_tree_gets_a_graph_version_distinct_from_clean_head() {
     assert_eq!(deleted["dirty_files_analyzed"], json!(1));
 }
 
-/// C9's consistency half. `dirty`/`dirty_files_analyzed` and `freshness.stale`
-/// describe one working tree from two angles, so a response reading `dirty: false`
-/// beside `stale: true` tells an agent two incompatible things and leaves it no
-/// way to know which field to trust. It could, while the envelope saw deletions
-/// and the overlay fields did not. Driven over the tree states that reach each
-/// field group, under both `include_dirty` settings.
-#[test]
-fn no_response_reads_dirty_false_beside_stale_true() {
-    struct Case {
-        name: &'static str,
-        mutate: fn(&Path),
-    }
-
-    let cases = [
-        Case {
-            name: "clean",
-            mutate: |_| {},
-        },
-        Case {
-            name: "modified",
-            mutate: |r| {
-                std::fs::write(r.join("src/other.rs"), "pub fn remote_fn() -> i32 { 3 }\n").unwrap()
-            },
-        },
-        Case {
-            name: "deleted",
-            mutate: |r| std::fs::remove_file(r.join("src/other.rs")).unwrap(),
-        },
-        Case {
-            name: "added",
-            mutate: |r| {
-                std::fs::write(r.join("src/extra.rs"), "pub fn extra() -> i32 { 4 }\n").unwrap()
-            },
-        },
-    ];
-
-    for Case { name, mutate } in cases {
-        for include_dirty in [true, false] {
-            let (_t, repo) = init_mixed_repo();
-            mutate(&repo);
-            let s = call_tool(
-                &repo,
-                "callees",
-                json!({ "symbol": "caller_fn", "include_dirty": include_dirty }),
-            );
-            let dirty = s["dirty"].as_bool().expect("dirty");
-            let stale = s["freshness"]["stale"].as_bool().expect("stale");
-            assert!(
-                dirty || !stale,
-                "{name} (include_dirty={include_dirty}): `dirty: {dirty}` beside \
-                 `stale: {stale}` is a contradiction — freshness {}",
-                s["freshness"]
-            );
-
-            // And the overlay fields are not merely consistent by staying silent:
-            // every state that moved the tree is reported as having moved it.
-            if include_dirty && name != "clean" {
-                assert!(
-                    dirty,
-                    "{name}: an active overlay over a changed tree is dirty"
-                );
-                assert!(
-                    s["dirty_files_analyzed"].as_u64().unwrap() >= 1,
-                    "{name}: dirty_files_analyzed counts the change: {s}"
-                );
-            }
-        }
-    }
-}
-
 /// The overlay manifest is a list of lines, one per differing path, and a git path
 /// may itself contain a newline. Joining those lines with `\n` before hashing is
 /// therefore not injective: deleting `a.rs` **and** `b.rs` serializes to exactly
@@ -1189,6 +1120,76 @@ fn a_newline_in_a_path_does_not_collide_two_working_trees_onto_one_graph_version
         "two working trees with disjoint answers must not share a graph_version: {} vs {}",
         a["graph_version"], b["graph_version"]
     );
+}
+
+/// C9's consistency half. `dirty`/`dirty_files_analyzed` and `freshness.stale`
+/// describe one working tree from two angles, so a response reading `dirty: false`
+/// beside `stale: true` tells an agent two incompatible things and leaves it no
+/// way to know which field to trust. It could, while the envelope saw deletions
+/// and the overlay fields did not. Driven over the tree states that reach each
+/// field group, under both `include_dirty` settings.
+#[test]
+fn no_response_reads_dirty_false_beside_stale_true() {
+    struct Case {
+        name: &'static str,
+        mutate: fn(&Path),
+    }
+
+    let cases = [
+        Case {
+            name: "clean",
+            mutate: |_| {},
+        },
+        Case {
+            name: "modified",
+            mutate: |r| {
+                std::fs::write(r.join("src/other.rs"), "pub fn remote_fn() -> i32 { 3 }\n").unwrap()
+            },
+        },
+        Case {
+            name: "deleted",
+            mutate: |r| std::fs::remove_file(r.join("src/other.rs")).unwrap(),
+        },
+        Case {
+            name: "added",
+            mutate: |r| {
+                std::fs::write(r.join("src/extra.rs"), "pub fn extra() -> i32 { 4 }\n").unwrap()
+            },
+        },
+    ];
+
+    for Case { name, mutate } in cases {
+        for include_dirty in [true, false] {
+            let (_t, repo) = init_mixed_repo();
+            mutate(&repo);
+            let s = call_tool(
+                &repo,
+                "callees",
+                json!({ "symbol": "caller_fn", "include_dirty": include_dirty }),
+            );
+            let dirty = s["dirty"].as_bool().expect("dirty");
+            let stale = s["freshness"]["stale"].as_bool().expect("stale");
+            assert!(
+                dirty || !stale,
+                "{name} (include_dirty={include_dirty}): `dirty: {dirty}` beside \
+                 `stale: {stale}` is a contradiction — freshness {}",
+                s["freshness"]
+            );
+
+            // And the overlay fields are not merely consistent by staying silent:
+            // every state that moved the tree is reported as having moved it.
+            if include_dirty && name != "clean" {
+                assert!(
+                    dirty,
+                    "{name}: an active overlay over a changed tree is dirty"
+                );
+                assert!(
+                    s["dirty_files_analyzed"].as_u64().unwrap() >= 1,
+                    "{name}: dirty_files_analyzed counts the change: {s}"
+                );
+            }
+        }
+    }
 }
 
 /// The other direction of the C9 consistency property, and the one the table above
@@ -1360,6 +1361,100 @@ fn mcp_and_cli_report_the_same_dirty_file_count() {
         cli, 4,
         "modified + deleted + two distinct additions; the ignored build/ is not divergence"
     );
+
+    // Parity is *same base → same count*, so the base is asserted rather than
+    // assumed: MCP measures from HEAD's tree, and says so in the envelope. The CLI
+    // measures from its index pointer's tree and names that instead (asserted on
+    // that surface, in `cli.rs`), which is why the count only agrees with this one
+    // when the index is at HEAD — the state this fixture is in.
+    assert_eq!(
+        mcp["freshness"]["dirty_files_base"],
+        json!(head),
+        "the count names the tree it was measured against: {}",
+        mcp["freshness"]
+    );
+    assert_ne!(
+        mcp["freshness"]["dirty_files_base"], mcp["freshness"]["indexed_tree"],
+        "and it is not the tree the answer came from — that is a `workdir:` key here"
+    );
+
+    // The ADR-06 overlay count is deliberately a *different* number: it keys the
+    // graph, so it counts everything the working-tree index actually read — the
+    // ignored `build/artifact.bin` included. Different question, same committed
+    // view, and neither contradicts the other. Pinned here so a later reader does
+    // not "simplify" the two back into one.
+    assert_eq!(
+        mcp["dirty_files_analyzed"],
+        json!(5),
+        "the overlay counts the ignored build artifact the index read: {mcp}"
+    );
+    assert_eq!(mcp["dirty"], json!(true));
+}
+
+/// The parity claim is *same base → same count*, and this is the case that shows
+/// why the qualifier is not pedantry. The CLI measures divergence from the tree its
+/// index pointer names; MCP's working-directory path measures it from `HEAD`'s
+/// tree. They coincide only when the index is at `HEAD` — which is exactly the
+/// state every parity fixture is in, so nothing else can see this.
+///
+/// Same working tree, `git status` clean, two bases: `0` from `HEAD`'s tree and `1`
+/// from the previous commit's. Both counts are right; the field is only readable
+/// because the envelope names which one it answered.
+#[test]
+fn the_same_working_tree_diverges_by_a_different_amount_from_a_different_base() {
+    let (_t, repo) = init_repo();
+    std::fs::write(repo.join("src/main.rs"), SRC_MAIN_DIRTY).unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+
+    let r = cgx_index::Repo::discover(&repo).expect("discover");
+    let head = r.head_tree_oid().expect("head tree");
+    let previous = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD~1^{tree}"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let count = |tree: &str| {
+        r.dirty_file_count(&r.tree_blob_oids(tree).expect("tree blob oids"))
+            .expect("dirty count")
+    };
+    assert_eq!(count(&head), 0, "the working tree is HEAD's tree");
+    assert_eq!(
+        count(&previous),
+        1,
+        "and it is one file away from the previous commit's"
+    );
+
+    // MCP answered over the working tree and measured from HEAD, so it reports the
+    // `0` — with the base that makes it checkable.
+    let mcp = call_tool(
+        &repo,
+        "callers",
+        json!({ "symbol": "leaf", "include_dirty": true }),
+    );
+    assert_eq!(mcp["freshness"]["dirty_files"], json!(0));
+    assert_eq!(mcp["freshness"]["dirty_files_base"], json!(head));
 }
 
 #[test]

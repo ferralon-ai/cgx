@@ -1606,6 +1606,7 @@ fn every_answer_format_carries_the_freshness_envelope() {
         vec!["callees", "main"],
         vec!["unused"],
         vec!["paths", "main", "beta"],
+        vec!["reaches", "main", "beta"],
         vec!["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
         vec!["explain", "main"],
         vec!["search", "beta"],
@@ -1620,6 +1621,13 @@ fn every_answer_format_carries_the_freshness_envelope() {
         assert_eq!(f["matches_head"], json!(true), "{args:?}: {f}");
         assert_eq!(f["dirty_files"], json!(0), "{args:?}: {f}");
         assert_eq!(f["stale"], json!(false), "{args:?}: {f}");
+        // The count names its own base, and on this surface that base is the tree
+        // the answer came from — not `HEAD`, which is a different tree whenever the
+        // index is pinned or lagging (see the MCP side, which measures from `HEAD`).
+        assert_eq!(
+            f["dirty_files_base"], f["indexed_tree"],
+            "{args:?}: the CLI measures divergence from its own indexed tree: {f}"
+        );
     }
 
     // Sarif: a `cgx/index-freshness` note carrying the structured envelope.
@@ -1645,6 +1653,70 @@ fn every_answer_format_carries_the_freshness_envelope() {
         let rules = doc["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r["id"] == json!("cgx/index-freshness")));
     }
+}
+
+/// The CLI measures divergence from the tree **its index pointer names**, which is
+/// not `HEAD`'s tree once the index lags a commit — and MCP's working-directory
+/// path measures the same field from `HEAD`. Both are right for the question their
+/// surface answers, so the envelope names the base rather than leaving a reader to
+/// assume the two counts are comparable.
+///
+/// Reproduced here: index at the first commit, commit a second, leave the working
+/// tree byte-identical to `HEAD`. `git status` is clean and MCP would report `0`;
+/// the CLI reports `1`, because the answer it just gave came from the older tree.
+#[test]
+fn the_cli_measures_dirty_files_from_the_indexed_tree_and_says_so() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let pinned = freshness_of(&run_cgx(&repo, &["callers", "beta", "--format", "json"]).0)
+        ["indexed_tree"]
+        .as_str()
+        .expect("indexed tree")
+        .to_string();
+
+    std::fs::write(repo.join("src/helper.rs"), "pub fn beta() -> i32 { 42 }\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+
+    let (out, code) = run_cgx(
+        &repo,
+        &["callers", "beta", "--format", "json", "--no-auto-index"],
+    );
+    assert_eq!(code, 0, "{out}");
+    let f = freshness_of(&out);
+    assert_eq!(
+        f["indexed_tree"],
+        json!(pinned),
+        "the index did not move: {f}"
+    );
+    assert_eq!(
+        f["dirty_files_base"], f["indexed_tree"],
+        "the count is measured from the tree the answer came from: {f}"
+    );
+    assert_eq!(
+        f["dirty_files"],
+        json!(1),
+        "one file diverges from the *indexed* tree, though none diverges from HEAD: {f}"
+    );
+    assert_eq!(f["matches_head"], json!(false), "{f}");
+    assert_eq!(f["stale"], json!(true), "{f}");
+    assert_ne!(
+        f["dirty_files_base"], f["head_tree"],
+        "and the base is demonstrably not HEAD's tree, which is the whole point: {f}"
+    );
 }
 
 /// `search`/`symbols` `--format json` used to emit a bare JSON *array* with no
@@ -1761,6 +1833,7 @@ fn the_cli_freshness_envelope_carries_no_timestamp() {
         keys,
         vec![
             "dirty_files",
+            "dirty_files_base",
             "head_tree",
             "indexed_tree",
             "matches_head",

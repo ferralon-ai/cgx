@@ -479,6 +479,71 @@ fn paths_mermaid_emitter() {
     assert!(out.contains("-->"), "mermaid has edges: {out}");
 }
 
+/// A fixture whose two call edges carry non-`always` conditions, so the Mermaid
+/// emitter takes its *labeled*-edge branch (`a -->|label| b`).
+const CONDITIONAL_RS: &str = "\
+pub mod sys {
+    pub fn run() {}
+    pub fn boom() {}
+}
+pub mod handler {
+    pub fn process(flag: bool) {
+        if flag {
+            crate::sys::run();
+        }
+        for _ in 0..3 {
+            crate::sys::boom();
+        }
+    }
+}
+";
+
+fn conditional_edge_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), CONDITIONAL_RS).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"cond\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    git_init_commit(&repo);
+    (tmp, repo)
+}
+
+/// R06-03: before this test, `mermaid_edge_label`'s *call site* was reached by no
+/// integration test at all — `cgx diff --path-added` leaves its edges unlabeled by
+/// decision D3, so `cgx paths` over a non-`always` edge is the only route in the
+/// product that emits `a -->|label| b`, and nothing exercised it.
+///
+/// What this pins is that the labeled-edge branch is live and its label survives
+/// end to end. It cannot pin *which* escaper the call site uses: cgx only ever
+/// emits `condition_str` words as edge labels, and both escapers are the identity
+/// on those. That negative control is `render_mermaid_escapes_both_label_positions`
+/// in `output.rs`, which drives the emitter directly with a hostile label.
+#[test]
+fn paths_mermaid_emits_a_labeled_edge() {
+    let (_tmp, repo) = conditional_edge_repo();
+    index(&repo);
+    for (to, condition) in [("**sys::run", "conditional"), ("**sys::boom", "loop")] {
+        let (out, code) = run_cgx(
+            &repo,
+            &["paths", "**handler::process", to, "--format", "mermaid"],
+        );
+        assert_eq!(code, 0, "paths --format mermaid exits 0: {out}");
+        let edge = out
+            .lines()
+            .find(|l| l.contains("-->|"))
+            .unwrap_or_else(|| panic!("a labeled mermaid edge was emitted: {out}"));
+        assert_eq!(
+            edge.trim(),
+            format!("n0 -->|{condition}| n1"),
+            "the edge carries its condition as a label: {out}"
+        );
+    }
+}
+
 #[test]
 fn paths_d2_emitter() {
     let (_tmp, repo) = fixture_repo();

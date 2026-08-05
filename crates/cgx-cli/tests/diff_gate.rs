@@ -794,45 +794,143 @@ fn parse_dot(src: &str) -> ParsedGraph {
     g
 }
 
-/// Characters the real Mermaid lexer *acts on* rather than prints when they appear
-/// raw inside `["…"]` — established against mermaid-cli 11.16.0, not by reasoning:
-/// a raw `"` is a parse error and no diagram is produced at all; a raw `<` is
-/// swallowed as an HTML tag (`List<String>` renders as `List`); a raw backtick
-/// opens a markdown code span. A raw `\` renders fine, but Mermaid has no
-/// backslash escape, so its presence in emitted source means someone reached for a
-/// Graphviz/D2 escaper — which is exactly the defect this guard exists to catch.
-const MERMAID_LABEL_HOSTILE: &[char] = &['"', '<', '`', '\\'];
+/// The emitter's entity table, restated here as the oracle's own inverse rather
+/// than imported: the two are meant to be checked against each other.
+const MERMAID_ENTITIES: &[(&str, char)] = &[
+    ("&amp;", '&'),
+    ("&quot;", '"'),
+    ("&lt;", '<'),
+    ("&grave;", '`'),
+    ("&bsol;", '\\'),
+    ("&semi;", ';'),
+    ("&num;", '#'),
+    ("&verbar;", '|'),
+    ("&lsqb;", '['),
+    ("&rsqb;", ']'),
+    ("&lpar;", '('),
+    ("&rpar;", ')'),
+    ("&lcub;", '{'),
+    ("&rcub;", '}'),
+];
 
-/// Assert a Mermaid label body carries nothing the lexer would act on.
+fn mermaid_entity_at(tail: &str) -> Option<(&'static str, char)> {
+    let end = tail.find(';')?;
+    MERMAID_ENTITIES
+        .iter()
+        .find(|(e, _)| *e == &tail[..=end])
+        .copied()
+}
+
+/// Characters the real Mermaid pipeline *acts on* rather than prints when they
+/// appear raw in a label — established against mermaid-cli 11.16.0, not by
+/// reasoning. A raw `"` is a parse error and no diagram is produced at all; a raw
+/// `<` is swallowed as an HTML tag (`List<String>` renders as `List`); a raw
+/// backtick opens a markdown code span. A raw `\` renders fine, but Mermaid has no
+/// backslash escape, so its presence means someone reached for a Graphviz/D2
+/// escaper. A raw `&` is the introducer of the encoding itself — `A&quot;B` renders
+/// `A"B`, and `A&ampB` renders `A&B` even with no `;`, so a raw `&` lets an FQN's
+/// own text be read as an entity. A raw `;` is what lets a raw `#` form a `#\w+;`
+/// code.
+const MERMAID_LABEL_HOSTILE: &[char] = &['&', '"', '<', '`', '\\', ';'];
+
+/// Assert a Mermaid label body carries nothing the pipeline would act on.
 ///
-/// This is the check the oracle used to lack. It previously split on `["`, stripped
-/// `"]`, and accepted whatever lay between — i.e. it shared the emitter's
-/// assumption that a backslash escapes a quote, and so accepted the exact byte
-/// string mermaid-cli rejects. This assertion is derived from the *grammar*, so it
-/// fails on emitter output no real parser would take.
+/// Derived from the grammar and from the two source rewrites in `encodeEntities`
+/// (`mermaid/dist/chunks/mermaid.esm/chunk-MMGVDTGO.mjs`), so it fails on emitter
+/// output no real parser would render faithfully — not merely on output that fails
+/// to parse. The three clauses are independent: hostile characters outside an
+/// entity, the `#\w+;` rewrite, and the `style` / `classDef` rewrite.
 fn assert_mermaid_label_inert(body: &str, ctx: &str) {
+    // Everything that is not part of an entity the emitter produced. A `&` that
+    // opens no known entity survives into the residue and trips the loop below.
+    let mut residue = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(amp) = rest.find('&') {
+        residue.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        match mermaid_entity_at(tail) {
+            Some((entity, _)) => rest = &tail[entity.len()..],
+            None => {
+                residue.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    residue.push_str(rest);
+
     for &c in MERMAID_LABEL_HOSTILE {
         assert!(
-            !body.contains(c),
-            "{ctx}: mermaid label carries a raw {c:?}, which the Mermaid lexer acts on \
-             rather than prints — the label must use an entity code: {body:?}"
+            !residue.contains(c),
+            "{ctx}: mermaid label carries a raw {c:?}, which the Mermaid pipeline acts on \
+             rather than prints — it must be a named character reference: {body:?}"
         );
+    }
+
+    let b = body.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c != b'#' {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        assert!(
+            !(j > i + 1 && j < b.len() && b[j] == b';'),
+            "{ctx}: mermaid label carries `#\\w+;`, which Mermaid's source rewrite decodes \
+             (`#quot;` → `\"`, `#1;` → U+0001): {body:?}"
+        );
+    }
+
+    // `/(?:style|classDef).*:\S*#.*;/` — the rewrite that replaces its match with
+    // the match minus its final character, silently deleting a `;` an entity needed.
+    for kw in ["style", "classDef"] {
+        let (Some(at), Some(last_semi)) = (body.find(kw), body.rfind(';')) else {
+            continue;
+        };
+        for colon in (at + kw.len())..b.len() {
+            if b[colon] != b':' {
+                continue;
+            }
+            for hash in (colon + 1)..b.len() {
+                if b[hash].is_ascii_whitespace() {
+                    break;
+                }
+                if b[hash] == b'#' {
+                    assert!(
+                        hash >= last_semi,
+                        "{ctx}: mermaid's {kw} source rewrite would strip the final `;` \
+                         off this label: {body:?}"
+                    );
+                    break;
+                }
+            }
+        }
     }
 }
 
-/// Decode the Mermaid entity codes the emitter uses, so a parsed label can be
+/// Decode the named character references the emitter uses, so a parsed label can be
 /// compared against the FQN it was built from rather than against the escaping.
 ///
-/// Known limitation, shared with Mermaid itself and pre-dating this oracle: `#` is
-/// deliberately *not* escaped by the emitter (it is cgx's own value-node suffix
-/// separator, `…::b#1`), so an FQN that literally contained the text `#quot;` would
-/// decode here — and render in Mermaid — as `"`. No fixture exercises that, and
-/// escaping `#` would change the emitted bytes for the majority of real FQNs.
+/// The exact inverse of the emitter, and unambiguous for the same structural reason
+/// the emitter is injective: `&` is the only introducer and the emitter escapes it,
+/// so every `&` here opens an entity the table below knows, and every entity
+/// terminates at its own `;`. Anything else is an emitter bug and panics rather
+/// than decoding to something plausible.
 fn mermaid_unescape(body: &str) -> String {
-    body.replace("#quot;", "\"")
-        .replace("#lt;", "<")
-        .replace("#96;", "`")
-        .replace("#92;", "\\")
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let (entity, c) = mermaid_entity_at(tail).unwrap_or_else(|| {
+            panic!("mermaid label carries a `&` that opens no known entity: {body:?}")
+        });
+        out.push(c);
+        rest = &tail[entity.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Mermaid: a `graph TD` header, `id["label"]` nodes and `-->` edges.

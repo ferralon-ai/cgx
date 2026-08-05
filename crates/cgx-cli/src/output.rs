@@ -567,80 +567,189 @@ fn quote(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Escape a string for a Mermaid **node** label (`n0["…"]`).
+/// The named character reference the Mermaid pipeline decodes back to `c`, or
+/// `None` when `c` survives raw in every Mermaid label context.
 ///
-/// Mermaid is not a backslash-escaping language: inside `["…"]` its lexer closes
-/// the string at the first `"` and there is no `\"`. Its only escape mechanism is
-/// the HTML entity code — `#quot;`, `#92;`, `#lt;` — which the flowchart lexer
-/// decodes before the label is rendered. So [`quote`], which is a Graphviz/D2
-/// escaper, must not be used here; `\"` produces source that does not parse at all.
-///
-/// The set below is the set that measurement showed to be hostile in this context
-/// against mermaid-cli 11.16.0, and nothing more — a wider set would change the
-/// emitted bytes for FQNs that render correctly today:
-///
-/// | char  | raw behaviour in `["…"]`                     |
-/// |-------|----------------------------------------------|
-/// | `"`   | parse error, no diagram                      |
-/// | `<`   | swallowed as an HTML tag: `List<String>` renders `List` |
-/// | `` ` `` | opens a markdown code span, delimiters lost |
-/// | `\`   | fine raw; it is [`quote`] that corrupts it, by doubling |
-///
-/// `>`, `&`, `#`, `;`, `|`, `[`, `]`, `(`, `)`, `{`, `}`, `*`, `_` and non-ASCII
-/// all render correctly raw in this context and are deliberately left alone.
-fn mermaid_node_label(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match mermaid_entity(c) {
-            Some(e) => out.push_str(e),
-            None => out.push(c),
-        }
-    }
-    out
-}
-
-/// The entity code for a character that is hostile in *any* Mermaid label context,
-/// or `None` when the character is safe raw everywhere. See
-/// [`mermaid_node_label`] for the measurements behind the set.
+/// `&` is in the table because it is the *introducer*, and escaping the introducer
+/// is what makes the encoding injective. See [`mermaid_label`] for the argument and
+/// for the measurements behind the rest of the table.
 fn mermaid_entity(c: char) -> Option<&'static str> {
     match c {
-        '"' => Some("#quot;"),
-        '<' => Some("#lt;"),
-        '`' => Some("#96;"),
-        '\\' => Some("#92;"),
+        '&' => Some("&amp;"),
+        '"' => Some("&quot;"),
+        '<' => Some("&lt;"),
+        '`' => Some("&grave;"),
+        '\\' => Some("&bsol;"),
+        ';' => Some("&semi;"),
         _ => None,
     }
 }
 
-/// Escape a string for a Mermaid **edge** label (`a -->|…| b`).
+/// The references the **edge** context needs on top of [`mermaid_entity`].
 ///
-/// A different context from [`mermaid_node_label`] and a more hostile one: the
-/// label is unquoted, so every node-shape delimiter terminates it. Measured
-/// against mermaid-cli 11.16.0, raw `|`, `[`, `]`, `(`, `)`, `{` and `}` each
-/// produce a parse error here while being harmless inside `["…"]`.
+/// An edge label (`a -->|…| b`) is unquoted, so every node-shape delimiter
+/// terminates it; measured against mermaid-cli 11.16.0, raw `|`, `[`, `]`, `(`,
+/// `)`, `{` and `}` each produce a parse error here while being harmless inside
+/// `["…"]`.
+fn mermaid_edge_entity(c: char) -> Option<&'static str> {
+    match c {
+        '|' => Some("&verbar;"),
+        '[' => Some("&lsqb;"),
+        ']' => Some("&rsqb;"),
+        '(' => Some("&lpar;"),
+        ')' => Some("&rpar;"),
+        '{' => Some("&lcub;"),
+        '}' => Some("&rcub;"),
+        _ => mermaid_entity(c),
+    }
+}
+
+/// Escape a string for a Mermaid label: a single-introducer HTML
+/// named-character-reference encoding.
 ///
-/// cgx only ever emits [`condition_str`] values (five lowercase words) as edge
-/// labels, so in practice this escaper is the identity — it exists so the emitter
-/// is correct rather than incidentally correct.
-fn mermaid_edge_label(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let entity = match c {
-            '|' => Some("#124;"),
-            '[' => Some("#91;"),
-            ']' => Some("#93;"),
-            '(' => Some("#40;"),
-            ')' => Some("#41;"),
-            '{' => Some("#123;"),
-            '}' => Some("#125;"),
-            _ => mermaid_entity(c),
-        };
-        match entity {
-            Some(e) => out.push_str(e),
-            None => out.push(c),
+/// # Injectivity, and why the table is not the argument
+///
+/// Two earlier rounds of this escaper enumerated the characters that misrender and
+/// escaped those. Round one missed `"` and `<`. Round two missed `&` and `#` —
+/// which are not merely two more characters, they are the *introducers* of the
+/// encoding itself, and an encoder that escapes everything except its own escape
+/// character is not injective. Adding characters to a list never fixes that.
+///
+/// So this encoding has exactly **one** introducer, `&`, and `&` is escaped. Every
+/// escape is `&` + an ASCII-letter name + `;`. Three consequences follow, in order:
+///
+/// 1. the only `&` in the output are ones this function emitted;
+/// 2. each escape is self-terminating at its `;`, and no escape body contains `&`;
+/// 3. therefore a left-to-right decode that maps `&name;` back and copies every
+///    other byte satisfies `decode(encode(s)) == s` for **every** `s` — whatever
+///    else the tables above do or do not contain.
+///
+/// That is the injectivity property and it holds by construction. The tables serve
+/// a *different* property, renderability, and a character missing from them
+/// misrenders visibly rather than silently decoding to some other text. The
+/// per-character loop below is load-bearing for (1): a chain of `str::replace`
+/// calls would feed each replacement's own `&` to the next call.
+///
+/// # What the renderer decodes (mermaid-cli 11.16.0, measured)
+///
+/// The pipeline rewrites the diagram *source* twice (`encodeEntities`, in
+/// `mermaid/dist/chunks/mermaid.esm/chunk-MMGVDTGO.mjs`) before the label reaches
+/// HTML, and those rewrites — not HTML — are why a bare `#` is dangerous:
+///
+/// | source pattern | rewritten to | measured |
+/// |----------------|--------------|----------|
+/// | `#\w+;` | `&\w+;`, or `&#\d+;` when the body is all digits | `A#quot;B` → `A"B`; `A#35;B` → `A#B`; `A#zzz;B` → `A&zzz;B`; `A#1;B` → `A\x01B` |
+/// | `(style\|classDef).*:\S*#.*;` | the same text minus its final `;` | `styles::b#1&bsol;x` → `styles::b#1&bsolx` |
+///
+/// Only then does the label become HTML, where the named references decode. Two
+/// consequences shaped the tables:
+///
+/// * **Numeric references are unusable.** `&#96;` contains `#96;`, which the first
+///   rewrite eats: `A&#96;B` renders as `A&` + a backtick. Every escape here is a
+///   *named* reference, each verified individually against mermaid-cli in both
+///   contexts.
+/// * **`;` must be escaped**, which is what buys a raw `#`. `\w` cannot cross the
+///   `&` that opens an escape, so once every `;` in the output is an escape
+///   terminator, `#\w+;` can no longer match — and `#`, cgx's own value-node
+///   separator (`…::b#1`, 632 of the 1210 fixture FQNs), stays byte-identical.
+///
+/// The `style` / `classDef` rewrite is the one hazard `;`-escaping does not cover,
+/// because it only needs a `#` and a later `;` on the same line; it is handled by
+/// [`directive_rewrite_matches`] below.
+///
+/// # Scope
+///
+/// A label containing a line terminator is outside the encoding: it would break the
+/// line-oriented emitters of all three formats alike, and no shipped adapter
+/// produces one. Injectivity is unaffected (a newline round-trips); renderability is
+/// not claimed for it.
+fn mermaid_label(s: &str, entity: fn(char) -> Option<&'static str>) -> String {
+    let encode = |escape_hash: bool| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match entity(c) {
+                Some(e) => out.push_str(e),
+                None if escape_hash && c == '#' => out.push_str("&num;"),
+                None => out.push(c),
+            }
+        }
+        out
+    };
+    let out = encode(false);
+    // Escaping `#` costs nothing in injectivity — `&num;` and a raw `#` both decode
+    // to `#` — so this conditional only chooses between two correct encodings, and
+    // choosing the cheap one keeps all 632 `#`-bearing fixture FQNs byte-identical.
+    if directive_rewrite_matches(&out) {
+        encode(true)
+    } else {
+        out
+    }
+}
+
+/// Would Mermaid's `style` / `classDef` source rewrite match this label?
+///
+/// The rewrite is `/(?:style|classDef).*:\S*#.*;/g` over the whole diagram source,
+/// replacing each match with itself minus its final character — silently deleting a
+/// `;` that an escape needed. `.` does not match a newline in JavaScript, so it is a
+/// per-line test; and running it on the label alone is equivalent to running it on
+/// the emitted line, because neither the `n0["` / `"]` node wrapper nor the ` -->|`
+/// / `| ` edge wrapper contains the keyword, a `:`, a `#` or a `;`.
+fn directive_rewrite_matches(label: &str) -> bool {
+    label.lines().any(|line| {
+        ["style", "classDef"]
+            .iter()
+            .any(|kw| directive_line_matches(line, kw))
+    })
+}
+
+fn directive_line_matches(line: &str, keyword: &str) -> bool {
+    // The earliest keyword occurrence maximises what the following `.*` can reach,
+    // so testing that one is enough.
+    let Some(kw) = line.find(keyword) else {
+        return false;
+    };
+    let Some(last_semi) = line.rfind(';') else {
+        return false;
+    };
+    let b = line.as_bytes();
+    for colon in (kw + keyword.len())..b.len() {
+        if b[colon] != b':' {
+            continue;
+        }
+        // `\S*#`: the first `#` reachable from the colon without crossing
+        // whitespace. A later `#` in the same run is further from `last_semi`, so
+        // the first one decides.
+        for hash in (colon + 1)..b.len() {
+            if b[hash].is_ascii_whitespace() {
+                break;
+            }
+            if b[hash] == b'#' {
+                return hash < last_semi;
+            }
         }
     }
-    out
+    false
+}
+
+/// Escape a string for a Mermaid **node** label (`n0["…"]`).
+///
+/// Mermaid is not a backslash-escaping language: inside `["…"]` its lexer closes the
+/// string at the first `"` and there is no `\"`. So [`quote`], which is a
+/// Graphviz/D2 escaper, must not be used here — `\"` produces source that does not
+/// parse at all. See [`mermaid_label`] for the encoding and its injectivity
+/// argument.
+fn mermaid_node_label(s: &str) -> String {
+    mermaid_label(s, mermaid_entity)
+}
+
+/// Escape a string for a Mermaid **edge** label (`a -->|…| b`).
+///
+/// cgx only ever emits [`condition_str`] values (five lowercase words) as edge
+/// labels, so in practice this escaper is the identity — it exists so the emitter is
+/// correct rather than incidentally correct, and `tests/query.rs` pins the call site
+/// so that removing it is not silent.
+fn mermaid_edge_label(s: &str) -> String {
+    mermaid_label(s, mermaid_edge_entity)
 }
 
 /// Render path-shaped results as Graphviz DOT (`digraph`). Dependency-free string
@@ -1418,20 +1527,214 @@ fn node_kind_str(node: &NodeRecord) -> String {
 mod tests {
     use super::*;
 
+    /// The inverse of the emitter's encoding, written out here independently of
+    /// [`mermaid_entity`] rather than derived from it, so that a typo on either
+    /// side is a failure rather than a shared assumption.
+    const MERMAID_DECODE: &[(&str, char)] = &[
+        ("&amp;", '&'),
+        ("&quot;", '"'),
+        ("&lt;", '<'),
+        ("&grave;", '`'),
+        ("&bsol;", '\\'),
+        ("&semi;", ';'),
+        ("&num;", '#'),
+        ("&verbar;", '|'),
+        ("&lsqb;", '['),
+        ("&rsqb;", ']'),
+        ("&lpar;", '('),
+        ("&rpar;", ')'),
+        ("&lcub;", '{'),
+        ("&rcub;", '}'),
+    ];
+
+    fn entity_at(tail: &str) -> Option<(&'static str, char)> {
+        let end = tail.find(';')?;
+        MERMAID_DECODE
+            .iter()
+            .find(|(e, _)| *e == &tail[..=end])
+            .copied()
+    }
+
+    /// Decode left to right: on `&`, take the entity that starts there; copy every
+    /// other byte. This terminates and is unambiguous only because the emitter
+    /// escapes `&` itself — which is the whole injectivity argument.
+    fn mermaid_decode(encoded: &str) -> String {
+        let mut out = String::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            let (entity, c) = entity_at(tail).unwrap_or_else(|| {
+                panic!("emitted a `&` that opens no known entity: {encoded:?}")
+            });
+            out.push(c);
+            rest = &tail[entity.len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Everything that is *not* part of an entity this emitter produced.
+    fn entity_residue(encoded: &str) -> String {
+        let mut out = String::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            match entity_at(tail) {
+                Some((entity, _)) => rest = &tail[entity.len()..],
+                None => {
+                    out.push('&');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Does `s` contain a `#\w+;`, the pattern Mermaid's first source rewrite acts
+    /// on? Measured: `A#zzz;B` renders `A&zzz;B`, `A#1;B` renders `A\x01B` — the
+    /// rewrite fires whether or not the result is a real entity.
+    fn has_hash_code(s: &str) -> bool {
+        let b = s.as_bytes();
+        for (i, &c) in b.iter().enumerate() {
+            if c != b'#' {
+                continue;
+            }
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 1 && j < b.len() && b[j] == b';' {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The renderability half of the contract, derived from the Mermaid grammar and
+    /// the two source rewrites rather than from the emitter's own table: whatever
+    /// the emitter produced, the real pipeline must not act on any of it.
+    fn assert_inert(encoded: &str, ctx: &str, raw: &str) {
+        let residue = entity_residue(encoded);
+        let mut hostile: Vec<char> = vec!['&', '"', '<', '`', '\\', ';'];
+        if ctx == "edge" {
+            hostile.extend(['|', '[', ']', '(', ')', '{', '}']);
+        }
+        for c in hostile {
+            assert!(
+                !residue.contains(c),
+                "{ctx}: emitted a raw {c:?} the Mermaid pipeline acts on \
+                 (input {raw:?}, emitted {encoded:?}, residue {residue:?})"
+            );
+        }
+        assert!(
+            !has_hash_code(encoded),
+            "{ctx}: emitted `#\\w+;`, which Mermaid's source rewrite decodes \
+             (input {raw:?}, emitted {encoded:?})"
+        );
+        assert!(
+            !directive_rewrite_matches(encoded),
+            "{ctx}: emitted a label Mermaid's style/classDef rewrite would strip a \
+             `;` from (input {raw:?}, emitted {encoded:?})"
+        );
+    }
+
+    /// The input space the round-trip property is checked over. Generated rather
+    /// than hand-listed on purpose: the previous two rounds of this escaper each
+    /// shipped a hand-listed set that was missing a character, so the test has to
+    /// cover characters nobody thought of.
+    fn round_trip_corpus() -> Vec<String> {
+        let mut corpus: Vec<String> = Vec::new();
+        for b in 0x20u8..=0x7e {
+            let c = b as char;
+            corpus.push(c.to_string());
+            corpus.push(format!("a{c}b"));
+        }
+        // Exhaustive over the alphabet that can form an escape, a `#\w+;` code or a
+        // directive-rewrite trigger: every pair and every triple.
+        const ALPHA: &[char] = &[
+            '&', '#', ';', '"', '<', '`', '\\', '|', '{', ':', 'q', 'u', 'o', 't', 'a', 'm', 'p',
+            'n', 's', '3', '5',
+        ];
+        for &x in ALPHA {
+            for &y in ALPHA {
+                corpus.push(format!("{x}{y}"));
+                for &z in ALPHA {
+                    corpus.push(format!("{x}{y}{z}"));
+                }
+            }
+        }
+        // Exhaustive length-4 over the narrower introducer alphabet.
+        const NARROW: &[char] = &['&', '#', ';', 'q', '3', 'n'];
+        for &w in NARROW {
+            for &x in NARROW {
+                for &y in NARROW {
+                    for &z in NARROW {
+                        corpus.push(format!("{w}{x}{y}{z}"));
+                    }
+                }
+            }
+        }
+        // The literal text of every code either decoder acts on, nested and
+        // overlapping forms, the directive-rewrite traps, and multi-byte UTF-8.
+        for s in [
+            "&quot;", "&amp;", "&num;", "&semi;", "&lt;", "&bsol;", "&grave;", "&verbar;",
+            "#quot;", "#lt;", "#35;", "#92;", "#96;", "&#35;", "#38;", "#zzz;", "#_;", "#1;",
+            "&amp;quot;", "#&#35;quot;", "&&amp;", "&quot", "&amp", "&lt", "&#", "#;", "##;;",
+            "styles::b#1", "styles::b#1\"x", "classDef::x\"y", "mystyle::a#35;b;c", "style:#;",
+            "classDef:#;", "aStyleClassDef", "π::日本", "🙂#1;🙂",
+            "ts::Handler::\"q\\\"<>&|#;`\\\\π日\"", "", "&", "#", ";", "\t",
+        ] {
+            corpus.push(s.to_string());
+        }
+        corpus
+    }
+
+    /// C3's real content: the Mermaid encoding is injective, and it is injective
+    /// for inputs nobody enumerated.
+    ///
+    /// Two properties per input, in both label contexts. `decode(encode(s)) == s`
+    /// is the injectivity one and holds by construction — every escape opens with
+    /// the one introducer, and the introducer is escaped. [`assert_inert`] is the
+    /// renderability one and is derived from the grammar and the two source
+    /// rewrites measured against mermaid-cli 11.16.0.
+    #[test]
+    fn mermaid_encoding_round_trips_every_generated_input() {
+        for raw in round_trip_corpus() {
+            for (ctx, encoded) in [
+                ("node", mermaid_node_label(&raw)),
+                ("edge", mermaid_edge_label(&raw)),
+            ] {
+                assert_eq!(
+                    mermaid_decode(&encoded),
+                    raw,
+                    "{ctx}: decode(encode(s)) != s for {raw:?} (emitted {encoded:?})"
+                );
+                assert_inert(&encoded, ctx, &raw);
+            }
+        }
+    }
+
     /// Each mapping below was verified against mermaid-cli 11.16.0 by rendering
     /// the escaped form and reading the label back out of the SVG: the raw
     /// character on the left is what the diagram displays. The node-label
-    /// integration coverage lives in `tests/diff_gate.rs`; this pins the *edge*
-    /// context, which no `cgx diff` path reaches.
+    /// integration coverage lives in `tests/diff_gate.rs`, the edge-label call site
+    /// in `tests/query.rs`.
     #[test]
     fn mermaid_escapers_cover_the_characters_each_context_acts_on() {
-        // Common to both contexts. `\` is not doubled: Mermaid has no backslash
-        // escape at all, so `quote()`'s `\\` would render as two backslashes.
+        // Common to both contexts. `&` is here because it is the introducer: it is
+        // *not* safe raw, contrary to what the previous round of this escaper
+        // asserted — measured, `A&quot;B` renders `A"B` and `A&ampB` renders `A&B`,
+        // so a raw `&` lets an FQN's own text be read as an entity.
         for (raw, escaped) in [
-            ("a\"b", "a#quot;b"),
-            ("a<b", "a#lt;b"),
-            ("a`b", "a#96;b"),
-            ("a\\b", "a#92;b"),
+            ("a\"b", "a&quot;b"),
+            ("a<b", "a&lt;b"),
+            ("a`b", "a&grave;b"),
+            ("a\\b", "a&bsol;b"),
+            ("a&b", "a&amp;b"),
+            ("a;b", "a&semi;b"),
         ] {
             assert_eq!(mermaid_node_label(raw), escaped);
             assert_eq!(mermaid_edge_label(raw), escaped);
@@ -1440,26 +1743,76 @@ mod tests {
         // Node labels sit inside `["…"]`, which makes the shape delimiters inert;
         // an edge label is bare between two `|`, and every one of them ends it.
         for (raw, escaped) in [
-            ("a|b", "a#124;b"),
-            ("a[b", "a#91;b"),
-            ("a]b", "a#93;b"),
-            ("a(b", "a#40;b"),
-            ("a)b", "a#41;b"),
-            ("a{b", "a#123;b"),
-            ("a}b", "a#125;b"),
+            ("a|b", "a&verbar;b"),
+            ("a[b", "a&lsqb;b"),
+            ("a]b", "a&rsqb;b"),
+            ("a(b", "a&lpar;b"),
+            ("a)b", "a&rpar;b"),
+            ("a{b", "a&lcub;b"),
+            ("a}b", "a&rcub;b"),
         ] {
             assert_eq!(mermaid_node_label(raw), raw, "inert inside [\"…\"]");
             assert_eq!(mermaid_edge_label(raw), escaped);
         }
 
-        // Deliberately untouched: these render correctly raw in both contexts, and
-        // escaping them would change the emitted bytes for output that is already
-        // correct. `#` especially — it is cgx's own value-node suffix separator
-        // (`…::b#1`), present in 632 of the 1210 FQNs in `fixtures/`.
-        for raw in ["a>b", "a&b", "a#1", "a;b", "a*b", "a_b", "π::日本"] {
+        // Left raw, and measured to render raw in both contexts.
+        for raw in ["a>b", "a#1", "a*b", "a_b", "π::日本"] {
             assert_eq!(mermaid_node_label(raw), raw);
             assert_eq!(mermaid_edge_label(raw), raw);
         }
+    }
+
+    /// `#` is the one character whose escape is conditional, and the condition is
+    /// the `style` / `classDef` source rewrite rather than anything about `#`
+    /// itself. Escaping it is never *needed* for injectivity — `&num;` and a raw
+    /// `#` both decode to `#` — so the condition only picks between two correct
+    /// encodings, and picking the cheap one keeps cgx's value-node separator
+    /// (`…::b#1`, 632 of the 1210 fixture FQNs) byte-identical.
+    ///
+    /// Both branches measured against mermaid-cli 11.16.0:
+    /// `styles::b#1&bsol;x` renders `styles::b#1&bsolx` (the rewrite ate the `;`),
+    /// `styles::b&num;1&bsol;x` renders `styles::b#1\x`.
+    #[test]
+    fn hash_is_escaped_only_where_the_directive_rewrite_would_bite() {
+        for unchanged in ["mod::b#1", "styles::b#1", "classDef::x#1", "a#b#c"] {
+            assert_eq!(mermaid_node_label(unchanged), unchanged);
+            assert_eq!(mermaid_edge_label(unchanged), unchanged);
+        }
+        assert_eq!(
+            mermaid_node_label("styles::b#1\"x"),
+            "styles::b&num;1&quot;x"
+        );
+        assert_eq!(
+            mermaid_node_label("mystyle::a#35;b;c"),
+            "mystyle::a&num;35&semi;b&semi;c"
+        );
+        // No `#` on the line, so the rewrite cannot match and `#` stays unescaped
+        // wherever it does not appear at all.
+        assert_eq!(mermaid_node_label("classDef::x\"y"), "classDef::x&quot;y");
+    }
+
+    /// Pins the two *call sites* inside [`render_mermaid`], not just the escapers.
+    ///
+    /// R06-03: reverting `mermaid_edge_label(label)` to `quote(label)` used to pass
+    /// the entire suite. cgx only ever emits [`condition_str`] words as edge labels
+    /// and both escapers are the identity on those, so no black-box test over the
+    /// shipped commands can tell them apart — the emitter has to be driven directly
+    /// with a label the two escapers disagree about. Reverting either call site
+    /// fails this assertion.
+    #[test]
+    fn render_mermaid_escapes_both_label_positions() {
+        let hostile = "a\"<&#;x";
+        let g = GraphData {
+            nodes: vec![hostile.to_string(), "b".to_string()],
+            edges: vec![(hostile.to_string(), "b".to_string(), "c\"<&|;y".to_string())],
+        };
+        assert_eq!(
+            render_mermaid(g),
+            "graph TD\n  \
+             n0[\"a&quot;&lt;&amp;#&semi;x\"]\n  \
+             n1[\"b\"]\n  \
+             n0 -->|c&quot;&lt;&amp;&verbar;&semi;y| n1\n"
+        );
     }
 
     /// `quote()` stays the Graphviz/D2 escaper it always was — the Mermaid fix

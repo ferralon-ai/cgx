@@ -230,6 +230,8 @@ dependencies = [
  "cgx-query",
  "cgx-store",
  "gix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -346,6 +348,7 @@ version = "0.3.0"
 dependencies = [
  "cgx-core",
  "cgx-cql",
+ "cgx-diff",
  "cgx-index",
  "cgx-query",
  "cgx-store",

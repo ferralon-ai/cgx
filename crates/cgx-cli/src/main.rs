@@ -1248,10 +1248,43 @@ fn run_impacted_tests(
     } else {
         filtered_count
     };
+    // A depth bound is not a confidence filter, so ADR-08 clause (b) does not and
+    // must not cover it — but it produces the same damage on the same surface. A
+    // `--depth N` added for speed can truncate the only route from the change to
+    // a test, and the gate then exits 0 with an empty stderr, which is exactly
+    // what `docs/commands/impacted-tests.md` defines as "a change that genuinely
+    // reaches no test". The contract does carry `depth-limit`, but a CI author
+    // reads the exit code.
+    //
+    // So a *passing* depth-bounded gate is re-asked with the bound lifted and
+    // everything else — including any confidence floor — identical. Only when
+    // that finds tests is the pass a truncation artifact; a bound that changed
+    // nothing leaves the honest exit 0 alone. Same shape and cost as the
+    // clause-(b) counterfactual above, and gated the same way, so only a passing
+    // depth-bounded gate pays for it.
+    let depth_truncated = if args.assert_empty && filtered_count == 0 && args.max_depth.is_some() {
+        cgx_query::impacted_tests(&answer.view, &answer.changed, &depth_lifted_walker(&args))
+            .tests
+            .len()
+    } else {
+        0
+    };
+
     let degenerate = answer.degenerate;
     let degenerate_reason = answer.degenerate_reason;
+    let degenerate_error = || {
+        CliError::new(
+            ExitCode::Vacuous,
+            format!(
+                "{}; the empty result is vacuous, not a clean bill of health",
+                degenerate_reason
+                    .clone()
+                    .unwrap_or_else(|| "no supported language in the changed set".to_string())
+            ),
+        )
+    };
 
-    emit(
+    match emit(
         IMPACTED_SUBCOMMAND,
         &args,
         ResultSet::Neighbors {
@@ -1261,17 +1294,40 @@ fn run_impacted_tests(
         any_symbol_matched,
         unfiltered_count,
         answer.contract,
-    )?;
+    ) {
+        Ok(()) => {}
+        // A usage error (exit 2) or a fired assertion (exit 1) is about the
+        // invocation, not about how much of the answer is trustworthy: it wins.
+        Err(e) if e.code != ExitCode::Vacuous => return Err(e),
+        // Both are exit 4. `emit`'s generic "assertion passed vacuously" says
+        // nothing a reader can act on, while the degenerate reason names the
+        // cause — the unanalysed language, or the file that yielded no symbols.
+        // Adding `--assert-empty` must not cost the user that sentence.
+        Err(e) => return Err(if degenerate { degenerate_error() } else { e }),
+    }
 
     if degenerate {
-        return Err(CliError::new(
-            ExitCode::Vacuous,
-            format!(
-                "{}; the empty result is vacuous, not a clean bill of health",
-                degenerate_reason
-                    .unwrap_or_else(|| "no supported language in the changed set".to_string())
-            ),
-        ));
+        return Err(degenerate_error());
+    }
+    if depth_truncated > 0 {
+        let bound = args.max_depth.unwrap_or_default();
+        let plural = if depth_truncated == 1 { "" } else { "s" };
+        let reason = format!(
+            "--depth {bound} truncated the only route to {depth_truncated} impacted test{plural}"
+        );
+        if args.allow_vacuous {
+            eprintln!(
+                "warning: --assert-empty passed vacuously ({reason}); allowed by --allow-vacuous"
+            );
+        } else {
+            return Err(CliError::new(
+                ExitCode::Vacuous,
+                format!(
+                    "{reason}; the empty result is an artifact of the bound, not a clean bill \
+                     of health (drop --depth, or pass --allow-vacuous to accept a bounded answer)"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -2072,6 +2128,17 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
 fn unfiltered_walker(args: &QueryArgs) -> PathWalker {
     PathWalker {
         filter: EdgeFilter::calls(),
+        ..build_walker(args)
+    }
+}
+
+/// [`build_walker`] with the depth bound lifted and every other filter left in
+/// place: "what would this same query return if `--depth` were not narrowing
+/// it". Used by `impacted-tests` to tell a genuinely empty `--assert-empty` pass
+/// from one the depth bound manufactured.
+fn depth_lifted_walker(args: &QueryArgs) -> PathWalker {
+    PathWalker {
+        max_depth: None,
         ..build_walker(args)
     }
 }

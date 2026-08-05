@@ -565,10 +565,7 @@ fn rows_on_every_surface(repo: &Path, extra: &[&str]) -> (Vec<String>, Vec<Strin
         .lines()
         .filter(|l| !l.starts_with("approximation:"))
         .filter_map(|l| {
-            l.replace('└', " ")
-                .replace('├', " ")
-                .replace('│', " ")
-                .replace('─', " ")
+            l.replace(['└', '├', '│', '─'], " ")
                 .split_whitespace()
                 .next()
                 .map(|s| s.to_string())
@@ -873,4 +870,199 @@ fn a_confidence_floor_that_excludes_every_candidate_is_still_vacuous() {
         &["impacted-tests", "--uncommitted", "--assert-empty"],
     );
     assert_eq!(code, 1, "without the floor the candidate is reported");
+}
+
+// --- the `--depth` truncation guard -------------------------------------------
+//
+// A depth bound is not a confidence filter, so ADR-08 clause (b) does not cover
+// it — but it produces the same damage on the same surface. `--depth N` added
+// for speed can cut the only route from the change to a test, and the gate then
+// exits 0 with an empty stderr, which is exactly the code documented as "a
+// change that genuinely reaches no test". The contract does carry `depth-limit`,
+// but a CI author reads the exit code.
+
+/// `--depth 1` cannot reach `test_mid`, which sits two hops from the change. The
+/// gate must not report that as a pass indistinguishable from a real one.
+#[test]
+fn a_depth_bound_that_truncates_the_only_route_cannot_pass_the_gate() {
+    let (_tmp, repo) = rust_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--depth",
+            "1",
+            "--assert-empty",
+        ],
+    );
+    assert_eq!(
+        code, 4,
+        "a depth-truncated empty answer is not a clean bill of health: \
+         stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("--depth 1") && stderr.contains("truncated"),
+        "the reason names the bound that caused it, not a filter the user never set: {stderr}"
+    );
+    assert!(
+        !stderr.contains("confidence/edge-condition filters"),
+        "no confidence filter is in play, so clause (b) must not be blamed: {stderr}"
+    );
+}
+
+/// The machine-readable half of the same disclosure: the contract carries
+/// `depth-limit` as an `under` reason on the very answer whose gate exited 4.
+#[test]
+fn the_depth_truncated_answer_carries_depth_limit_on_the_contract() {
+    let (_tmp, repo) = rust_fixture();
+    let (stdout, _stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--depth",
+            "1",
+            "--assert-empty",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 4);
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json body still emitted");
+    assert_eq!(doc["count"].as_u64(), Some(0));
+    assert!(
+        reason_codes(&doc).contains(&"depth-limit".to_string()),
+        "the truncation is on the contract too: {stdout}"
+    );
+    assert_ne!(doc["approximation"]["direction"].as_str(), Some("exact"));
+}
+
+/// The guard is a counterfactual, not a blanket ban on `--depth`: a bound that
+/// removes nothing leaves the honest exit 0 exactly as it was. `lonely` is
+/// called by nothing, so no depth reaches a test and the pass is real.
+#[test]
+fn a_depth_bound_that_changes_nothing_still_passes_the_gate() {
+    let (_tmp, repo) = unreached_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--depth",
+            "1",
+            "--assert-empty",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.trim().is_empty(),
+        "an honest pass says nothing on stderr: {stderr}"
+    );
+}
+
+/// And the assertion itself still fires when the bound is wide enough to see the
+/// test — the guard must not turn a real failure into a vacuity report.
+#[test]
+fn a_depth_bound_wide_enough_to_see_the_test_still_fails_the_assertion() {
+    let (_tmp, repo) = rust_fixture();
+    let (_stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--depth",
+            "2",
+            "--assert-empty",
+        ],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("assertion failed"), "{stderr}");
+}
+
+/// `--allow-vacuous` is the documented "I know, proceed" escape, and it covers
+/// this vacuity the same way it covers ADR-08's two clauses: exit 0, with the
+/// reason still on stderr.
+#[test]
+fn allow_vacuous_downgrades_a_depth_truncated_gate_but_keeps_the_warning() {
+    let (_tmp, repo) = rust_fixture();
+    let (_stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--depth",
+            "1",
+            "--assert-empty",
+            "--allow-vacuous",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("passed vacuously") && stderr.contains("--depth 1"),
+        "the downgrade still names what was truncated: {stderr}"
+    );
+}
+
+/// A plain query is unaffected: a depth bound narrowing the question is an
+/// honest, disclosed answer, and only the *gate* needs the extra guard.
+#[test]
+fn a_depth_bound_without_the_gate_is_still_a_plain_exit_zero() {
+    let (_tmp, repo) = rust_fixture();
+    let (_stdout, stderr, code) =
+        run_cgx(&repo, &["impacted-tests", "--uncommitted", "--depth", "1"]);
+    assert_eq!(code, 0, "{stderr}");
+}
+
+// --- the degenerate reason survives the gate ----------------------------------
+
+/// `emit` returns `Err` for an ADR-08 vacuous pass, which used to short-circuit
+/// the degenerate check below it. Both exits are 4, so no gate misbehaved — but
+/// adding `--assert-empty` replaced the message that names the cause with one
+/// that does not. The degenerate reason now wins whenever both fire.
+#[test]
+fn adding_assert_empty_does_not_cost_the_user_the_degenerate_reason() {
+    let (_tmp, repo) = no_symbol_fixture();
+    let (_stdout, plain_err, plain_code) = run_cgx(&repo, &["impacted-tests", "--uncommitted"]);
+    assert_eq!(plain_code, 4, "{plain_err}");
+    assert!(
+        plain_err.contains("no changed file contributed an indexed symbol"),
+        "the plain run names the cause: {plain_err}"
+    );
+
+    let (_stdout, gate_err, gate_code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(gate_code, 4, "same exit code either way: {gate_err}");
+    assert!(
+        gate_err.contains("no changed file contributed an indexed symbol"),
+        "and the gate must not swallow it: {gate_err}"
+    );
+}
+
+/// The degenerate reason wins over the generic vacuity line, but a *usage* error
+/// still wins over both — it is about the invocation, not the answer.
+#[test]
+fn a_format_usage_error_outranks_the_degenerate_reason() {
+    let (_tmp, repo) = typescript_only_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &[
+            "impacted-tests",
+            "--uncommitted",
+            "--assert-empty",
+            "--format",
+            "dot",
+        ],
+    );
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("only valid for path-returning results"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no answer body on a usage error: {stdout}"
+    );
 }

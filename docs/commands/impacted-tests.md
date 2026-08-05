@@ -57,7 +57,7 @@ The command does not run tests, does not read a coverage database, and does not 
 | `--no-merge-base` | — | off | Compare against the base ref's *tip* rather than `merge-base(base, head)`. Fires the `impacted-tip-to-tip-base` over-reason. No effect with `--uncommitted`. |
 | `--repo` | path | CWD | Path to the git repository. |
 | `--format` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. `dot`, `mermaid`, and `d2` are path-shaped renderers and are rejected with exit 2 on this subcommand. |
-| `--depth` | integer | unbounded | Maximum backward traversal depth from each changed symbol. Omitting it is the intended default: a test three hops from the change is still impacted. A bound fires the `depth-limit` under-reason. |
+| `--depth` | integer | unbounded | Maximum backward traversal depth from each changed symbol. Omitting it is the intended default: a test three hops from the change is still impacted. A bound fires the `depth-limit` under-reason, and cannot let an `--assert-empty` gate pass silently — see [the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
 | `--confidence` | `possible\|probable\|certain` | `possible` | Minimum confidence floor; edges below this level are excluded from the walk. Excluding any edge fires the `below-confidence-floor` under-reason. |
 | `--assert-empty` | — | off | CI assertion: exit 1 if any impacted test is found, 0 if none is, 4 if the empty answer proves nothing — see [`--assert-empty` and the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
 | `--allow-vacuous` | — | off | Suppress the `--assert-empty` vacuity guard, converting its exit 4 to exit 0. It does **not** suppress the degenerate-answer exit 4. |
@@ -161,7 +161,17 @@ The shared ADR-08 vacuity guard exists to separate that honest pass from an empt
 - **Nothing changed.** The changed set is empty, which the guard reads as a zero-symbol match: `--assert-empty passed vacuously (the symbol pattern matched zero symbols)`. Assert on a diff that contains nothing and the assertion has established nothing.
 - **A filter removed every candidate.** With `--confidence probable|certain`, the walk may drop the only edges by which a test reached the change. The answer is then empty because of the floor, not because of the code: `--assert-empty passed vacuously (confidence/edge-condition filters excluded every candidate result)`. Without such a flag this clause cannot fire — being reached and not being a test is a correct negative, not a candidate a filter removed.
 
-A [degenerate answer](#degenerate-answers) also exits 4, on its own signal, and `--allow-vacuous` does not suppress it.
+`impacted-tests` adds a third condition of its own, for the same reason:
+
+- **`--depth` truncated the only route.** A bound added for speed can cut the walk short of the tests that do reach the change, and the answer is then empty because of the bound. A passing depth-bounded gate is therefore re-asked with the bound lifted; only if *that* finds tests does the gate exit **4**:
+
+  ```
+  cgx: --depth 1 truncated the only route to 1 impacted test; the empty result is an artifact of the bound, not a clean bill of health (drop --depth, or pass --allow-vacuous to accept a bounded answer)
+  ```
+
+  A bound that removes nothing leaves the honest exit 0 alone, and a plain (non-gated) query with `--depth` is unaffected — it exits 0 and discloses the bound through the `depth-limit` reason as before.
+
+A [degenerate answer](#degenerate-answers) also exits 4, on its own signal, and `--allow-vacuous` does not suppress it. When an answer is degenerate *and* the gate passes vacuously, the degenerate reason is the one printed: it names the cause, and the generic vacuity line does not.
 
 `--allow-vacuous` downgrades the guard's exit 4 to 0. It still prints the warning to stderr and still sets `"vacuous": true` in JSON and a SARIF `note` — so the vacuity is recorded, not lost. Reach for it only when the vacuous case is one you have decided to tolerate; on a gate that runs per-PR it disables the guard on every future PR too.
 
@@ -172,7 +182,7 @@ A [degenerate answer](#degenerate-answers) also exits 4, on its own signal, and 
 | 0 | Success. Impacted tests were found, or the answer is empty and non-degenerate — including a `--assert-empty` gate that passed because the change reaches no test. |
 | 1 | `--assert-empty` failed: at least one impacted test was found. |
 | 2 | Usage error: `--uncommitted` combined with positional refs, neither side given, `--at` passed, or a path-graph `--format`. |
-| 4 | Either the answer is degenerate (see above), or `--assert-empty` passed vacuously: nothing changed, or a `--confidence` floor excluded every candidate. The second is suppressed by `--allow-vacuous`; the first is not. |
+| 4 | Either the answer is degenerate (see above), or `--assert-empty` passed vacuously: nothing changed, a `--confidence` floor excluded every candidate, or a `--depth` bound truncated the only route to a test. The vacuous-pass cases are suppressed by `--allow-vacuous`; the degenerate one is not. |
 
 Exit code 3 (missing index) is not reachable: the command indexes both sides itself.
 
@@ -430,6 +440,18 @@ approximation: over- and under-approximate — 1 call(s) in symbols outside the 
 ```
 
 Exit 0. The test is two hops from the change, so a depth of 1 loses it — and the `depth-limit` reason and the `depth<=1` scope both say so. Leave `--depth` unset unless the walk is too slow.
+
+Add `--assert-empty` to that same invocation and the exit code changes, because a gate cannot be allowed to pass on an answer the bound emptied:
+
+```
+cgx impacted-tests --uncommitted --repo /tmp/demo-conf --depth 1 --assert-empty
+```
+
+```
+cgx: --depth 1 truncated the only route to 1 impacted test; the empty result is an artifact of the bound, not a clean bill of health (drop --depth, or pass --allow-vacuous to accept a bounded answer)
+```
+
+Exit 4. At `--depth 2` the same gate exits 1, because the test is then reported.
 
 ### SARIF for a CI annotation
 

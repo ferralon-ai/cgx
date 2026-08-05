@@ -15,22 +15,30 @@
 //!   in-memory store backs each acquisition, and nothing is written to the
 //!   on-disk index. When the tree actually differs from `HEAD`, `graph_version`
 //!   becomes `"<short-tree-oid>+dirty.<overlay-digest>"` where `overlay-digest`
-//!   is a deterministic hash of the sorted synthetic blob OIDs of the files that
-//!   differ from the committed tree — so a cache keyed on `(query, graph_version)`
-//!   distinguishes bases (ADR-06). A clean tree under `include_dirty: true`
-//!   reports the committed `graph_version` (no spurious `+dirty`).
+//!   is a deterministic hash of the sorted *path → content* differences between
+//!   the committed tree and the working tree — so a cache keyed on
+//!   `(query, graph_version)` distinguishes bases (ADR-06). A working tree with
+//!   no such difference reports the committed `graph_version` (no spurious
+//!   `+dirty`).
 //!
 //! Because a working-directory blob OID is content-addressed exactly as git would
 //! compute it, a file whose content matches its committed blob contributes no
 //! difference — the overlay digest is a function of the *edited* content only,
 //! and is identical across runs (determinism).
+//!
+//! The difference is keyed by **path**, and a path present in the committed tree
+//! and absent from disk is a difference like any other. Keying it by blob OID
+//! alone — the original shape — made a deletion-only working tree hash to the
+//! empty difference and therefore collide with the clean-`HEAD` `graph_version`,
+//! while `index_workdir` had genuinely built a smaller graph: same cache key,
+//! different answer.
 
 use cgx_index::{
     compute_blob_oid, default_registry, index_path, index_workdir, IndexOpts, Repo, SourceFile,
 };
 use cgx_query::{FreshnessEnvelope, GraphView};
 use cgx_store::{FactStore, SqliteStore};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::error::ToolError;
@@ -45,7 +53,8 @@ pub struct GraphSession {
     pub graph_version: String,
     /// Whether the working-tree overlay was active *and* changed the base.
     pub dirty: bool,
-    /// How many working-tree files differed from the committed tree.
+    /// How many working-tree paths the overlay differed from the committed tree
+    /// by — edited, added, or deleted.
     pub dirty_files_analyzed: usize,
     /// How far the indexed state is from the working state, in the shared shape
     /// the CLI emits (divergence, never age — see [`FreshnessEnvelope`]).
@@ -53,7 +62,7 @@ pub struct GraphSession {
     /// Its `dirty_files` comes from `Repo::dirty_file_count` — the same function
     /// the CLI calls — and **not** from [`dirty_files_analyzed`](Self::dirty_files_analyzed)
     /// beside it. The two are different questions: `dirty_files_analyzed` counts the
-    /// distinct blobs the ADR-06 overlay contributed, which is what keys the
+    /// distinct paths the ADR-06 overlay contributed, which is what keys the
     /// `graph_version` digest; `freshness.dirty_files` counts the working-tree
     /// *paths* that diverge, ignore rules applied and deletions included, which is
     /// what an agent asking "is this answer still true of my checkout?" means.
@@ -114,7 +123,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     let working = repo
         .enumerate_workdir(&workdir)
         .map_err(|e| ToolError::index(e.to_string()))?;
-    let dirty_oids = dirty_synthetic_oids(&committed, &working);
+    let overlay = overlay_difference(&committed, &working);
 
     let outcome = index_workdir(root, &workdir, &registry, &mut store, &opts)
         .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
@@ -122,11 +131,11 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
 
     // The envelope's divergence count comes from the *same* function the CLI uses,
     // so `freshness.dirty_files` means exactly one thing on both surfaces. It is
-    // deliberately not `dirty_oids.len()`: that vector exists to key the ADR-06
-    // overlay digest, and as a divergence count it would be wrong three ways — it
-    // iterates the working set only (a deletion is invisible), it dedups by blob
-    // OID rather than by path, and it inherits `enumerate_workdir`'s blindness to
-    // `.gitignore`. `null` where the count could not be established, never a `0`.
+    // deliberately not `overlay.len()`: that vector exists to key the ADR-06
+    // overlay digest, and as a divergence count it would be wrong two ways — it
+    // counts paths rather than what `dirty_file_count` itself defines, and it
+    // inherits `enumerate_workdir`'s blindness to `.gitignore`. `null` where the
+    // count could not be established, never a `0`.
     let dirty_files = repo
         .tree_blob_oids(&head_tree_oid)
         .and_then(|indexed| repo.dirty_file_count(&indexed))
@@ -144,7 +153,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     let freshness =
         FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty_files);
 
-    if dirty_oids.is_empty() {
+    if overlay.is_empty() {
         // Clean tree: the overlay changed nothing, so report the committed base.
         Ok(GraphSession {
             view,
@@ -159,10 +168,10 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
             graph_version: format!(
                 "{}+dirty.{}",
                 short_oid(&head_tree_oid),
-                overlay_digest(&dirty_oids)
+                overlay_digest(&overlay)
             ),
             dirty: true,
-            dirty_files_analyzed: dirty_oids.len(),
+            dirty_files_analyzed: overlay.len(),
             freshness,
         })
     }
@@ -214,29 +223,52 @@ fn committed_oids(repo: &Repo) -> Result<BTreeMap<String, String>, ToolError> {
         .collect())
 }
 
-/// The synthetic blob OIDs of working-tree files that differ from the committed
-/// tree (added files, or files whose content-addressed OID changed), sorted for
-/// determinism. A file matching its committed blob yields an identical OID and is
-/// therefore absent from this set.
-fn dirty_synthetic_oids(
-    committed: &BTreeMap<String, String>,
-    working: &[SourceFile],
-) -> Vec<String> {
+/// Every way the working tree differs from the committed tree, one deterministic
+/// line per **path**, sorted. This is the overlay's content key (ADR-06): two
+/// working trees that produce the same lines produced the same graph from the same
+/// base, and two that produce different lines must not share a `graph_version`.
+///
+/// Two line shapes, matching `cgx_index`'s own `<oid> <path>` manifest form for
+/// the one that names content:
+///
+/// - `<blob_oid> <path>` — a path on disk whose content-addressed OID is not what
+///   the committed tree records (edited), or that the committed tree does not
+///   record at all (added).
+/// - `- <path>` — a path the committed tree records that is **absent from disk**.
+///   A blob OID is fixed-width hex, so a deletion line can never collide with a
+///   content line.
+///
+/// A file whose content matches its committed blob hashes identically and is
+/// therefore absent, which is what keeps a clean tree free of a spurious `+dirty`.
+///
+/// Keyed by path, not by OID: the earlier OID-keyed form dropped deletions
+/// entirely (a deletion-only tree hashed to the empty difference and collided with
+/// the clean-`HEAD` version) and deduped two distinct paths sharing a blob into
+/// one, so a pure rename was invisible to a cache keyed on `graph_version`.
+fn overlay_difference(committed: &BTreeMap<String, String>, working: &[SourceFile]) -> Vec<String> {
     let mut out: Vec<String> = working
         .iter()
         .filter(|w| committed.get(&w.rel_path) != Some(&w.blob_oid))
-        .map(|w| w.blob_oid.clone())
+        .map(|w| format!("{} {}", w.blob_oid, w.rel_path))
         .collect();
+
+    let on_disk: BTreeSet<&str> = working.iter().map(|w| w.rel_path.as_str()).collect();
+    out.extend(
+        committed
+            .keys()
+            .filter(|path| !on_disk.contains(path.as_str()))
+            .map(|path| format!("- {path}")),
+    );
+
     out.sort();
-    out.dedup();
     out
 }
 
-/// A deterministic digest of the sorted dirty synthetic OIDs (ADR-06): the git
-/// blob OID of the newline-joined OID list, truncated for compactness. Stable
-/// across runs and across `include_dirty` re-evaluations of the same edit.
-fn overlay_digest(dirty_oids: &[String]) -> String {
-    let manifest = dirty_oids.join("\n");
+/// A deterministic digest of the sorted overlay difference (ADR-06): the git blob
+/// OID of the newline-joined line list, truncated for compactness. Stable across
+/// runs and across `include_dirty` re-evaluations of the same edit.
+fn overlay_digest(overlay: &[String]) -> String {
+    let manifest = overlay.join("\n");
     let oid = compute_blob_oid(manifest.as_bytes());
     oid.chars().take(12).collect()
 }

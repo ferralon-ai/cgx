@@ -949,6 +949,136 @@ fn an_uncommitted_deletion_is_counted_and_reported_stale() {
     assert_eq!(deleted["freshness"]["stale"], json!(true));
 }
 
+/// C9, the cache-correctness half. A working tree whose only change is a
+/// **deletion** must not share a `graph_version` with the clean `HEAD` — it did,
+/// verified end to end: same key, `["helper::beta"]` one run and `[]` the next.
+/// The overlay difference was keyed by the blob OIDs of files *present on disk*,
+/// and a deleted file is present nowhere, so the digest could not see it. A cache
+/// keyed on `(query, graph_version)` — the exact ADR-06 use the field exists for —
+/// served a wrong hit.
+#[test]
+fn a_deletion_only_tree_gets_a_graph_version_distinct_from_clean_head() {
+    let (_t, repo) = init_mixed_repo();
+    let clean = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert_eq!(clean["dirty"], json!(false));
+    let clean_version = clean["graph_version"]
+        .as_str()
+        .expect("graph_version")
+        .to_string();
+    assert!(
+        !clean_version.contains("+dirty"),
+        "a clean tree carries no +dirty suffix: {clean_version}"
+    );
+
+    std::fs::remove_file(repo.join("src/other.rs")).unwrap();
+    let deleted = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+
+    // The deletion genuinely moves the answer, so a shared key would be a wrong
+    // hit rather than a harmless collision.
+    assert!(
+        result_names(&clean, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "fixture assumption: caller_fn calls other::remote_fn"
+    );
+    assert!(
+        !result_names(&deleted, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "the deletion must move the answer, or this proves nothing"
+    );
+
+    let deleted_version = deleted["graph_version"].as_str().expect("graph_version");
+    assert_ne!(
+        deleted_version, clean_version,
+        "a deletion-only tree must not reuse the clean-HEAD cache key"
+    );
+    assert!(
+        deleted_version.contains("+dirty."),
+        "a deletion is an overlay difference like any other: {deleted_version}"
+    );
+    assert_eq!(deleted["dirty"], json!(true));
+    assert_eq!(deleted["dirty_files_analyzed"], json!(1));
+}
+
+/// C9's consistency half. `dirty`/`dirty_files_analyzed` and `freshness.stale`
+/// describe one working tree from two angles, so a response reading `dirty: false`
+/// beside `stale: true` tells an agent two incompatible things and leaves it no
+/// way to know which field to trust. It could, while the envelope saw deletions
+/// and the overlay fields did not. Driven over the tree states that reach each
+/// field group, under both `include_dirty` settings.
+#[test]
+fn no_response_reads_dirty_false_beside_stale_true() {
+    struct Case {
+        name: &'static str,
+        mutate: fn(&Path),
+    }
+
+    let cases = [
+        Case {
+            name: "clean",
+            mutate: |_| {},
+        },
+        Case {
+            name: "modified",
+            mutate: |r| {
+                std::fs::write(r.join("src/other.rs"), "pub fn remote_fn() -> i32 { 3 }\n").unwrap()
+            },
+        },
+        Case {
+            name: "deleted",
+            mutate: |r| std::fs::remove_file(r.join("src/other.rs")).unwrap(),
+        },
+        Case {
+            name: "added",
+            mutate: |r| {
+                std::fs::write(r.join("src/extra.rs"), "pub fn extra() -> i32 { 4 }\n").unwrap()
+            },
+        },
+    ];
+
+    for Case { name, mutate } in cases {
+        for include_dirty in [true, false] {
+            let (_t, repo) = init_mixed_repo();
+            mutate(&repo);
+            let s = call_tool(
+                &repo,
+                "callees",
+                json!({ "symbol": "caller_fn", "include_dirty": include_dirty }),
+            );
+            let dirty = s["dirty"].as_bool().expect("dirty");
+            let stale = s["freshness"]["stale"].as_bool().expect("stale");
+            assert!(
+                dirty || !stale,
+                "{name} (include_dirty={include_dirty}): `dirty: {dirty}` beside \
+                 `stale: {stale}` is a contradiction — freshness {}",
+                s["freshness"]
+            );
+
+            // And the overlay fields are not merely consistent by staying silent:
+            // every state that moved the tree is reported as having moved it.
+            if include_dirty && name != "clean" {
+                assert!(
+                    dirty,
+                    "{name}: an active overlay over a changed tree is dirty"
+                );
+                assert!(
+                    s["dirty_files_analyzed"].as_u64().unwrap() >= 1,
+                    "{name}: dirty_files_analyzed counts the change: {s}"
+                );
+            }
+        }
+    }
+}
+
 /// Cross-surface parity: the same working-tree state under the same
 /// `freshness.dirty_files` key must mean the same thing on the CLI and on MCP.
 /// Their absence is what let the two surfaces disagree by three independent

@@ -19,12 +19,19 @@
 //!
 //! ## Tools (map to `cgx-query`)
 //!
-//! `callers`, `callees` (IF-11/12), `paths` (IF-13), `unused` (IF-14), `explain`
-//! (IF-15). `graph_query` (IF-10) is registered but reserved: the Cypher-subset
-//! query language is post-Phase-1, so it returns a clear "not implemented" error
-//! rather than a wrong answer. Every result carries the confidence ladder (GM-5)
-//! and edge-condition context (GM-3) — the same honesty the CLI emits — and
-//! supports `max_results`/`cursor` pagination (IF-18).
+//! `callers`, `callees` (IF-11/12), `reaches`, `paths` (IF-13), `unused` (IF-14),
+//! `explain` (IF-15), `search`, `symbols`, `flows_to`, `flows_from` — ten typed
+//! query wrappers, each a thin envelope over the matching `cgx-query` function.
+//! `graph_query` (IF-10) routes to the live CQL engine (`cgx_cql::run`) — the
+//! same engine the `cgx query` CLI subcommand drives, no second execution path.
+//! A `RETURN path` query surfaces a `paths` channel (the `paths`-tool shape); a
+//! tabular query surfaces `columns`/`rows`. Parse/plan/eval rejects map to an
+//! actionable `invalid_params` error rather than a wrong answer. Every result
+//! carries the confidence ladder (GM-5), edge-condition context (GM-3), and the
+//! A3/A4 approximation contract (`callers`/`callees`/`reaches`/`paths`/`unused`/
+//! `flows_to`/`flows_from`/`graph_query`; `explain`/`search`/`symbols` do not) —
+//! the same honesty the CLI emits — and supports `max_results`/`cursor`
+//! pagination (IF-18).
 //!
 //! ## `include_dirty` overlay (ADR-06, default **true** for MCP)
 //!

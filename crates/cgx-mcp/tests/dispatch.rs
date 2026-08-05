@@ -767,3 +767,251 @@ fn serve_io_returns_parse_error_for_malformed_line() {
     assert_eq!(resp["error"]["code"], json!(-32700));
     assert_eq!(resp["id"], json!(null));
 }
+// --- impacted_tests ---------------------------------------------------------
+
+/// A committed library whose test reaches the changed symbol through one
+/// intermediate hop. The test binds `mid(1)` to a local *before* asserting on it:
+/// a call written inside `assert_eq!(..)` sits in an unexpanded macro and
+/// produces no graph edge at all.
+const IMPACTED_LIB: &str = "pub mod api;\npub mod check;\n";
+const IMPACTED_API_BASE: &str = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+const IMPACTED_API_HEAD: &str = "pub fn add(a: i32, b: i32) -> i32 { b + a }\n";
+const IMPACTED_CHECK: &str = "\
+use crate::api::add;
+pub fn mid(x: i32) -> i32 { add(x, 1) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_mid() {
+        let got = mid(1);
+        assert_eq!(got, 2);
+    }
+}
+";
+
+fn commit_all(repo: &Path, msg: &str) {
+    run_git(repo, &["add", "-A"]);
+    run_git(
+        repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+}
+
+fn init_bare_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "cgx-test"]);
+    run_git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    (tmp, repo)
+}
+
+/// `add` <- `mid` <- `test_mid`, committed, with `add`'s body edited in the
+/// working tree.
+fn init_impacted_repo() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = init_bare_repo();
+    std::fs::write(repo.join("src/lib.rs"), IMPACTED_LIB).unwrap();
+    std::fs::write(repo.join("src/api.rs"), IMPACTED_API_BASE).unwrap();
+    std::fs::write(repo.join("src/check.rs"), IMPACTED_CHECK).unwrap();
+    commit_all(&repo, "base");
+    std::fs::write(repo.join("src/api.rs"), IMPACTED_API_HEAD).unwrap();
+    (tmp, repo)
+}
+
+/// A repo whose only working-tree edit is TypeScript — the language cgx cannot
+/// identify tests in at all.
+fn init_typescript_only_repo() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, repo) = init_bare_repo();
+    std::fs::create_dir_all(repo.join("web")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn keep() -> i32 { 1 }\n").unwrap();
+    std::fs::write(
+        repo.join("web/app.ts"),
+        "export function greet(): string { return \"hi\"; }\n",
+    )
+    .unwrap();
+    commit_all(&repo, "base");
+    std::fs::write(
+        repo.join("web/app.ts"),
+        "export function greet(): string { return \"hello\"; }\n",
+    )
+    .unwrap();
+    (tmp, repo)
+}
+
+fn reason_codes_of(structured: &Value) -> Vec<String> {
+    structured["approximation"]["reasons"]
+        .as_array()
+        .expect("reasons array")
+        .iter()
+        .map(|r| r["code"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// `tools.rs` states the tool order is fixed for determinism, so a new tool is
+/// **appended**. Inserting it would silently reorder every client's tool list.
+#[test]
+fn impacted_tests_is_registered_as_the_last_tool() {
+    let request = req(1, "tools/list", json!({}));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    let tools = resp.result.expect("result")["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names.last(),
+        Some(&"impacted_tests"),
+        "appended, never inserted: {names:?}"
+    );
+    let schema = &tools.last().unwrap()["inputSchema"];
+    assert_eq!(schema["required"], json!(["root"]));
+    assert_eq!(schema["properties"]["merge_base"]["default"], json!(true));
+}
+
+#[test]
+fn impacted_tests_reports_the_test_that_reaches_the_change() {
+    let (_tmp, repo) = init_impacted_repo();
+    let out = call_tool(&repo, "impacted_tests", json!({}));
+
+    let names = result_names(&out, "results");
+    assert_eq!(names.len(), 1, "one impacted test: {out}");
+    assert!(names[0].ends_with("::test_mid"), "{out}");
+
+    let row = &out["results"][0];
+    assert_eq!(
+        row["min_confidence_on_path"].as_str(),
+        Some("probable"),
+        "the weakest hop on the path, not the discovery edge's own: {row}"
+    );
+    assert!(
+        row["reached_change"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("::add"),
+        "the row names which changed symbol it reaches: {row}"
+    );
+    assert_eq!(row["via_containment_lift"], json!(false), "{row}");
+
+    // The envelope diverges from the eleven session-backed tools deliberately:
+    // no `graph_version`, but both sides' graph keys and refs instead.
+    assert_eq!(out["head_ref"].as_str(), Some("workdir"), "{out}");
+    assert_eq!(out["dirty"], json!(true));
+    assert!(out["base_graph_key"].as_str().is_some(), "{out}");
+    assert!(out["head_graph_key"].as_str().is_some(), "{out}");
+    assert_ne!(out["base_graph_key"], out["head_graph_key"], "{out}");
+    assert_eq!(out["degenerate"], json!(false));
+    assert_eq!(out["has_more"], json!(false));
+    assert!(
+        out["approximation"]["direction"].as_str().is_some(),
+        "{out}"
+    );
+}
+
+/// **The highest-damage failure this feature can ship.** MCP has no exit code,
+/// so the body carries the flag: an empty `results` array with `degenerate: true`
+/// means "cgx did not analyse this", never "no tests are affected". The call is
+/// deliberately *not* an error — a client must read it as a finding, not a
+/// transport failure to retry.
+#[test]
+fn a_typescript_only_change_is_flagged_degenerate_not_an_empty_answer() {
+    let (_tmp, repo) = init_typescript_only_repo();
+    let out = call_tool(&repo, "impacted_tests", json!({}));
+
+    assert_eq!(out["total_matched"], json!(0));
+    assert_eq!(
+        out["results"].as_array().map(Vec::len),
+        Some(0),
+        "no tests found: {out}"
+    );
+    assert_eq!(
+        out["degenerate"],
+        json!(true),
+        "an empty answer over an unsupported language is degenerate: {out}"
+    );
+    let reason = out["degenerate_reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("typescript"),
+        "the reason names the language: {out}"
+    );
+    assert!(
+        reason_codes_of(&out).contains(&"impacted-language-unsupported".to_string()),
+        "the contract carries the machine-readable code: {out}"
+    );
+    assert_ne!(
+        out["approximation"]["direction"].as_str(),
+        Some("exact"),
+        "a degenerate answer can never claim to be exact: {out}"
+    );
+}
+
+/// `include_dirty` selects the head side rather than decorating the call, so the
+/// one combination with nothing to compare is rejected up front instead of
+/// silently answering about an empty diff.
+#[test]
+fn no_base_with_include_dirty_false_has_nothing_to_diff() {
+    let (_tmp, repo) = init_impacted_repo();
+    let mut args = json!({ "include_dirty": false });
+    args.as_object_mut()
+        .unwrap()
+        .insert("root".into(), json!(repo.to_string_lossy()));
+    let request = req(
+        1,
+        "tools/call",
+        json!({ "name": "impacted_tests", "arguments": args }),
+    );
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    let err = resp
+        .error
+        .expect("invalid_params, not a silent empty answer");
+    assert_eq!(err.code, -32602, "{err:?}");
+    assert!(err.message.contains("nothing to diff"), "{err:?}");
+}
+
+/// Two committed refs: `include_dirty: false` with a `base` compares trees.
+#[test]
+fn impacted_tests_compares_two_committed_refs() {
+    let (_tmp, repo) = init_impacted_repo();
+    commit_all(&repo, "head: reorder the addends");
+
+    let out = call_tool(
+        &repo,
+        "impacted_tests",
+        json!({ "base": "HEAD~1", "head": "HEAD", "include_dirty": false }),
+    );
+    let names = result_names(&out, "results");
+    assert!(
+        names.iter().any(|n| n.ends_with("::test_mid")),
+        "CI mode reaches the same test: {out}"
+    );
+    assert_eq!(out["dirty"], json!(false));
+    assert_ne!(out["head_ref"].as_str(), Some("workdir"), "{out}");
+    assert!(
+        !reason_codes_of(&out).contains(&"impacted-tip-to-tip-base".to_string()),
+        "merge-base is the default: {out}"
+    );
+}
+
+#[test]
+fn impacted_tests_paginates_like_every_other_list_tool() {
+    let (_tmp, repo) = init_impacted_repo();
+    let out = call_tool(&repo, "impacted_tests", json!({ "max_results": 1 }));
+    assert_eq!(out["results"].as_array().map(Vec::len), Some(1), "{out}");
+    assert!(out["has_more"].is_boolean(), "{out}");
+    assert!(
+        out["cursor"].is_string() || out["cursor"].is_null(),
+        "{out}"
+    );
+}

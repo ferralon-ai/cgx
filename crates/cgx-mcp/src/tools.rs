@@ -10,12 +10,15 @@
 //! pure function of its arguments.
 
 use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
+use cgx_diff::impacted::Sides;
 use cgx_query::{
-    callees, callers, contract, entrypoint_roots, explain, paths as query_paths, rank_symbols,
-    reaches, reaches_all, resolve_anchor, search_symbols, unused, ApproximationContract,
-    ConditionFilter, Direction, EdgeBreakdown, EdgeFilter, GraphView, NeighborResult, PathResult,
-    PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit, SymbolRank,
+    callees, callers, contract, entrypoint_roots, explain, impacted::ImpactedWitness,
+    paths as query_paths, rank_symbols, reaches, reaches_all, resolve_anchor, search_symbols,
+    unused, ApproximationContract, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
+    GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
+    SymbolRank,
 };
+use cgx_store::SqliteStore;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -66,6 +69,7 @@ pub fn tool_list() -> Value {
             flow_tool("flows_to", "Forward data-flow slice: symbols a value flows into (its DerivesFrom consumers)."),
             flow_tool("flows_from", "Data-flow pedigree: the symbols a value derives from (its DerivesFrom sources)."),
             graph_query_tool(),
+            impacted_tests_tool(),
         ]
     })
 }
@@ -269,6 +273,42 @@ fn graph_query_tool() -> Value {
     })
 }
 
+/// `impacted_tests`: the reverse-reachability PR gate.
+///
+/// Unlike every other tool here this one compares **two** graphs, so it takes
+/// git refs rather than a symbol and carries no `edge_condition`/`kind` filter —
+/// the searched family is the call family, narrowed only by `confidence`.
+///
+/// `include_dirty` is load-bearing rather than decorative: it selects the head
+/// side. Absent `base` + `true` is the inner loop (HEAD tree vs. the working
+/// directory); `base` + `true` compares a ref against the working directory;
+/// `base` + `false` compares two committed trees; absent `base` + `false` has
+/// nothing to diff and is an `invalid_params`.
+fn impacted_tests_tool() -> Value {
+    json!({
+        "name": "impacted_tests",
+        "description": "Test functions whose call graph reaches a symbol changed between two git refs, \
+                        or in the uncommitted working tree. Rust, Go, Java and Python only: a diff \
+                        touching only other languages returns `degenerate: true` with an empty result \
+                        set, which means \"not analysed\", NOT \"no tests affected\".",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root":          { "type": "string", "description": "Repository root path" },
+                "base":          { "type": "string", "description": "Base git ref. Omit to compare the working tree against HEAD." },
+                "head":          { "type": "string", "description": "Head git ref (default: HEAD). Used only when `base` is given and `include_dirty` is false." },
+                "merge_base":    { "type": "boolean", "default": true, "description": "Compare against the merge-base of base and head rather than the base ref's tip" },
+                "depth":         { "type": "integer", "description": "Max traversal depth from each changed symbol; omit for unbounded" },
+                "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
+                "cursor":        { "type": "string" },
+                "include_dirty": include_dirty_prop()
+            },
+            "required": ["root"]
+        }
+    })
+}
+
 /// Dispatch a `tools/call` by tool name. Returns the `structuredContent` body
 /// (without the surrounding `content`/`isError` wrapper, which the server adds).
 pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
@@ -284,6 +324,7 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
         "flows_to" => flow_call(args, FlowDir::To),
         "flows_from" => flow_call(args, FlowDir::From),
         "graph_query" => graph_query_call(args),
+        "impacted_tests" => impacted_tests_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
 }
@@ -316,6 +357,16 @@ fn opt_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolError> {
         Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
             ToolError::invalid_params(format!("`{key}` must be a non-negative integer"))
         }),
+    }
+}
+
+fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(ToolError::invalid_params(format!(
+            "`{key}` must be a boolean"
+        ))),
     }
 }
 
@@ -672,6 +723,127 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
         "cursor": cursor
     });
     Ok(with_session_meta(with_contract(body, &approximation), &session))
+}
+
+/// `impacted_tests`: the test entrypoints whose call graph reaches a symbol
+/// changed between the two sides.
+///
+/// Two structural departures from every other handler here, both deliberate:
+///
+/// 1. **It does not call [`session::acquire`].** `acquire` opens a fresh
+///    in-memory store per call and returns *one* graph; this tool needs two
+///    graphs readable from one store, so it owns its store and calls
+///    [`cgx_diff::impacted::run`] — the same entry point the CLI uses, so the
+///    two surfaces cannot drift.
+/// 2. **The envelope is not [`with_session_meta`].** Without a `GraphSession`
+///    there is no `graph_version`; the two `graph_key`s are emitted instead,
+///    which are strictly more informative (a real tree OID, or a
+///    `workdir:<digest>`), alongside the resolved refs.
+///
+/// The store is `open_in_memory` to preserve the ADR-06 never-persist invariant,
+/// at the cost of a cold Layer-1 blob cache on every call — the same cost every
+/// MCP tool already pays.
+///
+/// A degenerate answer is **not** `isError`: it is a successful call whose
+/// answer is vacuous, and the flag plus the contract's reasons say so. Marking
+/// it an error would let a client treat "not analysed" as a transport failure
+/// and retry, rather than as the finding it is.
+fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
+    let root = PathBuf::from(req_str(args, "root")?);
+    let dirty = include_dirty(args)?;
+    let merge_base = opt_bool(args, "merge_base")?.unwrap_or(true);
+    let head = opt_str(args, "head").unwrap_or("HEAD").to_string();
+
+    let base = opt_str(args, "base");
+    if base.is_none() && !dirty {
+        return Err(ToolError::invalid_params(
+            "`include_dirty: false` with no `base` has nothing to diff: pass a `base` ref, \
+             or leave `include_dirty` at its default to compare the working tree against HEAD",
+        ));
+    }
+    let sides = match (base, dirty) {
+        (Some(base), true) => Sides::RefToWorkdir {
+            base: base.to_string(),
+            merge_base,
+        },
+        (Some(base), false) => Sides::Refs {
+            base: base.to_string(),
+            head,
+            merge_base,
+        },
+        // `base` absent with `include_dirty: false` is rejected above, so this is
+        // the inner loop: the committed HEAD tree against the working directory.
+        (None, _) => Sides::Workdir,
+    };
+
+    let mut filter = EdgeFilter::calls();
+    if let Some(c) = opt_str(args, "confidence") {
+        filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+    // Unbounded by default, as on the CLI: a test three hops from the change is
+    // still impacted. An explicit `depth` narrows it and the contract then
+    // carries `depth-limit`.
+    let walker = PathWalker {
+        filter,
+        max_depth: opt_u32(args, "depth")?,
+        max_paths: None,
+        max_steps: None,
+    };
+
+    let mut store = SqliteStore::open_in_memory()
+        .map_err(|e| ToolError::index(format!("opening in-memory store: {e}")))?;
+    let answer = cgx_diff::impacted::run(
+        &mut store,
+        cgx_diff::impacted::Request {
+            repo_root: &root,
+            sides,
+            walker,
+        },
+    )
+    .map_err(|e| ToolError::index(e.to_string()))?;
+
+    let total = answer.tests.tests.len();
+    let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
+    let offset = cursor_offset(args)?;
+    let (start, end, has_more, cursor) = paginate(total, offset, limit);
+    // `witnesses` is index-parallel to `tests`, so the same slice bounds apply.
+    let page: Vec<Value> = answer.tests.tests[start..end]
+        .iter()
+        .zip(&answer.tests.witnesses[start..end])
+        .map(|(r, w)| impacted_row_json(&answer.view, r, w))
+        .collect();
+
+    let body = json!({
+        "results": page,
+        "total_matched": total,
+        "has_more": has_more,
+        "cursor": cursor,
+        "base_ref": answer.base_ref,
+        "head_ref": answer.head_ref,
+        "base_graph_key": answer.base_graph_key,
+        "head_graph_key": answer.head_graph_key,
+        "changed_symbols": answer.changed.len(),
+        "dirty": dirty,
+        "dirty_files_analyzed": answer.dirty_files,
+        "degenerate": answer.degenerate,
+        "degenerate_reason": answer.degenerate_reason,
+    });
+    Ok(with_contract(body, &answer.contract))
+}
+
+/// One `impacted_tests` row: the shipped [`neighbor_json`] shape plus the two
+/// facts that make the row actionable — *which* changed symbol it reaches, and
+/// whether the path crossed a closure-containment lift (containment is not
+/// invocation, so such a row is an over-approximation).
+fn impacted_row_json(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) -> Value {
+    let mut obj = neighbor_json(r);
+    let map = obj.as_object_mut().expect("neighbor row is an object");
+    map.insert(
+        "reached_change".into(),
+        json!(view.try_node(w.root).map(|n| n.fqn.as_str())),
+    );
+    map.insert("via_containment_lift".into(), json!(w.via_containment_lift));
+    obj
 }
 
 fn explain_call(args: &Value) -> Result<Value, ToolError> {

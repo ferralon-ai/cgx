@@ -150,3 +150,76 @@ fn custom_attribute_proc_macro_on_a_fn_emits_a_cut_hint() {
         .any(|c| c.marker == CutMarker::UnexpandedMacro
             && c.macro_origin.as_deref() == Some("my_framework::route")));
 }
+
+// --- the widened test-attribute rule -----------------------------------------
+
+/// Every form the recognition rule is meant to cover, each asserted on its own
+/// so a regression names the framework it broke. Matching only the literal
+/// `test` left an async codebase with no test entrypoints at all — which
+/// silently drops those tests from `impacted-tests` *and* makes them invisible
+/// as `unused` roots.
+#[test]
+fn test_attributes_beyond_the_bare_literal_mark_test_entrypoints() {
+    for (attr, label) in [
+        ("#[test]", "builtin"),
+        ("#[tokio::test]", "tokio"),
+        ("#[async_std::test]", "async-std"),
+        ("#[test_log::test]", "test-log"),
+        ("#[actix_rt::test]", "actix (same convention, free)"),
+        ("#[wasm_bindgen_test]", "wasm-bindgen"),
+        ("#[rstest]", "rstest"),
+        ("#[rstest(a, b)]", "rstest with cases"),
+        (
+            "#[tokio::test(flavor = \"multi_thread\")]",
+            "tokio with args",
+        ),
+    ] {
+        let src = format!("{attr}\nfn it_works() {{}}");
+        let facts = extract("src/main.rs", &src);
+        let ep = facts
+            .entrypoint_hints
+            .iter()
+            .find(|e| e.fqn == "rust_sample::it_works")
+            .unwrap_or_else(|| panic!("{label}: no entrypoint hint for {attr}"));
+        assert_eq!(ep.kind, EntrypointKind::Test, "{label}: {attr}");
+    }
+}
+
+/// The other half of the rule, and the one that costs something when it is
+/// wrong. `unused` roots at every `entrypoint_kind`, so an attribute wrongly
+/// read as a test suppresses a genuine dead-code finding.
+#[test]
+fn non_test_attributes_do_not_mark_test_entrypoints() {
+    for attr in [
+        "#[inline]",
+        "#[should_panic]",
+        "#[ignore]",
+        "#[cfg(test)]",
+        "#[cfg_attr(test, derive(Debug))]",
+        "#[serial_test::serial]",
+        "#[my_crate::latest]",
+    ] {
+        let src = format!("{attr}\nfn f() {{}}");
+        let facts = extract("src/main.rs", &src);
+        assert!(
+            !facts
+                .entrypoint_hints
+                .iter()
+                .any(|e| e.fqn == "rust_sample::f" && e.kind == EntrypointKind::Test),
+            "{attr} must not read as a test"
+        );
+    }
+}
+
+/// `#[tokio::main]` still resolves to `AsyncMain`: the async-runtime arm is
+/// matched before the test rule, and `main` is not a test whatever the path.
+#[test]
+fn the_async_main_arm_still_wins_over_the_test_rule() {
+    let facts = extract("src/main.rs", "#[tokio::main]\nasync fn run() {}");
+    let ep = facts
+        .entrypoint_hints
+        .iter()
+        .find(|e| e.fqn == "rust_sample::run")
+        .expect("async-main entrypoint");
+    assert_eq!(ep.kind, EntrypointKind::AsyncMain);
+}

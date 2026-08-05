@@ -1338,3 +1338,161 @@ fn a_clean_tree_carrying_only_cgxs_own_store_is_still_exact() {
         "nothing changed is a complete answer, not an under-approximation: {stdout}"
     );
 }
+
+// --- the widened test-recognition lists, end to end ---------------------------
+//
+// The adapter tests assert the `EntrypointHint`. These assert the thing a user
+// actually gets: a row in the answer. Every call is bound to a local first,
+// because a call written inside `assert_eq!` is an unexpanded macro argument and
+// produces no edge — a separate, still-open gap that would otherwise mask this
+// one.
+
+/// One module holding a test under each Rust attribute form the widened rule is
+/// meant to cover, all reaching the same changed symbol.
+fn rust_test_attribute_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(&path, "src/lib.rs", "pub mod api;\npub mod suite;\n");
+    write(&path, "src/api.rs", API_BASE);
+    write(
+        &path,
+        "src/suite.rs",
+        "\
+use crate::api::add;
+
+#[tokio::test]
+async fn tokio_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+#[async_std::test]
+async fn async_std_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+#[test_log::test]
+fn test_log_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+#[wasm_bindgen_test]
+fn wasm_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+#[rstest]
+fn rstest_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+#[tokio::test(flavor = \"multi_thread\")]
+async fn tokio_flavored_case() { let got = add(1, 1); assert_eq!(got, 2); }
+
+pub fn not_a_test() { let got = add(1, 1); let _ = got; }
+",
+    );
+    commit(&path, "base");
+    write(&path, "src/api.rs", API_HEAD);
+    (tmp, path)
+}
+
+#[test]
+fn every_widened_rust_test_attribute_produces_an_impacted_row() {
+    let (_tmp, repo) = rust_test_attribute_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let fqns: Vec<String> = doc["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for case in [
+        "tokio_case",
+        "async_std_case",
+        "test_log_case",
+        "wasm_case",
+        "rstest_case",
+        "tokio_flavored_case",
+    ] {
+        assert!(
+            fqns.iter().any(|f| f.ends_with(case)),
+            "{case} is a test and must be reported: {fqns:?}"
+        );
+    }
+    assert!(
+        !fqns.iter().any(|f| f.ends_with("not_a_test")),
+        "a plain function reaching the change is not a test: {fqns:?}"
+    );
+}
+
+/// The same, in Java, over JUnit 5's four other test-declaring annotations.
+fn java_test_annotation_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(
+        &path,
+        "src/main/java/app/Api.java",
+        "package app;\n\npublic class Api {\n    public static int add(int a, int b) { return a + b; }\n}\n",
+    );
+    write(
+        &path,
+        "src/test/java/app/ApiTest.java",
+        "\
+package app;
+
+import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.params.ParameterizedTest;
+
+public class ApiTest {
+    @ParameterizedTest
+    public void parameterizedCase() { int n = Api.add(1, 1); if (n != 2) { throw new AssertionError(\"x\"); } }
+
+    @RepeatedTest(3)
+    public void repeatedCase() { int n = Api.add(1, 1); if (n != 2) { throw new AssertionError(\"x\"); } }
+
+    @TestFactory
+    public void factoryCase() { int n = Api.add(1, 1); if (n != 2) { throw new AssertionError(\"x\"); } }
+
+    @TestTemplate
+    public void templateCase() { int n = Api.add(1, 1); if (n != 2) { throw new AssertionError(\"x\"); } }
+
+    @BeforeTest
+    public void prepares() { int n = Api.add(1, 1); if (n != 2) { throw new AssertionError(\"x\"); } }
+}
+",
+    );
+    commit(&path, "base");
+    write(
+        &path,
+        "src/main/java/app/Api.java",
+        "package app;\n\npublic class Api {\n    public static int add(int a, int b) { return b + a; }\n}\n",
+    );
+    (tmp, path)
+}
+
+#[test]
+fn every_widened_java_test_annotation_produces_an_impacted_row() {
+    let (_tmp, repo) = java_test_annotation_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let fqns: Vec<String> = doc["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| r["fqn"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for case in [
+        "parameterizedCase",
+        "repeatedCase",
+        "factoryCase",
+        "templateCase",
+    ] {
+        assert!(
+            fqns.iter().any(|f| f.ends_with(case)),
+            "{case} is a test and must be reported: {fqns:?}"
+        );
+    }
+    assert!(
+        !fqns.iter().any(|f| f.ends_with("prepares")),
+        "@BeforeTest is a lifecycle hook, not a test: {fqns:?}"
+    );
+}

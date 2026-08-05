@@ -75,13 +75,26 @@ A diff that touches only other languages produces a *visibly degenerate* answer:
 
 TypeScript and JavaScript are indexed by cgx but are **not supported here**. Their test entrypoints are recorded as hints whose FQNs are built from the test's string label, so they never match a symbol FQN, and calls inside inline test callbacks produce no graph edge. There is no partial recovery — no TypeScript or JavaScript test appears in any answer.
 
-Within the four supported languages, test recognition is incomplete in named ways. Every answer whose changed set touches a language carries that language's gap as an under-approximation reason, whether or not it bit on this particular run:
+### What counts as a test
+
+| Language | Recognised |
+|----------|------------|
+| Rust | Any attribute whose last `::` segment is `test` (`#[test]`, `#[tokio::test]`, `#[async_std::test]`, `#[test_log::test]`, `#[actix_rt::test]`, …), any ending in `_test` (`#[wasm_bindgen_test]`), and `#[rstest]`. An argument list is ignored, so `#[tokio::test(flavor = "multi_thread")]` is the same as `#[tokio::test]`. |
+| Go | A function named `Test`, `Benchmark` or `Example` followed by nothing or by a non-lowercase character — the `go test` naming convention. |
+| Java | Method-level `@Test`, `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate` — imported or fully qualified — plus JUnit 3 `testXxx` naming. |
+| Python | A function named `test` or `test_*`; a class named `Test*` or with a `unittest.TestCase` base cgx can see. |
+
+The rules are anchored on the *whole* last segment rather than on a substring, deliberately. A mis-stamped entrypoint is not free: `cgx unused` roots its reachability walk at every entrypoint, so a false positive here silently suppresses a real dead-code finding. That is why Java uses an explicit set — TestNG's `@BeforeTest` and `@AfterTest` end in `Test` and declare no test.
+
+### What does not
+
+Within the four supported languages, test recognition is still incomplete in named ways. Every answer whose changed set touches a language carries that language's gap as an under-approximation reason, whether or not it bit on this particular run:
 
 | Language | Not recognised as a test |
 |----------|--------------------------|
-| Rust | A `#[test]` whose only call to the changed symbol sits **inside an assertion macro** — `assert_eq!(add(1, 1), 2)`, `assert!(add(1, 1) == 2)`, and friends. The call is an unexpanded macro argument and produces no call edge at all, so no backward walk reaches the test. Bind the call to a local first (`let got = add(1, 1); assert_eq!(got, 2);`) and it is reported. Plus `#[tokio::test]`, `#[async_std::test]`, `#[rstest]`, `#[wasm_bindgen_test]`, `#[test_log::test]`. Doc-tests have no node identity at all. |
+| Rust | A `#[test]` whose only call to the changed symbol sits **inside an assertion macro** — `assert_eq!(add(1, 1), 2)`, `assert!(add(1, 1) == 2)`, and friends. The call is an unexpanded macro argument and produces no call edge at all, so no backward walk reaches the test. Bind the call to a local first (`let got = add(1, 1); assert_eq!(got, 2);`) and it is reported. Plus test attributes whose last path segment is irregular — `#[proptest]`, `#[quickcheck]`, `#[test_case]` — and `#[bench]`, which is not a test. Doc-tests have no node identity at all. |
 | Go | `FuzzXxx` fuzz targets. `t.Run` subtest closures carry no call edge and are recovered by containment only (see below). |
-| Java | JUnit 5 `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate`; TestNG class-level `@Test`. |
+| Java | TestNG **class-level** `@Test`: the annotation sits on the type and every public method inherits it, and cgx reads method-level annotations only. JUnit 4's experimental `@Theory`. |
 | Python | `unittest` camelCase `testFoo` methods; non-default pytest `python_files`/`python_functions` configuration; `TestCase` chains through an unindexed third-party base. |
 
 ### The closure-containment lift

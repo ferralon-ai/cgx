@@ -478,8 +478,9 @@ fn recognition_gap(lang: &str) -> Option<(&'static str, &'static str)> {
         )),
         "java" => Some((
             "impacted-test-recognition-incomplete-java",
-            "java: JUnit5 @ParameterizedTest/@RepeatedTest/@TestFactory/@TestTemplate and TestNG \
-             class-level @Test are not recognised as tests.",
+            "java: a TestNG class-level @Test (annotating the type, so every public method is a \
+             test) is not read — only method-level annotations are; nor is JUnit4's experimental \
+             @Theory.",
         )),
         "python" => Some((
             "impacted-test-recognition-incomplete-python",
@@ -498,9 +499,9 @@ fn recognition_gap(lang: &str) -> Option<(&'static str, &'static str)> {
             "rust: a call written inside an assertion macro (assert!, assert_eq!, assert_ne!, \
              matches! and friends) is an unexpanded macro argument and yields no call edge, so a \
              #[test] whose only use of the changed symbol is inside one is not in this answer — \
-             bind the call to a local first to make it visible; #[tokio::test], #[async_std::test], \
-             #[rstest], #[wasm_bindgen_test] and #[test_log::test] are not recognised as tests; \
-             doc-tests have no node identity at all.",
+             bind the call to a local first to make it visible; a test attribute whose last path \
+             segment is neither `test` nor `*_test` nor `rstest` (#[proptest], #[quickcheck], \
+             #[test_case]) is not recognised as a test; doc-tests have no node identity at all.",
         )),
         _ => None,
     }

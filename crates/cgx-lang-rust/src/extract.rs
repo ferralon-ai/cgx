@@ -1198,9 +1198,13 @@ impl<'a> Builder<'a> {
             });
         }
         for attr in self.preceding_attributes(node) {
-            let kind = match attr.as_str() {
-                "test" => Some(EntrypointKind::Test),
+            // `attribute_content` appends an argument list, so `#[tokio::test]`
+            // and `#[tokio::test(flavor = "multi_thread")]` must reduce to the
+            // same path before either is classified.
+            let path = attr.split('(').next().unwrap_or(attr.as_str());
+            let kind = match path {
                 "tokio::main" | "async_std::main" => Some(EntrypointKind::AsyncMain),
+                _ if is_test_attribute(path) => Some(EntrypointKind::Test),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -1998,6 +2002,38 @@ fn is_panic_macro(name: &str) -> bool {
             | "debug_assert_eq"
             | "debug_assert_ne"
     )
+}
+
+/// Whether an attribute path marks its function as a test entrypoint.
+///
+/// Two shapes rather than a literal list, because the literal list was the
+/// defect: matching only `test` left every `#[tokio::test]` in an async
+/// codebase with no `EntrypointKind::Test`, which is not a documented
+/// approximation so much as a hole.
+///
+/// - **Last `::` segment exactly `test`** — `#[test]`, `#[tokio::test]`,
+///   `#[async_std::test]`, `#[test_log::test]`, `#[actix_rt::test]`,
+///   `#[googletest::test]`, and any future framework following the same
+///   convention, which is the dominant one.
+/// - **Last segment ending `_test`** — `#[wasm_bindgen_test]`, and a crate's
+///   own `#[integration_test]`.
+///
+/// `#[rstest]` fits neither and is the single literal: it is the standard
+/// parameterized-test attribute and its name is irregular.
+///
+/// The rule is anchored on the whole last segment, never on a substring,
+/// because a false positive is not free: `unused`
+/// (`cgx-query/src/engine.rs:291`) roots its reachability walk at *every*
+/// `entrypoint_kind`, so a mis-stamped function silently suppresses a genuine
+/// dead-code finding for itself and everything it reaches. `#[cfg(test)]` and
+/// `#[cfg_attr(test, ..)]` reduce to `cfg`/`cfg_attr` and are unaffected.
+///
+/// Deliberately left out, being neither named in the widening nor derivable
+/// from these shapes: `#[bench]` (not a test), and the irregular
+/// `#[proptest]` / `#[quickcheck]` / `#[test_case]`.
+fn is_test_attribute(path: &str) -> bool {
+    let last = path.rsplit("::").next().unwrap_or(path);
+    last == "test" || last.ends_with("_test") || last == "rstest"
 }
 
 fn is_attribute_proc_macro(attr: &str) -> bool {

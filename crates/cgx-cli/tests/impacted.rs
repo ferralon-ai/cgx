@@ -456,27 +456,19 @@ fn conflicting_or_missing_sides_are_usage_errors() {
     }
 }
 
-// --- known defect ------------------------------------------------------------
+// --- the clean-tree regression -----------------------------------------------
 
-/// **Escalation, dispatch 10.** A clean working tree must not be degenerate: the
-/// answer "no tests are impacted because nothing changed" is a real answer, not a
-/// vacuous one.
+/// A clean working tree must not be degenerate: "no tests are impacted because
+/// nothing changed" is a real answer, not a vacuous one.
 ///
-/// It currently exits 4. `cgx_diff::impacted::run` derives its changed-path set
-/// from `Repo::enumerate_workdir`, which walks every file under the repository
-/// root except `.git` — it consults no gitignore and no tracked-file set. cgx's
-/// own `.cgx/` store therefore lands in the working-tree manifest, is absent from
-/// the committed tree, and reads as four changed files that contribute no
-/// symbols; the degenerate predicate (`changed paths non-empty` + `no supported
-/// language in the changed set`) then fires on an unedited tree. Any untracked
-/// build output (`target/`, `node_modules/`) does the same, and on a real repo it
-/// is also a traversal-cost cliff.
-///
-/// The fix is in `cgx-diff/src/impacted.rs`, which this dispatch scopes out
-/// (`cgx-query` and `cgx-diff` are not to be modified). Ignored rather than
-/// deleted so the fix has a target that fails today and passes when it lands.
+/// This is the end-to-end guard on the changed-path narrowing in
+/// `cgx_diff::impacted::run`. The CLI writes its store to `.cgx/` inside the
+/// repository, and `Repo::enumerate_workdir` walks every file under the root
+/// except `.git` — no gitignore, no tracked-file set. Without the narrowing
+/// cgx's own store reads as four changed files that contribute no symbols, the
+/// vacuity predicate fires on an unedited tree, and the inner loop's default
+/// invocation exits 4 on every clean checkout.
 #[test]
-#[ignore = "escalated: cgx-diff's changed-path set counts untracked/ignored files (see doc comment)"]
 fn an_unchanged_working_tree_is_not_degenerate() {
     let (_tmp, repo) = repo();
     write(&repo, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");

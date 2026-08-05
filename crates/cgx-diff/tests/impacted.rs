@@ -402,6 +402,112 @@ fn a_changed_file_that_yields_no_symbols_is_carried_as_an_under_reason() {
     );
 }
 
+// --- the changed-path narrowing ----------------------------------------------
+
+/// `Repo::enumerate_workdir` walks every file under the repository root except
+/// `.git`, consulting no gitignore and no tracked-file set. cgx's own `.cgx/`
+/// store and any build output therefore land in the working-tree manifest and
+/// are absent from the committed tree. Left alone they read as changed files
+/// that contribute no symbols, which inflates `dirty_files`, fires
+/// `impacted-changed-file-unindexed` on every run, and — because the vacuity
+/// predicate is keyed on the changed *path* set — reports an unedited tree as
+/// degenerate.
+#[test]
+fn untracked_files_that_yield_no_symbols_are_not_changes() {
+    let repo = fixture_repo("go");
+    repo.write(".cgx/index.db", "not a source file\n");
+    repo.write("target/debug/build.log", "not a source file\n");
+
+    let (_store, a) = run_workdir(&repo);
+    assert_eq!(a.dirty_files, 0, "nothing tracked changed");
+    assert!(a.tests.tests.is_empty());
+    assert!(
+        !a.degenerate,
+        "a clean tree is a real answer, not a vacuous one"
+    );
+    assert!(
+        !codes(&a).contains(&"impacted-changed-file-unindexed"),
+        "cgx's own store is not a changed source file: {:?}",
+        codes(&a)
+    );
+}
+
+/// The narrowing must not buy the clean-tree answer by dropping real work: a
+/// genuine edit still reports its test with the same noise present.
+#[test]
+fn the_narrowing_leaves_a_real_edit_alone() {
+    let repo = fixture_repo("go");
+    repo.write(".cgx/index.db", "not a source file\n");
+    repo.write("target/debug/build.log", "not a source file\n");
+    edit(&repo, "dataflow.go", "c := b + 1", "c := b + 2");
+
+    let (_store, a) = run_workdir(&repo);
+    assert_eq!(a.dirty_files, 1, "exactly the edited file");
+    assert!(
+        reported(&a).contains(&"go_sample::TestPlain"),
+        "got {:?}",
+        reported(&a)
+    );
+    assert!(!a.degenerate);
+}
+
+/// A brand-new source file is untracked too, so it survives only on the second
+/// half of the predicate: an adapter claims it, so it contributes head symbols.
+#[test]
+fn a_new_untracked_source_file_is_still_a_change() {
+    let repo = fixture_repo("go");
+    repo.write(".cgx/index.db", "not a source file\n");
+    repo.write(
+        "fresh.go",
+        "package go_sample\n\nfunc Fresh(a int) int {\n\treturn a + 1\n}\n",
+    );
+
+    let (_store, a) = run_workdir(&repo);
+    assert_eq!(a.dirty_files, 1, "the new source file, and only it");
+    assert!(
+        a.changed
+            .iter()
+            .filter_map(|n| a.view.try_node(*n))
+            .any(|nd| nd.file == "fresh.go"),
+        "a new file's symbols must seed the walk"
+    );
+    assert!(!a.degenerate);
+}
+
+/// The narrowing is scoped to a working-directory head. Both sides of a
+/// ref-to-ref comparison are committed trees, so a file added in the head
+/// commit that yields no symbols is a real change and must still be disclosed.
+#[test]
+fn a_file_added_between_two_refs_still_carries_the_under_reason() {
+    let repo = common::TestRepo::init();
+    repo.write("src/lib.rs", "pub fn add() -> i32 { 1 }\n");
+    let base = repo.commit("base", "2020-01-01T00:00:00Z");
+    repo.write("NOTES.md", "hello\n");
+    let head = repo.commit("head", "2020-01-02T00:00:00Z");
+
+    let mut store = SqliteStore::open_in_memory().expect("store");
+    let a = run(
+        &mut store,
+        Request {
+            repo_root: &repo.path,
+            sides: Sides::Refs {
+                base,
+                head,
+                merge_base: true,
+            },
+            walker: PathWalker::default(),
+        },
+    )
+    .expect("impacted-tests");
+
+    assert_eq!(a.dirty_files, 1);
+    assert!(
+        codes(&a).contains(&"impacted-changed-file-unindexed"),
+        "got {:?}",
+        codes(&a)
+    );
+}
+
 // --- determinism at the orchestration level ----------------------------------
 
 #[test]

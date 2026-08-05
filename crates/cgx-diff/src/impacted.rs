@@ -156,6 +156,29 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
             files_with_symbols.insert(node.file.as_str());
         }
     }
+    // A working-directory manifest counts every file under the repository root
+    // except `.git` — `Repo::enumerate_workdir` consults no gitignore and no
+    // tracked-file set. cgx's own `.cgx/` store and any untracked build output
+    // (`target/`, `node_modules/`) therefore read as changed on an unedited
+    // tree, which inflates `dirty_files`, fires `impacted-changed-file-unindexed`
+    // on every run, and — because the vacuity predicate is keyed on the changed
+    // *path* set — reports a clean tree as degenerate.
+    //
+    // A path is a real change only if the base side also carries it (so it is
+    // tracked) or a head symbol is defined in it (so an adapter claims it, which
+    // keeps a genuinely new source file). The narrowing applies only where the
+    // noise is: both sides of a ref-to-ref comparison are committed trees, and
+    // there a newly added file that yields no symbols is a real change whose
+    // `under` reason must still fire.
+    let changed_paths: BTreeSet<String> = if req.sides.head_is_workdir() {
+        changed_paths
+            .into_iter()
+            .filter(|p| base.manifest.contains_key(p) || files_with_symbols.contains(p.as_str()))
+            .collect()
+    } else {
+        changed_paths
+    };
+
     let unindexed_changed_files = changed_paths
         .iter()
         .filter(|p| !files_with_symbols.contains(p.as_str()))
@@ -221,6 +244,13 @@ impl Sides {
             // The committed HEAD tree is the branch point by construction.
             Sides::Workdir => true,
         }
+    }
+
+    /// Whether the head side is the working directory rather than a committed
+    /// tree. A workdir manifest is unfiltered, so its changed-path set needs
+    /// narrowing; a tree manifest is already the tracked set.
+    fn head_is_workdir(&self) -> bool {
+        matches!(self, Sides::RefToWorkdir { .. } | Sides::Workdir)
     }
 }
 

@@ -167,6 +167,18 @@ fn call_tool(repo: &Path, name: &str, mut args: Value) -> Value {
         .expect("structuredContent")
 }
 
+/// The `fqn` fields of a `search`/`symbols` result's `results` array (those two
+/// emit `fqn` where the graph tools emit `name`).
+fn result_fqns(structured: &Value) -> Vec<String> {
+    structured
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array")
+        .iter()
+        .map(|r| r.get("fqn").and_then(Value::as_str).unwrap().to_string())
+        .collect()
+}
+
 /// The `name` fields of a tool result's `results` array.
 fn result_names(structured: &Value, key: &str) -> Vec<String> {
     structured
@@ -1077,6 +1089,106 @@ fn no_response_reads_dirty_false_beside_stale_true() {
             }
         }
     }
+}
+
+/// The overlay manifest is a list of lines, one per differing path, and a git path
+/// may itself contain a newline. Joining those lines with `\n` before hashing is
+/// therefore not injective: deleting `a.rs` **and** `b.rs` serializes to exactly
+/// the bytes that deleting the single file named `a.rs\n- b.rs` does. Both trees
+/// then share one `graph_version` while the graphs — and the answers — are
+/// disjoint, which is the wrong-cache-hit defect ADR-06's key exists to prevent,
+/// reachable by a filename in a repo cgx does not own.
+#[test]
+fn a_newline_in_a_path_does_not_collide_two_working_trees_onto_one_graph_version() {
+    let (_t, repo) = init_repo();
+    let weird = repo.join("a.rs\n- b.rs");
+    std::fs::write(repo.join("a.rs"), "pub fn from_a() -> i32 { 1 }\n").unwrap();
+    std::fs::write(repo.join("b.rs"), "pub fn from_b() -> i32 { 2 }\n").unwrap();
+    std::fs::write(&weird, "pub fn from_weird() -> i32 { 3 }\n").unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "weird",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    assert!(
+        weird.exists(),
+        "fixture assumption: this filesystem accepts a newline in a filename"
+    );
+
+    // State A: the two ordinary files are gone. Manifest lines ["- a.rs", "- b.rs"].
+    std::fs::remove_file(repo.join("a.rs")).unwrap();
+    std::fs::remove_file(repo.join("b.rs")).unwrap();
+    let a = call_tool(
+        &repo,
+        "search",
+        json!({ "pattern": "from_", "include_dirty": true }),
+    );
+
+    // State B: only the newline-named file is gone. One manifest line, whose bytes
+    // are exactly state A's two lines joined by `\n`.
+    let (_t2, repo_b) = init_repo();
+    std::fs::write(repo_b.join("a.rs"), "pub fn from_a() -> i32 { 1 }\n").unwrap();
+    std::fs::write(repo_b.join("b.rs"), "pub fn from_b() -> i32 { 2 }\n").unwrap();
+    std::fs::write(
+        repo_b.join("a.rs\n- b.rs"),
+        "pub fn from_weird() -> i32 { 3 }\n",
+    )
+    .unwrap();
+    run_git(&repo_b, &["add", "-A"]);
+    run_git(
+        &repo_b,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "weird",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    std::fs::remove_file(repo_b.join("a.rs\n- b.rs")).unwrap();
+    let b = call_tool(
+        &repo_b,
+        "search",
+        json!({ "pattern": "from_", "include_dirty": true }),
+    );
+
+    // Same committed tree, so a shared key would be a wrong hit rather than a
+    // harmless collision — and the answers really are disjoint.
+    assert_eq!(
+        a["freshness"]["head_tree"], b["freshness"]["head_tree"],
+        "fixture assumption: both repos committed the identical tree"
+    );
+    let names_a = result_fqns(&a);
+    let names_b = result_fqns(&b);
+    let has = |v: &[String], needle: &str| v.iter().any(|n| n.contains(needle));
+    assert!(
+        has(&names_a, "from_weird") && !has(&names_a, "from_a"),
+        "state A answers over the newline-named file only: {names_a:?}"
+    );
+    assert!(
+        has(&names_b, "from_a") && !has(&names_b, "from_weird"),
+        "state B answers over the two ordinary files only: {names_b:?}"
+    );
+
+    assert_ne!(
+        a["graph_version"], b["graph_version"],
+        "two working trees with disjoint answers must not share a graph_version: {} vs {}",
+        a["graph_version"], b["graph_version"]
+    );
 }
 
 /// Cross-surface parity: the same working-tree state under the same

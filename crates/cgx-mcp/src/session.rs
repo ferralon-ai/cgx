@@ -34,7 +34,7 @@
 //! different answer.
 
 use cgx_index::{
-    compute_blob_oid, default_registry, index_path, index_workdir, IndexOpts, Repo, SourceFile,
+    default_registry, index_path, index_workdir, manifest_digest, IndexOpts, Repo, SourceFile,
 };
 use cgx_query::{FreshnessEnvelope, GraphView};
 use cgx_store::{FactStore, SqliteStore};
@@ -226,10 +226,12 @@ fn committed_oids(repo: &Repo) -> Result<BTreeMap<String, String>, ToolError> {
 /// Every way the working tree differs from the committed tree, one deterministic
 /// line per **path**, sorted. This is the overlay's content key (ADR-06): two
 /// working trees that produce the same lines produced the same graph from the same
-/// base, and two that produce different lines must not share a `graph_version`.
+/// base, and two that produce different lines must not share a `graph_version` —
+/// which holds only because [`overlay_digest`] hashes the lines injectively, not
+/// because sorting and joining them would be.
 ///
-/// Two line shapes, matching `cgx_index`'s own `<oid> <path>` manifest form for
-/// the one that names content:
+/// Three line shapes, matching `cgx_index`'s own `<oid> <path>` manifest form for
+/// the two that name content:
 ///
 /// - `<blob_oid> <path>` — a path on disk whose content-addressed OID is not what
 ///   the committed tree records (edited), or that the committed tree does not
@@ -264,13 +266,16 @@ fn overlay_difference(committed: &BTreeMap<String, String>, working: &[SourceFil
     out
 }
 
-/// A deterministic digest of the sorted overlay difference (ADR-06): the git blob
-/// OID of the newline-joined line list, truncated for compactness. Stable across
-/// runs and across `include_dirty` re-evaluations of the same edit.
+/// A deterministic digest of the sorted overlay difference (ADR-06), truncated for
+/// compactness. Stable across runs and across `include_dirty` re-evaluations of the
+/// same edit.
+///
+/// The hash itself is [`cgx_index::manifest_digest`], the single implementation of
+/// the injective-join invariant this key depends on — a path may contain a newline,
+/// so a `\n`-joined manifest would let two different working trees share one
+/// `graph_version` (see that function).
 fn overlay_digest(overlay: &[String]) -> String {
-    let manifest = overlay.join("\n");
-    let oid = compute_blob_oid(manifest.as_bytes());
-    oid.chars().take(12).collect()
+    manifest_digest(overlay).chars().take(12).collect()
 }
 
 /// The short form of a tree/graph key OID, matching the docs/07 examples

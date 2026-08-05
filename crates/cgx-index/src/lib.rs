@@ -149,14 +149,81 @@ pub fn index_workdir(
 }
 
 /// A deterministic content-addressed Layer-2 key for a set of working-directory
-/// sources: `"workdir:"` followed by the blob OID of the sorted
-/// `<blob_oid> <path>\n` manifest. Stable across runs, distinct per content.
+/// sources: `"workdir:"` followed by the [`manifest_digest`] of the sorted
+/// `<blob_oid> <path>` lines. Stable across runs, distinct per content.
 fn workdir_key(sources: &[SourceFile]) -> String {
     let mut lines: Vec<String> = sources
         .iter()
         .map(|s| format!("{} {}", s.blob_oid, s.rel_path))
         .collect();
     lines.sort();
-    let manifest = lines.join("\n");
-    format!("workdir:{}", compute_blob_oid(manifest.as_bytes()))
+    format!("workdir:{}", manifest_digest(&lines))
+}
+
+/// The deterministic digest of a manifest of path-bearing lines: the git blob OID
+/// of the lines joined by `\0`.
+///
+/// **The separator is `\0`, and that is load-bearing rather than stylistic.** A
+/// git path may contain a newline, and both [`Repo::tree_blob_oids`] and
+/// [`Repo::enumerate_workdir`] pass one through verbatim, so joining with `\n` is
+/// **not injective**: `["- a.rs", "- b.rs"]` and the single line `"- a.rs\n- b.rs"`
+/// produce the same bytes and therefore the same digest, while describing two
+/// different working trees. A `\0` can appear in neither a path (no filesystem git
+/// supports permits it) nor a blob OID, so the joined form can always be decided
+/// back into its lines and two different line lists can never hash alike.
+///
+/// This is the one implementation of that invariant. Both content keys derived
+/// from a sorted manifest — the `workdir:` graph key here and the MCP overlay
+/// digest that keys `graph_version` — must go through it: the lines are only ever
+/// hashed, never parsed back, so nothing else about them constrains the separator.
+pub fn manifest_digest(lines: &[String]) -> String {
+    compute_blob_oid(lines.join("\0").as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(blob_oid: &str, rel_path: &str) -> SourceFile {
+        SourceFile {
+            blob_oid: blob_oid.to_string(),
+            rel_path: rel_path.to_string(),
+            content: Vec::new(),
+        }
+    }
+
+    /// A path containing the manifest separator must not let two different
+    /// working sets share one content key. With a `\n` join these two collide
+    /// byte-for-byte; the cache built on top of the key then serves one set's
+    /// answer for the other's question.
+    #[test]
+    fn a_path_containing_the_separator_does_not_collide_two_working_sets() {
+        let two_files = [
+            source("1111111111111111111111111111111111111111", "a.rs"),
+            source("2222222222222222222222222222222222222222", "b.rs"),
+        ];
+        // One file whose *name* reproduces the two-line manifest exactly:
+        // "1111… a.rs" + separator + "2222… b.rs".
+        let one_weird_file = [source(
+            "1111111111111111111111111111111111111111",
+            "a.rs\n2222222222222222222222222222222222222222 b.rs",
+        )];
+
+        assert_ne!(
+            workdir_key(&two_files),
+            workdir_key(&one_weird_file),
+            "two distinct working sets must not share a workdir key"
+        );
+    }
+
+    /// The digest is a function of the line list, not of the joined bytes: any two
+    /// distinct lists differ, including ones that only differ in where the line
+    /// boundaries fall.
+    #[test]
+    fn manifest_digest_is_injective_over_line_boundaries() {
+        let split = ["- a.rs".to_string(), "- b.rs".to_string()];
+        let joined = ["- a.rs\n- b.rs".to_string()];
+        assert_ne!(manifest_digest(&split), manifest_digest(&joined));
+        assert_eq!(manifest_digest(&split), manifest_digest(&split.clone()));
+    }
 }

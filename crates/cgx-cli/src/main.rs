@@ -20,14 +20,15 @@ use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
     callees, callers, contract, entrypoint_roots, neighborhood, paths as query_paths, rank_symbols,
-    reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, GraphView,
-    PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
+    reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter,
+    FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
+use cgx_cli::freshness;
 use cgx_cli::output::{
     render, render_explanation, render_search, render_symbols, Format, ResultSet, TableData,
 };
@@ -1241,8 +1242,20 @@ fn run_explain(
     let explanation = cgx_query::explain(&view, anchor)
         .ok_or_else(|| CliError::usage(format!("no symbol matched `{symbol}`")))?;
 
-    print!("{}", render_explanation(format, &explanation));
+    let freshness = freshness::envelope(Some(&repo_root), None);
+    print!("{}", render_explanation(format, &explanation, &freshness));
     Ok(())
+}
+
+/// The freshness envelope for `search`/`symbols`, whose `--format json` arm is a
+/// bare JSON array — a shipped output contract with no slot to put an envelope in.
+/// Computing one for that arm would run a full working-tree walk and discard the
+/// result, so the format decides whether the walk happens at all.
+fn human_only_freshness(format: Format, repo_root: &Path) -> FreshnessEnvelope {
+    match format {
+        Format::Json => FreshnessEnvelope::uninspected(),
+        _ => freshness::envelope(Some(repo_root), None),
+    }
 }
 
 /// `cgx search <pattern>` / `cgx search --all` (Since: v0.2; `--all` since v0.3): a
@@ -1301,7 +1314,10 @@ fn run_search(
     let hits =
         search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
 
-    print!("{}", render_search(format, &hits, limit));
+    // `--format json` is a bare array with no envelope slot (see `render_search`),
+    // so the walk would be paid for and thrown away.
+    let freshness = human_only_freshness(format, &repo_root);
+    print!("{}", render_search(format, &hits, limit, &freshness));
     Ok(())
 }
 
@@ -1337,7 +1353,11 @@ fn run_symbols(
 
     // `--top N` is sugar for `--limit N`; when both are given `--top` wins.
     let effective_limit = top.unwrap_or(limit);
-    print!("{}", render_symbols(format, &ranks, effective_limit));
+    let freshness = human_only_freshness(format, &repo_root);
+    print!(
+        "{}",
+        render_symbols(format, &ranks, effective_limit, &freshness)
+    );
     Ok(())
 }
 
@@ -1374,9 +1394,34 @@ fn emit(
         },
     );
 
+    // Computed here rather than threaded down from `prepare_view`: every threading
+    // shape would change a signature (`emit`'s, or `prepare_view`'s) that two
+    // sibling cycles are adding call sites to, and `args` already carries
+    // everything the envelope needs. A new subcommand routed through `emit` gets
+    // the envelope with no work on its author's part.
+    //
+    // The path-graph emitters render no prose (D5), so computing it for them would
+    // be a full working-tree walk whose result is discarded — seconds, on a large
+    // checkout. The format is already known here, so skip it.
+    let freshness = if args.format.is_path_graph() {
+        FreshnessEnvelope::uninspected()
+    } else {
+        freshness::envelope(
+            resolve_repo(args.repo.clone()).ok().as_deref(),
+            args.at.as_deref(),
+        )
+    };
+
     print!(
         "{}",
-        render(subcommand, args.format, &results, outcome.vacuous, &contract)
+        render(
+            subcommand,
+            args.format,
+            &results,
+            outcome.vacuous,
+            &contract,
+            &freshness,
+        )
     );
 
     if let Some(w) = &outcome.warning {

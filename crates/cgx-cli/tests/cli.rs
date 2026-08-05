@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use assert_cmd::cargo::cargo_bin;
+use serde_json::{json, Value};
 
 /// A minimal two-file Rust crate with a known, hand-auditable call graph:
 ///
@@ -101,6 +102,17 @@ fn run_cgx(repo: &Path, args: &[&str]) -> (String, i32) {
 fn index(repo: &Path) {
     let (_out, code) = run_cgx(repo, &["index"]);
     assert_eq!(code, 0, "index should succeed");
+}
+
+/// Count the *answer* rows in a human answer, dropping the trailing metadata
+/// lines every answer carries: the `… (N more)` truncation footer, the A3/A4
+/// approximation line, and the index-freshness line.
+fn answer_rows(out: &str) -> usize {
+    out.lines()
+        .filter(|l| {
+            !l.starts_with('…') && !l.starts_with("approximation:") && !l.starts_with("freshness:")
+        })
+        .count()
 }
 
 #[test]
@@ -1164,7 +1176,7 @@ fn search_limit_truncates_with_footer() {
     // Three `search_target_*` functions exist; --limit 2 shows two + a footer.
     let (out, code) = run_cgx(&repo, &["search", "search_target", "--kind", "function", "--limit", "2"]);
     assert_eq!(code, 0);
-    let body_lines = out.lines().filter(|l| !l.starts_with('…')).count();
+    let body_lines = answer_rows(&out);
     assert_eq!(body_lines, 2, "exactly --limit rows shown: {out}");
     assert!(
         out.contains("(1 more — raise --limit)"),
@@ -1180,7 +1192,7 @@ fn search_limit_zero_is_unlimited() {
     assert_eq!(code, 0);
     assert!(!out.contains("more — raise"), "no footer when unlimited: {out}");
     assert_eq!(
-        out.lines().count(),
+        answer_rows(&out),
         3,
         "all three functions shown with --limit 0: {out}"
     );
@@ -1503,7 +1515,7 @@ fn symbols_top_sugar_caps_rows() {
     index(&repo);
     let (out, code) = run_cgx(&repo, &["symbols", "--top", "1"]);
     assert_eq!(code, 0);
-    let body = out.lines().filter(|l| !l.starts_with('…')).count();
+    let body = answer_rows(&out);
     assert_eq!(body, 1, "--top 1 shows exactly one ranked row: {out}");
     assert!(out.contains("more)"), "footer reports hidden rows: {out}");
 }
@@ -1539,4 +1551,283 @@ fn symbols_output_is_byte_identical_across_runs() {
     let (ja, _) = run_cgx(&repo, &["symbols", "--format", "json"]);
     let (jb, _) = run_cgx(&repo, &["symbols", "--format", "json"]);
     assert_eq!(ja, jb, "two json symbols runs must be byte-identical");
+}
+
+// --- index-freshness envelope (C3, C5) --------------------------------------
+
+/// The freshness object from a `--format json` answer.
+fn freshness_of(out: &str) -> Value {
+    let v: Value = serde_json::from_str(out).expect("json answer");
+    v.get("freshness")
+        .cloned()
+        .unwrap_or_else(|| panic!("no freshness envelope in: {out}"))
+}
+
+/// C3: every answer format that is an *answer document* carries the envelope.
+/// Table-driven over the (subcommand × format) matrix so a format that stops
+/// carrying it fails by name.
+#[test]
+fn every_answer_format_carries_the_freshness_envelope() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+
+    // Human: the trailing envelope line, in the same shape as the contract line.
+    for args in [
+        vec!["callers", "beta"],
+        vec!["callees", "main"],
+        vec!["unused"],
+        vec!["paths", "main", "beta"],
+        vec!["reaches", "main", "beta"],
+        vec!["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
+        vec!["explain", "main"],
+        vec!["search", "beta"],
+        vec!["symbols"],
+    ] {
+        let (out, code) = run_cgx(&repo, &args);
+        assert_eq!(code, 0, "{args:?} exited {code}: {out}");
+        let last = out.lines().last().unwrap_or("");
+        assert!(
+            last.starts_with("freshness: "),
+            "human `{args:?}` must end with the freshness line, got: {out}"
+        );
+        assert!(
+            last.contains("indexed tree"),
+            "the human line names the tree: {last}"
+        );
+    }
+
+    // Json: a top-level `freshness` object on every answer document.
+    for args in [
+        vec!["callers", "beta"],
+        vec!["callees", "main"],
+        vec!["unused"],
+        vec!["paths", "main", "beta"],
+        vec!["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
+        vec!["explain", "main"],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "json"]);
+        let (out, code) = run_cgx(&repo, &argv);
+        assert_eq!(code, 0, "{argv:?} exited {code}: {out}");
+        let f = freshness_of(&out);
+        assert!(f["indexed_tree"].is_string(), "{args:?}: {f}");
+        assert_eq!(f["matches_head"], json!(true), "{args:?}: {f}");
+        assert_eq!(f["dirty_files"], json!(0), "{args:?}: {f}");
+        assert_eq!(f["stale"], json!(false), "{args:?}: {f}");
+    }
+
+    // Sarif: a `cgx/index-freshness` note carrying the structured envelope.
+    for args in [vec!["callers", "beta"], vec!["unused"]] {
+        let mut argv = args.clone();
+        argv.extend(["--format", "sarif"]);
+        let (out, code) = run_cgx(&repo, &argv);
+        assert_eq!(code, 0, "{argv:?} exited {code}: {out}");
+        let doc: Value = serde_json::from_str(&out).expect("sarif json");
+        let note = doc["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["ruleId"] == json!("cgx/index-freshness"))
+            .unwrap_or_else(|| panic!("no freshness note for {args:?}: {out}"));
+        assert_eq!(note["level"], json!("note"));
+        assert!(note["message"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("freshness: "));
+        assert_eq!(note["properties"]["stale"], json!(false));
+        // And the rule is declared, not just referenced.
+        let rules = doc["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["id"] == json!("cgx/index-freshness")));
+    }
+}
+
+/// The two CLI answer surfaces the envelope deliberately does **not** reach, so
+/// the gap is asserted rather than discovered. `search`/`symbols` `--format json`
+/// emit a bare JSON *array*; there is no envelope slot without changing that
+/// shipped output contract, which is out of scope here. Their human form does
+/// carry it (asserted above).
+#[test]
+fn search_and_symbols_json_remain_bare_arrays() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    for args in [
+        vec!["search", "beta", "--format", "json"],
+        vec!["symbols", "--format", "json"],
+    ] {
+        let (out, code) = run_cgx(&repo, &args);
+        assert_eq!(code, 0);
+        let v: Value = serde_json::from_str(&out).expect("json");
+        assert!(
+            v.is_array(),
+            "{args:?} is documented as a bare array; changing it is a separate, \
+             breaking decision: {out}"
+        );
+    }
+}
+
+/// The path-graph emitters stay contract-free and envelope-free by design: they
+/// are diagram *source*, not answer documents.
+#[test]
+fn path_graph_formats_carry_no_freshness_prose() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    for fmt in ["dot", "mermaid", "d2"] {
+        let (out, code) = run_cgx(&repo, &["paths", "main", "beta", "--format", fmt]);
+        assert_eq!(code, 0, "{fmt}: {out}");
+        assert!(
+            !out.contains("freshness"),
+            "{fmt} is graph source and carries no prose: {out}"
+        );
+    }
+}
+
+/// C5: repeated runs on an unchanged index are byte-identical *with the envelope
+/// present* — including on a dirty tree, where a clock-derived field would show.
+#[test]
+fn query_output_with_freshness_is_byte_identical_across_two_runs() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+
+    for args in [
+        vec!["callers", "beta", "--format", "json"],
+        vec!["callers", "beta", "--format", "sarif"],
+        vec!["callers", "beta"],
+        vec!["search", "beta"],
+        vec!["symbols"],
+        vec!["explain", "main", "--format", "json"],
+    ] {
+        let (a, ca) = run_cgx(&repo, &args);
+        let (b, cb) = run_cgx(&repo, &args);
+        assert_eq!((ca, cb), (0, 0), "{args:?}");
+        assert!(a.contains("freshness"), "{args:?} carries the envelope: {a}");
+        assert_eq!(a, b, "{args:?} must be byte-identical across runs");
+    }
+
+    // Dirty the tree and repeat: the envelope's values change, but two runs of the
+    // same query still agree exactly.
+    std::fs::write(repo.join("src/helper.rs"), "pub fn beta() { let _ = 2; }\n").unwrap();
+    let (a, _) = run_cgx(&repo, &["callers", "beta", "--format", "json", "--no-auto-index"]);
+    let (b, _) = run_cgx(&repo, &["callers", "beta", "--format", "json", "--no-auto-index"]);
+    assert_eq!(a, b, "a dirty tree must not make output time-dependent");
+    assert_eq!(freshness_of(&a)["dirty_files"], json!(1));
+}
+
+/// The envelope's schema carries no time-shaped key (D1): no timestamp, anywhere.
+#[test]
+fn the_cli_freshness_envelope_carries_no_timestamp() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json"]);
+    let f = freshness_of(&out);
+    let keys: Vec<&str> = f.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "dirty_files",
+            "head_tree",
+            "indexed_tree",
+            "matches_head",
+            "stale"
+        ]
+    );
+}
+
+/// The divergence cases, end to end through the binary: a clean tree, a dirty
+/// tree, and an index left behind HEAD.
+#[test]
+fn the_envelope_reports_dirty_and_behind_head_divergence() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json"]);
+    let f = freshness_of(&out);
+    assert_eq!(f["dirty_files"], json!(0));
+    assert_eq!(f["matches_head"], json!(true));
+    assert_eq!(f["stale"], json!(false));
+    let indexed_at_head = f["indexed_tree"].clone();
+
+    // A working-tree edit: still at HEAD's tree, but no longer clean.
+    std::fs::write(repo.join("src/helper.rs"), "pub fn beta() { let _ = 3; }\n").unwrap();
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json", "--no-auto-index"]);
+    let f = freshness_of(&out);
+    assert_eq!(f["dirty_files"], json!(1));
+    assert_eq!(f["matches_head"], json!(true));
+    assert_eq!(f["stale"], json!(true));
+
+    // An untracked addition counts too.
+    std::fs::write(repo.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json", "--no-auto-index"]);
+    assert_eq!(freshness_of(&out)["dirty_files"], json!(2));
+
+    // Commit: HEAD moves, the index does not (--no-auto-index), so the answer is
+    // now behind HEAD *and* the divergence is measured from the indexed tree.
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-02T00:00:00Z",
+        ],
+    );
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json", "--no-auto-index"]);
+    let f = freshness_of(&out);
+    assert_eq!(f["indexed_tree"], indexed_at_head, "the index did not move");
+    assert_eq!(f["matches_head"], json!(false));
+    assert_ne!(f["head_tree"], f["indexed_tree"]);
+    assert_eq!(f["dirty_files"], json!(2), "still 2 files from the old tree");
+    assert_eq!(f["stale"], json!(true));
+
+    // Re-index: back to current, and the human line says so in one glance.
+    index(&repo);
+    let (out, _) = run_cgx(&repo, &["unused"]);
+    assert!(
+        out.lines().last().unwrap().starts_with("freshness: current |"),
+        "{out}"
+    );
+}
+
+/// `--at <ref>` pins the answer to another commit's tree; the envelope names that
+/// tree, reports it as not-HEAD, and measures divergence from it.
+#[test]
+fn an_at_ref_query_reports_the_pinned_tree() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let (out, _) = run_cgx(&repo, &["unused", "--format", "json"]);
+    let first_tree = freshness_of(&out)["indexed_tree"].clone();
+
+    std::fs::write(repo.join("src/helper.rs"), "pub fn beta() { let _ = 4; }\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-02T00:00:00Z",
+        ],
+    );
+
+    let (out, code) = run_cgx(&repo, &["unused", "--format", "json", "--at", "HEAD~1"]);
+    assert_eq!(code, 0, "{out}");
+    let f = freshness_of(&out);
+    assert_eq!(f["indexed_tree"], first_tree, "pinned to HEAD~1's tree: {f}");
+    assert_eq!(f["matches_head"], json!(false));
+    assert_eq!(
+        f["dirty_files"],
+        json!(1),
+        "the working tree differs from the pinned tree by one file: {f}"
+    );
+    assert_eq!(f["stale"], json!(true));
 }

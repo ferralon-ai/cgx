@@ -562,9 +562,115 @@ fn node_ids(g: &GraphData) -> std::collections::HashMap<&str, String> {
         .collect()
 }
 
-/// Escape a string for a Graphviz / D2 double-quoted label.
-fn quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// Escape a string for a **D2** double-quoted label (`n0: "…"`).
+///
+/// d2 is a plain backslash-escaping language: `\\` decodes to `\`, `\"` to `"`, and
+/// nothing else is decoded. In particular — and this is the whole reason it does not
+/// share an escaper with [`dot_label`] — **d2 does not decode HTML character
+/// references.** Measured against d2 0.7.1 by reading the label back out of the
+/// emitted SVG: a label written `A&quot;B` displays `A&quot;B`, where Graphviz
+/// displays `A"B`. So `&` needs no escape here, and escaping it would corrupt every
+/// FQN that contains one.
+///
+/// Injectivity: `\` is the single introducer and is escaped; every escape is exactly
+/// two characters and no escape body contains a `\`. So the only backslashes in the
+/// output are ones this function wrote, and `decode(encode(s)) == s` for every `s`.
+///
+/// These are the bytes `quote()` emitted before DOT and D2 were split apart, and
+/// `d2_quote_is_byte_identical_to_the_shared_escaper_it_replaced` pins that.
+fn d2_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a string for a **Graphviz DOT** double-quoted label (`label="…"`).
+///
+/// # Two introducers, both escaped
+///
+/// DOT is a backslash-escaping language *and* Graphviz decodes HTML character
+/// references in ordinary labels. So this encoding has **two** introducers, `\` and
+/// `&`, and both are escaped:
+///
+/// | char | escape  |
+/// |------|---------|
+/// | `\`  | `\\`    |
+/// | `"`  | `\"`    |
+/// | `&`  | `&amp;` |
+///
+/// Injectivity follows from the escape bodies being disjoint in their introducers —
+/// `\\` and `\"` contain no `&`, and `&amp;` contains no `\`. Hence:
+///
+/// 1. the only `\` in the output are ones this function wrote, each the first
+///    character of a two-character escape whose second character is never `\`;
+/// 2. the only `&` in the output are ones this function wrote, each opening
+///    `&amp;`, which Graphviz decodes to exactly one `&` and does not rescan
+///    (`&amp;quot;` decodes to `&quot;`, not to `"`);
+/// 3. therefore no escape can be split or merged by the other introducer's escapes,
+///    the left-to-right decode is unambiguous, and `decode(encode(s)) == s` for
+///    **every** `s` — by construction, not because the table is long enough.
+///
+/// The table is not the correctness argument. A character missing from it misrenders
+/// *visibly* rather than silently decoding to different text; that weaker property is
+/// renderability, and it is asserted separately.
+///
+/// # The decoder, measured from Graphviz 15.1.0
+///
+/// Four stages run between the bytes we emit and the glyphs displayed, and their
+/// *order* is what rules out a one-introducer encoding. Every claim here was read
+/// back out of `dot -Tsvg`:
+///
+/// 1. **DOT lexer**, on the quoted string: `\"` → `"`, `\` + newline is a line
+///    continuation, every other backslash passes through verbatim. (`label="\\"`
+///    parses and yields `\`; `label="\"` is a syntax error, because that `\` ate the
+///    closing quote.)
+/// 2. **object substitution**: `\N` `\G` `\E` `\T` `\H` `\L`. The one stage where the
+///    node and edge contexts genuinely differ — in a node label `\N` is the node's
+///    name and `\T` is left alone; in an edge label `\T` is the tail and `\N` is left
+///    alone. `\\` is skipped as a pair here, so escaping `\` collapses the two
+///    contexts into one, which is why [`render_dot`] can use one escaper for both.
+/// 3. **entity decode**: `&name;` against Graphviz's own table (`&quot;` `&amp;`
+///    `&lt;` `&gt;` `&nbsp;` … but *not* `&bsol;` or `&apos;`, which are not in it),
+///    plus numeric `&#34;` / `&#x26;`. Case-sensitive, the `;` is required, and it is
+///    a single pass.
+/// 4. **escape and line processing**: `\\` → `\`, `\n` `\l` `\r` → a line break, and
+///    any other `\X` → `X`.
+///
+/// **Stage 3 running before stage 4 is the subtlety, and it forces two introducers.**
+/// A character reference that decodes to a backslash is handed to stage 4 as a live
+/// escape: `label="&#92;n"` renders as a *line break*, not as `\n`. So `\` cannot be
+/// encoded as an entity — the escape would be eaten by a later stage. And in the
+/// other direction `\&` cannot neutralise an `&`, because stage 3 has already run by
+/// the time stage 4 would strip the backslash. Neither introducer can encode the
+/// other; each has to escape itself. (This is the Graphviz analogue of Mermaid's
+/// unusable numeric references — see [`mermaid_label`] — with the stages reversed.)
+///
+/// Left alone deliberately, all measured literal inside a quoted label: `<` `>` `|`
+/// `{` `}` `#` `;` and a backtick. `<` only opens an HTML-like label when the
+/// attribute value is *unquoted* (`label=<…>`), which this emitter never writes.
+///
+/// # Scope
+///
+/// A label containing a line terminator is outside the encoding, exactly as for
+/// Mermaid and D2: all three emitters are line-oriented and no shipped adapter
+/// produces one. Injectivity is unaffected; renderability is not claimed for it.
+fn dot_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '&' => out.push_str("&amp;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The named character reference the Mermaid pipeline decodes back to `c`, or
@@ -734,9 +840,9 @@ fn directive_line_matches(line: &str, keyword: &str) -> bool {
 /// Escape a string for a Mermaid **node** label (`n0["…"]`).
 ///
 /// Mermaid is not a backslash-escaping language: inside `["…"]` its lexer closes the
-/// string at the first `"` and there is no `\"`. So [`quote`], which is a
-/// Graphviz/D2 escaper, must not be used here — `\"` produces source that does not
-/// parse at all. See [`mermaid_label`] for the encoding and its injectivity
+/// string at the first `"` and there is no `\"`. So [`dot_label`] and [`d2_quote`],
+/// which are backslash escapers, must not be used here — `\"` produces source that
+/// does not parse at all. See [`mermaid_label`] for the encoding and its injectivity
 /// argument.
 fn mermaid_node_label(s: &str) -> String {
     mermaid_label(s, mermaid_entity)
@@ -761,7 +867,7 @@ fn render_dot(g: GraphData) -> String {
         out.push_str(&format!(
             "  {} [label=\"{}\"];\n",
             ids[n.as_str()],
-            quote(n)
+            dot_label(n)
         ));
     }
     for (src, dst, label) in &g.edges {
@@ -772,7 +878,7 @@ fn render_dot(g: GraphData) -> String {
                 "  {} -> {} [label=\"{}\"];\n",
                 ids[src.as_str()],
                 ids[dst.as_str()],
-                quote(label)
+                dot_label(label)
             ));
         }
     }
@@ -812,7 +918,7 @@ fn render_d2(g: GraphData) -> String {
     let ids = node_ids(&g);
     let mut out = String::new();
     for n in &g.nodes {
-        out.push_str(&format!("{}: \"{}\"\n", ids[n.as_str()], quote(n)));
+        out.push_str(&format!("{}: \"{}\"\n", ids[n.as_str()], d2_quote(n)));
     }
     for (src, dst, label) in &g.edges {
         if label.is_empty() {
@@ -822,7 +928,7 @@ fn render_d2(g: GraphData) -> String {
                 "{} -> {}: \"{}\"\n",
                 ids[src.as_str()],
                 ids[dst.as_str()],
-                quote(label)
+                d2_quote(label)
             ));
         }
     }
@@ -1815,12 +1921,396 @@ mod tests {
         );
     }
 
-    /// `quote()` stays the Graphviz/D2 escaper it always was — the Mermaid fix
-    /// must not have leaked into the two formats a real compiler already accepts.
+    /// D2 keeps the exact bytes the shared `quote()` emitted before the split.
+    ///
+    /// Splitting one escaper into two is only safe for D2 if D2's output does not
+    /// move, so this pins it against a literal restatement of the pre-split
+    /// implementation rather than against a hand-written table — over the same
+    /// generated corpus the round-trip property uses. d2 0.7.1 does not decode
+    /// character references (`A&quot;B` displays `A&quot;B`), so `&` must **not** be
+    /// escaped here even though [`dot_label`] has to escape it.
     #[test]
-    fn quote_remains_the_backslash_escaper_for_dot_and_d2() {
-        assert_eq!(quote("a\"b"), "a\\\"b");
-        assert_eq!(quote("a\\b"), "a\\\\b");
-        assert_eq!(quote("a<b>&|#;`"), "a<b>&|#;`");
+    fn d2_quote_is_byte_identical_to_the_shared_escaper_it_replaced() {
+        for raw in dot_round_trip_corpus() {
+            let before = raw.replace('\\', "\\\\").replace('"', "\\\"");
+            assert_eq!(
+                d2_quote(&raw),
+                before,
+                "d2_quote changed D2's bytes for {raw:?}"
+            );
+        }
+        assert_eq!(d2_quote("a&b"), "a&b", "d2 does not decode entities");
+        assert_eq!(d2_quote("a&quot;b"), "a&quot;b");
+    }
+
+    /// The DOT label contexts a Graphviz object substitution distinguishes.
+    #[derive(Clone, Copy)]
+    enum DotCtx {
+        Node,
+        Edge,
+    }
+
+    /// Stage 1 of [`dot_decode`]: the DOT lexer, on a double-quoted string.
+    ///
+    /// `\"` yields `"`; `\` + newline is a line continuation; every other backslash
+    /// passes through verbatim, which is why stage 4 still sees `\\` pairs.
+    fn dot_lex(body: &str, ctx: &str) -> String {
+        let mut out = String::with_capacity(body.len());
+        let mut it = body.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                assert!(
+                    c != '"',
+                    "{ctx}: label body carries an unescaped quote, which would have \
+                     closed the string early: {body:?}"
+                );
+                out.push(c);
+                continue;
+            }
+            match it.peek() {
+                Some('"') => {
+                    out.push('"');
+                    it.next();
+                }
+                Some('\\') => {
+                    out.push_str("\\\\");
+                    it.next();
+                }
+                Some('\n') => {
+                    it.next();
+                }
+                Some(_) => out.push('\\'),
+                None => panic!(
+                    "{ctx}: label body ends in a dangling backslash, which would have \
+                     escaped the closing quote: {body:?}"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Stage 2: `\N` `\G` `\E` `\T` `\H` `\L` object substitution, the one stage
+    /// where the node and edge contexts differ. Measured: in a node label `\N` is the
+    /// node name and `\T` is untouched; in an edge label `\T` is the tail and `\N` is
+    /// untouched. A `\\` pair is skipped, so an emitter that escapes every backslash
+    /// makes this stage a no-op in both contexts — which is what a substitution here
+    /// showing up as the sentinel would disprove.
+    fn dot_subst(s: &str, ctx: DotCtx) -> String {
+        let keys: &[char] = match ctx {
+            DotCtx::Node => &['N', 'G', 'E'],
+            DotCtx::Edge => &['G', 'E', 'T', 'H'],
+        };
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.peek().copied() {
+                Some('\\') => {
+                    out.push_str("\\\\");
+                    it.next();
+                }
+                Some(k) if keys.contains(&k) => {
+                    out.push_str("\u{0}SUBST\u{0}");
+                    it.next();
+                }
+                _ => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    /// Stage 3: Graphviz's entity decode. Case-sensitive, `;` required, one pass —
+    /// `&amp;quot;` decodes to `&quot;`, not to `"`.
+    ///
+    /// The name table is Graphviz's, not this emitter's, and it is deliberately
+    /// partial: `assert_dot_inert` is what closes the gap, by rejecting any emitted
+    /// `&` that does not open `&amp;`. So a name Graphviz knows and this table does
+    /// not can never reach a label unescaped in the first place.
+    fn dot_entities(s: &str) -> String {
+        const NAMED: &[(&str, char)] = &[
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&nbsp;", '\u{a0}'),
+            ("&num;", '#'),
+            ("&semi;", ';'),
+            ("&verbar;", '|'),
+        ];
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        'outer: while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            for (name, c) in NAMED {
+                if let Some(stripped) = tail.strip_prefix(name) {
+                    out.push(*c);
+                    rest = stripped;
+                    continue 'outer;
+                }
+            }
+            if let Some(end) = tail.find(';') {
+                let body = &tail[2..end];
+                if tail.starts_with("&#") && !body.is_empty() {
+                    let parsed = match body.strip_prefix(['x', 'X']) {
+                        Some(hex) if !hex.is_empty() => u32::from_str_radix(hex, 16).ok(),
+                        Some(_) => None,
+                        None => body.parse::<u32>().ok(),
+                    };
+                    if let Some(ch) = parsed.and_then(char::from_u32) {
+                        out.push(ch);
+                        rest = &tail[end + 1..];
+                        continue 'outer;
+                    }
+                }
+            }
+            out.push('&');
+            rest = &tail[1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Stage 4: `\\` → `\`, `\n` `\l` `\r` → a line break, any other `\X` → `X`.
+    fn dot_escapes(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.next() {
+                Some('\\') => out.push('\\'),
+                Some('n' | 'l' | 'r') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// A model of the four Graphviz decode stages, in the order they run (see
+    /// [`dot_label`]). Deliberately **not** the encoder's inverse: it decodes
+    /// everything the real renderer decodes, so a character the emitter forgot to
+    /// escape surfaces as a mismatch instead of passing because both sides share a
+    /// blind spot. Every stage was measured against Graphviz 15.1.0 by reading the
+    /// label back out of `dot -Tsvg`.
+    fn dot_decode(body: &str, ctx: DotCtx, name: &str) -> String {
+        dot_escapes(&dot_entities(&dot_subst(&dot_lex(body, name), ctx)))
+    }
+
+    /// The renderability half of the DOT contract, derived from the grammar rather
+    /// than from the emitter's own table: whatever was emitted, no stage of the real
+    /// pipeline may act on any of it.
+    ///
+    /// This is also what lets [`dot_entities`] carry a partial name table — an `&`
+    /// that opens anything but `&amp;` is rejected here, so it can never reach the
+    /// decoder for the table to be wrong about.
+    fn assert_dot_inert(encoded: &str, ctx: &str, raw: &str) {
+        let b = encoded.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'&' => {
+                    assert!(
+                        encoded[i..].starts_with("&amp;"),
+                        "{ctx}: emitted a `&` that does not open `&amp;`; Graphviz \
+                         decodes character references in ordinary labels \
+                         (input {raw:?}, emitted {encoded:?}, at byte {i})"
+                    );
+                    i += 5;
+                }
+                b'\\' => {
+                    let next = b.get(i + 1);
+                    assert!(
+                        next == Some(&b'\\') || next == Some(&b'"'),
+                        "{ctx}: emitted a `\\` that opens neither `\\\\` nor `\\\"` \
+                         (input {raw:?}, emitted {encoded:?}, at byte {i})"
+                    );
+                    i += 2;
+                }
+                b'"' => panic!(
+                    "{ctx}: emitted an unescaped `\"`, which closes the DOT string \
+                     early (input {raw:?}, emitted {encoded:?})"
+                ),
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// [`round_trip_corpus`] plus the inputs specific to the Graphviz decoder: the
+    /// literal text of every sequence its four stages act on, nested and overlapping
+    /// forms, and the entity/backslash interactions that only exist because stage 3
+    /// runs before stage 4.
+    fn dot_round_trip_corpus() -> Vec<String> {
+        let mut corpus = round_trip_corpus();
+        const ALPHA: &[char] = &[
+            '\\', '"', '&', '#', ';', 'n', 'l', 'r', 'N', 'G', 'x', '9', '2',
+        ];
+        for &x in ALPHA {
+            for &y in ALPHA {
+                corpus.push(format!("{x}{y}"));
+                for &z in ALPHA {
+                    corpus.push(format!("{x}{y}{z}"));
+                }
+            }
+        }
+        const NARROW: &[char] = &['\\', '"', '&'];
+        for &w in NARROW {
+            for &x in NARROW {
+                for &y in NARROW {
+                    for &z in NARROW {
+                        corpus.push(format!("{w}{x}{y}{z}"));
+                    }
+                }
+            }
+        }
+        let literals = [
+            "&quot;",
+            "&amp;",
+            "&lt;",
+            "&gt;",
+            "&nbsp;",
+            "&apos;",
+            "&bsol;",
+            "&num;",
+            "&semi;",
+            "&#34;",
+            "&#38;",
+            "&#92;",
+            "&#x26;",
+            "&#X5C;",
+            "&#092;",
+            "&#0;",
+            "&#1;",
+            "&#160;",
+            "\\n",
+            "\\l",
+            "\\r",
+            "\\N",
+            "\\G",
+            "\\E",
+            "\\T",
+            "\\H",
+            "\\L",
+            "\\\\",
+            "\\\"",
+            "\\",
+            "&amp;quot;",
+            "&#38;quot;",
+            "&amp;#92;n",
+            "&#92;n",
+            "&#92;N",
+            "&#92;\\n",
+            "\\\\n",
+            "&quot;&quot;",
+            "&ampX&lt Y",
+            "&Amp;",
+            "&AMP;",
+            "&",
+            "\"",
+            "<b>x</b>",
+            "&lt;b&gt;",
+            "ts_sample::a::Handler::\"&quot;X&lt;Y&amp;Z\"",
+            "ts_sample::a::Handler::\"q\\\"<>&|#;`\\\\π日\"",
+        ];
+        for s in literals {
+            corpus.push(s.to_string());
+            corpus.push(format!("A{s}B"));
+            for h in ['\\', '"', '&', ';', '#'] {
+                corpus.push(format!("{h}{s}"));
+                corpus.push(format!("{s}{h}"));
+            }
+            corpus.push(format!("{s}{s}"));
+        }
+        corpus
+    }
+
+    /// C3's content for DOT: the encoding is injective, and it is injective for
+    /// inputs nobody enumerated.
+    ///
+    /// Two properties per input, in both label contexts. `decode(encode(s)) == s` is
+    /// injectivity and holds by construction — both introducers are escaped and the
+    /// escape bodies are disjoint in them. [`assert_dot_inert`] is renderability and
+    /// is derived from the Graphviz grammar. They are kept separate on purpose: the
+    /// first is why the output cannot be silently misread, the second is why it looks
+    /// right, and only the first can fail without anyone noticing.
+    ///
+    /// The same property was run against real Graphviz 15.1.0 out of band over an
+    /// equivalent generated corpus — 2,288 inputs × node and edge = 4,576 renders,
+    /// labels read back out of `dot -Tsvg`, 0 differing. The pre-split escaper fails
+    /// 286 of those.
+    #[test]
+    fn dot_encoding_round_trips_every_generated_input() {
+        for raw in dot_round_trip_corpus() {
+            let encoded = dot_label(&raw);
+            for (ctx, name) in [(DotCtx::Node, "node"), (DotCtx::Edge, "edge")] {
+                assert_dot_inert(&encoded, name, &raw);
+                assert_eq!(
+                    dot_decode(&encoded, ctx, name),
+                    raw,
+                    "dot {name} label does not round-trip: {raw:?} encoded as {encoded:?}"
+                );
+            }
+        }
+    }
+
+    /// The characters DOT escapes, and the ones it deliberately does not.
+    ///
+    /// Each mapping was verified against Graphviz 15.1.0 by rendering the escaped
+    /// form and reading the label back out of the SVG. `&` is the entry the
+    /// pre-existing escaper was missing: `label="A&quot;B"` renders `A"B`, so an FQN
+    /// whose own text is `A&quot;B` used to display as `A"B`.
+    #[test]
+    fn dot_label_escapes_the_characters_graphviz_acts_on() {
+        assert_eq!(dot_label("a\"b"), "a\\\"b");
+        assert_eq!(dot_label("a\\b"), "a\\\\b");
+        assert_eq!(dot_label("a&b"), "a&amp;b");
+        assert_eq!(dot_label("a&quot;b"), "a&amp;quot;b");
+        assert_eq!(dot_label("a\\nb"), "a\\\\nb");
+        assert_eq!(dot_label("a&#92;nb"), "a&amp;#92;nb");
+        // Literal inside a quoted DOT label; escaping them would be blast radius
+        // with no correctness gain.
+        assert_eq!(dot_label("a<b>|#;`{}"), "a<b>|#;`{}");
+    }
+
+    /// Pins the two *call sites* inside [`render_dot`], not just the escaper.
+    ///
+    /// The same gap R06-03 found in Mermaid applies here: cgx only ever emits
+    /// [`condition_str`] words as DOT edge labels, and `dot_label` and `d2_quote`
+    /// are the identity on all five of them, so no black-box test over the shipped
+    /// commands can tell the two apart. The emitter has to be driven directly with a
+    /// label they disagree about. Reverting either call site fails this assertion.
+    #[test]
+    fn render_dot_escapes_both_label_positions() {
+        let hostile = "a&\"x";
+        let g = GraphData {
+            nodes: vec![hostile.to_string(), "b".to_string()],
+            edges: vec![(hostile.to_string(), "b".to_string(), "c&\"y".to_string())],
+        };
+        assert_eq!(
+            render_dot(g),
+            "digraph cgx {\n  rankdir=LR;\n  \
+             n0 [label=\"a&amp;\\\"x\"];\n  \
+             n1 [label=\"b\"];\n  \
+             n0 -> n1 [label=\"c&amp;\\\"y\"];\n}\n"
+        );
+    }
+
+    /// D2's emitter must not have picked up DOT's `&` escape.
+    #[test]
+    fn render_d2_leaves_ampersand_raw() {
+        let g = GraphData {
+            nodes: vec!["a&\"x".to_string(), "b".to_string()],
+            edges: vec![("a&\"x".to_string(), "b".to_string(), "c&\"y".to_string())],
+        };
+        assert_eq!(
+            render_d2(g),
+            "n0: \"a&\\\"x\"\nn1: \"b\"\nn0 -> n1: \"c&\\\"y\"\n"
+        );
     }
 }

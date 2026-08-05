@@ -710,12 +710,15 @@ fn parse_graph(format: cgx_cli::output::Format, src: &str) -> ParsedGraph {
     g
 }
 
-/// Decode the backslash escapes a Graphviz / D2 double-quoted string uses, and
-/// assert on the way that the body is a well-formed one: a bare `"` inside it would
-/// have closed the string early, and a trailing `\` would escape the closing quote.
+/// Decode the backslash escapes a **D2** double-quoted string uses, and assert on
+/// the way that the body is a well-formed one: a bare `"` inside it would have closed
+/// the string early, and a trailing `\` would escape the closing quote.
 ///
-/// Unlike Mermaid's, these two grammars *do* backslash-escape, which is why
-/// `quote()` is correct for them and is left alone.
+/// D2-only. DOT used to share this decoder and must not: Graphviz *also* decodes
+/// character references in ordinary labels, so a DOT label checked with this function
+/// passes while rendering as different text — see [`dot_unescape`]. d2 0.7.1 does not
+/// decode them (measured: a label written `A&quot;B` displays `A&quot;B`), so for D2
+/// backslashes really are the whole decoder.
 fn backslash_unescape(body: &str, ctx: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
@@ -730,6 +733,81 @@ fn backslash_unescape(body: &str, ctx: &str) -> String {
         }
     }
     out
+}
+
+/// The entity names Graphviz decodes that this oracle needs to know about. Partial
+/// on purpose: [`assert_dot_label_inert`] rejects any emitted `&` that does not open
+/// `&amp;`, so a name Graphviz knows and this list does not can never reach here.
+const DOT_ENTITIES: &[(&str, char)] = &[
+    ("&amp;", '&'),
+    ("&quot;", '"'),
+    ("&lt;", '<'),
+    ("&gt;", '>'),
+    ("&nbsp;", '\u{a0}'),
+];
+
+/// The renderability half of the DOT contract, derived from the Graphviz grammar
+/// rather than from the emitter's table.
+///
+/// Graphviz decodes character references in ordinary labels — measured against
+/// Graphviz 15.1.0, `label="A&quot;B"` renders `A"B` — so an emitted `&` that opens
+/// anything but the emitter's own `&amp;` is a silent-corruption bug even though the
+/// source parses cleanly. Backslash escapes get the same treatment: only `\\` and
+/// `\"` are legal here, because a lone `\` reaches Graphviz's `\n`/`\l`/`\N`
+/// processing.
+fn assert_dot_label_inert(body: &str, ctx: &str) {
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'&' => {
+                assert!(
+                    body[i..].starts_with("&amp;"),
+                    "{ctx}: emitted a `&` that does not open `&amp;`; Graphviz decodes \
+                     character references in ordinary labels: {body:?}"
+                );
+                i += 5;
+            }
+            b'\\' => {
+                let next = b.get(i + 1);
+                assert!(
+                    next == Some(&b'\\') || next == Some(&b'"'),
+                    "{ctx}: emitted a `\\` that opens neither `\\\\` nor `\\\"`; \
+                     Graphviz would read it as an escape sequence: {body:?}"
+                );
+                i += 2;
+            }
+            b'"' => panic!("{ctx}: label body carries an unescaped quote: {body:?}"),
+            _ => i += 1,
+        }
+    }
+}
+
+/// Decode a DOT label body the way Graphviz does: character references first, then
+/// backslash escapes.
+///
+/// That order is Graphviz's and it matters — a reference decoding to a backslash is
+/// handed to the escape stage as a live escape (`label="&#92;n"` renders as a line
+/// break). Asserting inertness first is what makes the partial [`DOT_ENTITIES`] table
+/// sound.
+fn dot_unescape(body: &str, ctx: &str) -> String {
+    assert_dot_label_inert(body, ctx);
+    let mut entities = String::with_capacity(body.len());
+    let mut rest = body;
+    'outer: while let Some(amp) = rest.find('&') {
+        entities.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        for (name, c) in DOT_ENTITIES {
+            if let Some(stripped) = tail.strip_prefix(name) {
+                entities.push(*c);
+                rest = stripped;
+                continue 'outer;
+            }
+        }
+        panic!("{ctx}: emitted a `&` opening no entity this oracle knows: {body:?}");
+    }
+    entities.push_str(rest);
+    backslash_unescape(&entities, ctx)
 }
 
 /// Graphviz: a `digraph` header, one matching brace pair, one `label=` per node,
@@ -781,7 +859,7 @@ fn parse_dot(src: &str) -> ParsedGraph {
                 .strip_suffix("\"];")
                 .expect("dot node line ends [label=\"…\"];");
             g.nodes
-                .push((id.to_string(), backslash_unescape(body, "dot node label")));
+                .push((id.to_string(), dot_unescape(body, "dot node label")));
         } else {
             panic!("dot line is neither a node declaration nor an edge: {t}");
         }

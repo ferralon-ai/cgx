@@ -1,6 +1,6 @@
 # cgx CLI — Command Reference
 
-cgx provides 14 subcommands organised into five groups. Each command reads from a `.cgx/` index built by `cgx index`.
+cgx provides the subcommands below, organised into seven groups. Most read from a `.cgx/` index built by `cgx index`; `diff` and `impacted-tests` index the refs they compare themselves.
 
 ## Commands
 
@@ -36,6 +36,12 @@ cgx provides 14 subcommands organised into five groups. Each command reads from 
 | `cgx search` | Search the symbol table by FQN substring or regex | [search.md](search.md) |
 | `cgx unused` | Symbols not reachable from any indexed entrypoint | [unused.md](unused.md) |
 
+### Change impact
+
+| Command | Purpose | Reference |
+|---------|---------|-----------|
+| `cgx impacted-tests` | Test entrypoints whose call graph reaches a symbol changed between two refs, or in the working tree | [impacted-tests.md](impacted-tests.md) |
+
 ### Query
 
 | Command | Purpose | Reference |
@@ -52,7 +58,7 @@ cgx provides 14 subcommands organised into five groups. Each command reads from 
 
 ## Reproducing the examples
 
-All command reference examples query the same corpus.
+Command reference examples query the same corpus, with one exception: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so that page builds throwaway repositories from the fixture trees and documents the setup itself.
 
 **Corpus:** `fixtures/rust-sample` — a multi-file Rust crate included in the repository.
 

@@ -1,6 +1,6 @@
 # cgx MCP Tools — Reference
 
-cgx exposes six MCP tools over a STDIO server. Start the server with:
+cgx exposes a set of MCP tools over a STDIO server. Start the server with:
 
 ```bash
 cgx mcp
@@ -17,6 +17,7 @@ The server communicates over standard input and output using JSON-RPC 2.0 framin
 | `paths` | Enumerate call paths from one symbol to another, with per-path confidence and exceptional-class annotation | [paths.md](paths.md) |
 | `unused` | Symbols not reachable from any indexed entrypoint | [unused.md](unused.md) |
 | `explain` | Full provenance for one symbol: definition location, caller/callee counts, and all incident edges | [explain.md](explain.md) |
+| `impacted_tests` | Test functions whose call graph reaches a symbol changed between two git refs, or in the working tree | [impacted_tests.md](impacted_tests.md) |
 | `graph_query` | Reserved slot for a future Cypher-subset query interface (not yet implemented) | [graph_query.md](graph_query.md) |
 
 ## Status notes

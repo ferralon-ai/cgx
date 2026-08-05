@@ -825,11 +825,11 @@ fn directive_line_matches(line: &str, keyword: &str) -> bool {
         // `\S*#`: the first `#` reachable from the colon without crossing
         // whitespace. A later `#` in the same run is further from `last_semi`, so
         // the first one decides.
-        for hash in (colon + 1)..b.len() {
-            if b[hash].is_ascii_whitespace() {
+        for (hash, &c) in b.iter().enumerate().skip(colon + 1) {
+            if c.is_ascii_whitespace() {
                 break;
             }
-            if b[hash] == b'#' {
+            if c == b'#' {
                 return hash < last_semi;
             }
         }

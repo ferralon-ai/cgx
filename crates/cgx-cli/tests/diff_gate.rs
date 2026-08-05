@@ -970,11 +970,11 @@ fn assert_mermaid_label_inert(body: &str, ctx: &str) {
             if b[colon] != b':' {
                 continue;
             }
-            for hash in (colon + 1)..b.len() {
-                if b[hash].is_ascii_whitespace() {
+            for (hash, &c) in b.iter().enumerate().skip(colon + 1) {
+                if c.is_ascii_whitespace() {
                     break;
                 }
-                if b[hash] == b'#' {
+                if c == b'#' {
                     assert!(
                         hash >= last_semi,
                         "{ctx}: mermaid's {kw} source rewrite would strip the final `;` \

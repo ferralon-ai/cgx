@@ -44,9 +44,11 @@ mod age;
 mod diff;
 mod error;
 mod filter;
+pub mod impacted;
 mod path_diff;
 
 pub use age::{BlameRepo, EdgeAge, Warning};
+pub use impacted::{run as impacted_tests, Answer, Request, Sides};
 pub use diff::{diff_graphs, ChangedEdge, DiffEdge, DiffNode, EdgeChanges, GraphDiff};
 pub use error::{DiffError, Result};
 pub use filter::{BucketSelect, DiffFilter};

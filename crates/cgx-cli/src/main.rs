@@ -1247,17 +1247,6 @@ fn run_explain(
     Ok(())
 }
 
-/// The freshness envelope for `search`/`symbols`, whose `--format json` arm is a
-/// bare JSON array — a shipped output contract with no slot to put an envelope in.
-/// Computing one for that arm would run a full working-tree walk and discard the
-/// result, so the format decides whether the walk happens at all.
-fn human_only_freshness(format: Format, repo_root: &Path) -> FreshnessEnvelope {
-    match format {
-        Format::Json => FreshnessEnvelope::uninspected(),
-        _ => freshness::envelope(Some(repo_root), None),
-    }
-}
-
 /// `cgx search <pattern>` / `cgx search --all` (Since: v0.2; `--all` since v0.3): a
 /// pure node-table scan that resolves a partial/half-remembered name to exact FQNs,
 /// or — with `--all` — lists every symbol. Distinct from the exact-symbol surface
@@ -1314,9 +1303,7 @@ fn run_search(
     let hits =
         search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
 
-    // `--format json` is a bare array with no envelope slot (see `render_search`),
-    // so the walk would be paid for and thrown away.
-    let freshness = human_only_freshness(format, &repo_root);
+    let freshness = freshness::envelope(Some(&repo_root), None);
     print!("{}", render_search(format, &hits, limit, &freshness));
     Ok(())
 }
@@ -1353,7 +1340,7 @@ fn run_symbols(
 
     // `--top N` is sugar for `--limit N`; when both are given `--top` wins.
     let effective_limit = top.unwrap_or(limit);
-    let freshness = human_only_freshness(format, &repo_root);
+    let freshness = freshness::envelope(Some(&repo_root), None);
     print!(
         "{}",
         render_symbols(format, &ranks, effective_limit, &freshness)

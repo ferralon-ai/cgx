@@ -1146,14 +1146,24 @@ fn search_kind_type_excludes_functions() {
     );
 }
 
+/// The `results` array of a `search`/`symbols` `--format json` document. Both
+/// commands wrap their hits in an object so the freshness envelope has a slot
+/// beside them; the payload itself is unchanged.
+fn json_results(out: &str) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(out).expect("valid json");
+    v.get("results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("no `results` array in: {out}"))
+        .clone()
+}
+
 #[test]
-fn search_json_shape_is_array_of_objects() {
+fn search_json_shape_wraps_objects_under_results() {
     let (_tmp, repo) = search_fixture_repo();
     index(&repo);
     let (out, code) = run_cgx(&repo, &["search", "search_target", "--format", "json"]);
     assert_eq!(code, 0);
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().expect("search json is a bare array");
+    let arr = json_results(&out);
     assert!(!arr.is_empty(), "array has hits: {out}");
     let first = &arr[0];
     for key in ["fqn", "file", "line", "kind"] {
@@ -1317,13 +1327,12 @@ fn search_neither_pattern_nor_all_exit_2() {
 }
 
 #[test]
-fn search_all_json_is_array_of_objects() {
+fn search_all_json_is_objects_under_results() {
     let (_tmp, repo) = search_fixture_repo();
     index(&repo);
     let (out, code) = run_cgx(&repo, &["search", "--all", "--format", "json"]);
     assert_eq!(code, 0);
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().expect("array");
+    let arr = json_results(&out);
     assert!(!arr.is_empty(), "has hits: {out}");
     for key in ["fqn", "file", "line", "kind"] {
         assert!(arr[0].get(key).is_some(), "object has `{key}`: {out}");
@@ -1392,8 +1401,7 @@ fn symbols_ranks_hub_first_by_inbound_degree() {
     index(&repo);
     let (out, code) = run_cgx(&repo, &["symbols", "--rank", "inbound", "--format", "json"]);
     assert_eq!(code, 0, "symbols exits 0: {out}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().expect("array");
+    let arr = json_results(&out);
     // The most-depended-upon symbol leads. `hub` has 2 inbound callers — the most.
     let top = &arr[0];
     assert_eq!(top.get("fqn").unwrap().as_str().unwrap(), "fixture::hub");
@@ -1405,8 +1413,7 @@ fn symbols_breakdown_decomposes_inbound_edges() {
     let (_tmp, repo) = symbols_fixture_repo();
     index(&repo);
     let (out, _code) = run_cgx(&repo, &["symbols", "--format", "json"]);
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().unwrap();
+    let arr = json_results(&out);
     let hub = arr
         .iter()
         .find(|s| s.get("fqn").unwrap() == "fixture::hub")
@@ -1447,14 +1454,13 @@ fn symbols_default_rank_is_total_degree() {
     // must be >= every other row's total.
     let (out, code) = run_cgx(&repo, &["symbols", "--format", "json"]);
     assert_eq!(code, 0, "symbols exits 0: {out}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().unwrap();
+    let arr = json_results(&out);
     let total = |s: &serde_json::Value| {
         s.get("in_degree").unwrap().as_u64().unwrap()
             + s.get("out_degree").unwrap().as_u64().unwrap()
     };
     let top_total = total(&arr[0]);
-    for s in arr {
+    for s in &arr {
         assert!(top_total >= total(s), "default rank is total degree descending: {out}");
     }
     // The default surface and `--rank total` agree byte-for-byte.
@@ -1468,8 +1474,7 @@ fn symbols_rank_total_counts_in_plus_out() {
     index(&repo);
     let (out, code) = run_cgx(&repo, &["symbols", "--rank", "total", "--format", "json"]);
     assert_eq!(code, 0);
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().unwrap();
+    let arr = json_results(&out);
     // `main` has out=2 in=0 (total 2); `hub` in=2 out=0 (total 2); `caller_one`
     // out=1 in=1 (total 2) ... a tie at 2 broken by FQN, so caller_one leads main.
     let total = |fqn: &str| {
@@ -1487,11 +1492,10 @@ fn symbols_rank_outbound_leads_with_caller() {
     // ends, so the top row's out-degree dominates and `hub` is not first.
     let (out, code) = run_cgx(&repo, &["symbols", "--rank", "outbound", "--format", "json"]);
     assert_eq!(code, 0, "symbols exits 0: {out}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-    let arr = v.as_array().unwrap();
+    let arr = json_results(&out);
     let out_deg = |s: &serde_json::Value| s.get("out_degree").unwrap().as_u64().unwrap();
     let top_out = out_deg(&arr[0]);
-    for s in arr {
+    for s in &arr {
         assert!(top_out >= out_deg(s), "outbound rank is out-degree descending: {out}");
     }
     assert_ne!(
@@ -1604,6 +1608,8 @@ fn every_answer_format_carries_the_freshness_envelope() {
         vec!["paths", "main", "beta"],
         vec!["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
         vec!["explain", "main"],
+        vec!["search", "beta"],
+        vec!["symbols"],
     ] {
         let mut argv = args.clone();
         argv.extend(["--format", "json"]);
@@ -1641,27 +1647,56 @@ fn every_answer_format_carries_the_freshness_envelope() {
     }
 }
 
-/// The two CLI answer surfaces the envelope deliberately does **not** reach, so
-/// the gap is asserted rather than discovered. `search`/`symbols` `--format json`
-/// emit a bare JSON *array*; there is no envelope slot without changing that
-/// shipped output contract, which is out of scope here. Their human form does
-/// carry it (asserted above).
+/// `search`/`symbols` `--format json` used to emit a bare JSON *array* with no
+/// envelope slot; the shape was deliberately broken (cgx is unreleased, so there
+/// is no consumer to keep compatible) so both carry the envelope like every other
+/// answer document. This pins the wrapped shape in both directions: a revert to
+/// the bare array fails here, and the envelope must be a *real* one — a surface
+/// that quietly went back to `FreshnessEnvelope::uninspected()` would report a
+/// clean bill it never established, which is the defect this cycle exists to kill.
 #[test]
-fn search_and_symbols_json_remain_bare_arrays() {
+fn search_and_symbols_json_wrap_results_beside_a_real_envelope() {
     let (_tmp, repo) = fixture_repo();
     index(&repo);
-    for args in [
+    let argvs = [
         vec!["search", "beta", "--format", "json"],
         vec!["symbols", "--format", "json"],
-    ] {
-        let (out, code) = run_cgx(&repo, &args);
+    ];
+
+    for args in &argvs {
+        let (out, code) = run_cgx(&repo, args);
         assert_eq!(code, 0);
         let v: Value = serde_json::from_str(&out).expect("json");
         assert!(
-            v.is_array(),
-            "{args:?} is documented as a bare array; changing it is a separate, \
-             breaking decision: {out}"
+            !v.is_array(),
+            "{args:?} must not regress to a bare array: {out}"
         );
+        assert!(
+            v["results"].is_array(),
+            "{args:?} hits live under `results`: {out}"
+        );
+        let f = freshness_of(&out);
+        assert!(f["indexed_tree"].is_string(), "{args:?}: {f}");
+        assert_eq!(f["dirty_files"], json!(0), "{args:?}: {f}");
+        assert_eq!(f["matches_head"], json!(true), "{args:?}: {f}");
+        assert_eq!(f["stale"], json!(false), "{args:?}: {f}");
+    }
+
+    // On a dirty tree the count is a real number, not the `null` an uninspected
+    // envelope would carry: the walk genuinely runs for these two commands now.
+    std::fs::write(repo.join("src/helper.rs"), "pub fn beta() { let _ = 2; }\n").unwrap();
+    for args in &argvs {
+        let mut argv = args.clone();
+        argv.push("--no-auto-index");
+        let (out, code) = run_cgx(&repo, &argv);
+        assert_eq!(code, 0);
+        let f = freshness_of(&out);
+        assert_eq!(
+            f["dirty_files"],
+            json!(1),
+            "{argv:?} inspects the working tree for real: {f}"
+        );
+        assert_eq!(f["stale"], json!(true), "{argv:?}: {f}");
     }
 }
 
@@ -1693,7 +1728,9 @@ fn query_output_with_freshness_is_byte_identical_across_two_runs() {
         vec!["callers", "beta", "--format", "sarif"],
         vec!["callers", "beta"],
         vec!["search", "beta"],
+        vec!["search", "beta", "--format", "json"],
         vec!["symbols"],
+        vec!["symbols", "--format", "json"],
         vec!["explain", "main", "--format", "json"],
     ] {
         let (a, ca) = run_cgx(&repo, &args);

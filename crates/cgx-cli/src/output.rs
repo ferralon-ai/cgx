@@ -1063,7 +1063,8 @@ fn kind_str(kind: cgx_core::SymbolKind) -> String {
 /// aligned list (default) or `--format json`. Hits arrive pre-sorted by FQN; this
 /// applies the `--limit` cap (`0` = unlimited) and, when results exceed it, prints
 /// the top-N then a `… (N more — raise --limit)` footer (never silently dropped).
-/// JSON mirrors the hit struct as a bare array: `[{ "fqn", "file", "line", "kind" }]`.
+/// JSON is an object with the hits under `results` and the index-freshness envelope
+/// beside them: `{ "results": [{ "fqn", "file", "line", "kind" }], "freshness": {…} }`.
 pub fn render_search(
     format: Format,
     hits: &[cgx_query::SymbolHit],
@@ -1091,12 +1092,16 @@ pub fn render_search(
                     })
                 })
                 .collect();
-            // NOTE: `search --format json` is a *bare array* — a shipped output
-            // contract with no envelope slot. Wrapping it in an object to make room
-            // is a breaking change to that contract, out of this change's scope, so
-            // the freshness envelope rides the human form only here.
-            let mut s =
-                serde_json::to_string_pretty(&items).expect("search results serialize");
+            // `search --format json` was a bare array with no envelope slot. It is
+            // now an object, deliberately breaking that shape: cgx is unreleased, so
+            // there is no consumer to keep compatible, and an answer surface that
+            // cannot say how fresh it is was the actual defect. No dual shape and no
+            // flag — the wrapped form is the only form.
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("search results serialize");
             s.push('\n');
             s
         }
@@ -1139,8 +1144,9 @@ pub fn render_search(
 ///
 /// Human form, one row per symbol:
 /// `<fqn>  (file:line)  [kind]  in=<n> out=<m>  in:{…}  out:{…}` where each `{…}` is
-/// the family/condition breakdown of that direction's edges. JSON mirrors the rank
-/// struct with nested `inbound`/`outbound` breakdown objects.
+/// the family/condition breakdown of that direction's edges. JSON is an object —
+/// the ranks under `results`, each mirroring the rank struct with nested
+/// `inbound`/`outbound` breakdown objects, plus the `freshness` envelope.
 pub fn render_symbols(
     format: Format,
     ranks: &[cgx_query::SymbolRank],
@@ -1157,9 +1163,14 @@ pub fn render_symbols(
 
     match format {
         Format::Json => {
-            // Same bare-array constraint as `search --format json` above.
+            // Same wrapped shape as `search --format json` above, and the same
+            // deliberate break of the old bare array.
             let items: Vec<Value> = visible.iter().map(symbol_rank_json).collect();
-            let mut s = serde_json::to_string_pretty(&items).expect("symbols results serialize");
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("symbols results serialize");
             s.push('\n');
             s
         }

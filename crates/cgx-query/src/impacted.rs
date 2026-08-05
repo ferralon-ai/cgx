@@ -103,6 +103,13 @@ pub struct DiffFacts {
     /// Changed paths that contributed zero head nodes (no adapter claims the
     /// extension, or the file defines nothing).
     pub unindexed_changed_files: usize,
+    /// Working-tree paths the caller's changed-path narrowing **dropped** as
+    /// untracked-and-unclaimed, excluding cgx's own store. They never reach
+    /// [`unindexed_changed_files`], because on an ordinary run they are
+    /// `target/`-shaped noise. When the changed-symbol set comes out empty they
+    /// are the only thing that changed, and an empty answer over them is not
+    /// exact — see [`contract_for`].
+    pub dropped_unclaimed_paths: usize,
     /// `true` when the base is the ref tip rather than the merge-base.
     pub tip_to_tip_base: bool,
 }
@@ -340,6 +347,31 @@ pub fn contract_for(
                 "{} changed file(s) contributed no symbols (no adapter claims the extension, or \
                  the file defines none); edits there are not represented in the changed set.",
                 facts.unindexed_changed_files
+            ),
+        ));
+    } else if changed.is_empty() && facts.dropped_unclaimed_paths > 0 {
+        // The changed-path narrowing dropped every path it saw, so the walk was
+        // seeded with nothing and the answer is empty for a reason the user
+        // cannot see. Emitting nothing here is how an `impacted-tests` answer
+        // reads `exact` while having silently discarded the only thing that
+        // changed — the one failure this command exists to prevent.
+        //
+        // Gated on an *empty changed set* rather than on the drop itself: while
+        // anything else changed, the dropped paths are `target/`- and
+        // `node_modules/`-shaped noise, and firing on them would put that noise
+        // back on every ordinary answer. Counting them honestly needs git's
+        // exclude rules, which `Repo::enumerate_workdir` does not consult — but
+        // the `exact` claim does not require a count, only the knowledge that
+        // something was discarded.
+        reasons.push(under(
+            "impacted-changed-file-unindexed",
+            format!(
+                "the changed-symbol set is empty and {} working-tree path(s) were dropped from it \
+                 as untracked and unclaimed (no adapter claims the extension, or the file defines \
+                 nothing). cgx reads no gitignore here, so it cannot tell ignored build output \
+                 from a genuinely new unmodeled file such as a migration or a config: this empty \
+                 answer is not a clean bill of health.",
+                facts.dropped_unclaimed_paths
             ),
         ));
     }

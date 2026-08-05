@@ -34,6 +34,13 @@ use cgx_store::{FactStore, GraphId, SqliteStore};
 use crate::age::BlameRepo;
 use crate::error::{DiffError, Result};
 
+/// cgx's own store directory, written into the repository root by the CLI
+/// (`cgx-cli/src/store_loc.rs:18`). `Repo::enumerate_workdir` consults no
+/// gitignore, so the store reads as untracked working-tree content; counting an
+/// artefact of cgx's own execution as a dropped user change would be a
+/// self-inflicted false positive on every clean checkout.
+const CGX_STORE_DIR: &str = ".cgx/";
+
 /// What to compare.
 #[derive(Debug, Clone)]
 pub enum Sides {
@@ -170,11 +177,22 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
     // noise is: both sides of a ref-to-ref comparison are committed trees, and
     // there a newly added file that yields no symbols is a real change whose
     // `under` reason must still fire.
+    //
+    // What the narrowing drops is not free, though: a genuinely new untracked
+    // `migration.sql` is dropped by exactly the same rule as `target/`. That is
+    // survivable while *something else* changed, and is disclosed on the answer
+    // when the changed set comes out empty — see `dropped_unclaimed_paths`.
+    let mut dropped_unclaimed_paths = 0usize;
     let changed_paths: BTreeSet<String> = if req.sides.head_is_workdir() {
-        changed_paths
-            .into_iter()
-            .filter(|p| base.manifest.contains_key(p) || files_with_symbols.contains(p.as_str()))
-            .collect()
+        let (kept, dropped): (BTreeSet<String>, BTreeSet<String>) =
+            changed_paths.into_iter().partition(|p| {
+                base.manifest.contains_key(p) || files_with_symbols.contains(p.as_str())
+            });
+        dropped_unclaimed_paths = dropped
+            .iter()
+            .filter(|p| !p.starts_with(CGX_STORE_DIR))
+            .count();
+        kept
     } else {
         changed_paths
     };
@@ -214,6 +232,7 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
     let facts = DiffFacts {
         removed_symbols: diff.removed_nodes.len(),
         unindexed_changed_files,
+        dropped_unclaimed_paths,
         tip_to_tip_base: !req.sides.uses_merge_base(),
     };
     let contract = contract_for(&view, &req.walker, &changed, &tests, &facts);

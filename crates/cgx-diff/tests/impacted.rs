@@ -411,7 +411,20 @@ fn a_changed_file_that_yields_no_symbols_is_carried_as_an_under_reason() {
 /// that contribute no symbols, which inflates `dirty_files`, fires
 /// `impacted-changed-file-unindexed` on every run, and — because the vacuity
 /// predicate is keyed on the changed *path* set — reports an unedited tree as
-/// degenerate.
+/// degenerate. All three of those consequences are what this test holds.
+///
+/// What it deliberately **no longer** holds is the absence of the contract
+/// reason. A dropped `target/debug/build.log` and a dropped, genuinely new
+/// `migration.sql` are the same state to cgx — untracked, unclaimed, and
+/// indistinguishable to a manifest that reads no gitignore — so an answer that
+/// discards one and calls itself `exact` discards the other on identical terms.
+/// With the changed-symbol set empty the disclosure therefore fires for both,
+/// and this fixture pays a false positive so that the migration case cannot be
+/// silently lost. The cost is bounded: `the_narrowing_leaves_a_real_edit_alone`
+/// holds every run where anything else changed, the counted variant
+/// (`unindexed_changed_files`) still sees tracked paths only, and no exit code
+/// moves. Removing the false-positive half needs git's exclude rules, which
+/// `enumerate_workdir` does not consult.
 #[test]
 fn untracked_files_that_yield_no_symbols_are_not_changes() {
     let repo = fixture_repo("go");
@@ -425,6 +438,18 @@ fn untracked_files_that_yield_no_symbols_are_not_changes() {
         !a.degenerate,
         "a clean tree is a real answer, not a vacuous one"
     );
+}
+
+/// The one carve-out that is absolute: cgx's own store is an artefact of this
+/// very invocation, not user content, so on its own it never reads as a dropped
+/// change. This is what keeps an otherwise-clean checkout's answer `exact`.
+#[test]
+fn cgxs_own_store_alone_is_not_a_dropped_change() {
+    let repo = fixture_repo("go");
+    repo.write(".cgx/index.db", "not a source file\n");
+
+    let (_store, a) = run_workdir(&repo);
+    assert_eq!(a.dirty_files, 0, "nothing tracked changed");
     assert!(
         !codes(&a).contains(&"impacted-changed-file-unindexed"),
         "cgx's own store is not a changed source file: {:?}",

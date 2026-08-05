@@ -1189,3 +1189,152 @@ fn a_directory_that_is_not_a_git_repository_exits_three() {
     assert_eq!(code, 3, "{stderr}");
     assert!(stderr.contains("git error"), "{stderr}");
 }
+
+// --- the dropped-changed-set `exact` claim ------------------------------------
+//
+// The changed-path narrowing in `cgx_diff::impacted::run` drops every working-tree
+// path that is neither tracked at base nor claimed by an adapter, because
+// `Repo::enumerate_workdir` reads no gitignore and `target/`/`.cgx/` would
+// otherwise read as changed on an unedited tree. A new untracked `migration.sql`
+// is dropped by exactly the same rule — and when it is the *only* thing that
+// changed, the walk is seeded with nothing, the answer is empty, and the contract
+// used to call that empty answer `exact`. A user runs the returned set (nothing)
+// and believes they are covered.
+
+/// A repo whose only working-tree change is an **untracked** file no adapter
+/// claims — the shape that produced a silent `exact`.
+fn untracked_unclaimed_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, path) = repo();
+    write(&path, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+    commit(&path, "base");
+    write(&path, "migration.sql", "CREATE TABLE t (id int);\n");
+    (tmp, path)
+}
+
+/// **Case 1 — the blocker.** The entire changed set is one untracked unclaimed
+/// file. The answer is still empty and still exit 0, but it may not claim to be
+/// complete.
+#[test]
+fn a_dropped_untracked_changed_file_makes_the_empty_answer_under_not_exact() {
+    let (_tmp, repo) = untracked_unclaimed_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(doc["count"].as_u64(), Some(0));
+    assert_eq!(
+        doc["approximation"]["direction"].as_str(),
+        Some("under"),
+        "an answer that discarded the only changed path is not exact: {stdout}"
+    );
+    assert!(
+        reason_codes(&doc).contains(&"impacted-changed-file-unindexed".to_string()),
+        "the omission has to be named, not merely implied: {stdout}"
+    );
+}
+
+/// **Case 2 — no regression.** The tracked half of the same shape already worked
+/// through `unindexed_changed_files`, and must keep working: exactly one
+/// `impacted-changed-file-unindexed` reason, not two.
+///
+/// Exit 4 rather than case 1's exit 0, and that difference is load-bearing: a
+/// *tracked* unclaimed path survives the narrowing, so `changed_paths` is
+/// non-empty and the vacuity predicate fires. An untracked one is dropped before
+/// the predicate sees it, which is why case 1 needs the contract to carry the
+/// disclosure that the exit code does not.
+#[test]
+fn a_tracked_unclaimed_changed_file_is_still_under() {
+    let (_tmp, repo) = no_symbol_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 4, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(doc["count"].as_u64(), Some(0));
+    assert_eq!(doc["approximation"]["direction"].as_str(), Some("under"));
+    assert_eq!(
+        reason_codes(&doc)
+            .iter()
+            .filter(|c| *c == "impacted-changed-file-unindexed")
+            .count(),
+        1,
+        "one cause, one reason: {stdout}"
+    );
+}
+
+/// **Case 3 — the anti-flood assertion.** This is the objection that kept the
+/// general fix out of lane: a normal run over a tree carrying untracked build
+/// output must not pick up this reason. `target/` here is exactly the noise the
+/// narrowing exists to remove, and the guard is gated on an empty changed set
+/// precisely so it cannot reach an answer like this one.
+///
+/// Asserted against a run that really is normal — the test is found — so a
+/// regression cannot pass by making the answer empty.
+#[test]
+fn untracked_build_output_alongside_a_real_edit_does_not_gain_the_reason() {
+    let (_tmp, repo) = rust_fixture();
+    write(&repo, "target/debug/app.bin", "binary junk\n");
+    write(&repo, "target/debug/build/x/out.txt", "more junk\n");
+    write(&repo, "node_modules/pkg/index.js", "module.exports = 1;\n");
+
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        doc["count"].as_u64(),
+        Some(1),
+        "the run has to be a real one, or the assertion below is vacuous: {stdout}"
+    );
+    assert!(
+        !reason_codes(&doc).contains(&"impacted-changed-file-unindexed".to_string()),
+        "untracked build output is not a dropped user change: {stdout}"
+    );
+}
+
+/// **Case 4 — the gate.** `--assert-empty` over case 1 keeps its exit 4. The
+/// changed set is empty, so ADR-08 clause (a) is the honest verdict and the fix
+/// must not launder it into a pass.
+#[test]
+fn a_dropped_untracked_changed_file_still_exits_4_under_assert_empty() {
+    let (_tmp, repo) = untracked_unclaimed_fixture();
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--assert-empty"],
+    );
+    assert_eq!(code, 4, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("matched zero symbols"),
+        "clause (a) is the reason, and says so: {stderr}"
+    );
+}
+
+/// The carve-out that keeps the guard from firing on every clean checkout: cgx's
+/// own `.cgx/` store is untracked working-tree content that `enumerate_workdir`
+/// walks, and it is an artefact of this very invocation, not a user change. A
+/// clean tree whose only untracked content is that store stays `exact`.
+#[test]
+fn a_clean_tree_carrying_only_cgxs_own_store_is_still_exact() {
+    let (_tmp, repo) = repo();
+    write(&repo, "src/lib.rs", "pub fn keep() -> i32 { 1 }\n");
+    commit(&repo, "base");
+
+    // The first run creates `.cgx/`; the second is the one that sees it.
+    let _ = run_cgx(&repo, &["impacted-tests", "--uncommitted"]);
+    let (stdout, stderr, code) = run_cgx(
+        &repo,
+        &["impacted-tests", "--uncommitted", "--format", "json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        doc["approximation"]["direction"].as_str(),
+        Some("exact"),
+        "nothing changed is a complete answer, not an under-approximation: {stdout}"
+    );
+}

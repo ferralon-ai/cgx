@@ -628,6 +628,7 @@ fn diff_side_facts_fire_their_reasons() {
         removed_symbols: 2,
         unindexed_changed_files: 4,
         tip_to_tip_base: true,
+        ..DiffFacts::default()
     };
     let (_, c) = contract_of(&v, &[target], &unbounded(), facts);
     let got = codes(&c);
@@ -820,6 +821,7 @@ fn reason_order_is_stable_across_runs() {
         removed_symbols: 1,
         unindexed_changed_files: 1,
         tip_to_tip_base: true,
+        ..DiffFacts::default()
     };
     let first = contract_of(&v, &[mid, target], &unbounded(), facts.clone()).1;
     for _ in 0..2 {
@@ -910,5 +912,82 @@ fn the_dangling_reason_does_not_claim_the_callee_is_external() {
     assert!(
         detail.contains("unexpanded macro"),
         "the unmodelled-call-site cause is named too: {detail}"
+    );
+}
+
+// --- dropped-path disclosure on an empty changed set -------------------------
+
+/// A caller that narrowed its whole changed-path set away has seeded the walk
+/// with nothing. The answer is empty for a reason no consumer can see, and
+/// `exact` on such an answer tells a user their change is covered when cgx threw
+/// it away.
+#[test]
+fn dropped_paths_with_an_empty_changed_set_are_disclosed_as_under() {
+    let mut g = G::new();
+    let t = g.test("t");
+    let target = g.func("target");
+    g.calls(t, target);
+    let v = g.view();
+
+    let facts = DiffFacts {
+        dropped_unclaimed_paths: 1,
+        ..DiffFacts::default()
+    };
+    let (a, c) = contract_of(&v, &[], &unbounded(), facts);
+    assert!(a.tests.is_empty());
+    assert!(codes(&c).contains(&"impacted-changed-file-unindexed"));
+    assert_eq!(c.direction, ApproxDirection::Under);
+}
+
+/// The anti-flood gate, at the contract level: the *same* dropped paths beside a
+/// non-empty changed set are `target/`-shaped noise and must not reach the
+/// answer. Without this gate every ordinary run in a repository with build output
+/// carries the reason, which is what kept the general fix out of scope.
+#[test]
+fn dropped_paths_beside_a_non_empty_changed_set_are_not_disclosed() {
+    let mut g = G::new();
+    let t = g.test("t");
+    let target = g.func("target");
+    g.calls(t, target);
+    let v = g.view();
+
+    let facts = DiffFacts {
+        dropped_unclaimed_paths: 400,
+        ..DiffFacts::default()
+    };
+    let (a, c) = contract_of(&v, &[target], &unbounded(), facts);
+    assert_eq!(a.tests.len(), 1);
+    assert!(!codes(&c).contains(&"impacted-changed-file-unindexed"));
+}
+
+/// One cause, one reason: a caller reporting both counts gets the counted
+/// variant, never two rows under the same code.
+#[test]
+fn a_counted_unindexed_file_wins_over_the_dropped_path_disclosure() {
+    let mut g = G::new();
+    let t = g.test("t");
+    let target = g.func("target");
+    g.calls(t, target);
+    let v = g.view();
+
+    let facts = DiffFacts {
+        unindexed_changed_files: 2,
+        dropped_unclaimed_paths: 3,
+        ..DiffFacts::default()
+    };
+    let (_, c) = contract_of(&v, &[], &unbounded(), facts);
+    assert_eq!(
+        codes(&c)
+            .iter()
+            .filter(|code| **code == "impacted-changed-file-unindexed")
+            .count(),
+        1
+    );
+    assert!(
+        c.reasons
+            .iter()
+            .any(|r| r.code == "impacted-changed-file-unindexed" && r.detail.contains("2 changed")),
+        "the counted variant is the one that survives: {:?}",
+        c.reasons
     );
 }

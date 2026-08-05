@@ -444,17 +444,24 @@ Exit 4. cgx cannot tell whether that file drives behaviour, so it refuses to cal
 
 Untracked files that no adapter claims — cgx's own `.cgx/` store, `target/`, `node_modules/` — are excluded from the changed set under `--uncommitted` and do not trigger this. Without it the working-directory manifest, which consults no gitignore, would report a clean tree as degenerate on every run.
 
-**Two changed-path shapes are dropped with no reason on the contract.** Both are known limitations, not defects, and both are listed here because prose is the only surface that carries them:
+**What each changed-path shape does to the contract:**
 
 | Working-tree state | Contract reason |
 |---|---|
 | tracked file with no symbols edited | `impacted-changed-file-unindexed` |
 | new **untracked** file an adapter claims (e.g. `src/newmod.rs`) | kept and walked |
-| new **untracked** file no adapter claims (e.g. `migration.sql`) | **none** — dropped silently |
+| new **untracked** file no adapter claims (e.g. `migration.sql`), **and nothing else changed** | `impacted-changed-file-unindexed`, direction `under` |
+| new **untracked** file no adapter claims, **alongside another change** | **none** — dropped silently |
 | tracked source file deleted | `impacted-removed-symbols-not-walked` |
 | tracked file with no symbols deleted | **none** |
 
-The first is the price of the narrowing above: without git's exclude rules cgx cannot tell a genuinely new unindexed source file from build output, and mistaking build output for a change is the more damaging error. The second is its mirror — a deleted path contributes nothing at head, and a deleted file that defined no symbols leaves no trace on either side. Both close when `Repo::enumerate_workdir` learns git's exclude rules; neither can be counted honestly before then. In both cases the file has no call graph, so no impacted test can be lost through it — what is lost is the disclosure that something changed there.
+Row 3 is the case that must never read `exact`: the changed-symbol set comes out empty, the walk is seeded with nothing, and an empty answer labelled complete is a user told they are covered when cgx discarded the only thing that changed. The reason fires on the empty changed set alone — it names *that a path was dropped*, which needs no exclude rules, rather than *which* paths mattered, which does.
+
+Row 4 is the price of that gating. While anything else changed, cgx cannot distinguish the dropped `migration.sql` from the `target/` and `node_modules/` entries dropped beside it, and putting build output back onto every ordinary answer is the more damaging error. Row 6 is the mirror on the delete side: a deleted path contributes nothing at head, and a deleted file that defined no symbols leaves no trace on either side.
+
+Both close when `Repo::enumerate_workdir` learns git's exclude rules; neither can be *counted* honestly before then. In both cases the file has no call graph, so no impacted test can be lost through it — what is lost is the disclosure that something changed there.
+
+**One residual, in the safe direction.** Because the reason fires on any dropped path once the changed set is empty, a clean working tree carrying untracked build output that git ignores (`target/`, `node_modules/`) reports `under` rather than `exact`, naming a dropped path that is not a user change. cgx's own `.cgx/` store is excluded by name and does not do this, so a clean checkout with no other untracked content still reads `exact`. Exit codes are unaffected either way. This too closes with git's exclude rules.
 
 ### Bounding the walk
 

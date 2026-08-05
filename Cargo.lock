@@ -362,6 +362,7 @@ dependencies = [
  "cgx-store",
  "regex",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

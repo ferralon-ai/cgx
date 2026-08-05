@@ -767,3 +767,279 @@ fn serve_io_returns_parse_error_for_malformed_line() {
     assert_eq!(resp["error"]["code"], json!(-32700));
     assert_eq!(resp["id"], json!(null));
 }
+
+// --- index-freshness envelope (C2) ------------------------------------------
+
+/// A minimal valid argument set for each registered tool, keyed by tool name.
+/// Deliberately *not* the list the enumeration iterates — it is a lookup table the
+/// enumeration indexes into, so a tool present in `tools/list` with no recipe here
+/// fails the test rather than being skipped.
+fn tool_call_recipe(name: &str) -> Option<Value> {
+    Some(match name {
+        "callers" => json!({ "symbol": "leaf" }),
+        "callees" => json!({ "symbol": "main" }),
+        "reaches" => json!({ "from": "main", "to": "leaf" }),
+        "paths" => json!({ "from": "main", "to": "leaf" }),
+        "unused" => json!({}),
+        "explain" => json!({ "symbol": "helper" }),
+        "search" => json!({ "pattern": "helper" }),
+        "symbols" => json!({}),
+        "flows_to" => json!({ "symbol": "leaf" }),
+        "flows_from" => json!({ "symbol": "main" }),
+        "graph_query" => json!({ "query": r#"MATCH (a{name:"main"})-[:CALLS]->(b) RETURN a, b"# }),
+        _ => return None,
+    })
+}
+
+/// **Every** registered tool's response carries the freshness envelope.
+///
+/// Enumeration, not a spot check: the loop is driven by the live `tools/list`
+/// registry, so a twelfth tool added later is picked up automatically and fails
+/// this test two ways — no argument recipe, or a response without the envelope.
+/// A hand-written list of names could not do that.
+#[test]
+fn every_registered_tool_carries_the_freshness_envelope() {
+    let (_t, repo) = init_repo();
+    let resp = dispatch(&ServerConfig::default(), &req(1, "tools/list", json!({}))).expect("response");
+    let tools = resp.result.expect("result")["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    // Deliberately no `tools.len()` assertion: the registry grows additively and a
+    // hardcoded count would fail a new tool at rebase time with a message about
+    // arithmetic instead of about the envelope. The recipe lookup below already
+    // fails loudly, and says the useful thing.
+    assert!(
+        !tools.is_empty(),
+        "tools/list returned nothing to enumerate"
+    );
+
+    for t in &tools {
+        let name = t["name"].as_str().expect("tool name");
+        let args = tool_call_recipe(name).unwrap_or_else(|| {
+            panic!(
+                "tool `{name}` is registered but this test has no argument recipe for it. \
+                 A new tool must be added here AND must carry the freshness envelope."
+            )
+        });
+        let structured = call_tool(&repo, name, args);
+        let freshness = &structured["freshness"];
+        assert!(
+            freshness.is_object(),
+            "tool `{name}` response carries no freshness envelope: {structured}"
+        );
+        // The whole schema, not just the key: a partially-populated envelope is a
+        // silent gap of the same kind.
+        assert!(
+            freshness["indexed_tree"].is_string(),
+            "tool `{name}`: indexed_tree missing: {freshness}"
+        );
+        assert!(
+            freshness["head_tree"].is_string(),
+            "tool `{name}`: head_tree missing: {freshness}"
+        );
+        assert_eq!(
+            freshness["matches_head"],
+            json!(true),
+            "tool `{name}`: a freshly indexed repo is at HEAD: {freshness}"
+        );
+        assert!(
+            freshness["stale"].is_boolean(),
+            "tool `{name}`: stale missing: {freshness}"
+        );
+    }
+}
+
+/// No wall-clock anywhere in the envelope (D1). Byte-identical repeat calls
+/// already prove it dynamically; this proves the *schema* carries no time-shaped
+/// key, so a later addition is caught even if its value happened to be stable.
+#[test]
+fn the_freshness_envelope_carries_no_timestamp() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    let freshness = structured["freshness"].as_object().expect("envelope");
+    // `serde_json::Map` is a BTreeMap here, so the key order is sorted — which is
+    // also what makes the emitted JSON deterministic.
+    let keys: Vec<&str> = freshness.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "dirty_files",
+            "head_tree",
+            "indexed_tree",
+            "matches_head",
+            "stale"
+        ],
+        "the envelope's schema is fixed and time-free"
+    );
+}
+
+#[test]
+fn a_dirty_working_tree_is_reported_as_stale_with_a_real_count() {
+    let (_t, repo) = init_repo();
+    let clean = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": true }),
+    );
+    assert_eq!(clean["freshness"]["dirty_files"], json!(0));
+    assert_eq!(clean["freshness"]["stale"], json!(false));
+
+    make_dirty(&repo);
+    let dirty = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": true }),
+    );
+    assert_eq!(dirty["freshness"]["dirty_files"], json!(1));
+    assert_eq!(dirty["freshness"]["stale"], json!(true));
+    // The graph the answer came from is the working tree, which is now a synthetic
+    // tree and not HEAD's — `matches_head` states that rather than being a constant.
+    assert_eq!(dirty["freshness"]["matches_head"], json!(false));
+    assert_ne!(
+        dirty["freshness"]["indexed_tree"], clean["freshness"]["indexed_tree"],
+        "a dirty overlay is not the tree the clean run answered over"
+    );
+    assert_eq!(
+        dirty["freshness"]["head_tree"], clean["freshness"]["head_tree"],
+        "HEAD did not move"
+    );
+}
+
+/// The defect this test exists for: an uncommitted **deletion** changes the answer
+/// while leaving the working set smaller, so any count derived by iterating the
+/// working set alone reports `0` and the envelope tells the agent an answer is
+/// fresh when it is not. The count must come from the same path-based comparison
+/// the CLI uses.
+#[test]
+fn an_uncommitted_deletion_is_counted_and_reported_stale() {
+    let (_t, repo) = init_mixed_repo();
+    let intact = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert!(
+        result_names(&intact, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "fixture assumption: caller_fn calls other::remote_fn"
+    );
+    assert_eq!(intact["freshness"]["dirty_files"], json!(0));
+
+    std::fs::remove_file(repo.join("src/other.rs")).unwrap();
+
+    let deleted = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert!(
+        !result_names(&deleted, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "the deletion must actually move the answer, or this proves nothing"
+    );
+    assert_eq!(
+        deleted["freshness"]["dirty_files"],
+        json!(1),
+        "a deletion is one dirty file: {}",
+        deleted["freshness"]
+    );
+    assert_eq!(deleted["freshness"]["stale"], json!(true));
+}
+
+/// Cross-surface parity: the same working-tree state under the same
+/// `freshness.dirty_files` key must mean the same thing on the CLI and on MCP.
+/// Their absence is what let the two surfaces disagree by three independent
+/// mechanisms (deletions, ignore rules, and blob-OID-vs-path dedup) while every
+/// per-surface test passed.
+#[test]
+fn mcp_and_cli_report_the_same_dirty_file_count() {
+    let (_t, repo) = init_repo();
+    std::fs::write(repo.join(".gitignore"), "build/\n").unwrap();
+    std::fs::write(repo.join("src/second.rs"), "fn second() -> i32 { 2 }\n").unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+
+    // One modification, one deletion, two byte-identical additions, and an ignored
+    // build directory — one case per mechanism the two surfaces used to disagree on.
+    make_dirty(&repo);
+    std::fs::remove_file(repo.join("src/second.rs")).unwrap();
+    std::fs::write(repo.join("src/new_a.rs"), "").unwrap();
+    std::fs::write(repo.join("src/new_b.rs"), "").unwrap();
+    std::fs::create_dir_all(repo.join("build")).unwrap();
+    std::fs::write(repo.join("build/artifact.bin"), "junk\n").unwrap();
+
+    let mcp = call_tool(
+        &repo,
+        "callers",
+        json!({ "symbol": "leaf", "include_dirty": true }),
+    );
+
+    // The CLI's own computation, called directly — the same function `session.rs`
+    // now routes through, so this pins the unification rather than re-deriving it.
+    let r = cgx_index::Repo::discover(&repo).expect("discover");
+    let head = r.head_tree_oid().expect("head tree");
+    let cli = r
+        .dirty_file_count(&r.tree_blob_oids(&head).expect("tree blob oids"))
+        .expect("dirty count");
+
+    assert_eq!(
+        mcp["freshness"]["dirty_files"],
+        json!(cli),
+        "MCP and CLI must agree on dirty_files: {}",
+        mcp["freshness"]
+    );
+    assert_eq!(
+        cli, 4,
+        "modified + deleted + two distinct additions; the ignored build/ is not divergence"
+    );
+}
+
+#[test]
+fn a_committed_only_query_reports_the_working_tree_as_uninspected() {
+    let (_t, repo) = init_repo();
+    make_dirty(&repo);
+    let structured = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": false }),
+    );
+    // `include_dirty: false` never looks at the working tree, so the count is
+    // `null` ("not established"), never a `0` that would claim it was clean.
+    assert!(
+        structured["freshness"]["dirty_files"].is_null(),
+        "committed-only queries must not claim a dirty count: {structured}"
+    );
+    assert_eq!(structured["freshness"]["stale"], json!(false));
+}
+
+/// C5 at the MCP layer, *with the envelope present*: the shipped
+/// `repeated_calls_are_byte_identical` compares whole responses, so this asserts
+/// the same property specifically over the freshness object — including on a dirty
+/// tree, where a naive implementation would be most tempted to reach for a clock.
+#[test]
+fn the_freshness_envelope_is_byte_identical_across_runs() {
+    let (_t, repo) = init_repo();
+    make_dirty(&repo);
+    let a = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    let b = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    assert_eq!(
+        serde_json::to_string(&a["freshness"]).unwrap(),
+        serde_json::to_string(&b["freshness"]).unwrap()
+    );
+}

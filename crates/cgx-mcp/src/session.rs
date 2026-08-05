@@ -28,7 +28,7 @@
 use cgx_index::{
     compute_blob_oid, default_registry, index_path, index_workdir, IndexOpts, Repo, SourceFile,
 };
-use cgx_query::GraphView;
+use cgx_query::{FreshnessEnvelope, GraphView};
 use cgx_store::{FactStore, SqliteStore};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +47,17 @@ pub struct GraphSession {
     pub dirty: bool,
     /// How many working-tree files differed from the committed tree.
     pub dirty_files_analyzed: usize,
+    /// How far the indexed state is from the working state, in the shared shape
+    /// the CLI emits (divergence, never age — see [`FreshnessEnvelope`]).
+    ///
+    /// Its `dirty_files` comes from `Repo::dirty_file_count` — the same function
+    /// the CLI calls — and **not** from [`dirty_files_analyzed`](Self::dirty_files_analyzed)
+    /// beside it. The two are different questions: `dirty_files_analyzed` counts the
+    /// distinct blobs the ADR-06 overlay contributed, which is what keys the
+    /// `graph_version` digest; `freshness.dirty_files` counts the working-tree
+    /// *paths* that diverge, ignore rules applied and deletions included, which is
+    /// what an agent asking "is this answer still true of my checkout?" means.
+    pub freshness: FreshnessEnvelope,
 }
 
 /// Acquire a graph for one tool call.
@@ -71,11 +82,19 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         let outcome = index_path(root, &registry, &mut store, &opts)
             .map_err(|e| ToolError::index(format!("indexing committed tree: {e}")))?;
         let view = load_view(&store, outcome.graph_id)?;
+        // `HEAD` is resolved independently rather than reusing the graph key, so
+        // `matches_head` is derived from two separately established facts instead
+        // of being true by construction. The working tree was never inspected under
+        // `include_dirty: false` — `None`, not a `0` nobody established.
+        let head_tree = Repo::discover(root)
+            .ok()
+            .and_then(|r| r.head_tree_oid().ok());
         return Ok(GraphSession {
             view,
             graph_version: short_oid(&outcome.graph_key),
             dirty: false,
             dirty_files_analyzed: 0,
+            freshness: FreshnessEnvelope::new(Some(outcome.graph_key), head_tree, None),
         });
     }
 
@@ -101,6 +120,30 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
     let view = load_view(&store, outcome.graph_id)?;
 
+    // The envelope's divergence count comes from the *same* function the CLI uses,
+    // so `freshness.dirty_files` means exactly one thing on both surfaces. It is
+    // deliberately not `dirty_oids.len()`: that vector exists to key the ADR-06
+    // overlay digest, and as a divergence count it would be wrong three ways — it
+    // iterates the working set only (a deletion is invisible), it dedups by blob
+    // OID rather than by path, and it inherits `enumerate_workdir`'s blindness to
+    // `.gitignore`. `null` where the count could not be established, never a `0`.
+    let dirty_files = repo
+        .tree_blob_oids(&head_tree_oid)
+        .and_then(|indexed| repo.dirty_file_count(&indexed))
+        .ok();
+
+    // What the answer was computed over is the working tree, so that is what
+    // `indexed_tree` must name. A count of `0` establishes that the working tree is
+    // content-identical to HEAD's tree, and only then is the indexed tree HEAD's;
+    // otherwise it is the synthetic working-directory key, which is not HEAD's tree
+    // and must not derive `matches_head: true`.
+    let indexed_tree = match dirty_files {
+        Some(0) => head_tree_oid.clone(),
+        _ => outcome.graph_key.clone(),
+    };
+    let freshness =
+        FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty_files);
+
     if dirty_oids.is_empty() {
         // Clean tree: the overlay changed nothing, so report the committed base.
         Ok(GraphSession {
@@ -108,6 +151,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
             graph_version: short_oid(&head_tree_oid),
             dirty: false,
             dirty_files_analyzed: 0,
+            freshness,
         })
     } else {
         Ok(GraphSession {
@@ -119,6 +163,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
             ),
             dirty: true,
             dirty_files_analyzed: dirty_oids.len(),
+            freshness,
         })
     }
 }

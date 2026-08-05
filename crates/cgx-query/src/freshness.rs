@@ -35,6 +35,12 @@
 //! reports `Some(0)` — the two are deliberately distinguishable, the same way a
 //! negative answer carries its scope.
 //!
+//! `matches_head` has a third `None` case, reached through
+//! [`indeterminate_head`](FreshnessEnvelope::indeterminate_head): both trees are
+//! known, but the surface holds two views of the working tree that disagree about
+//! whether the graph it answered over *is* `HEAD`'s tree. Asserting either boolean
+//! there would state something nobody established, so the envelope says so.
+//!
 //! The same distinction leads the human line: it says `current` only when both
 //! halves were established and both came back clean, `stale` when a divergence
 //! was established, and `unknown` when something was never looked at. A `null`
@@ -61,8 +67,10 @@ pub struct FreshnessEnvelope {
     pub head_tree: Option<String>,
     /// Whether [`indexed_tree`](Self::indexed_tree) is the current `HEAD` tree.
     /// `false` means the index is pinned to, or lagging behind, a different commit.
-    /// `null` when either tree is unknown — never `false`, which would assert a
-    /// divergence nobody established.
+    /// `null` when either tree is unknown, or when the surface could not establish
+    /// the relation (see [`indeterminate_head`](Self::indeterminate_head)) — never
+    /// `false`, which would assert a divergence nobody established, and never
+    /// `true`, which would be a clean bill nobody established.
     pub matches_head: Option<bool>,
     /// How many working-tree files diverge from the indexed tree (content differs,
     /// or the file was added/removed). `null` when the surface did not inspect the
@@ -98,6 +106,36 @@ impl FreshnessEnvelope {
             (Some(i), Some(h)) => Some(i == h),
             _ => None,
         };
+        Self::build(indexed_tree, head_tree, matches_head, dirty_files)
+    }
+
+    /// An envelope whose `matches_head` the surface **could not establish**, though
+    /// it knows both trees.
+    ///
+    /// The case this exists for: a working-directory query whose graph key is a
+    /// synthetic `workdir:` key, where the surface's two views of the working tree
+    /// disagree about whether that graph is `HEAD`'s tree — one walk applies git's
+    /// ignore rules and the other (the one that fed the indexer) does not, so an
+    /// ignored source file is in the graph and not in `HEAD`. Comparing the two
+    /// keys as strings would answer `false` for a tree that may well be `HEAD`'s,
+    /// and the surface's own `dirty_files: 0` would answer `true` for a graph that
+    /// demonstrably is not. `None` is the only honest third answer, and
+    /// [`human_summary`](Self::human_summary)'s verdict word renders it `unknown`
+    /// rather than `current`.
+    pub fn indeterminate_head(
+        indexed_tree: Option<String>,
+        head_tree: Option<String>,
+        dirty_files: Option<usize>,
+    ) -> Self {
+        Self::build(indexed_tree, head_tree, None, dirty_files)
+    }
+
+    fn build(
+        indexed_tree: Option<String>,
+        head_tree: Option<String>,
+        matches_head: Option<bool>,
+        dirty_files: Option<usize>,
+    ) -> Self {
         let stale = matches_head == Some(false) || dirty_files.is_some_and(|n| n > 0);
         FreshnessEnvelope {
             indexed_tree,
@@ -268,6 +306,35 @@ mod tests {
             assert_eq!(env.matches_head, c.want_matches_head, "{}", c.name);
             assert_eq!(env.stale, c.want_stale, "{}", c.name);
         }
+    }
+
+    /// The third `matches_head` state. A surface that cannot establish the relation
+    /// must not be able to produce the reassuring word, and must not manufacture a
+    /// `stale: true` it never established either.
+    #[test]
+    fn an_indeterminate_head_relation_is_neither_current_nor_stale() {
+        let env = FreshnessEnvelope::indeterminate_head(
+            Some("workdir:abcdef".into()),
+            Some("aaaa".into()),
+            Some(0),
+        );
+        assert_eq!(env.matches_head, None);
+        assert!(!env.stale, "nothing established a divergence");
+        assert!(
+            env.human_summary().starts_with("freshness: unknown"),
+            "{}",
+            env.human_summary()
+        );
+
+        // A count that *did* establish divergence still reads stale.
+        let env = FreshnessEnvelope::indeterminate_head(
+            Some("workdir:abcdef".into()),
+            Some("aaaa".into()),
+            Some(2),
+        );
+        assert_eq!(env.matches_head, None);
+        assert!(env.stale);
+        assert!(env.human_summary().starts_with("freshness: stale"));
     }
 
     #[test]

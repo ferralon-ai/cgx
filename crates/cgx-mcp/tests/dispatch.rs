@@ -1191,6 +1191,116 @@ fn a_newline_in_a_path_does_not_collide_two_working_trees_onto_one_graph_version
     );
 }
 
+/// The other direction of the C9 consistency property, and the one the table above
+/// cannot see: `dirty: true` beside a verdict of `current`.
+///
+/// `dirty_file_count` applies git's ignore rules; `enumerate_workdir`, which feeds
+/// the indexer, applies none. When they disagree the graph contains a symbol that
+/// is not in `HEAD`'s tree while git calls the checkout clean, so neither
+/// `matches_head: true` (a clean bill over an answer HEAD cannot produce) nor
+/// `matches_head: false` (a divergence git denies) is established. `null` is the
+/// only honest answer, and it must never render as `current`.
+#[test]
+fn two_disagreeing_views_of_the_working_tree_yield_an_unestablished_matches_head() {
+    struct Case {
+        name: &'static str,
+        /// Returns the symbol the graph gains but `HEAD` does not have, if any.
+        setup: fn(&Path) -> Option<&'static str>,
+    }
+
+    let cases = [
+        Case {
+            // The harmful form: an ignored *source* file is in the answer.
+            name: "gitignored source file",
+            setup: |r| {
+                std::fs::write(r.join(".gitignore"), "generated/\n").unwrap();
+                run_git(r, &["add", ".gitignore"]);
+                run_git(
+                    r,
+                    &[
+                        "-c",
+                        "author.name=cgx-test",
+                        "-c",
+                        "author.email=cgx@test.invalid",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "ignore generated",
+                        "--date=2020-01-01T00:00:00Z",
+                    ],
+                );
+                std::fs::create_dir_all(r.join("generated")).unwrap();
+                std::fs::write(
+                    r.join("generated/gen.rs"),
+                    "pub fn ignored_symbol() -> i32 { 7 }\n",
+                )
+                .unwrap();
+                Some("ignored_symbol")
+            },
+        },
+        Case {
+            // The mundane form, which fires on every repo `cgx index` has touched:
+            // `.cgx/` is untracked and self-ignored via its own `.gitignore`.
+            name: "indexed repo with .cgx/ present",
+            setup: |r| {
+                std::fs::create_dir_all(r.join(".cgx")).unwrap();
+                std::fs::write(r.join(".cgx/.gitignore"), "*\n").unwrap();
+                std::fs::write(r.join(".cgx/HEAD.json"), "{}\n").unwrap();
+                None
+            },
+        },
+    ];
+
+    for Case { name, setup } in cases {
+        let (_t, repo) = init_repo();
+        let extra_symbol = setup(&repo);
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            out.stdout.is_empty(),
+            "{name}: fixture assumption — git must call this tree clean, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let s = call_tool(
+            &repo,
+            "search",
+            json!({ "all": true, "include_dirty": true }),
+        );
+        if let Some(symbol) = extra_symbol {
+            assert!(
+                result_fqns(&s).iter().any(|f| f.contains(symbol)),
+                "{name}: fixture assumption — the answer contains a symbol HEAD's tree does not: {:?}",
+                result_fqns(&s)
+            );
+        }
+
+        assert_eq!(s["dirty"], json!(true), "{name}: the overlay saw the file");
+        assert_eq!(
+            s["freshness"]["dirty_files"],
+            json!(0),
+            "{name}: git's own view is that nothing diverged: {}",
+            s["freshness"]
+        );
+        assert!(
+            s["freshness"]["matches_head"].is_null(),
+            "{name}: the two views disagree, so `matches_head` is not established: {}",
+            s["freshness"]
+        );
+        assert_eq!(
+            s["freshness"]["stale"],
+            json!(false),
+            "{name}: nothing established a divergence either: {}",
+            s["freshness"]
+        );
+    }
+}
+
 /// Cross-surface parity: the same working-tree state under the same
 /// `freshness.dirty_files` key must mean the same thing on the CLI and on MCP.
 /// Their absence is what let the two surfaces disagree by three independent

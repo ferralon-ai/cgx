@@ -19,7 +19,14 @@
 //!   the committed tree and the working tree — so a cache keyed on
 //!   `(query, graph_version)` distinguishes bases (ADR-06). A working tree with
 //!   no such difference reports the committed `graph_version` (no spurious
-//!   `+dirty`).
+//!   `+dirty`). That is **not** the same as "a tree git calls clean": the
+//!   difference is computed from [`cgx_index::Repo::enumerate_workdir`], which
+//!   applies no ignore rules, so an untracked or ignored file — cgx's own `.cgx/`
+//!   on any repo that has been indexed, most commonly — makes the overlay
+//!   non-empty and the `graph_version` `+dirty` on a `git status`-clean checkout.
+//!   That is honest: the ignored file *is* part of what the answer was computed
+//!   over. It is also why `freshness.matches_head` is three-valued (see
+//!   [`acquire`]).
 //!
 //! Because a working-directory blob OID is content-addressed exactly as git would
 //! compute it, a file whose content matches its committed blob contributes no
@@ -59,13 +66,29 @@ pub struct GraphSession {
     /// How far the indexed state is from the working state, in the shared shape
     /// the CLI emits (divergence, never age — see [`FreshnessEnvelope`]).
     ///
-    /// Its `dirty_files` comes from `Repo::dirty_file_count` — the same function
-    /// the CLI calls — and **not** from [`dirty_files_analyzed`](Self::dirty_files_analyzed)
-    /// beside it. The two are different questions: `dirty_files_analyzed` counts the
-    /// distinct paths the ADR-06 overlay contributed, which is what keys the
-    /// `graph_version` digest; `freshness.dirty_files` counts the working-tree
-    /// *paths* that diverge, ignore rules applied and deletions included, which is
-    /// what an agent asking "is this answer still true of my checkout?" means.
+    /// **Read this next to [`dirty_files_analyzed`](Self::dirty_files_analyzed),
+    /// and do not collapse the two.** They answer different questions and need not
+    /// be the same number, but both are derived from one committed-tree view
+    /// (`Repo::tree_blob_oids` of `HEAD`) and both see deletions — so they can
+    /// differ in magnitude and never contradict each other:
+    ///
+    /// - `dirty_files_analyzed` is a property of the **graph**: how many paths the
+    ///   overlay fed into the index differently from `HEAD`. It keys the
+    ///   `graph_version` digest, so it must count everything that reached the
+    ///   indexer, ignore rules included — an ignored file that the working-tree
+    ///   index read is part of what the answer was computed over.
+    /// - `freshness.dirty_files` is a property of the **checkout**: how many paths
+    ///   git would call divergent, from `Repo::dirty_file_count` (the function the
+    ///   CLI calls), ignore rules applied and submodules not descended. It answers
+    ///   "is this answer still true of my working tree?".
+    ///
+    /// Because the two counts apply different ignore rules, they can also disagree
+    /// about whether the graph is `HEAD`'s tree at all; `freshness.matches_head` is
+    /// `null` exactly there (see [`acquire`]).
+    ///
+    /// A repo with a populated `target/` therefore reports a larger
+    /// `dirty_files_analyzed` than `freshness.dirty_files`. That is correct on both
+    /// sides, not drift.
     pub freshness: FreshnessEnvelope,
 }
 
@@ -114,12 +137,17 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .ok_or_else(|| ToolError::index("repository has no working directory"))?
         .to_path_buf();
 
-    // Compute the overlay digest from the files that differ from HEAD, before we
-    // consume the store for indexing.
+    // Compute the overlay difference from HEAD, before we consume the store for
+    // indexing. `tree_blob_oids` is the *same* committed-tree view the envelope's
+    // count is measured against (and it reads no blob content, unlike
+    // `enumerate_tree`), so the two numbers below can never be derived from
+    // contradictory pictures of what `HEAD` contains.
     let head_tree_oid = repo
         .head_tree_oid()
         .map_err(|e| ToolError::index(e.to_string()))?;
-    let committed = committed_oids(&repo)?;
+    let committed = repo
+        .tree_blob_oids(&head_tree_oid)
+        .map_err(|e| ToolError::index(e.to_string()))?;
     let working = repo
         .enumerate_workdir(&workdir)
         .map_err(|e| ToolError::index(e.to_string()))?;
@@ -130,28 +158,62 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     let view = load_view(&store, outcome.graph_id)?;
 
     // The envelope's divergence count comes from the *same* function the CLI uses,
-    // so `freshness.dirty_files` means exactly one thing on both surfaces. It is
-    // deliberately not `overlay.len()`: that vector exists to key the ADR-06
-    // overlay digest, and as a divergence count it would be wrong two ways — it
-    // counts paths rather than what `dirty_file_count` itself defines, and it
-    // inherits `enumerate_workdir`'s blindness to `.gitignore`. `null` where the
-    // count could not be established, never a `0`.
-    let dirty_files = repo
-        .tree_blob_oids(&head_tree_oid)
-        .and_then(|indexed| repo.dirty_file_count(&indexed))
-        .ok();
+    // so `freshness.dirty_files` answers the same question on both surfaces. It is
+    // deliberately not `overlay.len()` — see `GraphSession::freshness` for why the
+    // two are different questions. `null` where the count could not be established,
+    // never a `0`.
+    let dirty_files = repo.dirty_file_count(&committed).ok();
+
+    // Whether the graph is HEAD's tree is **three-valued**, because neither view of
+    // the working tree is authoritative alone:
+    //
+    // - `overlay` is built from `enumerate_workdir`, which applies no ignore rules.
+    //   It is exactly what fed the indexer, so an empty overlay is the strongest
+    //   fact available: nothing on disk differs from the committed tree at all, and
+    //   the graph *is* HEAD's tree however git would describe the checkout.
+    // - `dirty_file_count` applies git's ignore rules, so it answers a narrower
+    //   question and can report `0` for a tree the indexer read extra files from.
+    //
+    // A non-empty overlay beside `dirty_files == 0` is those two views disagreeing:
+    // an ignored `.rs` file is in the graph and not in HEAD's tree (`matches_head:
+    // true` would be a false clean bill on an answer containing a symbol HEAD does
+    // not have), yet git's own account of the checkout is that it matches HEAD
+    // (`false` would assert a divergence nobody established). `None` is the honest
+    // third answer, and the envelope's verdict word renders it `unknown`.
+    //
+    // This is a bridge, not a permanent shrug: once `enumerate_workdir` becomes
+    // ignore-aware (backlog B-17), a git-clean repo has an empty overlay and this
+    // returns to `Some(true)` on its own.
+    let matches_head = if overlay.is_empty() {
+        Some(true)
+    } else if dirty_files.is_some_and(|n| n > 0) {
+        Some(false)
+    } else {
+        None
+    };
 
     // What the answer was computed over is the working tree, so that is what
-    // `indexed_tree` must name. A count of `0` establishes that the working tree is
-    // content-identical to HEAD's tree, and only then is the indexed tree HEAD's;
-    // otherwise it is the synthetic working-directory key, which is not HEAD's tree
-    // and must not derive `matches_head: true`.
-    let indexed_tree = match dirty_files {
-        Some(0) => head_tree_oid.clone(),
-        _ => outcome.graph_key.clone(),
+    // `indexed_tree` must name — unless the working tree is established to be
+    // content-identical to HEAD's tree, in which case naming HEAD's tree is the
+    // honest description of the same graph.
+    let indexed_tree = if matches_head == Some(true) {
+        head_tree_oid.clone()
+    } else {
+        outcome.graph_key.clone()
     };
-    let freshness =
-        FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty_files);
+    let freshness = match matches_head {
+        // The `workdir:` key is never HEAD's tree OID, so `new` derives exactly the
+        // `matches_head` computed above for both `Some` arms.
+        Some(_) => {
+            FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty_files)
+        }
+        None => FreshnessEnvelope::indeterminate_head(
+            Some(indexed_tree),
+            Some(head_tree_oid.clone()),
+            dirty_files,
+        ),
+    };
+    debug_assert_eq!(freshness.matches_head, matches_head);
 
     if overlay.is_empty() {
         // Clean tree: the overlay changed nothing, so report the committed base.
@@ -210,17 +272,6 @@ fn load_view(store: &SqliteStore, graph_id: cgx_store::GraphId) -> Result<GraphV
         .read_graph(graph_id)
         .map_err(|e| ToolError::index(format!("reading graph: {e}")))?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
-}
-
-/// The committed `HEAD` tree's `path -> blob_oid` map.
-fn committed_oids(repo: &Repo) -> Result<BTreeMap<String, String>, ToolError> {
-    let sources = repo
-        .enumerate_tree()
-        .map_err(|e| ToolError::index(e.to_string()))?;
-    Ok(sources
-        .into_iter()
-        .map(|s| (s.rel_path, s.blob_oid))
-        .collect())
 }
 
 /// Every way the working tree differs from the committed tree, one deterministic

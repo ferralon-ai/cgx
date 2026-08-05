@@ -567,6 +567,82 @@ fn quote(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Escape a string for a Mermaid **node** label (`n0["…"]`).
+///
+/// Mermaid is not a backslash-escaping language: inside `["…"]` its lexer closes
+/// the string at the first `"` and there is no `\"`. Its only escape mechanism is
+/// the HTML entity code — `#quot;`, `#92;`, `#lt;` — which the flowchart lexer
+/// decodes before the label is rendered. So [`quote`], which is a Graphviz/D2
+/// escaper, must not be used here; `\"` produces source that does not parse at all.
+///
+/// The set below is the set that measurement showed to be hostile in this context
+/// against mermaid-cli 11.16.0, and nothing more — a wider set would change the
+/// emitted bytes for FQNs that render correctly today:
+///
+/// | char  | raw behaviour in `["…"]`                     |
+/// |-------|----------------------------------------------|
+/// | `"`   | parse error, no diagram                      |
+/// | `<`   | swallowed as an HTML tag: `List<String>` renders `List` |
+/// | `` ` `` | opens a markdown code span, delimiters lost |
+/// | `\`   | fine raw; it is [`quote`] that corrupts it, by doubling |
+///
+/// `>`, `&`, `#`, `;`, `|`, `[`, `]`, `(`, `)`, `{`, `}`, `*`, `_` and non-ASCII
+/// all render correctly raw in this context and are deliberately left alone.
+fn mermaid_node_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match mermaid_entity(c) {
+            Some(e) => out.push_str(e),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The entity code for a character that is hostile in *any* Mermaid label context,
+/// or `None` when the character is safe raw everywhere. See
+/// [`mermaid_node_label`] for the measurements behind the set.
+fn mermaid_entity(c: char) -> Option<&'static str> {
+    match c {
+        '"' => Some("#quot;"),
+        '<' => Some("#lt;"),
+        '`' => Some("#96;"),
+        '\\' => Some("#92;"),
+        _ => None,
+    }
+}
+
+/// Escape a string for a Mermaid **edge** label (`a -->|…| b`).
+///
+/// A different context from [`mermaid_node_label`] and a more hostile one: the
+/// label is unquoted, so every node-shape delimiter terminates it. Measured
+/// against mermaid-cli 11.16.0, raw `|`, `[`, `]`, `(`, `)`, `{` and `}` each
+/// produce a parse error here while being harmless inside `["…"]`.
+///
+/// cgx only ever emits [`condition_str`] values (five lowercase words) as edge
+/// labels, so in practice this escaper is the identity — it exists so the emitter
+/// is correct rather than incidentally correct.
+fn mermaid_edge_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let entity = match c {
+            '|' => Some("#124;"),
+            '[' => Some("#91;"),
+            ']' => Some("#93;"),
+            '(' => Some("#40;"),
+            ')' => Some("#41;"),
+            '{' => Some("#123;"),
+            '}' => Some("#125;"),
+            _ => mermaid_entity(c),
+        };
+        match entity {
+            Some(e) => out.push_str(e),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render path-shaped results as Graphviz DOT (`digraph`). Dependency-free string
 /// templating — we emit `.dot` source text, never a rendered image.
 fn render_dot(g: GraphData) -> String {
@@ -600,7 +676,11 @@ fn render_mermaid(g: GraphData) -> String {
     let ids = node_ids(&g);
     let mut out = String::from("graph TD\n");
     for n in &g.nodes {
-        out.push_str(&format!("  {}[\"{}\"]\n", ids[n.as_str()], quote(n)));
+        out.push_str(&format!(
+            "  {}[\"{}\"]\n",
+            ids[n.as_str()],
+            mermaid_node_label(n)
+        ));
     }
     for (src, dst, label) in &g.edges {
         if label.is_empty() {
@@ -609,7 +689,7 @@ fn render_mermaid(g: GraphData) -> String {
             out.push_str(&format!(
                 "  {} -->|{}| {}\n",
                 ids[src.as_str()],
-                quote(label),
+                mermaid_edge_label(label),
                 ids[dst.as_str()]
             ));
         }
@@ -1332,4 +1412,62 @@ fn node_kind_str(node: &NodeRecord) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "symbol".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each mapping below was verified against mermaid-cli 11.16.0 by rendering
+    /// the escaped form and reading the label back out of the SVG: the raw
+    /// character on the left is what the diagram displays. The node-label
+    /// integration coverage lives in `tests/diff_gate.rs`; this pins the *edge*
+    /// context, which no `cgx diff` path reaches.
+    #[test]
+    fn mermaid_escapers_cover_the_characters_each_context_acts_on() {
+        // Common to both contexts. `\` is not doubled: Mermaid has no backslash
+        // escape at all, so `quote()`'s `\\` would render as two backslashes.
+        for (raw, escaped) in [
+            ("a\"b", "a#quot;b"),
+            ("a<b", "a#lt;b"),
+            ("a`b", "a#96;b"),
+            ("a\\b", "a#92;b"),
+        ] {
+            assert_eq!(mermaid_node_label(raw), escaped);
+            assert_eq!(mermaid_edge_label(raw), escaped);
+        }
+
+        // Node labels sit inside `["…"]`, which makes the shape delimiters inert;
+        // an edge label is bare between two `|`, and every one of them ends it.
+        for (raw, escaped) in [
+            ("a|b", "a#124;b"),
+            ("a[b", "a#91;b"),
+            ("a]b", "a#93;b"),
+            ("a(b", "a#40;b"),
+            ("a)b", "a#41;b"),
+            ("a{b", "a#123;b"),
+            ("a}b", "a#125;b"),
+        ] {
+            assert_eq!(mermaid_node_label(raw), raw, "inert inside [\"…\"]");
+            assert_eq!(mermaid_edge_label(raw), escaped);
+        }
+
+        // Deliberately untouched: these render correctly raw in both contexts, and
+        // escaping them would change the emitted bytes for output that is already
+        // correct. `#` especially — it is cgx's own value-node suffix separator
+        // (`…::b#1`), present in 632 of the 1210 FQNs in `fixtures/`.
+        for raw in ["a>b", "a&b", "a#1", "a;b", "a*b", "a_b", "π::日本"] {
+            assert_eq!(mermaid_node_label(raw), raw);
+            assert_eq!(mermaid_edge_label(raw), raw);
+        }
+    }
+
+    /// `quote()` stays the Graphviz/D2 escaper it always was — the Mermaid fix
+    /// must not have leaked into the two formats a real compiler already accepts.
+    #[test]
+    fn quote_remains_the_backslash_escaper_for_dot_and_d2() {
+        assert_eq!(quote("a\"b"), "a\\\"b");
+        assert_eq!(quote("a\\b"), "a\\\\b");
+        assert_eq!(quote("a<b>&|#;`"), "a<b>&|#;`");
+    }
 }

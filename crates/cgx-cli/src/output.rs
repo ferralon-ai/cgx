@@ -2036,9 +2036,14 @@ mod tests {
             ("&lt;", '<'),
             ("&gt;", '>'),
             ("&nbsp;", '\u{a0}'),
-            ("&num;", '#'),
-            ("&semi;", ';'),
-            ("&verbar;", '|'),
+            // Graphviz 15.1.0 decodes exactly these five names — measured, not taken
+            // from HTML5's table, which is much larger. `&num;` `&semi;` `&verbar;`
+            // were listed here and are NOT decoded by Graphviz; they rendered
+            // literally. They were unreachable (`assert_dot_label_inert` rejects any
+            // `&` not opening `&amp;` before the decoder sees it), so no test caught
+            // the disagreement with the copy of this table in `tests/diff_gate.rs`,
+            // which was right. A model that over-decodes is a trap for the next
+            // reader even when it cannot currently misfire.
         ];
         let mut out = String::with_capacity(s.len());
         let mut rest = s;

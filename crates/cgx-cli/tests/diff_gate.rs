@@ -1297,3 +1297,32 @@ fn format_rejection_happens_before_indexing() {
         "the guard rejects before `.cgx/` is created and the refs are indexed"
     );
 }
+
+/// Cover the `style`/`classDef` branch of [`assert_mermaid_label_inert`].
+///
+/// That branch guards Mermaid's third source rewrite — `/(?:style|classDef).*:\S*#.*;/`
+/// replaces its match with the match minus its final character, silently deleting a
+/// `;` an entity needed. No fixture FQN contains `style` or `classDef`, so the branch
+/// never executed: a `panic!` planted as its first statement left the target green,
+/// and inverting its assertion survived the suite. A guard no test reaches is not a
+/// guard, so it is driven directly here rather than left to a fixture that will never
+/// produce one.
+#[test]
+fn mermaid_inert_oracle_rejects_a_directive_line_that_loses_its_semicolon() {
+    // `#` sits before the final `;`, so the rewrite would strip that `;` and break
+    // the `&quot;` the label depends on.
+    let hostile = "classDef x:#fff&quot;";
+    let caught = std::panic::catch_unwind(|| {
+        assert_mermaid_label_inert(hostile, "directive-branch coverage");
+    });
+    assert!(
+        caught.is_err(),
+        "the oracle must reject a style/classDef label whose `#` precedes the final `;` \
+         — this is the branch that was previously unreachable"
+    );
+
+    // The same label without the directive keyword is inert: the rewrite cannot match,
+    // so the branch must NOT fire. This pins that the guard is specific, not a blanket
+    // rejection of `#`.
+    assert_mermaid_label_inert("plain x:#fff&quot;", "directive-branch negative");
+}

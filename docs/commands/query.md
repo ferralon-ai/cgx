@@ -32,18 +32,28 @@ Use `cgx query` when the dedicated subcommands (`callers`, `paths`, `reaches`, e
 | `WHERE a.fqn = "..."` | supported |
 | `WHERE a.name = "..."` | supported |
 | `WHERE a.kind = "..."` | supported — values: `function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint` |
+| `WHERE a.file = "..."` / `a.line = n` | supported |
+| `WHERE r.confidence = "..."` | supported on a **named** relationship (`-[r:CALLS]->`) — values `possible`, `probable`, `certain`. `a.confidence` is a plan error: confidence is an edge attribute, not a node one |
+| `WHERE r.condition = "..."` | supported — values `always`, `conditional`, `loop`, `exception`, `panic` |
+| `WHERE r.kind = "..."` | supported — the edge-kind token |
 | `RETURN a.fqn, b.fqn` | supported |
 | `RETURN a.name, b.name` | supported |
 | `RETURN a.kind, b.kind` | supported |
-| `RETURN path` | supported for path-shaped results; enables `--format dot\|mermaid\|d2` |
+| `MATCH p = (a)-[:CALLS*1..3]->(b) … RETURN p` | supported — a named variable-length pattern is the path-shaped form, and the only one that enables `--format dot\|mermaid\|d2`. A plain `MATCH (a)-[:CALLS]->(b)` returns a table however you spell the `RETURN`, and the graph formats then exit 2. Variable-length expansion is not work-budgeted the way [`cgx paths`](paths.md) is; on a graph of tens of thousands of nodes prefer `cgx paths`, which answers the same question in bounded time |
 | `LIMIT n` | supported |
 | `WHERE a.source_class = "..."` | unsupported — plan error, exit 2 |
 | `WHERE a.sink_class = "..."` | unsupported — plan error, exit 2 |
 | `WHERE a.taint_label = "..."` | unsupported — plan error, exit 2 |
 
-### Confidence and edge conditions
+### Filtering happens in the query, not on the command line
 
-Results include edges from all confidence tiers by default (`possible`, `probable`, `certain`). Pass `--confidence` to set a floor. Edge-condition tags on results follow the same rendering convention as other subcommands: `always` edges are omitted from output, `conditional` renders as `[if]`, `exception` renders as `[exc]`, `loop` and `panic` render verbatim.
+CQL carries its own filters, so `cgx query` reads the graph unfiltered and lets the statement do the selecting. Three `QueryArgs` flags are therefore accepted but inert here — **`--confidence`, `--depth`, and `--tree` change nothing about the result**. Filter by confidence with `r.confidence` on a named relationship, bound a traversal with the pattern's own `*1..n` range, and shape path output with `--format`. (This is a known wart: the flags are shared with the Layer-1 subcommands and are not rejected. Passing them is silent, not an error.)
+
+Edge-condition and confidence tags are a property of the *forest and path* renderers, not of the query result table. A tabular result prints exactly the columns you asked for; select the underlying values explicitly if you need them.
+
+### Vacuity works differently here
+
+`--assert-empty` and the ADR-08 vacuity guard behave as they do elsewhere with one deviation: because CQL carries its filters intrinsically, the "filters excluded every candidate" clause can never fire. The guard reduces to "the graph has no nodes at all", so a populated graph returning zero rows under `--assert-empty` is a genuine, non-vacuous pass (exit 0).
 
 ### Dataflow edges
 
@@ -60,12 +70,12 @@ Results include edges from all confidence tiers by default (`possible`, `probabl
 | Flag | Value | Default | Meaning |
 |------|-------|---------|---------|
 | `--repo <REPO>` | path | CWD | Path to the indexed repository containing a `.cgx/` store. |
-| `--format <FORMAT>` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. Tabular results (all `RETURN` forms except `RETURN path`) support `human`, `json`, and `sarif`. Path-shaped results (`RETURN path`) additionally support `dot`, `mermaid`, and `d2`. |
+| `--format <FORMAT>` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. Tabular results support `human`, `json`, and `sarif`; `dot\|mermaid\|d2` exit 2 with `dot/mermaid/d2 are only valid for path-returning queries`. A path-shaped result (a named variable-length pattern) accepts all six and renders identically to [`cgx paths`](paths.md). |
 | `--at <AT>` | git ref | working HEAD | Pin the query to a specific commit's graph snapshot (Q-17). |
-| `--depth <DEPTH>` | integer | `6` | Maximum traversal depth. `0` = unlimited (work-budgeted, may show `[truncated]`). |
-| `--tree <TREE>` | `full\|spanning` | `full` | Forest shape. Applies to path-shaped results; ignored for tabular results. |
-| `--confidence <CONFIDENCE>` | `possible\|probable\|certain` | — | Floor filter: exclude edges below this confidence tier. No flag = all tiers shown. |
-| `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any results are found; exit 4 if the query passed vacuously (filters excluded all candidates). See [Exit codes](#exit-codes). |
+| `--depth <DEPTH>` | integer | — | **Accepted and ignored.** Traversal depth comes from the pattern's `*n..m` range, not from this flag. |
+| `--tree <TREE>` | `full\|spanning` | `full` | **Accepted and ignored.** `query` renders tables and paths, never a forest. |
+| `--confidence <CONFIDENCE>` | `possible\|probable\|certain` | — | **Accepted and ignored.** Filter confidence with a `WHERE` clause instead. |
+| `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any rows are returned; exit 4 only if the graph itself was empty (see "Vacuity works differently here"). |
 | `--allow-vacuous` | boolean flag | — | Suppress the ADR-08 vacuity guard: converts exit 4 to exit 0 when `--assert-empty` passes vacuously. |
 | `--no-auto-index` | boolean flag | — | Require an explicit prior `cgx index`; if no `.cgx/` store is present, exit 3 instead of auto-indexing. |
 
@@ -75,7 +85,7 @@ Results include edges from all confidence tiers by default (`possible`, `probabl
 
 ```
 cgx query 'MATCH (a)-[:CALLS]->(b) WHERE a.fqn = "rust_sample::conditions::dispatch" RETURN a.fqn, b.fqn' \
-  --repo /path/to/rust-sample
+  --repo /path/to/worktree
 ```
 
 ```
@@ -83,45 +93,62 @@ a.fqn                              b.fqn
 rust_sample::conditions::dispatch  rust_sample::conditions::log_info
 rust_sample::conditions::dispatch  rust_sample::conditions::log_warn
 rust_sample::conditions::dispatch  rust_sample::conditions::log_error
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 5ea331d, working tree clean
 ```
 
 The result table has one row per matching edge. The `a.fqn` and `b.fqn` columns are the FQNs of the caller and callee respectively.
 
 ### Find all callers of a function, filtered to certain confidence
 
+Confidence is an **edge** attribute, so it is filtered by naming the relationship and constraining `r.confidence` — not by the `--confidence` flag, which `query` ignores.
+
 ```
-cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.fqn = "rust_sample::conditions::log_info" RETURN a.fqn, b.fqn' \
-  --repo /path/to/rust-sample \
-  --confidence certain
+cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE b.fqn = "rust_sample::conditions::log_info" AND r.confidence = "certain" RETURN a.fqn, b.fqn' \
+  --repo /path/to/worktree
 ```
 
 ```
-a.fqn                                       b.fqn
-rust_sample::conditions::cleanup            rust_sample::conditions::log_info
-rust_sample::conditions::dispatch           rust_sample::conditions::log_info
-rust_sample::conditions::maybe_log          rust_sample::conditions::log_info
-ts_sample::closures::closureVariable        rust_sample::conditions::log_info
-ts_sample::closures::nestedClosures         rust_sample::conditions::log_info
-ts_sample::closures::nestedClosures::outer  rust_sample::conditions::log_info
+a.fqn                               b.fqn
+rust_sample::conditions::cleanup    rust_sample::conditions::log_info
+rust_sample::conditions::dispatch   rust_sample::conditions::log_info
+rust_sample::conditions::maybe_log  rust_sample::conditions::log_info
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 5ea331d, working tree clean
 ```
 
-`--confidence certain` excludes `possible` and `probable` edges; only `scope_graph`-resolved calls survive. The result is a subset of what `cgx callers log_info` would return.
+Only `scope_graph`-resolved calls survive. Dropping the `r.confidence` clause adds three `ts_sample::closures::*` rows — name-collision candidates that `cgx callers log_info` shows as `[possible]`. That is the whole difference between an audit-grade caller list and a discovery-grade one, and CQL is where you choose.
+
+Note that the contract still reads `exact`. It describes the traversal, not the filter: no edge was dropped by a confidence *floor* on the walk, because there was no floor — the filter ran as a predicate over an unrestricted scan.
 
 ### JSON output for tool integration
 
 ```
 cgx query 'MATCH (a)-[:CALLS]->(b) WHERE a.fqn = "rust_sample::conditions::dispatch" RETURN a.fqn, b.fqn' \
-  --repo /path/to/rust-sample \
+  --repo /path/to/worktree \
   --format json
 ```
 
 ```json
 {
+  "approximation": {
+    "direction": "exact",
+    "modeled_graph": "descended function bodies in the indexed repository; external/unindexed callees, undescended closure bodies, and unexpanded macros are outside the modeled graph",
+    "reasons": []
+  },
   "columns": [
     "a.fqn",
     "b.fqn"
   ],
   "count": 3,
+  "freshness": {
+    "dirty_files": 0,
+    "dirty_files_base": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "head_tree": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "indexed_tree": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "matches_head": true,
+    "stale": false
+  },
   "rows": [
     [
       "rust_sample::conditions::dispatch",
@@ -140,13 +167,13 @@ cgx query 'MATCH (a)-[:CALLS]->(b) WHERE a.fqn = "rust_sample::conditions::dispa
 }
 ```
 
-The JSON envelope includes `columns`, `count`, `rows`, and `vacuous`. The `vacuous` field is `true` when `--assert-empty` passed only because a confidence filter excluded all candidates.
+The JSON envelope includes `columns`, `count`, `rows`, `vacuous`, `approximation`, and `freshness`. A tabular result swaps `results` for the `columns`/`rows` pair; everything else is the shape the Layer-1 subcommands emit. `vacuous` is `true` only when the graph itself had no nodes — see "Vacuity works differently here" above.
 
 ### Read a query from a file
 
 ```
 cgx query @dispatch-callees.cql \
-  --repo /path/to/rust-sample
+  --repo /path/to/worktree
 ```
 
 Where `dispatch-callees.cql` contains:
@@ -160,6 +187,8 @@ a.fqn                              b.fqn
 rust_sample::conditions::dispatch  rust_sample::conditions::log_info
 rust_sample::conditions::dispatch  rust_sample::conditions::log_warn
 rust_sample::conditions::dispatch  rust_sample::conditions::log_error
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 5ea331d, working tree clean
 ```
 
 The `@file` form is useful for multi-line queries or when the query needs to be stored in version control.
@@ -170,9 +199,9 @@ The `@file` form is useful for multi-line queries or when the query needs to be 
 |------|-----------|
 | `0` | Success. Results found, or no results (empty table). Both are normal. |
 | `1` | `--assert-empty` was given and results were present. |
-| `2` | Parse error (invalid CQL syntax), plan error (unsupported property), or no symbol matched a pattern. |
+| `2` | Parse error (invalid CQL syntax), plan error (unsupported property or edge type), unreadable `@file`, inaccessible `--repo`, `--format dot\|mermaid\|d2` on a tabular query, or `--sql` (the recursive-CTE interface is not implemented in this release). Parse and plan errors print a caret view to stderr. |
 | `3` | No index present and `--no-auto-index` was given. |
-| `4` | `--assert-empty` passed vacuously: confidence or edge-condition filters excluded every candidate result. Suppress with `--allow-vacuous`. |
+| `4` | `--assert-empty` passed vacuously: the graph had no nodes at all. The "filters excluded every candidate" clause cannot fire for CQL. Suppress with `--allow-vacuous`. |
 
 ## See also
 

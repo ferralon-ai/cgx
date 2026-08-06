@@ -167,6 +167,18 @@ fn call_tool(repo: &Path, name: &str, mut args: Value) -> Value {
         .expect("structuredContent")
 }
 
+/// The `fqn` fields of a `search`/`symbols` result's `results` array (those two
+/// emit `fqn` where the graph tools emit `name`).
+fn result_fqns(structured: &Value) -> Vec<String> {
+    structured
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array")
+        .iter()
+        .map(|r| r.get("fqn").and_then(Value::as_str).unwrap().to_string())
+        .collect()
+}
+
 /// The `name` fields of a tool result's `results` array.
 fn result_names(structured: &Value, key: &str) -> Vec<String> {
     structured
@@ -766,4 +778,715 @@ fn serve_io_returns_parse_error_for_malformed_line() {
         serde_json::from_str(text.lines().next().expect("one response line")).unwrap();
     assert_eq!(resp["error"]["code"], json!(-32700));
     assert_eq!(resp["id"], json!(null));
+}
+
+// --- index-freshness envelope (C2) ------------------------------------------
+
+/// A minimal valid argument set for each registered tool, keyed by tool name.
+/// Deliberately *not* the list the enumeration iterates — it is a lookup table the
+/// enumeration indexes into, so a tool present in `tools/list` with no recipe here
+/// fails the test rather than being skipped.
+fn tool_call_recipe(name: &str) -> Option<Value> {
+    Some(match name {
+        "callers" => json!({ "symbol": "leaf" }),
+        "callees" => json!({ "symbol": "main" }),
+        "reaches" => json!({ "from": "main", "to": "leaf" }),
+        "paths" => json!({ "from": "main", "to": "leaf" }),
+        "unused" => json!({}),
+        "explain" => json!({ "symbol": "helper" }),
+        "search" => json!({ "pattern": "helper" }),
+        "symbols" => json!({}),
+        "flows_to" => json!({ "symbol": "leaf" }),
+        "flows_from" => json!({ "symbol": "main" }),
+        "graph_query" => json!({ "query": r#"MATCH (a{name:"main"})-[:CALLS]->(b) RETURN a, b"# }),
+        _ => return None,
+    })
+}
+
+/// **Every** registered tool's response carries the freshness envelope.
+///
+/// Enumeration, not a spot check: the loop is driven by the live `tools/list`
+/// registry, so a twelfth tool added later is picked up automatically and fails
+/// this test two ways — no argument recipe, or a response without the envelope.
+/// A hand-written list of names could not do that.
+#[test]
+fn every_registered_tool_carries_the_freshness_envelope() {
+    let (_t, repo) = init_repo();
+    let resp = dispatch(&ServerConfig::default(), &req(1, "tools/list", json!({}))).expect("response");
+    let tools = resp.result.expect("result")["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    // Deliberately no `tools.len()` assertion: the registry grows additively and a
+    // hardcoded count would fail a new tool at rebase time with a message about
+    // arithmetic instead of about the envelope. The recipe lookup below already
+    // fails loudly, and says the useful thing.
+    assert!(
+        !tools.is_empty(),
+        "tools/list returned nothing to enumerate"
+    );
+
+    for t in &tools {
+        let name = t["name"].as_str().expect("tool name");
+        let args = tool_call_recipe(name).unwrap_or_else(|| {
+            panic!(
+                "tool `{name}` is registered but this test has no argument recipe for it. \
+                 A new tool must be added here AND must carry the freshness envelope."
+            )
+        });
+        let structured = call_tool(&repo, name, args);
+        let freshness = &structured["freshness"];
+        assert!(
+            freshness.is_object(),
+            "tool `{name}` response carries no freshness envelope: {structured}"
+        );
+        // The whole schema, not just the key: a partially-populated envelope is a
+        // silent gap of the same kind.
+        assert!(
+            freshness["indexed_tree"].is_string(),
+            "tool `{name}`: indexed_tree missing: {freshness}"
+        );
+        assert!(
+            freshness["head_tree"].is_string(),
+            "tool `{name}`: head_tree missing: {freshness}"
+        );
+        assert_eq!(
+            freshness["matches_head"],
+            json!(true),
+            "tool `{name}`: a freshly indexed repo is at HEAD: {freshness}"
+        );
+        assert!(
+            freshness["stale"].is_boolean(),
+            "tool `{name}`: stale missing: {freshness}"
+        );
+    }
+}
+
+/// No wall-clock anywhere in the envelope (D1). Byte-identical repeat calls
+/// already prove it dynamically; this proves the *schema* carries no time-shaped
+/// key, so a later addition is caught even if its value happened to be stable.
+#[test]
+fn the_freshness_envelope_carries_no_timestamp() {
+    let (_t, repo) = init_repo();
+    let structured = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    let freshness = structured["freshness"].as_object().expect("envelope");
+    // `serde_json::Map` is a BTreeMap here, so the key order is sorted — which is
+    // also what makes the emitted JSON deterministic.
+    let keys: Vec<&str> = freshness.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "dirty_files",
+            "dirty_files_base",
+            "head_tree",
+            "indexed_tree",
+            "matches_head",
+            "stale"
+        ],
+        "the envelope's schema is fixed and time-free"
+    );
+}
+
+#[test]
+fn a_dirty_working_tree_is_reported_as_stale_with_a_real_count() {
+    let (_t, repo) = init_repo();
+    let clean = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": true }),
+    );
+    assert_eq!(clean["freshness"]["dirty_files"], json!(0));
+    assert_eq!(clean["freshness"]["stale"], json!(false));
+
+    make_dirty(&repo);
+    let dirty = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": true }),
+    );
+    assert_eq!(dirty["freshness"]["dirty_files"], json!(1));
+    assert_eq!(dirty["freshness"]["stale"], json!(true));
+    // The graph the answer came from is the working tree, which is now a synthetic
+    // tree and not HEAD's — `matches_head` states that rather than being a constant.
+    assert_eq!(dirty["freshness"]["matches_head"], json!(false));
+    assert_ne!(
+        dirty["freshness"]["indexed_tree"], clean["freshness"]["indexed_tree"],
+        "a dirty overlay is not the tree the clean run answered over"
+    );
+    assert_eq!(
+        dirty["freshness"]["head_tree"], clean["freshness"]["head_tree"],
+        "HEAD did not move"
+    );
+}
+
+/// The defect this test exists for: an uncommitted **deletion** changes the answer
+/// while leaving the working set smaller, so any count derived by iterating the
+/// working set alone reports `0` and the envelope tells the agent an answer is
+/// fresh when it is not. The count must come from the same path-based comparison
+/// the CLI uses.
+#[test]
+fn an_uncommitted_deletion_is_counted_and_reported_stale() {
+    let (_t, repo) = init_mixed_repo();
+    let intact = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert!(
+        result_names(&intact, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "fixture assumption: caller_fn calls other::remote_fn"
+    );
+    assert_eq!(intact["freshness"]["dirty_files"], json!(0));
+
+    std::fs::remove_file(repo.join("src/other.rs")).unwrap();
+
+    let deleted = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert!(
+        !result_names(&deleted, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "the deletion must actually move the answer, or this proves nothing"
+    );
+    assert_eq!(
+        deleted["freshness"]["dirty_files"],
+        json!(1),
+        "a deletion is one dirty file: {}",
+        deleted["freshness"]
+    );
+    assert_eq!(deleted["freshness"]["stale"], json!(true));
+}
+
+/// C9, the cache-correctness half. A working tree whose only change is a
+/// **deletion** must not share a `graph_version` with the clean `HEAD` — it did,
+/// verified end to end: same key, `["helper::beta"]` one run and `[]` the next.
+/// The overlay difference was keyed by the blob OIDs of files *present on disk*,
+/// and a deleted file is present nowhere, so the digest could not see it. A cache
+/// keyed on `(query, graph_version)` — the exact ADR-06 use the field exists for —
+/// served a wrong hit.
+#[test]
+fn a_deletion_only_tree_gets_a_graph_version_distinct_from_clean_head() {
+    let (_t, repo) = init_mixed_repo();
+    let clean = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+    assert_eq!(clean["dirty"], json!(false));
+    let clean_version = clean["graph_version"]
+        .as_str()
+        .expect("graph_version")
+        .to_string();
+    assert!(
+        !clean_version.contains("+dirty"),
+        "a clean tree carries no +dirty suffix: {clean_version}"
+    );
+
+    std::fs::remove_file(repo.join("src/other.rs")).unwrap();
+    let deleted = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "caller_fn", "include_dirty": true }),
+    );
+
+    // The deletion genuinely moves the answer, so a shared key would be a wrong
+    // hit rather than a harmless collision.
+    assert!(
+        result_names(&clean, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "fixture assumption: caller_fn calls other::remote_fn"
+    );
+    assert!(
+        !result_names(&deleted, "results")
+            .iter()
+            .any(|n| n.ends_with("remote_fn")),
+        "the deletion must move the answer, or this proves nothing"
+    );
+
+    let deleted_version = deleted["graph_version"].as_str().expect("graph_version");
+    assert_ne!(
+        deleted_version, clean_version,
+        "a deletion-only tree must not reuse the clean-HEAD cache key"
+    );
+    assert!(
+        deleted_version.contains("+dirty."),
+        "a deletion is an overlay difference like any other: {deleted_version}"
+    );
+    assert_eq!(deleted["dirty"], json!(true));
+    assert_eq!(deleted["dirty_files_analyzed"], json!(1));
+}
+
+/// The overlay manifest is a list of lines, one per differing path, and a git path
+/// may itself contain a newline. Joining those lines with `\n` before hashing is
+/// therefore not injective: deleting `a.rs` **and** `b.rs` serializes to exactly
+/// the bytes that deleting the single file named `a.rs\n- b.rs` does. Both trees
+/// then share one `graph_version` while the graphs — and the answers — are
+/// disjoint, which is the wrong-cache-hit defect ADR-06's key exists to prevent,
+/// reachable by a filename in a repo cgx does not own.
+#[test]
+fn a_newline_in_a_path_does_not_collide_two_working_trees_onto_one_graph_version() {
+    let (_t, repo) = init_repo();
+    let weird = repo.join("a.rs\n- b.rs");
+    std::fs::write(repo.join("a.rs"), "pub fn from_a() -> i32 { 1 }\n").unwrap();
+    std::fs::write(repo.join("b.rs"), "pub fn from_b() -> i32 { 2 }\n").unwrap();
+    std::fs::write(&weird, "pub fn from_weird() -> i32 { 3 }\n").unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "weird",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    assert!(
+        weird.exists(),
+        "fixture assumption: this filesystem accepts a newline in a filename"
+    );
+
+    // State A: the two ordinary files are gone. Manifest lines ["- a.rs", "- b.rs"].
+    std::fs::remove_file(repo.join("a.rs")).unwrap();
+    std::fs::remove_file(repo.join("b.rs")).unwrap();
+    let a = call_tool(
+        &repo,
+        "search",
+        json!({ "pattern": "from_", "include_dirty": true }),
+    );
+
+    // State B: only the newline-named file is gone. One manifest line, whose bytes
+    // are exactly state A's two lines joined by `\n`.
+    let (_t2, repo_b) = init_repo();
+    std::fs::write(repo_b.join("a.rs"), "pub fn from_a() -> i32 { 1 }\n").unwrap();
+    std::fs::write(repo_b.join("b.rs"), "pub fn from_b() -> i32 { 2 }\n").unwrap();
+    std::fs::write(
+        repo_b.join("a.rs\n- b.rs"),
+        "pub fn from_weird() -> i32 { 3 }\n",
+    )
+    .unwrap();
+    run_git(&repo_b, &["add", "-A"]);
+    run_git(
+        &repo_b,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "weird",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    std::fs::remove_file(repo_b.join("a.rs\n- b.rs")).unwrap();
+    let b = call_tool(
+        &repo_b,
+        "search",
+        json!({ "pattern": "from_", "include_dirty": true }),
+    );
+
+    // Same committed tree, so a shared key would be a wrong hit rather than a
+    // harmless collision — and the answers really are disjoint.
+    assert_eq!(
+        a["freshness"]["head_tree"], b["freshness"]["head_tree"],
+        "fixture assumption: both repos committed the identical tree"
+    );
+    let names_a = result_fqns(&a);
+    let names_b = result_fqns(&b);
+    let has = |v: &[String], needle: &str| v.iter().any(|n| n.contains(needle));
+    assert!(
+        has(&names_a, "from_weird") && !has(&names_a, "from_a"),
+        "state A answers over the newline-named file only: {names_a:?}"
+    );
+    assert!(
+        has(&names_b, "from_a") && !has(&names_b, "from_weird"),
+        "state B answers over the two ordinary files only: {names_b:?}"
+    );
+
+    assert_ne!(
+        a["graph_version"], b["graph_version"],
+        "two working trees with disjoint answers must not share a graph_version: {} vs {}",
+        a["graph_version"], b["graph_version"]
+    );
+}
+
+/// C9's consistency half. `dirty`/`dirty_files_analyzed` and `freshness.stale`
+/// describe one working tree from two angles, so a response reading `dirty: false`
+/// beside `stale: true` tells an agent two incompatible things and leaves it no
+/// way to know which field to trust. It could, while the envelope saw deletions
+/// and the overlay fields did not. Driven over the tree states that reach each
+/// field group, under both `include_dirty` settings.
+#[test]
+fn no_response_reads_dirty_false_beside_stale_true() {
+    struct Case {
+        name: &'static str,
+        mutate: fn(&Path),
+    }
+
+    let cases = [
+        Case {
+            name: "clean",
+            mutate: |_| {},
+        },
+        Case {
+            name: "modified",
+            mutate: |r| {
+                std::fs::write(r.join("src/other.rs"), "pub fn remote_fn() -> i32 { 3 }\n").unwrap()
+            },
+        },
+        Case {
+            name: "deleted",
+            mutate: |r| std::fs::remove_file(r.join("src/other.rs")).unwrap(),
+        },
+        Case {
+            name: "added",
+            mutate: |r| {
+                std::fs::write(r.join("src/extra.rs"), "pub fn extra() -> i32 { 4 }\n").unwrap()
+            },
+        },
+    ];
+
+    for Case { name, mutate } in cases {
+        for include_dirty in [true, false] {
+            let (_t, repo) = init_mixed_repo();
+            mutate(&repo);
+            let s = call_tool(
+                &repo,
+                "callees",
+                json!({ "symbol": "caller_fn", "include_dirty": include_dirty }),
+            );
+            let dirty = s["dirty"].as_bool().expect("dirty");
+            let stale = s["freshness"]["stale"].as_bool().expect("stale");
+            assert!(
+                dirty || !stale,
+                "{name} (include_dirty={include_dirty}): `dirty: {dirty}` beside \
+                 `stale: {stale}` is a contradiction — freshness {}",
+                s["freshness"]
+            );
+
+            // And the overlay fields are not merely consistent by staying silent:
+            // every state that moved the tree is reported as having moved it.
+            if include_dirty && name != "clean" {
+                assert!(
+                    dirty,
+                    "{name}: an active overlay over a changed tree is dirty"
+                );
+                assert!(
+                    s["dirty_files_analyzed"].as_u64().unwrap() >= 1,
+                    "{name}: dirty_files_analyzed counts the change: {s}"
+                );
+            }
+        }
+    }
+}
+
+/// The other direction of the C9 consistency property, and the one the table above
+/// cannot see: `dirty: true` beside a verdict of `current`.
+///
+/// `dirty_file_count` applies git's ignore rules; `enumerate_workdir`, which feeds
+/// the indexer, applies none. When they disagree the graph contains a symbol that
+/// is not in `HEAD`'s tree while git calls the checkout clean, so neither
+/// `matches_head: true` (a clean bill over an answer HEAD cannot produce) nor
+/// `matches_head: false` (a divergence git denies) is established. `null` is the
+/// only honest answer, and it must never render as `current`.
+#[test]
+fn two_disagreeing_views_of_the_working_tree_yield_an_unestablished_matches_head() {
+    struct Case {
+        name: &'static str,
+        /// Returns the symbol the graph gains but `HEAD` does not have, if any.
+        setup: fn(&Path) -> Option<&'static str>,
+    }
+
+    let cases = [
+        Case {
+            // The harmful form: an ignored *source* file is in the answer.
+            name: "gitignored source file",
+            setup: |r| {
+                std::fs::write(r.join(".gitignore"), "generated/\n").unwrap();
+                run_git(r, &["add", ".gitignore"]);
+                run_git(
+                    r,
+                    &[
+                        "-c",
+                        "author.name=cgx-test",
+                        "-c",
+                        "author.email=cgx@test.invalid",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "ignore generated",
+                        "--date=2020-01-01T00:00:00Z",
+                    ],
+                );
+                std::fs::create_dir_all(r.join("generated")).unwrap();
+                std::fs::write(
+                    r.join("generated/gen.rs"),
+                    "pub fn ignored_symbol() -> i32 { 7 }\n",
+                )
+                .unwrap();
+                Some("ignored_symbol")
+            },
+        },
+        Case {
+            // The mundane form, which fires on every repo `cgx index` has touched:
+            // `.cgx/` is untracked and self-ignored via its own `.gitignore`.
+            name: "indexed repo with .cgx/ present",
+            setup: |r| {
+                std::fs::create_dir_all(r.join(".cgx")).unwrap();
+                std::fs::write(r.join(".cgx/.gitignore"), "*\n").unwrap();
+                std::fs::write(r.join(".cgx/HEAD.json"), "{}\n").unwrap();
+                None
+            },
+        },
+    ];
+
+    for Case { name, setup } in cases {
+        let (_t, repo) = init_repo();
+        let extra_symbol = setup(&repo);
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            out.stdout.is_empty(),
+            "{name}: fixture assumption — git must call this tree clean, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let s = call_tool(
+            &repo,
+            "search",
+            json!({ "all": true, "include_dirty": true }),
+        );
+        if let Some(symbol) = extra_symbol {
+            assert!(
+                result_fqns(&s).iter().any(|f| f.contains(symbol)),
+                "{name}: fixture assumption — the answer contains a symbol HEAD's tree does not: {:?}",
+                result_fqns(&s)
+            );
+        }
+
+        assert_eq!(s["dirty"], json!(true), "{name}: the overlay saw the file");
+        assert_eq!(
+            s["freshness"]["dirty_files"],
+            json!(0),
+            "{name}: git's own view is that nothing diverged: {}",
+            s["freshness"]
+        );
+        assert!(
+            s["freshness"]["matches_head"].is_null(),
+            "{name}: the two views disagree, so `matches_head` is not established: {}",
+            s["freshness"]
+        );
+        assert_eq!(
+            s["freshness"]["stale"],
+            json!(false),
+            "{name}: nothing established a divergence either: {}",
+            s["freshness"]
+        );
+    }
+}
+
+/// Cross-surface parity: the same working-tree state under the same
+/// `freshness.dirty_files` key must mean the same thing on the CLI and on MCP.
+/// Their absence is what let the two surfaces disagree by three independent
+/// mechanisms (deletions, ignore rules, and blob-OID-vs-path dedup) while every
+/// per-surface test passed.
+#[test]
+fn mcp_and_cli_report_the_same_dirty_file_count() {
+    let (_t, repo) = init_repo();
+    std::fs::write(repo.join(".gitignore"), "build/\n").unwrap();
+    std::fs::write(repo.join("src/second.rs"), "fn second() -> i32 { 2 }\n").unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+
+    // One modification, one deletion, two byte-identical additions, and an ignored
+    // build directory — one case per mechanism the two surfaces used to disagree on.
+    make_dirty(&repo);
+    std::fs::remove_file(repo.join("src/second.rs")).unwrap();
+    std::fs::write(repo.join("src/new_a.rs"), "").unwrap();
+    std::fs::write(repo.join("src/new_b.rs"), "").unwrap();
+    std::fs::create_dir_all(repo.join("build")).unwrap();
+    std::fs::write(repo.join("build/artifact.bin"), "junk\n").unwrap();
+
+    let mcp = call_tool(
+        &repo,
+        "callers",
+        json!({ "symbol": "leaf", "include_dirty": true }),
+    );
+
+    // The CLI's own computation, called directly — the same function `session.rs`
+    // now routes through, so this pins the unification rather than re-deriving it.
+    let r = cgx_index::Repo::discover(&repo).expect("discover");
+    let head = r.head_tree_oid().expect("head tree");
+    let cli = r
+        .dirty_file_count(&r.tree_blob_oids(&head).expect("tree blob oids"))
+        .expect("dirty count");
+
+    assert_eq!(
+        mcp["freshness"]["dirty_files"],
+        json!(cli),
+        "MCP and CLI must agree on dirty_files: {}",
+        mcp["freshness"]
+    );
+    assert_eq!(
+        cli, 4,
+        "modified + deleted + two distinct additions; the ignored build/ is not divergence"
+    );
+
+    // Parity is *same base → same count*, so the base is asserted rather than
+    // assumed: MCP measures from HEAD's tree, and says so in the envelope. The CLI
+    // measures from its index pointer's tree and names that instead (asserted on
+    // that surface, in `cli.rs`), which is why the count only agrees with this one
+    // when the index is at HEAD — the state this fixture is in.
+    assert_eq!(
+        mcp["freshness"]["dirty_files_base"],
+        json!(head),
+        "the count names the tree it was measured against: {}",
+        mcp["freshness"]
+    );
+    assert_ne!(
+        mcp["freshness"]["dirty_files_base"], mcp["freshness"]["indexed_tree"],
+        "and it is not the tree the answer came from — that is a `workdir:` key here"
+    );
+
+    // The ADR-06 overlay count is deliberately a *different* number: it keys the
+    // graph, so it counts everything the working-tree index actually read — the
+    // ignored `build/artifact.bin` included. Different question, same committed
+    // view, and neither contradicts the other. Pinned here so a later reader does
+    // not "simplify" the two back into one.
+    assert_eq!(
+        mcp["dirty_files_analyzed"],
+        json!(5),
+        "the overlay counts the ignored build artifact the index read: {mcp}"
+    );
+    assert_eq!(mcp["dirty"], json!(true));
+}
+
+/// The parity claim is *same base → same count*, and this is the case that shows
+/// why the qualifier is not pedantry. The CLI measures divergence from the tree its
+/// index pointer names; MCP's working-directory path measures it from `HEAD`'s
+/// tree. They coincide only when the index is at `HEAD` — which is exactly the
+/// state every parity fixture is in, so nothing else can see this.
+///
+/// Same working tree, `git status` clean, two bases: `0` from `HEAD`'s tree and `1`
+/// from the previous commit's. Both counts are right; the field is only readable
+/// because the envelope names which one it answered.
+#[test]
+fn the_same_working_tree_diverges_by_a_different_amount_from_a_different_base() {
+    let (_t, repo) = init_repo();
+    std::fs::write(repo.join("src/main.rs"), SRC_MAIN_DIRTY).unwrap();
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+
+    let r = cgx_index::Repo::discover(&repo).expect("discover");
+    let head = r.head_tree_oid().expect("head tree");
+    let previous = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD~1^{tree}"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let count = |tree: &str| {
+        r.dirty_file_count(&r.tree_blob_oids(tree).expect("tree blob oids"))
+            .expect("dirty count")
+    };
+    assert_eq!(count(&head), 0, "the working tree is HEAD's tree");
+    assert_eq!(
+        count(&previous),
+        1,
+        "and it is one file away from the previous commit's"
+    );
+
+    // MCP answered over the working tree and measured from HEAD, so it reports the
+    // `0` — with the base that makes it checkable.
+    let mcp = call_tool(
+        &repo,
+        "callers",
+        json!({ "symbol": "leaf", "include_dirty": true }),
+    );
+    assert_eq!(mcp["freshness"]["dirty_files"], json!(0));
+    assert_eq!(mcp["freshness"]["dirty_files_base"], json!(head));
+}
+
+#[test]
+fn a_committed_only_query_reports_the_working_tree_as_uninspected() {
+    let (_t, repo) = init_repo();
+    make_dirty(&repo);
+    let structured = call_tool(
+        &repo,
+        "callees",
+        json!({ "symbol": "main", "include_dirty": false }),
+    );
+    // `include_dirty: false` never looks at the working tree, so the count is
+    // `null` ("not established"), never a `0` that would claim it was clean.
+    assert!(
+        structured["freshness"]["dirty_files"].is_null(),
+        "committed-only queries must not claim a dirty count: {structured}"
+    );
+    assert_eq!(structured["freshness"]["stale"], json!(false));
+}
+
+/// C5 at the MCP layer, *with the envelope present*: the shipped
+/// `repeated_calls_are_byte_identical` compares whole responses, so this asserts
+/// the same property specifically over the freshness object — including on a dirty
+/// tree, where a naive implementation would be most tempted to reach for a clock.
+#[test]
+fn the_freshness_envelope_is_byte_identical_across_runs() {
+    let (_t, repo) = init_repo();
+    make_dirty(&repo);
+    let a = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    let b = call_tool(&repo, "callers", json!({ "symbol": "leaf" }));
+    assert_eq!(
+        serde_json::to_string(&a["freshness"]).unwrap(),
+        serde_json::to_string(&b["freshness"]).unwrap()
+    );
 }

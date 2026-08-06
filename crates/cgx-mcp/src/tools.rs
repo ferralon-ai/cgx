@@ -534,7 +534,14 @@ fn with_contract(mut body: Value, contract: &ApproximationContract) -> Value {
     body
 }
 
-/// Attach the ADR-06 honesty metadata to a result envelope.
+/// Attach the ADR-06 honesty metadata plus the index-freshness envelope to a
+/// result envelope.
+///
+/// This is the one function **every** registered tool's response passes through —
+/// deliberately not the `with_contract` sibling above, which `explain`/`search`/
+/// `symbols` skip. Anything that must ride on every answer without exception
+/// belongs here; `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and
+/// fails if a tool's response ever misses the `freshness` key.
 fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     let obj = body.as_object_mut().expect("result body is an object");
     obj.insert("graph_version".into(), json!(session.graph_version));
@@ -542,6 +549,10 @@ fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     obj.insert(
         "dirty_files_analyzed".into(),
         json!(session.dirty_files_analyzed),
+    );
+    obj.insert(
+        "freshness".into(),
+        serde_json::to_value(&session.freshness).expect("freshness envelope serializes"),
     );
     body
 }

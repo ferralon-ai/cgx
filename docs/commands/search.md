@@ -115,27 +115,42 @@ cgx search "AsyncService" \
 ```
 
 ```json
-[
-  {
-    "file": "fixtures/rust-sample/src/async_calls.rs",
-    "fqn": "rust_sample::async_calls::AsyncService::get",
-    "kind": "method",
-    "line": 38
+{
+  "freshness": {
+    "dirty_files": 0,
+    "dirty_files_base": "0bbf73560f23bbd2b54d2992564a2810bfa0371d",
+    "head_tree": "0bbf73560f23bbd2b54d2992564a2810bfa0371d",
+    "indexed_tree": "0bbf73560f23bbd2b54d2992564a2810bfa0371d",
+    "matches_head": true,
+    "stale": false
   },
-  {
-    "file": "fixtures/rust-sample/src/async_calls.rs",
-    "fqn": "rust_sample::async_calls::AsyncService::new",
-    "kind": "method",
-    "line": 34
-  },
-  {
-    "file": "fixtures/rust-sample/src/async_calls.rs",
-    "fqn": "rust_sample::async_calls::AsyncService::post",
-    "kind": "method",
-    "line": 43
-  }
-]
+  "results": [
+    {
+      "file": "fixtures/rust-sample/src/async_calls.rs",
+      "fqn": "rust_sample::async_calls::AsyncService::get",
+      "kind": "method",
+      "line": 38
+    },
+    {
+      "file": "fixtures/rust-sample/src/async_calls.rs",
+      "fqn": "rust_sample::async_calls::AsyncService::new",
+      "kind": "method",
+      "line": 34
+    },
+    {
+      "file": "fixtures/rust-sample/src/async_calls.rs",
+      "fqn": "rust_sample::async_calls::AsyncService::post",
+      "kind": "method",
+      "line": 43
+    }
+  ]
+}
 ```
+
+The hits live under `results`; `freshness` is the index-freshness envelope every
+answer document carries — which tree the answer was computed over, whether that is
+`HEAD`'s tree, and how many working-tree files diverge from `dirty_files_base`
+(`null` there means "not established", never zero).
 
 ## Exit codes
 

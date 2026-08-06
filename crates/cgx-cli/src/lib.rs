@@ -11,6 +11,7 @@
 pub mod assertions;
 pub mod exit;
 pub mod forest;
+pub mod freshness;
 pub mod output;
 pub mod pattern;
 pub mod store_loc;

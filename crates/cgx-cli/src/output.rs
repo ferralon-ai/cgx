@@ -11,8 +11,8 @@
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
 use cgx_query::{
-    ApproximationContract, Explanation, GraphView, NeighborResult, PathResult, PathSet,
-    TruncationReason,
+    ApproximationContract, Explanation, FreshnessEnvelope, GraphView, NeighborResult, PathResult,
+    PathSet, TruncationReason,
 };
 use serde_json::{json, Value};
 
@@ -418,11 +418,12 @@ pub fn render(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
 ) -> String {
     match format {
-        // The approximation contract (A3/A4) rides on every human answer as one
-        // compact trailing line; the graph emitters (dot/mermaid/d2) are raw graph
-        // source and carry no prose.
+        // The approximation contract (A3/A4) and the index-freshness envelope ride
+        // on every human answer as two compact trailing lines; the graph emitters
+        // (dot/mermaid/d2) are raw graph source and carry no prose.
         Format::Human => {
             let mut body = render_human(results);
             if !body.ends_with('\n') {
@@ -430,10 +431,14 @@ pub fn render(
             }
             body.push_str(&contract.human_summary());
             body.push('\n');
+            body.push_str(&freshness.human_summary());
+            body.push('\n');
             body
         }
-        Format::Json => render_json(results, vacuous, contract),
-        Format::Sarif => sarif_document(subcommand, results, vacuous, contract).to_string(),
+        Format::Json => render_json(results, vacuous, contract, freshness),
+        Format::Sarif => {
+            sarif_document(subcommand, results, vacuous, contract, freshness).to_string()
+        }
         // Path-graph emitters. The CLI gates these to path-shaped results before
         // dispatch (a tabular query + dot/mermaid/d2 is a usage error), so anything
         // other than a `Paths` set here is empty graph source.
@@ -1042,9 +1047,14 @@ fn render_table_human(t: &TableData) -> String {
     out
 }
 
-fn render_json(results: &ResultSet, vacuous: bool, contract: &ApproximationContract) -> String {
+fn render_json(
+    results: &ResultSet,
+    vacuous: bool,
+    contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
+) -> String {
     if let ResultSet::Table(t) = results {
-        return render_table_json(t, vacuous, contract);
+        return render_table_json(t, vacuous, contract, freshness);
     }
     let items: Vec<Value> = match results {
         ResultSet::Neighbors { results, .. } => {
@@ -1061,6 +1071,8 @@ fn render_json(results: &ResultSet, vacuous: bool, contract: &ApproximationContr
         // A3/A4 answer-honesty contract: the direction this answer can be wrong,
         // machine-readable reasons, and (for a negative) the searched scope.
         "approximation": approximation_json(contract),
+        // How far the indexed state this answer describes is from the working tree.
+        "freshness": freshness_json(freshness),
     });
     // ADR-06 honesty: a `paths` budget/cap cutoff is surfaced, never silent.
     if let ResultSet::Paths(_) = results {
@@ -1078,7 +1090,12 @@ fn render_json(results: &ResultSet, vacuous: bool, contract: &ApproximationContr
 
 /// Render a tabular CQL result as `{ "columns": [...], "rows": [...] }`, where each
 /// row is an array of cell JSON values in column order (per the dispatch shape).
-fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContract) -> String {
+fn render_table_json(
+    t: &TableData,
+    vacuous: bool,
+    contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let rows: Vec<Value> = t
         .rows
         .iter()
@@ -1090,6 +1107,7 @@ fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContr
         "count": t.rows.len(),
         "vacuous": vacuous,
         "approximation": approximation_json(contract),
+        "freshness": freshness_json(freshness),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("table doc serializes");
     s.push('\n');
@@ -1100,6 +1118,12 @@ fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContr
 /// `cgx_query` type so the CLI and MCP surfaces emit a byte-identical schema.
 fn approximation_json(contract: &ApproximationContract) -> Value {
     serde_json::to_value(contract).expect("approximation contract serializes")
+}
+
+/// The index-freshness envelope as a JSON object. Serialized straight off the
+/// shared `cgx_query` type, so the CLI and MCP surfaces emit the identical schema.
+fn freshness_json(freshness: &FreshnessEnvelope) -> Value {
+    serde_json::to_value(freshness).expect("freshness envelope serializes")
 }
 
 /// The human-format marker line appended when a `paths` enumeration was cut short.
@@ -1151,6 +1175,7 @@ pub fn sarif_document(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
 ) -> Value {
     let rid = rule_id(subcommand);
     let mut sarif_results: Vec<Value> = match results {
@@ -1195,6 +1220,16 @@ pub fn sarif_document(
         "properties": approximation_json(contract),
     }));
 
+    // The index-freshness envelope as a second note, same shape: the human line as
+    // the message, the structured envelope in `properties` so a SARIF consumer can
+    // gate on `stale`/`dirty_files` without parsing prose.
+    sarif_results.push(json!({
+        "ruleId": "cgx/index-freshness",
+        "level": "note",
+        "message": { "text": freshness.human_summary() },
+        "properties": freshness_json(freshness),
+    }));
+
     json!({
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
@@ -1220,6 +1255,10 @@ pub fn sarif_document(
                         "id": "cgx/approximation-contract",
                         "name": "approximation-contract",
                         "shortDescription": { "text": "The direction this answer can be wrong (over/under/exact) with machine-readable reasons and, for a negative, the searched scope (A3/A4)." }
+                    }, {
+                        "id": "cgx/index-freshness",
+                        "name": "index-freshness",
+                        "shortDescription": { "text": "How far the indexed state this answer describes is from the working tree: the indexed tree OID, whether it is HEAD's, and the working-tree divergence count." }
                     }]
                 }
             },
@@ -1382,8 +1421,14 @@ fn kind_str(kind: cgx_core::SymbolKind) -> String {
 /// aligned list (default) or `--format json`. Hits arrive pre-sorted by FQN; this
 /// applies the `--limit` cap (`0` = unlimited) and, when results exceed it, prints
 /// the top-N then a `… (N more — raise --limit)` footer (never silently dropped).
-/// JSON mirrors the hit struct as a bare array: `[{ "fqn", "file", "line", "kind" }]`.
-pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize) -> String {
+/// JSON is an object with the hits under `results` and the index-freshness envelope
+/// beside them: `{ "results": [{ "fqn", "file", "line", "kind" }], "freshness": {…} }`.
+pub fn render_search(
+    format: Format,
+    hits: &[cgx_query::SymbolHit],
+    limit: usize,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let shown = if limit == 0 {
         hits.len()
     } else {
@@ -1405,14 +1450,25 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
                     })
                 })
                 .collect();
-            let mut s =
-                serde_json::to_string_pretty(&items).expect("search results serialize");
+            // `search --format json` was a bare array with no envelope slot. It is
+            // now an object, deliberately breaking that shape: cgx is unreleased, so
+            // there is no consumer to keep compatible, and an answer surface that
+            // cannot say how fresh it is was the actual defect. No dual shape and no
+            // flag — the wrapped form is the only form.
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("search results serialize");
             s.push('\n');
             s
         }
         _ => {
             if hits.is_empty() {
-                return "(no results)\n".to_string();
+                let mut out = "(no results)\n".to_string();
+                out.push_str(&freshness.human_summary());
+                out.push('\n');
+                return out;
             }
             // Align on the FQN column so `file:line` starts at a fixed offset.
             let fqn_width = visible.iter().map(|h| h.fqn.chars().count()).max().unwrap_or(0);
@@ -1431,6 +1487,8 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
             if hidden > 0 {
                 out.push_str(&format!("… ({hidden} more — raise --limit)\n"));
             }
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
             out
         }
     }
@@ -1444,9 +1502,15 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
 ///
 /// Human form, one row per symbol:
 /// `<fqn>  (file:line)  [kind]  in=<n> out=<m>  in:{…}  out:{…}` where each `{…}` is
-/// the family/condition breakdown of that direction's edges. JSON mirrors the rank
-/// struct with nested `inbound`/`outbound` breakdown objects.
-pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: usize) -> String {
+/// the family/condition breakdown of that direction's edges. JSON is an object —
+/// the ranks under `results`, each mirroring the rank struct with nested
+/// `inbound`/`outbound` breakdown objects, plus the `freshness` envelope.
+pub fn render_symbols(
+    format: Format,
+    ranks: &[cgx_query::SymbolRank],
+    limit: usize,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let shown = if limit == 0 {
         ranks.len()
     } else {
@@ -1457,14 +1521,23 @@ pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: us
 
     match format {
         Format::Json => {
+            // Same wrapped shape as `search --format json` above, and the same
+            // deliberate break of the old bare array.
             let items: Vec<Value> = visible.iter().map(symbol_rank_json).collect();
-            let mut s = serde_json::to_string_pretty(&items).expect("symbols results serialize");
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("symbols results serialize");
             s.push('\n');
             s
         }
         _ => {
             if ranks.is_empty() {
-                return "(no results)\n".to_string();
+                let mut out = "(no results)\n".to_string();
+                out.push_str(&freshness.human_summary());
+                out.push('\n');
+                return out;
             }
             let fqn_width = visible.iter().map(|r| r.fqn.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
@@ -1486,6 +1559,8 @@ pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: us
             if hidden > 0 {
                 out.push_str(&format!("… ({hidden} more)\n"));
             }
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
             out
         }
     }
@@ -1541,10 +1616,19 @@ fn breakdown_json(b: &cgx_query::EdgeBreakdown) -> Value {
 /// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text
 /// (default) or `--format json`. SARIF is not a meaningful shape for a single
 /// symbol's provenance, so `explain` supports only human/json (the dispatch scope).
-pub fn render_explanation(format: Format, e: &Explanation) -> String {
+pub fn render_explanation(
+    format: Format,
+    e: &Explanation,
+    freshness: &FreshnessEnvelope,
+) -> String {
     match format {
-        Format::Json => explanation_json(e),
-        _ => explanation_human(e),
+        Format::Json => explanation_json(e, freshness),
+        _ => {
+            let mut out = explanation_human(e);
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
+            out
+        }
     }
 }
 
@@ -1588,7 +1672,7 @@ fn explanation_human(e: &Explanation) -> String {
     out
 }
 
-fn explanation_json(e: &Explanation) -> String {
+fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
     let n = &e.node;
     let edges: Vec<Value> = e
         .edges
@@ -1616,6 +1700,7 @@ fn explanation_json(e: &Explanation) -> String {
         "callers_count": e.callers_count,
         "callees_count": e.callees_count,
         "edges": edges,
+        "freshness": freshness_json(freshness),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("explanation doc serializes");
     s.push('\n');

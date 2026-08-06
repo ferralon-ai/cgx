@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as ProcExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cgx_core::{EdgeKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::BlameRepo;
@@ -29,7 +29,8 @@ use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::output::{
-    render, render_explanation, render_search, render_symbols, Format, ResultSet, TableData,
+    render, render_explanation, render_path_walks, render_search, render_symbols, Format,
+    ResultSet, TableData,
 };
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
@@ -1492,7 +1493,68 @@ struct DiffArgs {
     require_anchor_match: bool,
 }
 
+/// The `--format` values the full `cgx diff` output path actually implements.
+const DIFF_FULL_FORMATS: &[Format] = &[Format::Human, Format::Json];
+
+/// The `--format` values `cgx diff --path-added` actually implements.
+///
+/// The path-graph three are here and not in [`DIFF_FULL_FORMATS`] because only this
+/// mode is path-shaped: an added path is a walk of node FQNs, which is the same
+/// graph shape `cgx paths` emits. A full `cgx diff` is an edge/node bucket set, not
+/// a graph walk, so dot/mermaid/d2 stay rejected there.
+const PATH_ADDED_FORMATS: &[Format] = &[
+    Format::Human,
+    Format::Json,
+    Format::Dot,
+    Format::Mermaid,
+    Format::D2,
+];
+
+/// Reject a `--format` the selected diff mode does not implement.
+///
+/// Deliberately an allow-list per mode, **not** a reuse of [`Format::is_path_graph`]:
+/// the defect this closes is that every non-`json` format fell into a human-text
+/// catch-all and exited 0, and `sarif` — the CI ingestion format — was the worst
+/// case of it. An allow-list rejects an unimplemented format by default; an
+/// `is_path_graph`-shaped guard would have left `sarif` broken. Widening a mode is
+/// one entry here plus the matching arm in that mode's printer.
+fn check_diff_format(format: Format, path_added: bool) -> Result<(), CliError> {
+    let (mode, supported) = if path_added {
+        ("cgx diff --path-added", PATH_ADDED_FORMATS)
+    } else {
+        ("cgx diff", DIFF_FULL_FORMATS)
+    };
+    if supported.contains(&format) {
+        return Ok(());
+    }
+    let named = supported
+        .iter()
+        .copied()
+        .map(format_name)
+        .collect::<Vec<_>>()
+        .join("|");
+    Err(CliError::usage(format!(
+        "{} format is not supported by `{mode}` — use --format {named}",
+        format_name(format)
+    )))
+}
+
+/// The spelling clap accepts for a [`Format`] variant, so a rejection message can
+/// never drift from the flag value the user actually typed.
+fn format_name(format: Format) -> String {
+    format
+        .to_possible_value()
+        .expect("every Format variant has a clap value name")
+        .get_name()
+        .to_string()
+}
+
 fn run_diff(args: DiffArgs) -> Result<(), CliError> {
+    // Before any indexing: telling the user their format is invalid only after
+    // building two graphs is a bad trade, and this is the one cheap place to
+    // catch both modes.
+    check_diff_format(args.format, args.path_added)?;
+
     let repo_root = resolve_repo(args.repo.clone())?;
 
     // Open (or create) the shared on-disk store for this diff session.
@@ -1669,7 +1731,7 @@ fn print_path_added(
                 serde_json::to_string_pretty(&doc).expect("path-added json serializes")
             );
         }
-        _ => {
+        Format::Human => {
             if paths.is_empty() {
                 println!("(no new call/dataflow reachability path)");
                 return;
@@ -1698,6 +1760,21 @@ fn print_path_added(
                 println!("+ path  {route}  [{commit}]");
             }
         }
+        // Graph source for the added-path set. Each path's `via` witness is a walk
+        // of node FQNs, so it renders through the same emitters `cgx paths` uses
+        // rather than a second renderer. Edges carry no label: `AddedPath` has no
+        // `EdgeCondition`. Node labels are the FQN, matching `cgx paths` exactly.
+        Format::Dot | Format::Mermaid | Format::D2 => {
+            let walks: Vec<&[String]> = paths.iter().map(|(p, _)| p.via.as_slice()).collect();
+            print!("{}", render_path_walks(format, &walks));
+        }
+        // Rejected by `check_diff_format` before any work happens (D1: a diff-mode
+        // SARIF result would have no `physicalLocation`). Spelling the variant out
+        // instead of `_` is what makes a future `Format` a compile error here rather
+        // than another silent fallthrough to human text.
+        Format::Sarif => {
+            unreachable!("{format:?} is rejected for --path-added by check_diff_format")
+        }
     }
 }
 
@@ -1716,7 +1793,7 @@ fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
                 serde_json::to_string_pretty(&doc).expect("diff json serializes")
             );
         }
-        _ => {
+        Format::Human => {
             for e in &diff.added_edges {
                 println!(
                     "+ edge  {}  ->  {}  ({})",
@@ -1749,6 +1826,10 @@ fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
             {
                 println!("(no diff)");
             }
+        }
+        // See the note in `print_path_added`: exhaustive on purpose.
+        Format::Sarif | Format::Dot | Format::Mermaid | Format::D2 => {
+            unreachable!("{format:?} is rejected for `cgx diff` by check_diff_format")
         }
     }
 }

@@ -107,39 +107,42 @@ RETURN v.name, v.file, v.line, candidate_type, confidence
 
 ### Q111 — After this value is validated and returned from `parse_user_input()`, which aliases or callees can mutate it before it reaches the authorization check?
 
-**Personas:** PSE · **Status:** schema-room — depends on DF-17 mutability model, `writes-param(i)` / `writes-receiver` effect summaries (`schema-room`, Phase 3)
+**Personas:** PSE · **Status:** partial — `CALL cgx.mutation_fanout(...) YIELD mutator, confidence` runs today; only the `effect` column is deferred
 
 Validation does not help if a callee can overwrite the validated value before it
-reaches the check that relies on it. The mutation fan-out query (Q-27) traces
-every function that can write to a parameter after a given program point, using
-the `writes-param(i)` and `writes-receiver` effect summaries from DF-17. Specified
-in docs/05 Q-27.
+reaches the check that relies on it. `cgx.mutation_fanout` is a real, shipped CQL procedure — a
+`DerivesFrom` forward traversal from the named value — that names every downstream mutator and its
+confidence. What is not shipped is the per-mutator `effect` label (`writes-param(0)`,
+`writes-receiver`, …); that column is an explicit, named plan-error reject, not a missing procedure.
 
 **The query**
 
 ```cgx
--- illustrative: requires DF-17 (schema-room) `writes-param` / `writes-receiver` effect summaries
-MATCH (v {name:"user_record", scope:"AuthHandler::validate"})
-CALL cgx.mutation_fanout(v) YIELD mutator, effect, confidence
-RETURN mutator.name, mutator.file, mutator.line,
-       effect,
-       confidence
-ORDER BY confidence DESC, mutator.file
+cgx query '
+  CALL cgx.mutation_fanout("AuthHandler::validate::user_record") YIELD mutator, confidence
+  RETURN mutator.name, mutator.file, mutator.line, confidence
+  ORDER BY confidence DESC, mutator.file
+' --repo ./
 ```
 
-Via Layer 1:
+Adding `effect` to the `YIELD` list is a plan error today: `procedure cgx.mutation_fanout does not
+yield column "effect"; it yields "mutator" and "confidence" (the effect/transform/evidence columns
+are not populated by the current frontend and are deferred)`. Live-verified: dropping `effect`, the
+query above runs to completion, exit 0.
 
-`cgx mutation-fanout` does not exist in v0.3.0. Use `cgx query` with the CQL form above once DF-17 (schema-room) is available. The flags `--at-function` and the trailing-path convention do not exist; use `--repo <path>` when specifying a repository.
+Via Layer 1: `cgx mutation-fanout` does not exist as a top-level subcommand — this is CQL-only, via
+`CALL cgx.mutation_fanout(...)`. The procedure takes the value's FQN as a string literal argument
+directly, not a bound `MATCH` variable — `CALL cgx.mutation_fanout(v)` where `v` came from a `MATCH`
+is not the shipped calling convention.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
-| `MATCH (v {name:"user_record", scope:"AuthHandler::validate"})` | Select the value at the specific function scope where validation has just completed. |
-| `CALL cgx.mutation_fanout(v)` | Invoke the mutation fan-out procedure. This is the outbound dual of pedigree: instead of "what populated this value" it asks "who can change this value from this point forward." The procedure traverses alias edges (DF-16) and effect summaries (DF-17). |
-| `YIELD mutator, effect, confidence` | Receive the mutating callee, its mutation effect label (`writes-param(0)`, `writes-receiver`, `mutation-out`), and the confidence of the edge. |
+| `CALL cgx.mutation_fanout("AuthHandler::validate::user_record")` | Invoke the mutation fan-out procedure directly on the value's FQN string. This is the outbound dual of pedigree: instead of "what populated this value" it asks "who can change this value from this point forward" — the same `DerivesFrom` machinery, walked forward instead of backward. |
+| `YIELD mutator, confidence` | Receive the mutating callee and the confidence of the edge. `effect` (the mutation-kind label) is the one deferred column — asking for it is a named plan-error reject, not silence. |
 
-**Reading the result** — Each row names a function that can write to the validated value before the authorization check. Focus on high-confidence mutators (`certain` or `probable`) whose `effect` is `writes-param(0)` or `writes-receiver` — those directly overwrite the value through a parameter or receiver reference. A long list of potential mutators suggests the validated value is passed to too many callees before the auth check.
+**Reading the result** — Each row names a function that can write to the validated value before the authorization check. Focus on high-confidence mutators (`certain` or `probable`). Without `effect`, the result cannot yet distinguish "overwrites the whole value" from "mutates one field of it" — a long list of potential mutators still suggests the validated value is passed to too many callees before the auth check, but treat every row as a candidate to inspect by hand rather than a pre-classified mutation kind.
 
 ---
 

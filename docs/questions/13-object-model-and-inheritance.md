@@ -69,10 +69,19 @@ A base method's callers were written against the exception surface the base decl
 -- illustrative: requires Q-32 (core-extension; depends on corrected Q-20)
 MATCH (sub:method)-[:OVERRIDES]->(base:method)
 MATCH p_sub = (sub)-[:CALLS*]->(x)
+MATCH p_base = (base)-[:CALLS*]->(x)
 WHERE ANY(r IN relationships(p_sub) WHERE r.condition IN ["exception","panic"])
-  AND NONE(r IN relationships((base)-[:CALLS*]->(x)) WHERE r.condition IN ["exception","panic"])
+  AND NONE(r IN relationships(p_base) WHERE r.condition IN ["exception","panic"])
 RETURN sub.name, sub.file, sub.line
 ```
+
+Q-32/`OVERRIDES` being unshipped is real, but it is not the only reason this query doesn't run: the
+form as originally written fed an inline, unbound pattern — `relationships((base)-[:CALLS*]->(x))`
+— straight to `relationships()`, which requires a **named path variable**. Live-verified against a
+`CALLS` edge that does exist today: that inline form is an eval error, `relationships: argument must
+be a path, got a bool value`, not a schema-room plan error. Naming the second leg `p_base` (as above)
+fixes that half independent of Q-32; `OVERRIDES` is still the genuine blocker for the query as a
+whole.
 
 **Breaking it down**
 
@@ -80,8 +89,9 @@ RETURN sub.name, sub.file, sub.line
 |---|---|
 | `(sub:method)-[:OVERRIDES]->(base:method)` | Bind each override/base pair in the `overrides` relation. |
 | `MATCH p_sub = (sub)-[:CALLS*]->(x)` | Find any node `x` reachable from the override's body, binding the path. |
+| `MATCH p_base = (base)-[:CALLS*]->(x)` | Find the same `x` reachable from the base's body, binding a second path — `relationships()` needs this name; it cannot take an inline pattern. |
 | `ANY(r IN relationships(p_sub) WHERE r.condition IN ["exception","panic"])` | At least one edge on that path is in the exceptional class — the override reaches `x` via an exception or panic path. |
-| `NONE(r IN relationships((base)-[:CALLS*]->(x)) WHERE r.condition IN ["exception","panic"])` | No such exceptional edge exists on any path from the base to the same `x` — the base never exposed this exceptional surface. |
+| `NONE(r IN relationships(p_base) WHERE r.condition IN ["exception","panic"])` | No such exceptional edge exists on any path from the base to the same `x` — the base never exposed this exceptional surface. |
 | `RETURN sub.name, sub.file, sub.line` | Return the override whose exceptional surface is a strict superset of the base's. |
 
 **Reading the result** — Each returned method is an override that introduces exception or panic paths the base method did not have. Priority candidates are overrides that call `unwrap()`/`expect()` (panic edges) where the base returned a `Result`, or that throw checked exceptions the base never declared. Callers of the base may not handle these new failure modes.
@@ -292,20 +302,31 @@ An override that mutates fields the base method never touched, or stops mutating
 **The query**
 
 ```cgx
--- illustrative: requires Q-32 (core-extension)
+-- illustrative: requires Q-32 (core-extension) for OVERRIDES; ALSO has an independent syntax
+-- defect below, unrelated to Q-32 — see the note after the query
 MATCH (sub:method)-[:OVERRIDES]->(base:method)
 MATCH (sub)-[:WRITES_FIELD]->(f)
 WHERE NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)
 RETURN sub.name, f.name, sub.file, sub.line
 ```
 
+`WRITES_FIELD` itself is real and shipped (GM-2.2) — it is not part of what Q-32 gates. The
+`[x IN (base)-[:WRITES_FIELD]->() | x]` fragment is not valid regardless of `OVERRIDES`:
+`IN` requires an actual list value, the kind `nodes(p)`/`relationships(p)` produce from a bound
+path — never a bare relationship pattern. Live-verified on a `CALLS` edge that exists today (standing
+in for `WRITES_FIELD`, to isolate the syntax question from the OVERRIDES gate): this form is an eval
+error, `expected a list (e.g. from nodes(p) / relationships(p))`, not a schema-room plan error. A
+working version would need to bind the base's written fields into a real list first (e.g. via
+`collect()` over a second `MATCH`) rather than embedding the pattern inline — not attempted here
+since `OVERRIDES` still blocks the query regardless.
+
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
 | `(sub:method)-[:OVERRIDES]->(base:method)` | Bind each override/base pair. |
-| `MATCH (sub)-[:WRITES_FIELD]->(f)` | Find each field that the override writes directly. |
-| `NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)` | The base method does not write field `f` — so this is a new field write the override introduced. |
+| `MATCH (sub)-[:WRITES_FIELD]->(f)` | Find each field that the override writes directly — a real, shipped edge kind. |
+| `NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)` | Intended to mean "the base method does not write field `f`," but the inline pattern inside `[... | x]` is not a valid list source — an eval error independent of whether `OVERRIDES` ships. |
 | `RETURN sub.name, f.name, sub.file, sub.line` | Return the override and the newly-written field. |
 
 **Reading the result** — Each row is a field that an override writes but the base method did not. This may indicate the override is taking on additional state responsibilities, or may reveal an unintended mutation. The inverse (fields the base writes but the override drops) requires a symmetric query with `sub` and `base` swapped.

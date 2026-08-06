@@ -256,13 +256,13 @@ When typed-taint ships, add `WHERE sink.sink_class IN ["sql", "path", "net-reque
 
 ### Q34 — Which functions mutate shared state that is later read by the authentication check?
 
-**Personas:** SSE · **Status:** deferred (requires `r.kind = "mutation-out"` edge property — unknown in v0.3.0, exit 2)
+**Personas:** SSE · **Status:** partial — the structural skeleton runs today; the `mutation-out` distinction does not exist in the shipped schema
 
 If mutable shared state (a global, a field, a cache) is written before the authentication check reads it, a race condition or an ordering vulnerability can let an attacker manipulate the authentication outcome. This question finds data-flow paths from `mutation-out` events to the auth check's inputs.
 
 **The query**
 
-The `r.kind` edge property is not supported in v0.3.0 and causes a plan error (exit 2). The multi-MATCH structural skeleton (without the `mutation-out` filter) is runnable today:
+`r.kind` is a real, queryable edge property (`EdgeField::Kind`) — it is not blocked. The multi-MATCH structural skeleton below runs to completion today, exit 0:
 
 ```cgx
 MATCH path = (mutator)-[:DATA_FLOW*]->(auth_input)
@@ -274,7 +274,11 @@ RETURN mutator.name, mutator.file, mutator.line,
        length(path) AS hops
 ```
 
-When `r.kind` ships, add `WHERE ANY(r IN relationships(path) WHERE r.kind = "mutation-out")` to restrict to mutation paths.
+There is no dedicated `mutation-out`/`mutation-in` edge-kind distinction to filter on (DF-2's category
+table is schema-room, not shipped) — every `DATA_FLOW` edge's `r.kind` is the single literal
+`"derives-from"`. Adding `WHERE ANY(r IN relationships(path) WHERE r.kind = "mutation-out")` does not
+error; it silently matches zero rows, because `"mutation-out"` is not a real edge-kind token. Do not
+add that clause — it looks like a working filter and returns nothing.
 
 **Breaking it down**
 
@@ -282,7 +286,7 @@ When `r.kind` ships, add `WHERE ANY(r IN relationships(path) WHERE r.kind = "mut
 |---|---|
 | `(mutator)-[:DATA_FLOW*]->(auth_input)` | Find any data-flow path from a mutating site to a value that the auth check reads. |
 | `(auth_check {name:"authenticate"})-[:CALLS*0..1]->(auth_input)` | Identify the authentication check and the values it reads (direct inputs, up to 1 call away). |
-| `ANY(r IN relationships(path) WHERE r.kind = "mutation-out")` | Require that the path includes at least one `mutation-out` edge (DF-2.1), confirming that shared state was written. **Deferred** — `r.kind` is not a supported edge property in v0.3.0. |
+| `r.kind` | Real and queryable, but every `DATA_FLOW` edge carries the same value, `"derives-from"` — there is no per-edge write/read distinction (DF-2.1's `mutation-out` category) to filter on yet. |
 
 **Reading the result** — Non-empty results name functions that write to state the auth check relies on. Pay particular attention to `edge_conditions`: a `conditional` or `exception` edge condition on the mutation path may indicate that the mutation only occurs in certain cases, reducing — but not eliminating — the risk.
 
@@ -549,5 +553,5 @@ ORDER BY unwrap.file, unwrap.line
 | `src.kind = "entrypoint"` | Restrict sources to entrypoint-kind nodes. `kind` is a supported node property in v0.3.0. |
 | `NONE(n IN nodes(path) WHERE n.name IN ["is_some", ...])` | Require that no null/None/Err checking pattern appears on the path between the entry point and the `unwrap`. This implements the absence of a dominating check. |
 
-**Reading the result** — Each row is an `unwrap` site reachable from an entrypoint with no null check on any path traversed. The `hops` count suggests how many call frames deep the `unwrap` is. In Rust, `unwrap` on `None` or `Err` produces a panic; use `cgx callers unwrap --confidence certain` to list direct callers without the path overhead. Note: there is no `--edge-condition` flag on any cgx subcommand. Prioritize `unwrap` sites on `always`-conditioned paths from HTTP handlers.
+**Reading the result** — Each row is an `unwrap` site reachable from an entrypoint with no null check on any path traversed. The `hops` count suggests how many call frames deep the `unwrap` is. In Rust, `unwrap` on `None` or `Err` produces a panic; use `cgx callers unwrap --confidence certain` to list direct callers without the path overhead. Note: `--edge-condition` is not a flag on `callers`/`callees`/`paths` — it exists only on `cgx diff`. To restrict this query to `always`-conditioned paths, filter in CQL instead: add `AND ALL(r IN relationships(path) WHERE r.condition = "always")`. Prioritize `unwrap` sites reached that way from HTTP handlers.
 

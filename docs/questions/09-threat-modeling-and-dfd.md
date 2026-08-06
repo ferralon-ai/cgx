@@ -24,7 +24,10 @@ call. `cgx` adds edge-condition and sanitizer context that dependency-level tool
 **The query**
 
 ```cgx
--- illustrative: requires GM-14 (schema-room) for dependency edge package/version attribution
+-- illustrative: requires GM-14 (schema-room) for dependency edge package/version attribution,
+-- AND a CQL grammar change — `edge.dependency.package` is a 2-segment nested property path,
+-- which is categorically rejected today ("nested property access is not supported"), independent
+-- of whether `dependency` itself is populated. GM-14 shipping alone would not make this runnable.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::parse_header"})
 WHERE ANY(edge IN relationships(path)
           WHERE edge.dependency.package = "libfoo"
@@ -43,7 +46,7 @@ LIMIT 20
 | Fragment | What it means |
 |---|---|
 | `MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::parse_header"})` | Find any call path of any length from a declared entrypoint to the named vulnerable function; bind the whole path to `path`. |
-| `ANY(edge IN relationships(path) WHERE edge.dependency.package = "libfoo" AND edge.dependency.version STARTS WITH "1.")` | Restrict to paths that cross at least one edge whose dependency attribution names the advisory package and version prefix (the GM-14 dependency attribute). |
+| `ANY(edge IN relationships(path) WHERE edge.dependency.package = "libfoo" AND edge.dependency.version STARTS WITH "1.")` | Restrict to paths that cross at least one edge whose dependency attribution names the advisory package and version prefix (the GM-14 dependency attribute). Live-verified plan error today is `nested property access is not supported` — a categorical CQL restriction that fires before GM-14's missing data would even matter; `STARTS WITH` is a separate, additional parser rejection on top of that. |
 | `[e IN relationships(path) | e.condition] AS conditions` | Project the edge-condition label sequence for the entire path, showing whether the path is a happy-path call (`always`), conditional, loop, exception, or panic path. |
 | `MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence` | Return the weakest-link confidence on the path. A path where every edge is `certain` is a confirmed reachable path; one with a `possible` edge may be a false positive from dynamic dispatch over-approximation. |
 | `ORDER BY hops, ep.name` | Shortest paths first — the shortest path is usually the highest-priority triage candidate. |

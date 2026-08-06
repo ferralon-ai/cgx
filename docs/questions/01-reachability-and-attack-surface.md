@@ -102,9 +102,15 @@ cgx query '
 ' --repo ./
 ```
 
-This query also has a Layer 1 form (specified in docs/05 Q-25 Worked Example 5):
+There is no single Layer 1 form of this question: `cgx reaches <FROM> [TO]` requires a specific
+`FROM` symbol, and omitting `TO` walks *forward* from `FROM` — what `libfoo::deserialize` itself
+calls, the opposite direction from "is it reachable from an entrypoint." To check one entrypoint at
+a time with the witness form instead of the CQL query above:
 
-`cgx reaches 'libfoo::deserialize' --confidence probable --repo ./`
+`cgx reaches 'http::handle_request' 'libfoo::deserialize' --confidence probable --repo ./`
+
+This answers reachability from that one named entrypoint; asking "from any entrypoint" in a single
+command is exactly what the CQL query above is for.
 
 **Breaking it down**
 

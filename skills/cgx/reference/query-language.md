@@ -136,7 +136,7 @@ MATCH (a)-[:DATA_FLOW*1..12]->(b) RETURN a.name
 
 | Property | Values |
 |---|---|
-| `condition` | `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"` |
+| `condition` | `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"`. **`"panic"` is accepted but matches nothing** — the label is schema-only and no edge in any language carries it (`reference/mental-model.md` §3), so a filter on it returns 0 rows at exit 0 |
 | `confidence` | `"certain"`, `"probable"`, `"possible"` |
 | `kind` | the kebab-case edge-kind token — `"calls"`, `"calls-virtual"`, `"calls-closure"`, `"calls-callback"`, `"calls-async"`, `"calls-indirect"`, `"spawns"`, `"derives-from"`, … (same serde convention as node `kind`) |
 
@@ -213,6 +213,11 @@ WHERE r.condition IN ["exception", "panic"]
 RETURN a.name, a.file, a.line, b.name
 LIMIT 25
 ```
+
+The `"panic"` arm of that `IN` list contributes nothing on any repo — the label is schema-only
+(`reference/mental-model.md` §3). It is kept here because the exceptional class is defined as both,
+and dropping it would make the query stop matching the definition; the rows all come from
+`"exception"`.
 
 ### NOT IN is unsupported — use NOT x = …
 

@@ -58,6 +58,63 @@ impl TestRepo {
         rev_parse(&self.path, "HEAD")
     }
 
+    /// `git checkout -b <name>`.
+    pub fn branch(&self, name: &str) {
+        git(&self.path, &["checkout", "-q", "-b", name]);
+    }
+
+    /// `git checkout <name>`.
+    pub fn checkout(&self, name: &str) {
+        git(&self.path, &["checkout", "-q", name]);
+    }
+
+    /// `git checkout --orphan <name>` — start a **disjoint** history. The only way
+    /// to build a rev range whose walk actually reaches a root commit: `A..B`
+    /// hides `A`'s ancestors, so a root shared with `A` is never returned.
+    pub fn orphan_branch(&self, name: &str) {
+        git(&self.path, &["checkout", "-q", "--orphan", name]);
+    }
+
+    /// `git merge --no-ff -m <msg> <name>`, returning the merge commit's hex OID.
+    ///
+    /// Goes through the same `git()` helper as every other command so it inherits
+    /// the pinned `GIT_COMMITTER_*` env — a merge created any other way has a
+    /// non-reproducible OID and makes every test that walks past it flaky.
+    pub fn merge_no_ff(&self, name: &str, msg: &str) -> String {
+        git(
+            &self.path,
+            &[
+                "-c",
+                "author.name=cgx-test",
+                "-c",
+                "author.email=cgx@test.invalid",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                msg,
+                name,
+            ],
+        );
+        rev_parse(&self.path, "HEAD")
+    }
+
+    /// `git tag -a <name> -m <msg>` at HEAD — an **annotated** tag, i.e. a real tag
+    /// object that `rev-parse` resolves to instead of the commit. Returns the tag
+    /// object's hex OID (deliberately *not* the commit's, so a caller can assert
+    /// the two differ). Goes through the same `git()` helper, whose pinned
+    /// `GIT_COMMITTER_*` env is what `git tag` uses for the tagger line, so the tag
+    /// object's OID is reproducible.
+    pub fn annotated_tag(&self, name: &str, msg: &str) -> String {
+        git(&self.path, &["tag", "-a", name, "-m", msg]);
+        rev_parse(&self.path, name)
+    }
+
+    /// `git config <key> <value>` (repo-local).
+    pub fn config(&self, key: &str, value: &str) {
+        git(&self.path, &["config", key, value]);
+    }
+
     /// Index the current committed HEAD tree into the store, returning its graph.
     pub fn index_head(&mut self) -> (GraphId, LinkedGraph) {
         let registry = default_registry();

@@ -30,8 +30,8 @@ use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::freshness;
 use cgx_cli::output::{
-    render, render_explanation, render_path_walks, render_search, render_symbols, Format,
-    ResultSet, TableData,
+    render, render_coupling, render_explanation, render_path_walks, render_search, render_symbols,
+    Format, ResultSet, TableData,
 };
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
@@ -298,6 +298,31 @@ enum Command {
         /// in CI to fail closed when a configured sink isn't in the graph.
         #[arg(long = "require-anchor-match")]
         require_anchor_match: bool,
+    },
+    /// Which files historically change together: for every pair of files changed in
+    /// the same commit within an explicit commit range, the co-change count and each
+    /// file's own change count. Reads committed git history only — no index needed.
+    /// File-level, not symbol-level.
+    Coupling {
+        /// Range start, exclusive (a ref, tag, or commit SHA).
+        base: String,
+        /// Range end, inclusive.
+        head: String,
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Do not report pairs with fewer co-changes than this.
+        #[arg(long, default_value_t = 2)]
+        min_cochanges: u32,
+        /// Commits touching more than this many files contribute nothing (0 = no cap).
+        #[arg(long, default_value_t = 50)]
+        max_files_per_commit: usize,
+        /// Maximum pairs to report (0 = all).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
     },
     /// Start the MCP STDIO server (docs/07 IF-9).
     Mcp {
@@ -581,6 +606,23 @@ fn run(command: Command) -> Result<(), CliError> {
             to,
             path_added,
             require_anchor_match,
+        }),
+        Command::Coupling {
+            base,
+            head,
+            repo,
+            min_cochanges,
+            max_files_per_commit,
+            limit,
+            format,
+        } => run_coupling(CouplingArgs {
+            base,
+            head,
+            repo,
+            min_cochanges,
+            max_files_per_commit,
+            limit,
+            format,
         }),
         Command::Mcp { root } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
@@ -1633,6 +1675,56 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
 
     print_diff_full(&filtered, args.format);
 
+    Ok(())
+}
+
+/// Arguments for `cgx coupling`, mirroring the clap variant one-for-one.
+struct CouplingArgs {
+    base: String,
+    head: String,
+    repo: Option<PathBuf>,
+    min_cochanges: u32,
+    max_files_per_commit: usize,
+    limit: usize,
+    format: Format,
+}
+
+/// `cgx coupling <BASE> <HEAD>`: which files historically change together over an
+/// explicit commit range.
+///
+/// Reads committed git history only — no store is opened and no index is built,
+/// which is why this is the one subcommand that works on an unindexed repository.
+/// Both endpoints are required positionals: a default `HEAD` would make the same
+/// typed command mean different things on different days, and the answer would
+/// stop being re-derivable from what was asked.
+///
+/// Never gates: a coupling answer is a report, not an assertion, so success is
+/// always exit 0.
+fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
+    // `sarif` describes locatable findings and `dot`/`mermaid`/`d2` describe path
+    // graphs; a co-change table is neither. Rejected loudly rather than silently
+    // rendered as human.
+    if !matches!(args.format, Format::Human | Format::Json) {
+        return Err(CliError::usage(format!(
+            "{:?} format is not available for `coupling` (a co-change table is \
+             neither a locatable finding nor a path graph) — use --format human|json",
+            args.format
+        )));
+    }
+
+    let repo_root = resolve_repo(args.repo.clone())?;
+    let blame = BlameRepo::discover(&repo_root)
+        .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
+
+    let options = cgx_diff::CouplingOptions {
+        max_files_per_commit: args.max_files_per_commit,
+        min_cochanges: args.min_cochanges,
+        limit: args.limit,
+    };
+    let report = cgx_diff::coupling(&blame, &args.base, &args.head, &options)
+        .map_err(|e| CliError::usage(format!("coupling {:?}..{:?}: {e}", args.base, args.head)))?;
+
+    print!("{}", render_coupling(args.format, &report));
     Ok(())
 }
 

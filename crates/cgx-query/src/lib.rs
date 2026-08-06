@@ -55,7 +55,8 @@ pub mod symbols;
 pub mod walk;
 
 pub use contract::{
-    for_neighbors, for_path_set, for_paths, for_reaches, for_unused, over_only, ApproxDirection,
+    for_history, for_neighbors, for_path_set, for_paths, for_reaches, for_unused, over_only,
+    ApproxDirection,
     ApproxReason, ApproximationContract, NegativeScope, ReasonDirection,
 };
 pub use freshness::FreshnessEnvelope;

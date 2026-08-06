@@ -10,6 +10,7 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
+use cgx_diff::CouplingReport;
 use cgx_query::{
     ApproximationContract, Explanation, FreshnessEnvelope, GraphView, NeighborResult, PathResult,
     PathSet, TruncationReason,
@@ -1611,6 +1612,94 @@ fn breakdown_json(b: &cgx_query::EdgeBreakdown) -> Value {
         "by_condition": b.by_condition,
         "by_confidence": b.by_confidence,
     })
+}
+
+/// Render a [`CouplingReport`] (the `coupling` subcommand) as a human table
+/// (default) or `--format json`.
+///
+/// **JSON is the whole typed report, serialized once**: the echoed rev range and
+/// its resolved OIDs, the walk counters, the echoed knobs, `pairs_total`, `pairs`,
+/// and the `approximation` contract. The MCP `coupling` tool serializes the very
+/// same value, so the two surfaces carry byte-identical contract bytes *by
+/// construction* rather than by two hand-rolled formatters happening to agree —
+/// which is exactly what `cgx diff`'s bespoke `json!{}` emitter failed to do (it
+/// carries no contract at all).
+///
+/// Human form: the resolved range, a counts line, a `degraded:` line when the walk
+/// truncated or the repository is shallow, the pair table
+/// (`cochanges  a-changes  b-changes  files`), a truncation footer when `--limit`
+/// cut the list short, and the contract's one-line summary last.
+pub fn render_coupling(format: Format, report: &CouplingReport) -> String {
+    match format {
+        Format::Json => {
+            let mut s = serde_json::to_string_pretty(report).expect("coupling report serializes");
+            s.push('\n');
+            s
+        }
+        _ => coupling_human(report),
+    }
+}
+
+fn coupling_human(r: &CouplingReport) -> String {
+    let short = |oid: &str| oid.chars().take(7).collect::<String>();
+    let mut out = format!(
+        "{} ({})..{} ({})\n{} commits considered · {} merge excluded · {} root excluded · \
+         {} oversized excluded\n",
+        r.base_rev,
+        short(&r.base_commit),
+        r.head_rev,
+        short(&r.head_commit),
+        r.commits_considered,
+        r.commits_merge_excluded,
+        r.commits_root_excluded,
+        r.commits_large_excluded,
+    );
+
+    // Both flags ride in the JSON envelope and in the contract prose, but a human
+    // looking at an empty table needs to see *here* why it is empty — on a shallow
+    // CI checkout (`fetch-depth: 1`) that is the whole answer.
+    let mut degraded: Vec<&str> = Vec::new();
+    if r.truncated_at_history_boundary {
+        degraded.push("walk truncated at a history boundary (missing or unreadable object)");
+    }
+    if r.shallow_repository {
+        degraded.push("shallow clone — deepen the clone to see more history");
+    }
+    if !degraded.is_empty() {
+        out.push_str(&format!("degraded: {}\n", degraded.join(" · ")));
+    }
+
+    if r.pairs.is_empty() {
+        out.push_str("(no co-changed pairs)\n");
+    } else {
+        const H_CO: &str = "cochanges";
+        const H_A: &str = "a-changes";
+        const H_B: &str = "b-changes";
+        let width = |head: &str, max: u32| head.len().max(max.to_string().len());
+        let wco = width(H_CO, r.pairs.iter().map(|p| p.cochanges).max().unwrap_or(0));
+        let wa = width(H_A, r.pairs.iter().map(|p| p.changes_a).max().unwrap_or(0));
+        let wb = width(H_B, r.pairs.iter().map(|p| p.changes_b).max().unwrap_or(0));
+        out.push_str(&format!("{H_CO:>wco$}  {H_A:>wa$}  {H_B:>wb$}  files\n"));
+        for p in &r.pairs {
+            out.push_str(&format!(
+                "{:>wco$}  {:>wa$}  {:>wb$}  {}  {}\n",
+                p.cochanges, p.changes_a, p.changes_b, p.file_a, p.file_b
+            ));
+        }
+    }
+
+    if r.pairs.len() < r.pairs_total {
+        out.push_str(&format!(
+            "(showing {} of {} pairs with >= {} co-changes)\n",
+            r.pairs.len(),
+            r.pairs_total,
+            r.min_cochanges
+        ));
+    }
+
+    out.push_str(&r.approximation.human_summary());
+    out.push('\n');
+    out
 }
 
 /// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text

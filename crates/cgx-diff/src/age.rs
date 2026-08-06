@@ -75,6 +75,12 @@ impl BlameRepo {
         Ok(BlameRepo { repo })
     }
 
+    /// The underlying `gix` handle, for sibling modules in this crate that need
+    /// the repository itself rather than blame attribution.
+    pub(crate) fn repository(&self) -> &gix::Repository {
+        &self.repo
+    }
+
     /// Resolve a git ref/revspec (`HEAD`, a tag, a branch, a SHA) to a commit OID
     /// (hex). The base/head selectors of `cgx diff` resolve through this.
     pub fn resolve_commit(&self, revspec: &str) -> Result<String> {

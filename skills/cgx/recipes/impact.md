@@ -32,16 +32,21 @@ cgx callers MyModule::my_fn --depth 3 --format json
 ```
 
 **Why this works:** `callers` walks the CALLS graph in reverse, returning every
-node that can reach the target within `--depth` hops (default: 2; pass
-`--depth 0` for unlimited, work-budgeted). The result is the set of callers that will be affected if the
-function's signature or behavior changes.
+node that can reach the target within `--depth` hops (default: **2**). The result is the set of
+callers that will be affected if the function's signature or behavior changes.
+
+**`--depth 0` does not mean unlimited on `callers`** — it returns the seed symbol and nothing else,
+with an `approximation: under-approximate — search stopped at depth 0` line. `cgx paths` is the one
+CLI command where `0` means unbounded; the CLI's own `--help` text over-generalizes the sentinel.
+For a blast-radius sweep, name a real depth (`--depth 6`) and read the contract to see whether the
+horizon truncated the answer.
 
 **Reading the result:** Each row carries `file:line` evidence and a confidence
-label (`certain`/`probable`/`possible`). `probable` and `possible` edges
-reflect syntactic analysis; SCIP-enriched indexes (v0.2+) can resolve some to
-`certain`. Use `--confidence probable` to exclude `possible` edges. See
-`reference/mental-model.md` for the full confidence ladder and
-edge-condition meanings.
+label (`certain`/`probable`/`possible`). A plain `cgx index .` already produces `certain` edges for
+direct, unambiguous calls; SCIP enrichment upgrades *ambiguous* ones and is not a prerequisite for
+`certain`. `--confidence probable` excludes `possible` edges — which for a refactor is usually the
+wrong trade, since an unlisted call site is a compile error later. See `reference/mental-model.md`
+for the full confidence ladder and edge-condition meanings.
 
 ---
 
@@ -247,9 +252,21 @@ past v0.3.0. Do not emit them as runnable commands.
 | `entrypoint_class:"test"` / `entrypoint_class` node property in CQL WHERE | Plan error, exit 2 in v0.3 — deferred past v0.3 | **deferred past v0.3** |
 | Test-coverage boolean via CQL `EXISTS { … }` subquery | `EXISTS` subquery is a parse error (exit 2) in v0.3 | **deferred past v0.3** |
 | Public-API scope partitioning via `visibility:"public"`, `OPTIONAL MATCH`, `WITH`, `CASE WHEN` | `visibility` is an unknown node property (plan error exit 2) in v0.3; `OPTIONAL MATCH`/`WITH`/`CASE WHEN` not confirmed in v0.3 ground truth | unscheduled |
-| `certain` edges in results (true `certain` vs `probable` distinction) | `--confidence certain` works in v0.3; producing `certain` edges requires a SCIP-enriched index (`cgx index --scip <path>`, since v0.2). Plain indexes produce only `probable`/`possible` edges. | **v0.2** (SCIP enrichment) |
 
-For diff-based impact today, use `cgx diff HEAD~1 HEAD` (positional) with
+**Not gated: `certain` edges without SCIP.** An earlier row here claimed plain indexes produce only
+`probable`/`possible` edges and that `certain` requires `cgx index --scip <path>`. That is false. A
+plain index bands direct, unambiguous calls `certain` — verified on the shipped Rust fixture, where
+`cgx explain rust_sample::panics::check_invariant` reports its one incoming edge as
+`[always]  [certain]  tier=scope_graph  rule=scope-ref` with no SCIP index anywhere. SCIP raises
+confidence on calls the syntactic resolver could not pin down; it is an upgrade path, not a gate.
+
+**Not gated either: diff-scoped impact on newly-reachable sinks.** `cgx diff <BASE> <HEAD>
+--path-added --from <glob> --to <glob>` ships today and exits 1 when the ref introduces a new
+reachability path between the two anchors — the structural PR gate the `--calls-to-sink-class` row
+above gestures at. It does not classify sinks, so you name the sink yourself, and its own output
+labels the answer *reachability, not a security guarantee*. See `recipes/vcs-diffs.md`.
+
+For broader diff-based impact, use `cgx diff HEAD~1 HEAD` (positional) with
 `--newer-than` to filter to newly added edges, then manually inspect the result
 for sink proximity. See `recipes/vcs-diffs.md`.
 

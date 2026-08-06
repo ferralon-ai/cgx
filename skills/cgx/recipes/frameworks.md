@@ -6,9 +6,24 @@ reflective dispatch, and mediated call sites.
 **Not answerable in v0.3.0. Requires framework packs (GM-15/GM-17/GM-18) — deferred past v0.3.0.**
 
 Run `cgx --version` before using this recipe. Every query in this theme depends
-on framework-pack node/edge properties that are not populated in v0.3.0. Emitting
-any of these queries against a v0.3.0 index produces a plan error (exit 2).
+on framework-pack node/edge properties that are not populated in v0.3.0.
 A capability marked `Since: v0.N` requires `MINOR >= N`. See `reference/versions.md`.
+
+**Two different failure modes, and the quiet one is the dangerous one.** Queries naming a deferred
+*property* (`entrypoint_class`, `guard_class`, `cut_marker`, `string_pedigree`, …) are **plan errors,
+exit 2** — loud, unmissable, and annotated as such on every query below. But a query that anchors
+only on `{kind:"entrypoint"}` **runs, exits 0, and returns nothing**:
+
+`SymbolKind::Entrypoint` is declared in the schema and accepted by both CQL and `cgx --kind`, yet no
+language frontend ever constructs it — the only references in the tree are the CLI's `--kind`
+mapping and the CQL lowering. Entrypoint detection *does* happen, but it lands on a separate
+`NodeRecord.entrypoint_kind` field while the node's `kind` stays `function`. Verified on the shipped
+Rust fixture: `cgx search rust_sample::main` reports `[function]`, and
+`cgx unused --kind entrypoint` returns `(no results)`.
+
+So an empty result from an entrypoint-anchored query is a modeling gap wearing the costume of a
+clean audit — the same shape as the unpopulated `panic` edge condition (`recipes/failure-paths.md`).
+Until framework packs ship, anchor on a handler's actual FQN.
 
 **Step 0 — find the exact symbol name first.**
 Use `cgx search <pattern>` (Since: v0.2) to resolve a partial name to an exact

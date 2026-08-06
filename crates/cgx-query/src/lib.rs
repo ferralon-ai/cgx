@@ -47,6 +47,7 @@
 pub mod contract;
 pub mod engine;
 pub mod filter;
+pub mod freshness;
 pub mod impacted;
 pub mod result;
 pub mod search;
@@ -55,9 +56,11 @@ pub mod symbols;
 pub mod walk;
 
 pub use contract::{
-    for_neighbors, for_path_set, for_paths, for_reaches, for_unused, over_only, ApproxDirection,
+    for_history, for_neighbors, for_path_set, for_paths, for_reaches, for_unused, over_only,
+    ApproxDirection,
     ApproxReason, ApproximationContract, NegativeScope, ReasonDirection,
 };
+pub use freshness::FreshnessEnvelope;
 pub use engine::{
     callees, callers, entrypoint_roots, explain, impacted_tests, neighborhood, paths, reaches,
     reaches_all, resolve_anchor, unused,

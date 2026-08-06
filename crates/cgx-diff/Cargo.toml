@@ -13,8 +13,10 @@ cgx-store = { path = "../cgx-store" }
 cgx-index = { path = "../cgx-index" }
 cgx-query = { path = "../cgx-query" }
 gix = { version = "0.80", default-features = false, features = ["blame", "revision"] }
+serde = { workspace = true }
 tempfile = "3"
 thiserror.workspace = true
 
 [dev-dependencies]
 cgx-frontend.workspace = true
+serde_json = "1"

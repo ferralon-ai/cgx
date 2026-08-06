@@ -230,6 +230,8 @@ dependencies = [
  "cgx-query",
  "cgx-store",
  "gix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -363,6 +365,7 @@ dependencies = [
  "cgx-store",
  "regex",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

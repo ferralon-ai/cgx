@@ -124,6 +124,31 @@ pub fn commit_all(repo: &Path, msg: &str) {
     );
 }
 
+/// Add `child` as a submodule of `repo` at `rel` and commit it, so the parent's
+/// tree holds a gitlink (mode `160000`) there. `protocol.file.allow` is set
+/// locally because git refuses `file://`-style submodule sources by default
+/// (CVE-2022-39253); this is a throwaway temp repo.
+pub fn add_submodule(repo: &Path, child: &Path, rel: &str) {
+    run_git(
+        repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().expect("utf-8 child path"),
+            rel,
+        ],
+    );
+    commit_all(repo, "add submodule");
+}
+
+/// Detach `HEAD` at its current commit (leaves the tree untouched).
+pub fn detach_head(repo: &Path) {
+    run_git(repo, &["checkout", "-q", "--detach"]);
+}
+
 /// An in-memory store, fine for single-process tests.
 pub fn mem_store() -> SqliteStore {
     SqliteStore::open_in_memory().expect("open store")

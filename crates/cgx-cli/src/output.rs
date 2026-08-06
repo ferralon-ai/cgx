@@ -10,9 +10,10 @@
 //! runs over the same index produce byte-identical output.
 
 use cgx_core::{Confidence, EdgeCondition, NodeRecord, Tier};
+use cgx_diff::CouplingReport;
 use cgx_query::{
-    ApproximationContract, Explanation, GraphView, NeighborResult, PathResult, PathSet,
-    TruncationReason,
+    ApproximationContract, Explanation, FreshnessEnvelope, GraphView, NeighborResult, PathResult,
+    PathSet, TruncationReason,
 };
 use serde_json::{json, Value};
 
@@ -462,11 +463,12 @@ pub fn render(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
 ) -> String {
     match format {
-        // The approximation contract (A3/A4) rides on every human answer as one
-        // compact trailing line; the graph emitters (dot/mermaid/d2) are raw graph
-        // source and carry no prose.
+        // The approximation contract (A3/A4) and the index-freshness envelope ride
+        // on every human answer as two compact trailing lines; the graph emitters
+        // (dot/mermaid/d2) are raw graph source and carry no prose.
         Format::Human => {
             let mut body = render_human(results);
             if !body.ends_with('\n') {
@@ -474,10 +476,14 @@ pub fn render(
             }
             body.push_str(&contract.human_summary());
             body.push('\n');
+            body.push_str(&freshness.human_summary());
+            body.push('\n');
             body
         }
-        Format::Json => render_json(subcommand, results, vacuous, contract),
-        Format::Sarif => sarif_document(subcommand, results, vacuous, contract).to_string(),
+        Format::Json => render_json(subcommand, results, vacuous, contract, freshness),
+        Format::Sarif => {
+            sarif_document(subcommand, results, vacuous, contract, freshness).to_string()
+        }
         // Path-graph emitters. The CLI gates these to path-shaped results before
         // dispatch (a tabular query + dot/mermaid/d2 is a usage error), so anything
         // other than a `Paths` set here is empty graph source.
@@ -489,8 +495,9 @@ pub fn render(
 
 /// A directed graph distilled from a path-shaped result: a deduped, ordered node
 /// list and the directed edges between consecutive path steps. This is the single
-/// shape every path-graph emitter (dot/mermaid/d2) renders, so Layer-1 `paths` and
-/// a CQL `RETURN path` query produce identical graph source.
+/// shape every path-graph emitter (dot/mermaid/d2) renders, so Layer-1 `paths`, a
+/// CQL `RETURN path` query, and `cgx diff --path-added` produce identical graph
+/// source.
 struct GraphData {
     /// Node fqns in first-seen order (stable: paths arrive in deterministic order).
     nodes: Vec<String>,
@@ -498,39 +505,101 @@ struct GraphData {
     edges: Vec<(String, String, String)>,
 }
 
+/// Accumulates a [`GraphData`] over a sequence of walks, keeping first-seen order.
+///
+/// The two hash sets exist **only** to dedup and are never iterated; every byte of
+/// emission order comes from the `Vec`s, which are appended in exactly the order the
+/// caller pushes. That is what makes the graph source byte-stable for a fixed input
+/// (AR-10) — a caller that pushes in a deterministic order gets deterministic output.
+#[derive(Default)]
+struct GraphBuilder {
+    nodes: Vec<String>,
+    edges: Vec<(String, String, String)>,
+    seen_node: std::collections::HashSet<String>,
+    seen_edge: std::collections::HashSet<(String, String, String)>,
+}
+
+impl GraphBuilder {
+    fn push_node(&mut self, fqn: &str) {
+        if self.seen_node.insert(fqn.to_string()) {
+            self.nodes.push(fqn.to_string());
+        }
+    }
+
+    fn push_edge(&mut self, src: &str, dst: &str, label: &str) {
+        let edge = (src.to_string(), dst.to_string(), label.to_string());
+        if self.seen_edge.insert(edge.clone()) {
+            self.edges.push(edge);
+        }
+    }
+
+    fn finish(self) -> GraphData {
+        GraphData {
+            nodes: self.nodes,
+            edges: self.edges,
+        }
+    }
+}
+
 /// Build [`GraphData`] from a result set's path channel. A non-path result yields
 /// an empty graph (the CLI never reaches this with a tabular result).
 fn graph_data(results: &ResultSet) -> GraphData {
-    let mut nodes: Vec<String> = Vec::new();
-    let mut edges: Vec<(String, String, String)> = Vec::new();
-    let mut seen_node: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_edge: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
+    let mut g = GraphBuilder::default();
 
     if let ResultSet::Paths(set) = results {
         for p in &set.paths {
             for step in &p.steps {
-                let fqn = step.node.fqn.clone();
-                if seen_node.insert(fqn.clone()) {
-                    nodes.push(fqn);
-                }
+                g.push_node(&step.node.fqn);
             }
             for pair in p.steps.windows(2) {
-                let src = pair[0].node.fqn.clone();
-                let dst = pair[1].node.fqn.clone();
                 let label = pair[1]
                     .via
                     .as_ref()
                     .map(|e| condition_str(e.condition).to_string())
                     .unwrap_or_default();
-                let edge = (src, dst, label);
-                if seen_edge.insert(edge.clone()) {
-                    edges.push(edge);
-                }
+                g.push_edge(&pair[0].node.fqn, &pair[1].node.fqn, &label);
             }
         }
     }
-    GraphData { nodes, edges }
+    g.finish()
+}
+
+/// Render node-FQN walks as path-graph source (`dot`/`mermaid`/`d2`).
+///
+/// `cgx diff --path-added` carries its own result shape (`cgx_diff::AddedPath`, a
+/// witness path of FQNs) rather than a [`ResultSet`], but the graph it wants is
+/// exactly the one `cgx paths` emits — so it goes through the same [`GraphData`] and
+/// the same emitters instead of a second renderer. Each walk is one path's node FQNs
+/// in path order; nodes and edges are deduped across walks in first-seen order.
+///
+/// Edges are **unlabeled**: an added path's witness is FQNs only and carries no
+/// `EdgeCondition`, and inventing one from the head graph would be ambiguous (a node
+/// pair may have several edges with differing conditions). The emitters already
+/// render an empty label as an unlabeled edge, which also matches the house
+/// convention of omitting `always`.
+///
+/// **Precondition:** `format` must satisfy [`Format::is_path_graph`]; the CLI rejects
+/// every other format for this mode before dispatch.
+pub fn render_path_walks(format: Format, walks: &[&[String]]) -> String {
+    let mut g = GraphBuilder::default();
+    for walk in walks {
+        for fqn in walk.iter() {
+            g.push_node(fqn);
+        }
+        for pair in walk.windows(2) {
+            g.push_edge(&pair[0], &pair[1], "");
+        }
+    }
+    let data = g.finish();
+
+    match format {
+        Format::Dot => render_dot(data),
+        Format::Mermaid => render_mermaid(data),
+        Format::D2 => render_d2(data),
+        Format::Human | Format::Json | Format::Sarif => panic!(
+            "render_path_walks requires a path-graph format (dot|mermaid|d2), got {format:?}"
+        ),
+    }
 }
 
 /// A stable identifier for a node in graph source: `n0`, `n1`, … assigned in the
@@ -543,9 +612,300 @@ fn node_ids(g: &GraphData) -> std::collections::HashMap<&str, String> {
         .collect()
 }
 
-/// Escape a string for a Graphviz / D2 double-quoted label.
-fn quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// Escape a string for a **D2** double-quoted label (`n0: "…"`).
+///
+/// d2 is a plain backslash-escaping language: `\\` decodes to `\`, `\"` to `"`, and
+/// nothing else is decoded. In particular — and this is the whole reason it does not
+/// share an escaper with [`dot_label`] — **d2 does not decode HTML character
+/// references.** Measured against d2 0.7.1 by reading the label back out of the
+/// emitted SVG: a label written `A&quot;B` displays `A&quot;B`, where Graphviz
+/// displays `A"B`. So `&` needs no escape here, and escaping it would corrupt every
+/// FQN that contains one.
+///
+/// Injectivity: `\` is the single introducer and is escaped; every escape is exactly
+/// two characters and no escape body contains a `\`. So the only backslashes in the
+/// output are ones this function wrote, and `decode(encode(s)) == s` for every `s`.
+///
+/// These are the bytes `quote()` emitted before DOT and D2 were split apart, and
+/// `d2_quote_is_byte_identical_to_the_shared_escaper_it_replaced` pins that.
+fn d2_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a string for a **Graphviz DOT** double-quoted label (`label="…"`).
+///
+/// # Two introducers, both escaped
+///
+/// DOT is a backslash-escaping language *and* Graphviz decodes HTML character
+/// references in ordinary labels. So this encoding has **two** introducers, `\` and
+/// `&`, and both are escaped:
+///
+/// | char | escape  |
+/// |------|---------|
+/// | `\`  | `\\`    |
+/// | `"`  | `\"`    |
+/// | `&`  | `&amp;` |
+///
+/// Injectivity follows from the escape bodies being disjoint in their introducers —
+/// `\\` and `\"` contain no `&`, and `&amp;` contains no `\`. Hence:
+///
+/// 1. the only `\` in the output are ones this function wrote, each the first
+///    character of a two-character escape whose second character is never `\`;
+/// 2. the only `&` in the output are ones this function wrote, each opening
+///    `&amp;`, which Graphviz decodes to exactly one `&` and does not rescan
+///    (`&amp;quot;` decodes to `&quot;`, not to `"`);
+/// 3. therefore no escape can be split or merged by the other introducer's escapes,
+///    the left-to-right decode is unambiguous, and `decode(encode(s)) == s` for
+///    **every** `s` — by construction, not because the table is long enough.
+///
+/// The table is not the correctness argument. A character missing from it misrenders
+/// *visibly* rather than silently decoding to different text; that weaker property is
+/// renderability, and it is asserted separately.
+///
+/// # The decoder, measured from Graphviz 15.1.0
+///
+/// Four stages run between the bytes we emit and the glyphs displayed, and their
+/// *order* is what rules out a one-introducer encoding. Every claim here was read
+/// back out of `dot -Tsvg`:
+///
+/// 1. **DOT lexer**, on the quoted string: `\"` → `"`, `\` + newline is a line
+///    continuation, every other backslash passes through verbatim. (`label="\\"`
+///    parses and yields `\`; `label="\"` is a syntax error, because that `\` ate the
+///    closing quote.)
+/// 2. **object substitution**: `\N` `\G` `\E` `\T` `\H` `\L`. The one stage where the
+///    node and edge contexts genuinely differ — in a node label `\N` is the node's
+///    name and `\T` is left alone; in an edge label `\T` is the tail and `\N` is left
+///    alone. `\\` is skipped as a pair here, so escaping `\` collapses the two
+///    contexts into one, which is why [`render_dot`] can use one escaper for both.
+/// 3. **entity decode**: `&name;` against Graphviz's own table (`&quot;` `&amp;`
+///    `&lt;` `&gt;` `&nbsp;` … but *not* `&bsol;` or `&apos;`, which are not in it),
+///    plus numeric `&#34;` / `&#x26;`. Case-sensitive, the `;` is required, and it is
+///    a single pass.
+/// 4. **escape and line processing**: `\\` → `\`, `\n` `\l` `\r` → a line break, and
+///    any other `\X` → `X`.
+///
+/// **Stage 3 running before stage 4 is the subtlety, and it forces two introducers.**
+/// A character reference that decodes to a backslash is handed to stage 4 as a live
+/// escape: `label="&#92;n"` renders as a *line break*, not as `\n`. So `\` cannot be
+/// encoded as an entity — the escape would be eaten by a later stage. And in the
+/// other direction `\&` cannot neutralise an `&`, because stage 3 has already run by
+/// the time stage 4 would strip the backslash. Neither introducer can encode the
+/// other; each has to escape itself. (This is the Graphviz analogue of Mermaid's
+/// unusable numeric references — see [`mermaid_label`] — with the stages reversed.)
+///
+/// Left alone deliberately, all measured literal inside a quoted label: `<` `>` `|`
+/// `{` `}` `#` `;` and a backtick. `<` only opens an HTML-like label when the
+/// attribute value is *unquoted* (`label=<…>`), which this emitter never writes.
+///
+/// # Scope
+///
+/// A label containing a line terminator is outside the encoding, exactly as for
+/// Mermaid and D2: all three emitters are line-oriented and no shipped adapter
+/// produces one. Injectivity is unaffected; renderability is not claimed for it.
+fn dot_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '&' => out.push_str("&amp;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The named character reference the Mermaid pipeline decodes back to `c`, or
+/// `None` when `c` survives raw in every Mermaid label context.
+///
+/// `&` is in the table because it is the *introducer*, and escaping the introducer
+/// is what makes the encoding injective. See [`mermaid_label`] for the argument and
+/// for the measurements behind the rest of the table.
+fn mermaid_entity(c: char) -> Option<&'static str> {
+    match c {
+        '&' => Some("&amp;"),
+        '"' => Some("&quot;"),
+        '<' => Some("&lt;"),
+        '`' => Some("&grave;"),
+        '\\' => Some("&bsol;"),
+        ';' => Some("&semi;"),
+        _ => None,
+    }
+}
+
+/// The references the **edge** context needs on top of [`mermaid_entity`].
+///
+/// An edge label (`a -->|…| b`) is unquoted, so every node-shape delimiter
+/// terminates it; measured against mermaid-cli 11.16.0, raw `|`, `[`, `]`, `(`,
+/// `)`, `{` and `}` each produce a parse error here while being harmless inside
+/// `["…"]`.
+fn mermaid_edge_entity(c: char) -> Option<&'static str> {
+    match c {
+        '|' => Some("&verbar;"),
+        '[' => Some("&lsqb;"),
+        ']' => Some("&rsqb;"),
+        '(' => Some("&lpar;"),
+        ')' => Some("&rpar;"),
+        '{' => Some("&lcub;"),
+        '}' => Some("&rcub;"),
+        _ => mermaid_entity(c),
+    }
+}
+
+/// Escape a string for a Mermaid label: a single-introducer HTML
+/// named-character-reference encoding.
+///
+/// # Injectivity, and why the table is not the argument
+///
+/// Two earlier rounds of this escaper enumerated the characters that misrender and
+/// escaped those. Round one missed `"` and `<`. Round two missed `&` and `#` —
+/// which are not merely two more characters, they are the *introducers* of the
+/// encoding itself, and an encoder that escapes everything except its own escape
+/// character is not injective. Adding characters to a list never fixes that.
+///
+/// So this encoding has exactly **one** introducer, `&`, and `&` is escaped. Every
+/// escape is `&` + an ASCII-letter name + `;`. Three consequences follow, in order:
+///
+/// 1. the only `&` in the output are ones this function emitted;
+/// 2. each escape is self-terminating at its `;`, and no escape body contains `&`;
+/// 3. therefore a left-to-right decode that maps `&name;` back and copies every
+///    other byte satisfies `decode(encode(s)) == s` for **every** `s` — whatever
+///    else the tables above do or do not contain.
+///
+/// That is the injectivity property and it holds by construction. The tables serve
+/// a *different* property, renderability, and a character missing from them
+/// misrenders visibly rather than silently decoding to some other text. The
+/// per-character loop below is load-bearing for (1): a chain of `str::replace`
+/// calls would feed each replacement's own `&` to the next call.
+///
+/// # What the renderer decodes (mermaid-cli 11.16.0, measured)
+///
+/// The pipeline rewrites the diagram *source* twice (`encodeEntities`, in
+/// `mermaid/dist/chunks/mermaid.esm/chunk-MMGVDTGO.mjs`) before the label reaches
+/// HTML, and those rewrites — not HTML — are why a bare `#` is dangerous:
+///
+/// | source pattern | rewritten to | measured |
+/// |----------------|--------------|----------|
+/// | `#\w+;` | `&\w+;`, or `&#\d+;` when the body is all digits | `A#quot;B` → `A"B`; `A#35;B` → `A#B`; `A#zzz;B` → `A&zzz;B`; `A#1;B` → `A\x01B` |
+/// | `(style\|classDef).*:\S*#.*;` | the same text minus its final `;` | `styles::b#1&bsol;x` → `styles::b#1&bsolx` |
+///
+/// Only then does the label become HTML, where the named references decode. Two
+/// consequences shaped the tables:
+///
+/// * **Numeric references are unusable.** `&#96;` contains `#96;`, which the first
+///   rewrite eats: `A&#96;B` renders as `A&` + a backtick. Every escape here is a
+///   *named* reference, each verified individually against mermaid-cli in both
+///   contexts.
+/// * **`;` must be escaped**, which is what buys a raw `#`. `\w` cannot cross the
+///   `&` that opens an escape, so once every `;` in the output is an escape
+///   terminator, `#\w+;` can no longer match — and `#`, cgx's own value-node
+///   separator (`…::b#1`, 632 of the 1210 fixture FQNs), stays byte-identical.
+///
+/// The `style` / `classDef` rewrite is the one hazard `;`-escaping does not cover,
+/// because it only needs a `#` and a later `;` on the same line; it is handled by
+/// [`directive_rewrite_matches`] below.
+///
+/// # Scope
+///
+/// A label containing a line terminator is outside the encoding: it would break the
+/// line-oriented emitters of all three formats alike, and no shipped adapter
+/// produces one. Injectivity is unaffected (a newline round-trips); renderability is
+/// not claimed for it.
+fn mermaid_label(s: &str, entity: fn(char) -> Option<&'static str>) -> String {
+    let encode = |escape_hash: bool| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match entity(c) {
+                Some(e) => out.push_str(e),
+                None if escape_hash && c == '#' => out.push_str("&num;"),
+                None => out.push(c),
+            }
+        }
+        out
+    };
+    let out = encode(false);
+    // Escaping `#` costs nothing in injectivity — `&num;` and a raw `#` both decode
+    // to `#` — so this conditional only chooses between two correct encodings, and
+    // choosing the cheap one keeps all 632 `#`-bearing fixture FQNs byte-identical.
+    if directive_rewrite_matches(&out) {
+        encode(true)
+    } else {
+        out
+    }
+}
+
+/// Would Mermaid's `style` / `classDef` source rewrite match this label?
+///
+/// The rewrite is `/(?:style|classDef).*:\S*#.*;/g` over the whole diagram source,
+/// replacing each match with itself minus its final character — silently deleting a
+/// `;` that an escape needed. `.` does not match a newline in JavaScript, so it is a
+/// per-line test; and running it on the label alone is equivalent to running it on
+/// the emitted line, because neither the `n0["` / `"]` node wrapper nor the ` -->|`
+/// / `| ` edge wrapper contains the keyword, a `:`, a `#` or a `;`.
+fn directive_rewrite_matches(label: &str) -> bool {
+    label.lines().any(|line| {
+        ["style", "classDef"]
+            .iter()
+            .any(|kw| directive_line_matches(line, kw))
+    })
+}
+
+fn directive_line_matches(line: &str, keyword: &str) -> bool {
+    // The earliest keyword occurrence maximises what the following `.*` can reach,
+    // so testing that one is enough.
+    let Some(kw) = line.find(keyword) else {
+        return false;
+    };
+    let Some(last_semi) = line.rfind(';') else {
+        return false;
+    };
+    let b = line.as_bytes();
+    for colon in (kw + keyword.len())..b.len() {
+        if b[colon] != b':' {
+            continue;
+        }
+        // `\S*#`: the first `#` reachable from the colon without crossing
+        // whitespace. A later `#` in the same run is further from `last_semi`, so
+        // the first one decides.
+        for (hash, &c) in b.iter().enumerate().skip(colon + 1) {
+            if c.is_ascii_whitespace() {
+                break;
+            }
+            if c == b'#' {
+                return hash < last_semi;
+            }
+        }
+    }
+    false
+}
+
+/// Escape a string for a Mermaid **node** label (`n0["…"]`).
+///
+/// Mermaid is not a backslash-escaping language: inside `["…"]` its lexer closes the
+/// string at the first `"` and there is no `\"`. So [`dot_label`] and [`d2_quote`],
+/// which are backslash escapers, must not be used here — `\"` produces source that
+/// does not parse at all. See [`mermaid_label`] for the encoding and its injectivity
+/// argument.
+fn mermaid_node_label(s: &str) -> String {
+    mermaid_label(s, mermaid_entity)
+}
+
+/// Escape a string for a Mermaid **edge** label (`a -->|…| b`).
+///
+/// cgx only ever emits [`condition_str`] values (five lowercase words) as edge
+/// labels, so in practice this escaper is the identity — it exists so the emitter is
+/// correct rather than incidentally correct, and `tests/query.rs` pins the call site
+/// so that removing it is not silent.
+fn mermaid_edge_label(s: &str) -> String {
+    mermaid_label(s, mermaid_edge_entity)
 }
 
 /// Render path-shaped results as Graphviz DOT (`digraph`). Dependency-free string
@@ -557,7 +917,7 @@ fn render_dot(g: GraphData) -> String {
         out.push_str(&format!(
             "  {} [label=\"{}\"];\n",
             ids[n.as_str()],
-            quote(n)
+            dot_label(n)
         ));
     }
     for (src, dst, label) in &g.edges {
@@ -568,7 +928,7 @@ fn render_dot(g: GraphData) -> String {
                 "  {} -> {} [label=\"{}\"];\n",
                 ids[src.as_str()],
                 ids[dst.as_str()],
-                quote(label)
+                dot_label(label)
             ));
         }
     }
@@ -581,7 +941,11 @@ fn render_mermaid(g: GraphData) -> String {
     let ids = node_ids(&g);
     let mut out = String::from("graph TD\n");
     for n in &g.nodes {
-        out.push_str(&format!("  {}[\"{}\"]\n", ids[n.as_str()], quote(n)));
+        out.push_str(&format!(
+            "  {}[\"{}\"]\n",
+            ids[n.as_str()],
+            mermaid_node_label(n)
+        ));
     }
     for (src, dst, label) in &g.edges {
         if label.is_empty() {
@@ -590,7 +954,7 @@ fn render_mermaid(g: GraphData) -> String {
             out.push_str(&format!(
                 "  {} -->|{}| {}\n",
                 ids[src.as_str()],
-                quote(label),
+                mermaid_edge_label(label),
                 ids[dst.as_str()]
             ));
         }
@@ -604,7 +968,7 @@ fn render_d2(g: GraphData) -> String {
     let ids = node_ids(&g);
     let mut out = String::new();
     for n in &g.nodes {
-        out.push_str(&format!("{}: \"{}\"\n", ids[n.as_str()], quote(n)));
+        out.push_str(&format!("{}: \"{}\"\n", ids[n.as_str()], d2_quote(n)));
     }
     for (src, dst, label) in &g.edges {
         if label.is_empty() {
@@ -614,7 +978,7 @@ fn render_d2(g: GraphData) -> String {
                 "{} -> {}: \"{}\"\n",
                 ids[src.as_str()],
                 ids[dst.as_str()],
-                quote(label)
+                d2_quote(label)
             ));
         }
     }
@@ -736,9 +1100,10 @@ fn render_json(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
 ) -> String {
     if let ResultSet::Table(t) = results {
-        return render_table_json(t, vacuous, contract);
+        return render_table_json(t, vacuous, contract, freshness);
     }
     let items: Vec<Value> = match results {
         ResultSet::Neighbors { results, .. } => results
@@ -756,6 +1121,8 @@ fn render_json(
         // A3/A4 answer-honesty contract: the direction this answer can be wrong,
         // machine-readable reasons, and (for a negative) the searched scope.
         "approximation": approximation_json(contract),
+        // How far the indexed state this answer describes is from the working tree.
+        "freshness": freshness_json(freshness),
     });
     // ADR-06 honesty: a `paths` budget/cap cutoff is surfaced, never silent.
     if let ResultSet::Paths(_) = results {
@@ -773,7 +1140,12 @@ fn render_json(
 
 /// Render a tabular CQL result as `{ "columns": [...], "rows": [...] }`, where each
 /// row is an array of cell JSON values in column order (per the dispatch shape).
-fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContract) -> String {
+fn render_table_json(
+    t: &TableData,
+    vacuous: bool,
+    contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let rows: Vec<Value> = t
         .rows
         .iter()
@@ -785,6 +1157,7 @@ fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContr
         "count": t.rows.len(),
         "vacuous": vacuous,
         "approximation": approximation_json(contract),
+        "freshness": freshness_json(freshness),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("table doc serializes");
     s.push('\n');
@@ -795,6 +1168,12 @@ fn render_table_json(t: &TableData, vacuous: bool, contract: &ApproximationContr
 /// `cgx_query` type so the CLI and MCP surfaces emit a byte-identical schema.
 fn approximation_json(contract: &ApproximationContract) -> Value {
     serde_json::to_value(contract).expect("approximation contract serializes")
+}
+
+/// The index-freshness envelope as a JSON object. Serialized straight off the
+/// shared `cgx_query` type, so the CLI and MCP surfaces emit the identical schema.
+fn freshness_json(freshness: &FreshnessEnvelope) -> Value {
+    serde_json::to_value(freshness).expect("freshness envelope serializes")
 }
 
 /// The human-format marker line appended when a `paths` enumeration was cut short.
@@ -846,6 +1225,7 @@ pub fn sarif_document(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    freshness: &FreshnessEnvelope,
 ) -> Value {
     let rid = rule_id(subcommand);
     let mut sarif_results: Vec<Value> = match results {
@@ -890,6 +1270,16 @@ pub fn sarif_document(
         "properties": approximation_json(contract),
     }));
 
+    // The index-freshness envelope as a second note, same shape: the human line as
+    // the message, the structured envelope in `properties` so a SARIF consumer can
+    // gate on `stale`/`dirty_files` without parsing prose.
+    sarif_results.push(json!({
+        "ruleId": "cgx/index-freshness",
+        "level": "note",
+        "message": { "text": freshness.human_summary() },
+        "properties": freshness_json(freshness),
+    }));
+
     json!({
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
@@ -915,6 +1305,10 @@ pub fn sarif_document(
                         "id": "cgx/approximation-contract",
                         "name": "approximation-contract",
                         "shortDescription": { "text": "The direction this answer can be wrong (over/under/exact) with machine-readable reasons and, for a negative, the searched scope (A3/A4)." }
+                    }, {
+                        "id": "cgx/index-freshness",
+                        "name": "index-freshness",
+                        "shortDescription": { "text": "How far the indexed state this answer describes is from the working tree: the indexed tree OID, whether it is HEAD's, and the working-tree divergence count." }
                     }]
                 }
             },
@@ -1077,8 +1471,14 @@ fn kind_str(kind: cgx_core::SymbolKind) -> String {
 /// aligned list (default) or `--format json`. Hits arrive pre-sorted by FQN; this
 /// applies the `--limit` cap (`0` = unlimited) and, when results exceed it, prints
 /// the top-N then a `… (N more — raise --limit)` footer (never silently dropped).
-/// JSON mirrors the hit struct as a bare array: `[{ "fqn", "file", "line", "kind" }]`.
-pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize) -> String {
+/// JSON is an object with the hits under `results` and the index-freshness envelope
+/// beside them: `{ "results": [{ "fqn", "file", "line", "kind" }], "freshness": {…} }`.
+pub fn render_search(
+    format: Format,
+    hits: &[cgx_query::SymbolHit],
+    limit: usize,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let shown = if limit == 0 {
         hits.len()
     } else {
@@ -1100,14 +1500,25 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
                     })
                 })
                 .collect();
-            let mut s =
-                serde_json::to_string_pretty(&items).expect("search results serialize");
+            // `search --format json` was a bare array with no envelope slot. It is
+            // now an object, deliberately breaking that shape: cgx is unreleased, so
+            // there is no consumer to keep compatible, and an answer surface that
+            // cannot say how fresh it is was the actual defect. No dual shape and no
+            // flag — the wrapped form is the only form.
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("search results serialize");
             s.push('\n');
             s
         }
         _ => {
             if hits.is_empty() {
-                return "(no results)\n".to_string();
+                let mut out = "(no results)\n".to_string();
+                out.push_str(&freshness.human_summary());
+                out.push('\n');
+                return out;
             }
             // Align on the FQN column so `file:line` starts at a fixed offset.
             let fqn_width = visible.iter().map(|h| h.fqn.chars().count()).max().unwrap_or(0);
@@ -1126,6 +1537,8 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
             if hidden > 0 {
                 out.push_str(&format!("… ({hidden} more — raise --limit)\n"));
             }
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
             out
         }
     }
@@ -1139,9 +1552,15 @@ pub fn render_search(format: Format, hits: &[cgx_query::SymbolHit], limit: usize
 ///
 /// Human form, one row per symbol:
 /// `<fqn>  (file:line)  [kind]  in=<n> out=<m>  in:{…}  out:{…}` where each `{…}` is
-/// the family/condition breakdown of that direction's edges. JSON mirrors the rank
-/// struct with nested `inbound`/`outbound` breakdown objects.
-pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: usize) -> String {
+/// the family/condition breakdown of that direction's edges. JSON is an object —
+/// the ranks under `results`, each mirroring the rank struct with nested
+/// `inbound`/`outbound` breakdown objects, plus the `freshness` envelope.
+pub fn render_symbols(
+    format: Format,
+    ranks: &[cgx_query::SymbolRank],
+    limit: usize,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let shown = if limit == 0 {
         ranks.len()
     } else {
@@ -1152,14 +1571,23 @@ pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: us
 
     match format {
         Format::Json => {
+            // Same wrapped shape as `search --format json` above, and the same
+            // deliberate break of the old bare array.
             let items: Vec<Value> = visible.iter().map(symbol_rank_json).collect();
-            let mut s = serde_json::to_string_pretty(&items).expect("symbols results serialize");
+            let doc = json!({
+                "results": items,
+                "freshness": freshness_json(freshness),
+            });
+            let mut s = serde_json::to_string_pretty(&doc).expect("symbols results serialize");
             s.push('\n');
             s
         }
         _ => {
             if ranks.is_empty() {
-                return "(no results)\n".to_string();
+                let mut out = "(no results)\n".to_string();
+                out.push_str(&freshness.human_summary());
+                out.push('\n');
+                return out;
             }
             let fqn_width = visible.iter().map(|r| r.fqn.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
@@ -1181,6 +1609,8 @@ pub fn render_symbols(format: Format, ranks: &[cgx_query::SymbolRank], limit: us
             if hidden > 0 {
                 out.push_str(&format!("… ({hidden} more)\n"));
             }
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
             out
         }
     }
@@ -1233,13 +1663,110 @@ fn breakdown_json(b: &cgx_query::EdgeBreakdown) -> Value {
     })
 }
 
+/// Render a [`CouplingReport`] (the `coupling` subcommand) as a human table
+/// (default) or `--format json`.
+///
+/// **JSON is the whole typed report, serialized once**: the echoed rev range and
+/// its resolved OIDs, the walk counters, the echoed knobs, `pairs_total`, `pairs`,
+/// and the `approximation` contract. The MCP `coupling` tool serializes the very
+/// same value, so the two surfaces carry byte-identical contract bytes *by
+/// construction* rather than by two hand-rolled formatters happening to agree —
+/// which is exactly what `cgx diff`'s bespoke `json!{}` emitter failed to do (it
+/// carries no contract at all).
+///
+/// Human form: the resolved range, a counts line, a `degraded:` line when the walk
+/// truncated or the repository is shallow, the pair table
+/// (`cochanges  a-changes  b-changes  files`), a truncation footer when `--limit`
+/// cut the list short, and the contract's one-line summary last.
+pub fn render_coupling(format: Format, report: &CouplingReport) -> String {
+    match format {
+        Format::Json => {
+            let mut s = serde_json::to_string_pretty(report).expect("coupling report serializes");
+            s.push('\n');
+            s
+        }
+        _ => coupling_human(report),
+    }
+}
+
+fn coupling_human(r: &CouplingReport) -> String {
+    let short = |oid: &str| oid.chars().take(7).collect::<String>();
+    let mut out = format!(
+        "{} ({})..{} ({})\n{} commits considered · {} merge excluded · {} root excluded · \
+         {} oversized excluded\n",
+        r.base_rev,
+        short(&r.base_commit),
+        r.head_rev,
+        short(&r.head_commit),
+        r.commits_considered,
+        r.commits_merge_excluded,
+        r.commits_root_excluded,
+        r.commits_large_excluded,
+    );
+
+    // Both flags ride in the JSON envelope and in the contract prose, but a human
+    // looking at an empty table needs to see *here* why it is empty — on a shallow
+    // CI checkout (`fetch-depth: 1`) that is the whole answer.
+    let mut degraded: Vec<&str> = Vec::new();
+    if r.truncated_at_history_boundary {
+        degraded.push("walk truncated at a history boundary (missing or unreadable object)");
+    }
+    if r.shallow_repository {
+        degraded.push("shallow clone — deepen the clone to see more history");
+    }
+    if !degraded.is_empty() {
+        out.push_str(&format!("degraded: {}\n", degraded.join(" · ")));
+    }
+
+    if r.pairs.is_empty() {
+        out.push_str("(no co-changed pairs)\n");
+    } else {
+        const H_CO: &str = "cochanges";
+        const H_A: &str = "a-changes";
+        const H_B: &str = "b-changes";
+        let width = |head: &str, max: u32| head.len().max(max.to_string().len());
+        let wco = width(H_CO, r.pairs.iter().map(|p| p.cochanges).max().unwrap_or(0));
+        let wa = width(H_A, r.pairs.iter().map(|p| p.changes_a).max().unwrap_or(0));
+        let wb = width(H_B, r.pairs.iter().map(|p| p.changes_b).max().unwrap_or(0));
+        out.push_str(&format!("{H_CO:>wco$}  {H_A:>wa$}  {H_B:>wb$}  files\n"));
+        for p in &r.pairs {
+            out.push_str(&format!(
+                "{:>wco$}  {:>wa$}  {:>wb$}  {}  {}\n",
+                p.cochanges, p.changes_a, p.changes_b, p.file_a, p.file_b
+            ));
+        }
+    }
+
+    if r.pairs.len() < r.pairs_total {
+        out.push_str(&format!(
+            "(showing {} of {} pairs with >= {} co-changes)\n",
+            r.pairs.len(),
+            r.pairs_total,
+            r.min_cochanges
+        ));
+    }
+
+    out.push_str(&r.approximation.human_summary());
+    out.push('\n');
+    out
+}
+
 /// Render a symbol [`Explanation`] (the `explain` subcommand, Q-6) as human text
 /// (default) or `--format json`. SARIF is not a meaningful shape for a single
 /// symbol's provenance, so `explain` supports only human/json (the dispatch scope).
-pub fn render_explanation(format: Format, e: &Explanation) -> String {
+pub fn render_explanation(
+    format: Format,
+    e: &Explanation,
+    freshness: &FreshnessEnvelope,
+) -> String {
     match format {
-        Format::Json => explanation_json(e),
-        _ => explanation_human(e),
+        Format::Json => explanation_json(e, freshness),
+        _ => {
+            let mut out = explanation_human(e);
+            out.push_str(&freshness.human_summary());
+            out.push('\n');
+            out
+        }
     }
 }
 
@@ -1283,7 +1810,7 @@ fn explanation_human(e: &Explanation) -> String {
     out
 }
 
-fn explanation_json(e: &Explanation) -> String {
+fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
     let n = &e.node;
     let edges: Vec<Value> = e
         .edges
@@ -1311,6 +1838,7 @@ fn explanation_json(e: &Explanation) -> String {
         "callers_count": e.callers_count,
         "callees_count": e.callees_count,
         "edges": edges,
+        "freshness": freshness_json(freshness),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("explanation doc serializes");
     s.push('\n');
@@ -1322,4 +1850,695 @@ fn node_kind_str(node: &NodeRecord) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "symbol".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The inverse of the emitter's encoding, written out here independently of
+    /// [`mermaid_entity`] rather than derived from it, so that a typo on either
+    /// side is a failure rather than a shared assumption.
+    const MERMAID_DECODE: &[(&str, char)] = &[
+        ("&amp;", '&'),
+        ("&quot;", '"'),
+        ("&lt;", '<'),
+        ("&grave;", '`'),
+        ("&bsol;", '\\'),
+        ("&semi;", ';'),
+        ("&num;", '#'),
+        ("&verbar;", '|'),
+        ("&lsqb;", '['),
+        ("&rsqb;", ']'),
+        ("&lpar;", '('),
+        ("&rpar;", ')'),
+        ("&lcub;", '{'),
+        ("&rcub;", '}'),
+    ];
+
+    fn entity_at(tail: &str) -> Option<(&'static str, char)> {
+        let end = tail.find(';')?;
+        MERMAID_DECODE
+            .iter()
+            .find(|(e, _)| *e == &tail[..=end])
+            .copied()
+    }
+
+    /// Decode left to right: on `&`, take the entity that starts there; copy every
+    /// other byte. This terminates and is unambiguous only because the emitter
+    /// escapes `&` itself — which is the whole injectivity argument.
+    fn mermaid_decode(encoded: &str) -> String {
+        let mut out = String::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            let (entity, c) = entity_at(tail).unwrap_or_else(|| {
+                panic!("emitted a `&` that opens no known entity: {encoded:?}")
+            });
+            out.push(c);
+            rest = &tail[entity.len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Everything that is *not* part of an entity this emitter produced.
+    fn entity_residue(encoded: &str) -> String {
+        let mut out = String::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            match entity_at(tail) {
+                Some((entity, _)) => rest = &tail[entity.len()..],
+                None => {
+                    out.push('&');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Does `s` contain a `#\w+;`, the pattern Mermaid's first source rewrite acts
+    /// on? Measured: `A#zzz;B` renders `A&zzz;B`, `A#1;B` renders `A\x01B` — the
+    /// rewrite fires whether or not the result is a real entity.
+    fn has_hash_code(s: &str) -> bool {
+        let b = s.as_bytes();
+        for (i, &c) in b.iter().enumerate() {
+            if c != b'#' {
+                continue;
+            }
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 1 && j < b.len() && b[j] == b';' {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The renderability half of the contract, derived from the Mermaid grammar and
+    /// the two source rewrites rather than from the emitter's own table: whatever
+    /// the emitter produced, the real pipeline must not act on any of it.
+    fn assert_inert(encoded: &str, ctx: &str, raw: &str) {
+        let residue = entity_residue(encoded);
+        let mut hostile: Vec<char> = vec!['&', '"', '<', '`', '\\', ';'];
+        if ctx == "edge" {
+            hostile.extend(['|', '[', ']', '(', ')', '{', '}']);
+        }
+        for c in hostile {
+            assert!(
+                !residue.contains(c),
+                "{ctx}: emitted a raw {c:?} the Mermaid pipeline acts on \
+                 (input {raw:?}, emitted {encoded:?}, residue {residue:?})"
+            );
+        }
+        assert!(
+            !has_hash_code(encoded),
+            "{ctx}: emitted `#\\w+;`, which Mermaid's source rewrite decodes \
+             (input {raw:?}, emitted {encoded:?})"
+        );
+        assert!(
+            !directive_rewrite_matches(encoded),
+            "{ctx}: emitted a label Mermaid's style/classDef rewrite would strip a \
+             `;` from (input {raw:?}, emitted {encoded:?})"
+        );
+    }
+
+    /// The input space the round-trip property is checked over. Generated rather
+    /// than hand-listed on purpose: the previous two rounds of this escaper each
+    /// shipped a hand-listed set that was missing a character, so the test has to
+    /// cover characters nobody thought of.
+    fn round_trip_corpus() -> Vec<String> {
+        let mut corpus: Vec<String> = Vec::new();
+        for b in 0x20u8..=0x7e {
+            let c = b as char;
+            corpus.push(c.to_string());
+            corpus.push(format!("a{c}b"));
+        }
+        // Exhaustive over the alphabet that can form an escape, a `#\w+;` code or a
+        // directive-rewrite trigger: every pair and every triple.
+        const ALPHA: &[char] = &[
+            '&', '#', ';', '"', '<', '`', '\\', '|', '{', ':', 'q', 'u', 'o', 't', 'a', 'm', 'p',
+            'n', 's', '3', '5',
+        ];
+        for &x in ALPHA {
+            for &y in ALPHA {
+                corpus.push(format!("{x}{y}"));
+                for &z in ALPHA {
+                    corpus.push(format!("{x}{y}{z}"));
+                }
+            }
+        }
+        // Exhaustive length-4 over the narrower introducer alphabet.
+        const NARROW: &[char] = &['&', '#', ';', 'q', '3', 'n'];
+        for &w in NARROW {
+            for &x in NARROW {
+                for &y in NARROW {
+                    for &z in NARROW {
+                        corpus.push(format!("{w}{x}{y}{z}"));
+                    }
+                }
+            }
+        }
+        // The literal text of every code either decoder acts on, nested and
+        // overlapping forms, the directive-rewrite traps, and multi-byte UTF-8.
+        for s in [
+            "&quot;", "&amp;", "&num;", "&semi;", "&lt;", "&bsol;", "&grave;", "&verbar;",
+            "#quot;", "#lt;", "#35;", "#92;", "#96;", "&#35;", "#38;", "#zzz;", "#_;", "#1;",
+            "&amp;quot;", "#&#35;quot;", "&&amp;", "&quot", "&amp", "&lt", "&#", "#;", "##;;",
+            "styles::b#1", "styles::b#1\"x", "classDef::x\"y", "mystyle::a#35;b;c", "style:#;",
+            "classDef:#;", "aStyleClassDef", "π::日本", "🙂#1;🙂",
+            "ts::Handler::\"q\\\"<>&|#;`\\\\π日\"", "", "&", "#", ";", "\t",
+        ] {
+            corpus.push(s.to_string());
+        }
+        corpus
+    }
+
+    /// C3's real content: the Mermaid encoding is injective, and it is injective
+    /// for inputs nobody enumerated.
+    ///
+    /// Two properties per input, in both label contexts. `decode(encode(s)) == s`
+    /// is the injectivity one and holds by construction — every escape opens with
+    /// the one introducer, and the introducer is escaped. [`assert_inert`] is the
+    /// renderability one and is derived from the grammar and the two source
+    /// rewrites measured against mermaid-cli 11.16.0.
+    #[test]
+    fn mermaid_encoding_round_trips_every_generated_input() {
+        for raw in round_trip_corpus() {
+            for (ctx, encoded) in [
+                ("node", mermaid_node_label(&raw)),
+                ("edge", mermaid_edge_label(&raw)),
+            ] {
+                assert_eq!(
+                    mermaid_decode(&encoded),
+                    raw,
+                    "{ctx}: decode(encode(s)) != s for {raw:?} (emitted {encoded:?})"
+                );
+                assert_inert(&encoded, ctx, &raw);
+            }
+        }
+    }
+
+    /// Each mapping below was verified against mermaid-cli 11.16.0 by rendering
+    /// the escaped form and reading the label back out of the SVG: the raw
+    /// character on the left is what the diagram displays. The node-label
+    /// integration coverage lives in `tests/diff_gate.rs`, the edge-label call site
+    /// in `tests/query.rs`.
+    #[test]
+    fn mermaid_escapers_cover_the_characters_each_context_acts_on() {
+        // Common to both contexts. `&` is here because it is the introducer: it is
+        // *not* safe raw, contrary to what the previous round of this escaper
+        // asserted — measured, `A&quot;B` renders `A"B` and `A&ampB` renders `A&B`,
+        // so a raw `&` lets an FQN's own text be read as an entity.
+        for (raw, escaped) in [
+            ("a\"b", "a&quot;b"),
+            ("a<b", "a&lt;b"),
+            ("a`b", "a&grave;b"),
+            ("a\\b", "a&bsol;b"),
+            ("a&b", "a&amp;b"),
+            ("a;b", "a&semi;b"),
+        ] {
+            assert_eq!(mermaid_node_label(raw), escaped);
+            assert_eq!(mermaid_edge_label(raw), escaped);
+        }
+
+        // Node labels sit inside `["…"]`, which makes the shape delimiters inert;
+        // an edge label is bare between two `|`, and every one of them ends it.
+        for (raw, escaped) in [
+            ("a|b", "a&verbar;b"),
+            ("a[b", "a&lsqb;b"),
+            ("a]b", "a&rsqb;b"),
+            ("a(b", "a&lpar;b"),
+            ("a)b", "a&rpar;b"),
+            ("a{b", "a&lcub;b"),
+            ("a}b", "a&rcub;b"),
+        ] {
+            assert_eq!(mermaid_node_label(raw), raw, "inert inside [\"…\"]");
+            assert_eq!(mermaid_edge_label(raw), escaped);
+        }
+
+        // Left raw, and measured to render raw in both contexts.
+        for raw in ["a>b", "a#1", "a*b", "a_b", "π::日本"] {
+            assert_eq!(mermaid_node_label(raw), raw);
+            assert_eq!(mermaid_edge_label(raw), raw);
+        }
+    }
+
+    /// `#` is the one character whose escape is conditional, and the condition is
+    /// the `style` / `classDef` source rewrite rather than anything about `#`
+    /// itself. Escaping it is never *needed* for injectivity — `&num;` and a raw
+    /// `#` both decode to `#` — so the condition only picks between two correct
+    /// encodings, and picking the cheap one keeps cgx's value-node separator
+    /// (`…::b#1`, 632 of the 1210 fixture FQNs) byte-identical.
+    ///
+    /// Both branches measured against mermaid-cli 11.16.0:
+    /// `styles::b#1&bsol;x` renders `styles::b#1&bsolx` (the rewrite ate the `;`),
+    /// `styles::b&num;1&bsol;x` renders `styles::b#1\x`.
+    #[test]
+    fn hash_is_escaped_only_where_the_directive_rewrite_would_bite() {
+        for unchanged in ["mod::b#1", "styles::b#1", "classDef::x#1", "a#b#c"] {
+            assert_eq!(mermaid_node_label(unchanged), unchanged);
+            assert_eq!(mermaid_edge_label(unchanged), unchanged);
+        }
+        assert_eq!(
+            mermaid_node_label("styles::b#1\"x"),
+            "styles::b&num;1&quot;x"
+        );
+        assert_eq!(
+            mermaid_node_label("mystyle::a#35;b;c"),
+            "mystyle::a&num;35&semi;b&semi;c"
+        );
+        // No `#` on the line, so the rewrite cannot match and `#` stays unescaped
+        // wherever it does not appear at all.
+        assert_eq!(mermaid_node_label("classDef::x\"y"), "classDef::x&quot;y");
+    }
+
+    /// Pins the two *call sites* inside [`render_mermaid`], not just the escapers.
+    ///
+    /// R06-03: reverting `mermaid_edge_label(label)` to `quote(label)` used to pass
+    /// the entire suite. cgx only ever emits [`condition_str`] words as edge labels
+    /// and both escapers are the identity on those, so no black-box test over the
+    /// shipped commands can tell them apart — the emitter has to be driven directly
+    /// with a label the two escapers disagree about. Reverting either call site
+    /// fails this assertion.
+    #[test]
+    fn render_mermaid_escapes_both_label_positions() {
+        let hostile = "a\"<&#;x";
+        let g = GraphData {
+            nodes: vec![hostile.to_string(), "b".to_string()],
+            edges: vec![(hostile.to_string(), "b".to_string(), "c\"<&|;y".to_string())],
+        };
+        assert_eq!(
+            render_mermaid(g),
+            "graph TD\n  \
+             n0[\"a&quot;&lt;&amp;#&semi;x\"]\n  \
+             n1[\"b\"]\n  \
+             n0 -->|c&quot;&lt;&amp;&verbar;&semi;y| n1\n"
+        );
+    }
+
+    /// D2 keeps the exact bytes the shared `quote()` emitted before the split.
+    ///
+    /// Splitting one escaper into two is only safe for D2 if D2's output does not
+    /// move, so this pins it against a literal restatement of the pre-split
+    /// implementation rather than against a hand-written table — over the same
+    /// generated corpus the round-trip property uses. d2 0.7.1 does not decode
+    /// character references (`A&quot;B` displays `A&quot;B`), so `&` must **not** be
+    /// escaped here even though [`dot_label`] has to escape it.
+    #[test]
+    fn d2_quote_is_byte_identical_to_the_shared_escaper_it_replaced() {
+        for raw in dot_round_trip_corpus() {
+            let before = raw.replace('\\', "\\\\").replace('"', "\\\"");
+            assert_eq!(
+                d2_quote(&raw),
+                before,
+                "d2_quote changed D2's bytes for {raw:?}"
+            );
+        }
+        assert_eq!(d2_quote("a&b"), "a&b", "d2 does not decode entities");
+        assert_eq!(d2_quote("a&quot;b"), "a&quot;b");
+    }
+
+    /// The DOT label contexts a Graphviz object substitution distinguishes.
+    #[derive(Clone, Copy)]
+    enum DotCtx {
+        Node,
+        Edge,
+    }
+
+    /// Stage 1 of [`dot_decode`]: the DOT lexer, on a double-quoted string.
+    ///
+    /// `\"` yields `"`; `\` + newline is a line continuation; every other backslash
+    /// passes through verbatim, which is why stage 4 still sees `\\` pairs.
+    fn dot_lex(body: &str, ctx: &str) -> String {
+        let mut out = String::with_capacity(body.len());
+        let mut it = body.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                assert!(
+                    c != '"',
+                    "{ctx}: label body carries an unescaped quote, which would have \
+                     closed the string early: {body:?}"
+                );
+                out.push(c);
+                continue;
+            }
+            match it.peek() {
+                Some('"') => {
+                    out.push('"');
+                    it.next();
+                }
+                Some('\\') => {
+                    out.push_str("\\\\");
+                    it.next();
+                }
+                Some('\n') => {
+                    it.next();
+                }
+                Some(_) => out.push('\\'),
+                None => panic!(
+                    "{ctx}: label body ends in a dangling backslash, which would have \
+                     escaped the closing quote: {body:?}"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Stage 2: `\N` `\G` `\E` `\T` `\H` `\L` object substitution, the one stage
+    /// where the node and edge contexts differ. Measured: in a node label `\N` is the
+    /// node name and `\T` is untouched; in an edge label `\T` is the tail and `\N` is
+    /// untouched. A `\\` pair is skipped, so an emitter that escapes every backslash
+    /// makes this stage a no-op in both contexts — which is what a substitution here
+    /// showing up as the sentinel would disprove.
+    fn dot_subst(s: &str, ctx: DotCtx) -> String {
+        let keys: &[char] = match ctx {
+            DotCtx::Node => &['N', 'G', 'E'],
+            DotCtx::Edge => &['G', 'E', 'T', 'H'],
+        };
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.peek().copied() {
+                Some('\\') => {
+                    out.push_str("\\\\");
+                    it.next();
+                }
+                Some(k) if keys.contains(&k) => {
+                    out.push_str("\u{0}SUBST\u{0}");
+                    it.next();
+                }
+                _ => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    /// Stage 3: Graphviz's entity decode. Case-sensitive, `;` required, one pass —
+    /// `&amp;quot;` decodes to `&quot;`, not to `"`.
+    ///
+    /// The name table is Graphviz's, not this emitter's, and it is deliberately
+    /// partial: `assert_dot_inert` is what closes the gap, by rejecting any emitted
+    /// `&` that does not open `&amp;`. So a name Graphviz knows and this table does
+    /// not can never reach a label unescaped in the first place.
+    fn dot_entities(s: &str) -> String {
+        const NAMED: &[(&str, char)] = &[
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&nbsp;", '\u{a0}'),
+            // Graphviz 15.1.0 decodes exactly these five names — measured, not taken
+            // from HTML5's table, which is much larger. `&num;` `&semi;` `&verbar;`
+            // were listed here and are NOT decoded by Graphviz; they rendered
+            // literally. They were unreachable (`assert_dot_label_inert` rejects any
+            // `&` not opening `&amp;` before the decoder sees it), so no test caught
+            // the disagreement with the copy of this table in `tests/diff_gate.rs`,
+            // which was right. A model that over-decodes is a trap for the next
+            // reader even when it cannot currently misfire.
+        ];
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        'outer: while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            for (name, c) in NAMED {
+                if let Some(stripped) = tail.strip_prefix(name) {
+                    out.push(*c);
+                    rest = stripped;
+                    continue 'outer;
+                }
+            }
+            if let Some(end) = tail.find(';') {
+                let body = &tail[2..end];
+                if tail.starts_with("&#") && !body.is_empty() {
+                    let parsed = match body.strip_prefix(['x', 'X']) {
+                        Some(hex) if !hex.is_empty() => u32::from_str_radix(hex, 16).ok(),
+                        Some(_) => None,
+                        None => body.parse::<u32>().ok(),
+                    };
+                    if let Some(ch) = parsed.and_then(char::from_u32) {
+                        out.push(ch);
+                        rest = &tail[end + 1..];
+                        continue 'outer;
+                    }
+                }
+            }
+            out.push('&');
+            rest = &tail[1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Stage 4: `\\` → `\`, `\n` `\l` `\r` → a line break, any other `\X` → `X`.
+    fn dot_escapes(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.next() {
+                Some('\\') => out.push('\\'),
+                Some('n' | 'l' | 'r') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// A model of the four Graphviz decode stages, in the order they run (see
+    /// [`dot_label`]). Deliberately **not** the encoder's inverse: it decodes
+    /// everything the real renderer decodes, so a character the emitter forgot to
+    /// escape surfaces as a mismatch instead of passing because both sides share a
+    /// blind spot. Every stage was measured against Graphviz 15.1.0 by reading the
+    /// label back out of `dot -Tsvg`.
+    fn dot_decode(body: &str, ctx: DotCtx, name: &str) -> String {
+        dot_escapes(&dot_entities(&dot_subst(&dot_lex(body, name), ctx)))
+    }
+
+    /// The renderability half of the DOT contract, derived from the grammar rather
+    /// than from the emitter's own table: whatever was emitted, no stage of the real
+    /// pipeline may act on any of it.
+    ///
+    /// This is also what lets [`dot_entities`] carry a partial name table — an `&`
+    /// that opens anything but `&amp;` is rejected here, so it can never reach the
+    /// decoder for the table to be wrong about.
+    fn assert_dot_inert(encoded: &str, ctx: &str, raw: &str) {
+        let b = encoded.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'&' => {
+                    assert!(
+                        encoded[i..].starts_with("&amp;"),
+                        "{ctx}: emitted a `&` that does not open `&amp;`; Graphviz \
+                         decodes character references in ordinary labels \
+                         (input {raw:?}, emitted {encoded:?}, at byte {i})"
+                    );
+                    i += 5;
+                }
+                b'\\' => {
+                    let next = b.get(i + 1);
+                    assert!(
+                        next == Some(&b'\\') || next == Some(&b'"'),
+                        "{ctx}: emitted a `\\` that opens neither `\\\\` nor `\\\"` \
+                         (input {raw:?}, emitted {encoded:?}, at byte {i})"
+                    );
+                    i += 2;
+                }
+                b'"' => panic!(
+                    "{ctx}: emitted an unescaped `\"`, which closes the DOT string \
+                     early (input {raw:?}, emitted {encoded:?})"
+                ),
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// [`round_trip_corpus`] plus the inputs specific to the Graphviz decoder: the
+    /// literal text of every sequence its four stages act on, nested and overlapping
+    /// forms, and the entity/backslash interactions that only exist because stage 3
+    /// runs before stage 4.
+    fn dot_round_trip_corpus() -> Vec<String> {
+        let mut corpus = round_trip_corpus();
+        const ALPHA: &[char] = &[
+            '\\', '"', '&', '#', ';', 'n', 'l', 'r', 'N', 'G', 'x', '9', '2',
+        ];
+        for &x in ALPHA {
+            for &y in ALPHA {
+                corpus.push(format!("{x}{y}"));
+                for &z in ALPHA {
+                    corpus.push(format!("{x}{y}{z}"));
+                }
+            }
+        }
+        const NARROW: &[char] = &['\\', '"', '&'];
+        for &w in NARROW {
+            for &x in NARROW {
+                for &y in NARROW {
+                    for &z in NARROW {
+                        corpus.push(format!("{w}{x}{y}{z}"));
+                    }
+                }
+            }
+        }
+        let literals = [
+            "&quot;",
+            "&amp;",
+            "&lt;",
+            "&gt;",
+            "&nbsp;",
+            "&apos;",
+            "&bsol;",
+            "&num;",
+            "&semi;",
+            "&#34;",
+            "&#38;",
+            "&#92;",
+            "&#x26;",
+            "&#X5C;",
+            "&#092;",
+            "&#0;",
+            "&#1;",
+            "&#160;",
+            "\\n",
+            "\\l",
+            "\\r",
+            "\\N",
+            "\\G",
+            "\\E",
+            "\\T",
+            "\\H",
+            "\\L",
+            "\\\\",
+            "\\\"",
+            "\\",
+            "&amp;quot;",
+            "&#38;quot;",
+            "&amp;#92;n",
+            "&#92;n",
+            "&#92;N",
+            "&#92;\\n",
+            "\\\\n",
+            "&quot;&quot;",
+            "&ampX&lt Y",
+            "&Amp;",
+            "&AMP;",
+            "&",
+            "\"",
+            "<b>x</b>",
+            "&lt;b&gt;",
+            "ts_sample::a::Handler::\"&quot;X&lt;Y&amp;Z\"",
+            "ts_sample::a::Handler::\"q\\\"<>&|#;`\\\\π日\"",
+        ];
+        for s in literals {
+            corpus.push(s.to_string());
+            corpus.push(format!("A{s}B"));
+            for h in ['\\', '"', '&', ';', '#'] {
+                corpus.push(format!("{h}{s}"));
+                corpus.push(format!("{s}{h}"));
+            }
+            corpus.push(format!("{s}{s}"));
+        }
+        corpus
+    }
+
+    /// C3's content for DOT: the encoding is injective, and it is injective for
+    /// inputs nobody enumerated.
+    ///
+    /// Two properties per input, in both label contexts. `decode(encode(s)) == s` is
+    /// injectivity and holds by construction — both introducers are escaped and the
+    /// escape bodies are disjoint in them. [`assert_dot_inert`] is renderability and
+    /// is derived from the Graphviz grammar. They are kept separate on purpose: the
+    /// first is why the output cannot be silently misread, the second is why it looks
+    /// right, and only the first can fail without anyone noticing.
+    ///
+    /// The same property was run against real Graphviz 15.1.0 out of band over an
+    /// equivalent generated corpus — 2,288 inputs × node and edge = 4,576 renders,
+    /// labels read back out of `dot -Tsvg`, 0 differing. The pre-split escaper fails
+    /// 286 of those.
+    #[test]
+    fn dot_encoding_round_trips_every_generated_input() {
+        for raw in dot_round_trip_corpus() {
+            let encoded = dot_label(&raw);
+            for (ctx, name) in [(DotCtx::Node, "node"), (DotCtx::Edge, "edge")] {
+                assert_dot_inert(&encoded, name, &raw);
+                assert_eq!(
+                    dot_decode(&encoded, ctx, name),
+                    raw,
+                    "dot {name} label does not round-trip: {raw:?} encoded as {encoded:?}"
+                );
+            }
+        }
+    }
+
+    /// The characters DOT escapes, and the ones it deliberately does not.
+    ///
+    /// Each mapping was verified against Graphviz 15.1.0 by rendering the escaped
+    /// form and reading the label back out of the SVG. `&` is the entry the
+    /// pre-existing escaper was missing: `label="A&quot;B"` renders `A"B`, so an FQN
+    /// whose own text is `A&quot;B` used to display as `A"B`.
+    #[test]
+    fn dot_label_escapes_the_characters_graphviz_acts_on() {
+        assert_eq!(dot_label("a\"b"), "a\\\"b");
+        assert_eq!(dot_label("a\\b"), "a\\\\b");
+        assert_eq!(dot_label("a&b"), "a&amp;b");
+        assert_eq!(dot_label("a&quot;b"), "a&amp;quot;b");
+        assert_eq!(dot_label("a\\nb"), "a\\\\nb");
+        assert_eq!(dot_label("a&#92;nb"), "a&amp;#92;nb");
+        // Literal inside a quoted DOT label; escaping them would be blast radius
+        // with no correctness gain.
+        assert_eq!(dot_label("a<b>|#;`{}"), "a<b>|#;`{}");
+    }
+
+    /// Pins the two *call sites* inside [`render_dot`], not just the escaper.
+    ///
+    /// The same gap R06-03 found in Mermaid applies here: cgx only ever emits
+    /// [`condition_str`] words as DOT edge labels, and `dot_label` and `d2_quote`
+    /// are the identity on all five of them, so no black-box test over the shipped
+    /// commands can tell the two apart. The emitter has to be driven directly with a
+    /// label they disagree about. Reverting either call site fails this assertion.
+    #[test]
+    fn render_dot_escapes_both_label_positions() {
+        let hostile = "a&\"x";
+        let g = GraphData {
+            nodes: vec![hostile.to_string(), "b".to_string()],
+            edges: vec![(hostile.to_string(), "b".to_string(), "c&\"y".to_string())],
+        };
+        assert_eq!(
+            render_dot(g),
+            "digraph cgx {\n  rankdir=LR;\n  \
+             n0 [label=\"a&amp;\\\"x\"];\n  \
+             n1 [label=\"b\"];\n  \
+             n0 -> n1 [label=\"c&amp;\\\"y\"];\n}\n"
+        );
+    }
+
+    /// D2's emitter must not have picked up DOT's `&` escape.
+    #[test]
+    fn render_d2_leaves_ampersand_raw() {
+        let g = GraphData {
+            nodes: vec!["a&\"x".to_string(), "b".to_string()],
+            edges: vec![("a&\"x".to_string(), "b".to_string(), "c&\"y".to_string())],
+        };
+        assert_eq!(
+            render_d2(g),
+            "n0: \"a&\\\"x\"\nn1: \"b\"\nn0 -> n1: \"c&\\\"y\"\n"
+        );
+    }
 }

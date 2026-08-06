@@ -16,7 +16,7 @@ Every subcommand accepts `--format <FMT>`. The default is `human`.
 | Format | Since | Best for |
 |--------|-------|----------|
 | `human` | v0.1 | Reading at a terminal. `callers`/`callees`/`flows-to`/`flows-from`/`reaches <from>` render an ASCII call **forest** (see §1.1); `paths`/`unused` render a list. File:line evidence and edge/confidence tags inline. |
-| `json` | v0.1 | Scripting, agents, CI pipelines. Structured envelope with `count` and `results[]`. |
+| `json` | v0.1 | Scripting, agents, CI pipelines. Structured envelope with `results[]`, `count`, `vacuous`, and — on the eight subcommands that carry it — the `approximation` contract (§1.2). |
 | `sarif` | v0.1 | Security tooling. SARIF 2.1.0 — uploads to GitHub Advanced Security, VS Code SARIF viewer, and any OASIS-compliant tool. |
 | `dot` | v0.1 | Path-shaped results only. Feeds `dot -Tsvg` or any Graphviz consumer for SVG/PNG artifacts. Use for large graphs (Mermaid has a node limit). |
 | `mermaid` | v0.1 | Path-shaped results only. Renders inline in GitHub Markdown, Notion, and most docs platforms. Human-writeable and diff-friendly. |
@@ -24,9 +24,20 @@ Every subcommand accepts `--format <FMT>`. The default is `human`.
 
 **Path-shaped restriction:** `dot`, `mermaid`, and `d2` are only valid for output that describes a
 graph path — the `paths` and `reaches <from> <to>` subcommands, or a `cgx query` that uses `RETURN path`.
-Applying them to any other command (e.g., `callers`, `callees`, `unused`) exits `2` with an error:
-`Dot format is only valid for path-returning results`. The flag is accepted in the help text but
-rejected at runtime for non-path commands.
+Applying them to any other command (e.g., `callers`, `callees`, `unused`) exits `2`. Three
+different messages carry that rejection, depending on which command you asked:
+
+```
+Dot format is only valid for path-returning results (`paths`, `reaches <from> <to>`, or a CQL `RETURN path` query)
+dot/mermaid/d2 are only valid for path-returning queries (RETURN path); this query returns a table — use --format human|json|sarif
+Dot format is not supported by `search` — use --format human|json
+```
+
+The first is the shared result-emitting path (`callers`/`callees`/`unused`/`reaches <from>`);
+the second is a tabular `cgx query`; the third is `search`/`symbols`, which reject the format
+themselves. The format name at the front varies (`Dot`, `Mermaid`, `D2`). Match on the exit
+code, not the wording. The flag is accepted in the help text but rejected at runtime for
+non-path commands.
 
 ### 1.1 The human call forest (`callers` / `callees` / `flows-to` / `flows-from` / `reaches <from>`)
 
@@ -73,22 +84,74 @@ keeps its **witness-path** rendering — it is not a forest.
 - Generating a diagram artifact in CI or embedding in docs → `dot` (CI) or `mermaid` (docs).
 - Interactive diagram editing with D2 → `d2`.
 
+### 1.2 The approximation contract — which answers carry it
+
+*Shipped on `main`, ahead of the `0.3.0` version string — `cgx --version` cannot tell you whether
+your binary emits it. Check by running `cgx callers <sym>` and looking for the trailing
+`approximation:` line — probe it on a subcommand that has one, per the list below.*
+
+The contract rides on the eight subcommands whose results are rendered through the shared
+result-emitting path: **`callers`, `callees`, `reaches`, `paths`, `flows-to`, `flows-from`,
+`unused`, `query`**. Each of those states **which direction it can be wrong**, so a consumer
+never has to guess whether an empty result means "proven absent" or "we stopped looking".
+
+**`index`, `explain`, `search`, `symbols`, `doctor`, and `diff` render directly and carry no
+contract** — on any version. Two consequences worth internalising:
+
+- A probe for the `approximation:` line against `cgx search` or `cgx symbols` reports a current
+  binary as an old one.
+- **`cgx diff --path-added` is the sharp edge.** Its clean exit *is* a negative-completeness
+  claim — "no new call/dataflow path from `--from` to `--to`" — and it is exactly the command
+  that carries no `approximation` and no `scope`. When you gate a PR on it, the scope of the
+  search is not stated in the output; you have to know it from the flags you passed.
+
+- **human** — one compact trailing line:
+  `approximation: <exact (within modeled graph)|over-approximate|under-approximate|over- and under-approximate>`,
+  then ` — <reasons joined by ; >` when there are any, then ` | scope: <edge kinds>, confidence>=<tier>, depth<=<N>`
+  on a negative/absence answer.
+- **json** — two extra top-level keys alongside `count`/`results`: `"vacuous": <bool>` and an
+  `"approximation"` object with `direction` (`exact`/`over`/`under`/`over_under`), `reasons[]`
+  (each `{direction, code, detail}` — `code` is a stable kebab-case token to match on in CI),
+  `modeled_graph` (the standing carve-out: external/unindexed callees, undescended closure bodies,
+  and unexpanded macros are outside the modeled graph), and, on a negative answer only, `scope`
+  (`searched_edge_kinds`, `confidence_floor`, `max_depth`).
+- **sarif** — an extra result under `ruleId: "cgx/approximation-contract"`.
+- **dot / mermaid / d2** — nothing; these emit raw graph source and carry no prose.
+
+`exact` is always relative to `modeled_graph`. It never means "proven for the whole program".
+
 ### Real output samples
 
-The following samples are from a live run of
-`cgx reaches cgx_cli::emit cgx_cli::assertions::evaluate`.
+The following samples show the **shape** of `cgx reaches cgx_cli::emit
+cgx_cli::assertions::evaluate`. The `approximation` values are per-answer and will differ for your
+query — read them, do not assume them.
 
 **human:**
 ```
 path 1 (1 hops, min-confidence=probable):
      cgx_cli::emit  (crates/cgx-cli/src/main.rs:989)
   -> cgx_cli::assertions::evaluate  (crates/cgx-cli/src/assertions.rs:57) [always]
+approximation: over-approximate — <one reason phrase per contributing reason>
 ```
 
 **json:**
 ```json
-{"count": 1, "results": [{"condition": "always", "confidence": "certain", "depth": 1}]}
+{
+  "results": [{"condition": "always", "confidence": "certain", "depth": 1}],
+  "count": 1,
+  "vacuous": false,
+  "approximation": {
+    "direction": "over",
+    "reasons": [{"direction": "over", "code": "<stable-kebab-token>", "detail": "<phrase>"}],
+    "modeled_graph": "descended function bodies in the indexed repository; external/unindexed callees, undescended closure bodies, and unexpanded macros are outside the modeled graph"
+  },
+  "truncated": false,
+  "truncation_reason": null
+}
 ```
+
+The `truncated`/`truncation_reason` pair appears on path-shaped results only. A negative answer
+additionally carries `approximation.scope`.
 
 **dot:**
 ```dot
@@ -128,20 +191,21 @@ makes SARIF upload and build failure composable in the same step.
 | `0` | Success — query ran; results returned (including zero results) | Normal query against an indexed repo |
 | `1` | Assert failure — `--assert-empty` fired because results were found | `cgx callers foo --assert-empty` when `foo` has callers |
 | `2` | Usage error — unresolved symbol, CQL parse or plan error, bad argument | `cgx callers nonexistent_xyz`; unsupported CQL property; phantom flag |
-| `3` | Graph missing or corrupt (only reachable with `--no-auto-index`) | `cgx callers foo --no-auto-index` with no `.cgx/` directory present |
-| `4` | Vacuous pass — `--assert-empty` would exit 0 but the query matched zero nodes; the guard fires instead | `cgx callers nonexistent_xyz --assert-empty --repo /path/to/repo` |
+| `3` | Graph error — the index is missing, corrupt, or could not be built | `cgx callers foo --no-auto-index` with no `.cgx/` present; also a corrupt `.cgx/index.db` or a failed index build, regardless of `--no-auto-index` |
+| `4` | Vacuous pass — `--assert-empty` would exit 0, but either the pattern matched zero nodes or the active filters excluded every result the unfiltered query would have returned | `cgx callers nonexistent_xyz --assert-empty`; `cgx paths A B --confidence certain --assert-empty` when only `possible` paths exist |
 
 **Key insight — exit 0 includes empty results.** A query that finds nothing is not an error. Empty
 results exit `0`. Only assertion flags (`--assert-empty`) change that. Exit `2` means the command
 itself was malformed (bad symbol name, bad CQL, bad flag) — not that results were absent.
 
-**Auto-index is on by default.** A missing `.cgx/` triggers an automatic build. Exit `3` is only
-reachable when `--no-auto-index` is passed explicitly.
+**Auto-index is on by default.** A missing `.cgx/` triggers an automatic build, which is why exit
+`3` is most often seen with `--no-auto-index`. It is not exclusive to that flag: a corrupt store or
+a build that fails also exits `3`.
 
 **Exit 2 disambiguation.** All of these produce exit 2:
 - Unknown or mistyped symbol name: `no symbol matched pattern '<x>'`
-- CQL parse error (e.g., single-quoted string, `NOT IN [...]`, node-only MATCH with no relationship, `MUST PASS THROUGH`, `AVOIDING`)
-- CQL plan error (e.g., unsupported node property: `source_class`, `sink_class`, `sanitizer_class`, `taint_label`, `entrypoint_class`)
+- CQL parse error (e.g., single-quoted string, `NOT IN [...]`, node-only MATCH with no relationship)
+- CQL plan error — `MATCH ALL … MUST PASS THROUGH`/`AVOIDING`, intercepted by name and reported as `(deferred)`; unsupported **node** property (`entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`) reported as `(no backing field on a symbol node)`; unsupported **edge** property (`via`, `taint_label`, `site`) reported as `(no backing field on an edge)`. `taint_label` is an *edge* property, not a node property
 - Phantom flag that does not exist (e.g., `--max-depth`, `--base`, `--dataflow`, `--assert-count`, `--assert-max`)
 
 Exit 2 is the signal to check the symbol name (grep source first), the CQL syntax, and the flag
@@ -176,9 +240,38 @@ no paths are found and the assertion trivially passes — but for the wrong reas
 because the symbol was mistyped (exit `0`) is indistinguishable from a gate that passes because no
 paths exist (also exit `0`) without the vacuity guard.
 
-**The guard.** When `--assert-empty` would exit `0` but zero nodes were matched by the query pattern,
-cgx exits `4` instead ("assertion vacuously satisfied"). This prevents a mistyped symbol from silently
-passing a security gate.
+**The guard.** When `--assert-empty` would exit `0`, cgx exits `4` instead ("assertion vacuously
+satisfied") if **either** of two clauses fires:
+
+- **(a) zero-symbol match** — the symbol pattern resolved to no nodes. This catches a mistyped
+  symbol silently passing a security gate.
+- **(b) filters excluded everything** — the *same* query run without its confidence/edge-condition
+  filters would have returned results, and the active filters removed all of them. `cgx paths A B
+  --confidence certain --assert-empty` exits `4`, not `0`, when a real `possible`-confidence path
+  exists between A and B. The gate did not prove absence; it proved your floor was too high.
+
+Clause (b) applies to `callers`, `callees`, `flows-to`, `flows-from`, `paths`, and
+`reaches <from>` (the enumerate-all form). It does **not** apply to `reaches <from> <to>`,
+to `unused`, or to `query` (which reads no `--confidence` flag at all). Clause (a) applies
+everywhere.
+
+**`unused` is the dangerous exemption, and not for the reason you would guess.**
+`--confidence` *does* change `unused`'s result: the floor is applied to the reachability
+walk, so raising it drops edges, makes fewer symbols reachable, and **inflates** the dead-code
+complement. Clause (b) still never fires — `unused` reports its filtered count as its own
+unfiltered baseline, so the guard has nothing to compare against. The net effect:
+
+```bash
+cgx unused --confidence certain --assert-empty
+```
+
+is a gate whose **clause-(b) check never fires** — clause (a) still does, but only on a wholly
+empty graph. The exposure is *not* a false pass. Because raising the floor only removes edges,
+the filtered unused set is a **superset** of the unfiltered one, so a pass proves the unfiltered
+answer is empty too. What you lose is the *warning*: the inflated complement makes the gate fail
+**loudly and spuriously** — exit 1 on symbols that are reachable in the honest graph — and nothing
+in the output tells you the floor caused it. If you gate on `unused`, drop `--confidence`, or run
+the unfiltered query yourself and compare the two counts before believing an exit 1.
 
 ```bash
 # Since: v0.1

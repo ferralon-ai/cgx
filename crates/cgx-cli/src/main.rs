@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as ProcExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::{impacted::Sides, BlameRepo};
@@ -21,16 +21,17 @@ use cgx_mcp::ServerConfig;
 use cgx_query::{
     callees, callers, contract, entrypoint_roots, neighborhood, paths as query_paths, rank_symbols,
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
-    GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
+    FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
 use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
+use cgx_cli::freshness;
 use cgx_cli::output::{
-    render, render_explanation, render_search, render_symbols, Format, ResultSet, TableData,
-    IMPACTED_SUBCOMMAND,
+    render, render_coupling, render_explanation, render_path_walks, render_search, render_symbols,
+    Format, ResultSet, TableData, IMPACTED_SUBCOMMAND,
 };
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
@@ -297,6 +298,31 @@ enum Command {
         /// in CI to fail closed when a configured sink isn't in the graph.
         #[arg(long = "require-anchor-match")]
         require_anchor_match: bool,
+    },
+    /// Which files historically change together: for every pair of files changed in
+    /// the same commit within an explicit commit range, the co-change count and each
+    /// file's own change count. Reads committed git history only — no index needed.
+    /// File-level, not symbol-level.
+    Coupling {
+        /// Range start, exclusive (a ref, tag, or commit SHA).
+        base: String,
+        /// Range end, inclusive.
+        head: String,
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Do not report pairs with fewer co-changes than this.
+        #[arg(long, default_value_t = 2)]
+        min_cochanges: u32,
+        /// Commits touching more than this many files contribute nothing (0 = no cap).
+        #[arg(long, default_value_t = 50)]
+        max_files_per_commit: usize,
+        /// Maximum pairs to report (0 = all).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
     },
     /// Start the MCP STDIO server (docs/07 IF-9).
     Mcp {
@@ -617,6 +643,23 @@ fn run(command: Command) -> Result<(), CliError> {
             to,
             path_added,
             require_anchor_match,
+        }),
+        Command::Coupling {
+            base,
+            head,
+            repo,
+            min_cochanges,
+            max_files_per_commit,
+            limit,
+            format,
+        } => run_coupling(CouplingArgs {
+            base,
+            head,
+            repo,
+            min_cochanges,
+            max_files_per_commit,
+            limit,
+            format,
         }),
         Command::Mcp { root } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
@@ -1560,7 +1603,8 @@ fn run_explain(
     let explanation = cgx_query::explain(&view, anchor)
         .ok_or_else(|| CliError::usage(format!("no symbol matched `{symbol}`")))?;
 
-    print!("{}", render_explanation(format, &explanation));
+    let freshness = freshness::envelope(Some(&repo_root), None);
+    print!("{}", render_explanation(format, &explanation, &freshness));
     Ok(())
 }
 
@@ -1620,7 +1664,8 @@ fn run_search(
     let hits =
         search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
 
-    print!("{}", render_search(format, &hits, limit));
+    let freshness = freshness::envelope(Some(&repo_root), None);
+    print!("{}", render_search(format, &hits, limit, &freshness));
     Ok(())
 }
 
@@ -1656,7 +1701,11 @@ fn run_symbols(
 
     // `--top N` is sugar for `--limit N`; when both are given `--top` wins.
     let effective_limit = top.unwrap_or(limit);
-    print!("{}", render_symbols(format, &ranks, effective_limit));
+    let freshness = freshness::envelope(Some(&repo_root), None);
+    print!(
+        "{}",
+        render_symbols(format, &ranks, effective_limit, &freshness)
+    );
     Ok(())
 }
 
@@ -1693,9 +1742,34 @@ fn emit(
         },
     );
 
+    // Computed here rather than threaded down from `prepare_view`: every threading
+    // shape would change a signature (`emit`'s, or `prepare_view`'s) that two
+    // sibling cycles are adding call sites to, and `args` already carries
+    // everything the envelope needs. A new subcommand routed through `emit` gets
+    // the envelope with no work on its author's part.
+    //
+    // The path-graph emitters render no prose (D5), so computing it for them would
+    // be a full working-tree walk whose result is discarded — seconds, on a large
+    // checkout. The format is already known here, so skip it.
+    let freshness = if args.format.is_path_graph() {
+        FreshnessEnvelope::uninspected()
+    } else {
+        freshness::envelope(
+            resolve_repo(args.repo.clone()).ok().as_deref(),
+            args.at.as_deref(),
+        )
+    };
+
     print!(
         "{}",
-        render(subcommand, args.format, &results, outcome.vacuous, &contract)
+        render(
+            subcommand,
+            args.format,
+            &results,
+            outcome.vacuous,
+            &contract,
+            &freshness,
+        )
     );
 
     if let Some(w) = &outcome.warning {
@@ -1811,7 +1885,68 @@ struct DiffArgs {
     require_anchor_match: bool,
 }
 
+/// The `--format` values the full `cgx diff` output path actually implements.
+const DIFF_FULL_FORMATS: &[Format] = &[Format::Human, Format::Json];
+
+/// The `--format` values `cgx diff --path-added` actually implements.
+///
+/// The path-graph three are here and not in [`DIFF_FULL_FORMATS`] because only this
+/// mode is path-shaped: an added path is a walk of node FQNs, which is the same
+/// graph shape `cgx paths` emits. A full `cgx diff` is an edge/node bucket set, not
+/// a graph walk, so dot/mermaid/d2 stay rejected there.
+const PATH_ADDED_FORMATS: &[Format] = &[
+    Format::Human,
+    Format::Json,
+    Format::Dot,
+    Format::Mermaid,
+    Format::D2,
+];
+
+/// Reject a `--format` the selected diff mode does not implement.
+///
+/// Deliberately an allow-list per mode, **not** a reuse of [`Format::is_path_graph`]:
+/// the defect this closes is that every non-`json` format fell into a human-text
+/// catch-all and exited 0, and `sarif` — the CI ingestion format — was the worst
+/// case of it. An allow-list rejects an unimplemented format by default; an
+/// `is_path_graph`-shaped guard would have left `sarif` broken. Widening a mode is
+/// one entry here plus the matching arm in that mode's printer.
+fn check_diff_format(format: Format, path_added: bool) -> Result<(), CliError> {
+    let (mode, supported) = if path_added {
+        ("cgx diff --path-added", PATH_ADDED_FORMATS)
+    } else {
+        ("cgx diff", DIFF_FULL_FORMATS)
+    };
+    if supported.contains(&format) {
+        return Ok(());
+    }
+    let named = supported
+        .iter()
+        .copied()
+        .map(format_name)
+        .collect::<Vec<_>>()
+        .join("|");
+    Err(CliError::usage(format!(
+        "{} format is not supported by `{mode}` — use --format {named}",
+        format_name(format)
+    )))
+}
+
+/// The spelling clap accepts for a [`Format`] variant, so a rejection message can
+/// never drift from the flag value the user actually typed.
+fn format_name(format: Format) -> String {
+    format
+        .to_possible_value()
+        .expect("every Format variant has a clap value name")
+        .get_name()
+        .to_string()
+}
+
 fn run_diff(args: DiffArgs) -> Result<(), CliError> {
+    // Before any indexing: telling the user their format is invalid only after
+    // building two graphs is a bad trade, and this is the one cheap place to
+    // catch both modes.
+    check_diff_format(args.format, args.path_added)?;
+
     let repo_root = resolve_repo(args.repo.clone())?;
 
     // Open (or create) the shared on-disk store for this diff session.
@@ -1858,6 +1993,56 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
 
     print_diff_full(&filtered, args.format);
 
+    Ok(())
+}
+
+/// Arguments for `cgx coupling`, mirroring the clap variant one-for-one.
+struct CouplingArgs {
+    base: String,
+    head: String,
+    repo: Option<PathBuf>,
+    min_cochanges: u32,
+    max_files_per_commit: usize,
+    limit: usize,
+    format: Format,
+}
+
+/// `cgx coupling <BASE> <HEAD>`: which files historically change together over an
+/// explicit commit range.
+///
+/// Reads committed git history only — no store is opened and no index is built,
+/// which is why this is the one subcommand that works on an unindexed repository.
+/// Both endpoints are required positionals: a default `HEAD` would make the same
+/// typed command mean different things on different days, and the answer would
+/// stop being re-derivable from what was asked.
+///
+/// Never gates: a coupling answer is a report, not an assertion, so success is
+/// always exit 0.
+fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
+    // `sarif` describes locatable findings and `dot`/`mermaid`/`d2` describe path
+    // graphs; a co-change table is neither. Rejected loudly rather than silently
+    // rendered as human.
+    if !matches!(args.format, Format::Human | Format::Json) {
+        return Err(CliError::usage(format!(
+            "{:?} format is not available for `coupling` (a co-change table is \
+             neither a locatable finding nor a path graph) — use --format human|json",
+            args.format
+        )));
+    }
+
+    let repo_root = resolve_repo(args.repo.clone())?;
+    let blame = BlameRepo::discover(&repo_root)
+        .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
+
+    let options = cgx_diff::CouplingOptions {
+        max_files_per_commit: args.max_files_per_commit,
+        min_cochanges: args.min_cochanges,
+        limit: args.limit,
+    };
+    let report = cgx_diff::coupling(&blame, &args.base, &args.head, &options)
+        .map_err(|e| CliError::usage(format!("coupling {:?}..{:?}: {e}", args.base, args.head)))?;
+
+    print!("{}", render_coupling(args.format, &report));
     Ok(())
 }
 
@@ -1988,7 +2173,7 @@ fn print_path_added(
                 serde_json::to_string_pretty(&doc).expect("path-added json serializes")
             );
         }
-        _ => {
+        Format::Human => {
             if paths.is_empty() {
                 println!("(no new call/dataflow reachability path)");
                 return;
@@ -2017,6 +2202,21 @@ fn print_path_added(
                 println!("+ path  {route}  [{commit}]");
             }
         }
+        // Graph source for the added-path set. Each path's `via` witness is a walk
+        // of node FQNs, so it renders through the same emitters `cgx paths` uses
+        // rather than a second renderer. Edges carry no label: `AddedPath` has no
+        // `EdgeCondition`. Node labels are the FQN, matching `cgx paths` exactly.
+        Format::Dot | Format::Mermaid | Format::D2 => {
+            let walks: Vec<&[String]> = paths.iter().map(|(p, _)| p.via.as_slice()).collect();
+            print!("{}", render_path_walks(format, &walks));
+        }
+        // Rejected by `check_diff_format` before any work happens (D1: a diff-mode
+        // SARIF result would have no `physicalLocation`). Spelling the variant out
+        // instead of `_` is what makes a future `Format` a compile error here rather
+        // than another silent fallthrough to human text.
+        Format::Sarif => {
+            unreachable!("{format:?} is rejected for --path-added by check_diff_format")
+        }
     }
 }
 
@@ -2035,7 +2235,7 @@ fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
                 serde_json::to_string_pretty(&doc).expect("diff json serializes")
             );
         }
-        _ => {
+        Format::Human => {
             for e in &diff.added_edges {
                 println!(
                     "+ edge  {}  ->  {}  ({})",
@@ -2068,6 +2268,10 @@ fn print_diff_full(diff: &cgx_diff::GraphDiff, format: Format) {
             {
                 println!("(no diff)");
             }
+        }
+        // See the note in `print_path_added`: exhaustive on purpose.
+        Format::Sarif | Format::Dot | Format::Mermaid | Format::D2 => {
+            unreachable!("{format:?} is rejected for `cgx diff` by check_diff_format")
         }
     }
 }

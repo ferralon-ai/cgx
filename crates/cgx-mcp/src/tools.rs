@@ -15,8 +15,8 @@ use cgx_query::{
     callees, callers, contract, entrypoint_roots, explain, impacted::ImpactedWitness,
     paths as query_paths, rank_symbols, reaches, reaches_all, resolve_anchor, search_symbols,
     unused, ApproximationContract, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
-    GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
-    SymbolRank,
+    FreshnessEnvelope, GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult,
+    SearchMatch, SymbolHit, SymbolRank,
 };
 use cgx_store::SqliteStore;
 use serde_json::{json, Value};
@@ -69,6 +69,7 @@ pub fn tool_list() -> Value {
             flow_tool("flows_to", "Forward data-flow slice: symbols a value flows into (its DerivesFrom consumers)."),
             flow_tool("flows_from", "Data-flow pedigree: the symbols a value derives from (its DerivesFrom sources)."),
             graph_query_tool(),
+            coupling_tool(),
             impacted_tests_tool(),
         ]
     })
@@ -273,6 +274,29 @@ fn graph_query_tool() -> Value {
     })
 }
 
+/// The one tool on this surface that is **not** a graph tool: it reads committed
+/// git history and never opens the call graph, so it declares no `include_dirty`
+/// property. `include_dirty` describes the ADR-06 working-tree overlay *on the
+/// graph*; advertising it here would promise something this answer never consults.
+fn coupling_tool() -> Value {
+    json!({
+        "name": "coupling",
+        "description": "Which files historically change together: for every pair of files changed in the same commit within an explicit commit range, the co-change count and each file's own change count. Reads committed git history only — no index, no working tree.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root":                 { "type": "string",  "description": "Repository root path" },
+                "base":                 { "type": "string",  "description": "Range start, exclusive (rev/ref/SHA)" },
+                "head":                 { "type": "string",  "description": "Range end, inclusive (rev/ref/SHA)" },
+                "min_cochanges":        { "type": "integer", "default": 2 },
+                "max_files_per_commit": { "type": "integer", "default": 50 },
+                "limit":                { "type": "integer", "default": 50 }
+            },
+            "required": ["root", "base", "head"]
+        }
+    })
+}
+
 /// `impacted_tests`: the reverse-reachability PR gate.
 ///
 /// Unlike every other tool here this one compares **two** graphs, so it takes
@@ -324,6 +348,7 @@ pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
         "flows_to" => flow_call(args, FlowDir::To),
         "flows_from" => flow_call(args, FlowDir::From),
         "graph_query" => graph_query_call(args),
+        "coupling" => coupling_call(args),
         "impacted_tests" => impacted_tests_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
     }
@@ -585,7 +610,19 @@ fn with_contract(mut body: Value, contract: &ApproximationContract) -> Value {
     body
 }
 
-/// Attach the ADR-06 honesty metadata to a result envelope.
+/// Attach the ADR-06 honesty metadata plus the index-freshness envelope to a
+/// result envelope.
+///
+/// This is the one function every **graph-backed** tool's response passes through —
+/// deliberately not the `with_contract` sibling above, which `explain`/`search`/
+/// `symbols` skip. Anything that must ride on every graph-derived answer belongs
+/// here; `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and fails if
+/// such a tool's response ever misses the `freshness` key.
+///
+/// `coupling` does **not** pass through here, and that is the contract, not an
+/// oversight: it answers from committed git history with no index open, so an
+/// index-freshness envelope on its answer would describe a store it never read.
+/// The test's `INDEX_FREE_TOOLS` is the closed list of such tools.
 fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     let obj = body.as_object_mut().expect("result body is an object");
     obj.insert("graph_version".into(), json!(session.graph_version));
@@ -593,6 +630,10 @@ fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     obj.insert(
         "dirty_files_analyzed".into(),
         json!(session.dirty_files_analyzed),
+    );
+    obj.insert(
+        "freshness".into(),
+        serde_json::to_value(&session.freshness).expect("freshness envelope serializes"),
     );
     body
 }
@@ -827,8 +868,45 @@ fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
         "dirty_files_analyzed": answer.dirty_files,
         "degenerate": answer.degenerate,
         "degenerate_reason": answer.degenerate_reason,
+        "freshness": serde_json::to_value(impacted_freshness(&root, &answer))
+            .expect("freshness envelope serializes"),
     });
     Ok(with_contract(body, &answer.contract))
+}
+
+/// The index-freshness envelope for a two-graph answer.
+///
+/// This tool cannot use [`with_session_meta`]: it has no [`GraphSession`], because
+/// it builds *two* graphs rather than one. The envelope's semantics are still the
+/// ones `session.rs` established — `indexed_tree` names **the graph the answer was
+/// computed over**, which here is unambiguously the *head* side. The base side is
+/// already reported separately as `base_graph_key`/`base_ref`.
+///
+/// The clean-working-tree refinement is `session.rs`'s and is reproduced rather
+/// than reinvented: a `workdir:` key names no tree, so when the head side is the
+/// working directory and nothing diverges from it, naming `HEAD`'s tree is the
+/// honest description of the same graph — and `matches_head` then comes out
+/// `true` instead of comparing a synthetic key against an OID and answering
+/// `false` for a tree that *is* `HEAD`'s.
+///
+/// A two-committed-ref comparison whose head ref is not `HEAD` yields
+/// `matches_head: false`. That is correct, not a surprise: the graph this answer
+/// was computed over genuinely is not the current `HEAD` tree.
+fn impacted_freshness(root: &std::path::Path, answer: &cgx_diff::Answer) -> FreshnessEnvelope {
+    let head_tree = cgx_index::Repo::discover(root)
+        .ok()
+        .and_then(|r| r.head_tree_oid().ok());
+    let head_is_workdir = answer.head_ref == "workdir";
+    let indexed_tree = if head_is_workdir && answer.dirty_files == 0 {
+        // Content-identical to HEAD: name the tree, not the synthetic key.
+        head_tree.clone()
+    } else {
+        Some(answer.head_graph_key.clone())
+    };
+    let dirty = head_tree
+        .clone()
+        .map(|base| (base, answer.dirty_files));
+    FreshnessEnvelope::new(indexed_tree, head_tree, dirty)
 }
 
 /// One `impacted_tests` row: the shipped [`neighbor_json`] shape plus the two
@@ -1154,6 +1232,44 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
         "truncation_reason": truncation_reason,
     });
     Ok(with_session_meta(with_contract(body, &approximation), &session))
+}
+
+/// `coupling`: co-change over an explicit commit range, straight off
+/// [`cgx_diff::coupling`] — the same typed report `cgx coupling --format json`
+/// serializes, so both surfaces emit one schema from one type.
+///
+/// **Two deliberate departures from every other handler here, both decisions:**
+///
+/// 1. **No `with_contract(..)`.** The approximation contract already *is* a field
+///    of `CouplingReport`, and it serializes through `serde_json::to_value` to the
+///    same bytes `with_contract` would insert; calling it would emit the
+///    `approximation` key twice.
+/// 2. **No `session_for(..)`/`with_session_meta(..)`.** `graph_version`/`dirty`/
+///    `dirty_files_analyzed` describe the ADR-06 working-tree overlay on the call
+///    graph. Coupling never opens the graph and needs no index to exist at all, so
+///    `session_for` would trigger an unnecessary — possibly failing — index for an
+///    answer that does not use it, and `dirty: false` would assert something about
+///    a graph this answer never consulted.
+fn coupling_call(args: &Value) -> Result<Value, ToolError> {
+    let root = req_str(args, "root")?;
+    let base = req_str(args, "base")?;
+    let head = req_str(args, "head")?;
+
+    let defaults = cgx_diff::CouplingOptions::default();
+    let options = cgx_diff::CouplingOptions {
+        max_files_per_commit: opt_usize(args, "max_files_per_commit")?
+            .unwrap_or(defaults.max_files_per_commit),
+        min_cochanges: opt_u32(args, "min_cochanges")?.unwrap_or(defaults.min_cochanges),
+        limit: opt_usize(args, "limit")?.unwrap_or(defaults.limit),
+    };
+
+    let repo = cgx_diff::BlameRepo::discover(std::path::Path::new(root))
+        .map_err(|e| ToolError::invalid_params(format!("discovering repo {root:?}: {e}")))?;
+    let report = cgx_diff::coupling(&repo, base, head, &options)
+        .map_err(|e| ToolError::invalid_params(format!("coupling {base:?}..{head:?}: {e}")))?;
+
+    serde_json::to_value(&report)
+        .map_err(|e| ToolError::invalid_params(format!("serializing coupling report: {e}")))
 }
 
 /// Whether any bound edge cell in a CQL result was resolved over an

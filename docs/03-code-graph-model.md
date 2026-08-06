@@ -1,8 +1,12 @@
 # 03 — Code Graph Model
 
-**Status:** Feature specification (pre-implementation)
+**Status:** Mixed. The core taxonomy — symbol kinds, edge kinds, edge-condition labels,
+confidence values and tiers, provenance records, cut markers — is **implemented and
+authoritative**; the enums in this document match `crates/cgx-core/` exactly. The extension
+sections (GM-9 onward) are largely schema reservation or design, and each carries its own
+`Status:` line. Where a `Status:` line and the body of a section disagree about whether
+something exists, the section now says so inline.
 **Audience:** Engineers integrating with or extending `cgx`; contributors; advanced users building queries
-**Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/04-dataflow-and-provenance.md · docs/05-queries.md · docs/08-language-support.md · docs/10-landscape.md · docs/12-language-primitives-and-frameworks.md
 
 ---
@@ -77,8 +81,16 @@ Every symbol node carries:
 - `language`: source language tag
 - `visibility`: `public` / `private` / `protected` / `internal` / `package` (language-mapped)
 - `is_abstract`: boolean (interfaces, abstract methods, trait declarations)
-- `confidence`: the weakest confidence of any fact contributing to this node (see GM-5)
-- `in_degree` / `out_degree`: per-edge-kind inbound and outbound edge counts, computed at index time. Each is a map keyed by edge kind — at minimum `calls`, `derives-from`, and `coerce` — recording how many edges of that kind enter (`in_degree`) or leave (`out_degree`) the node. The count is a cheap grouped count over the edge tables already present (no extra traversal) and is recomputed when the node's edges change. These attributes are **structural only**: they record graph shape and are explicitly **not** coupled to `confidence` (a high-degree node is not more or less confidently resolved for being a hub). They are queryable and filterable like any other node attribute (e.g. `MATCH (n) WHERE n.in_degree.calls > 5000`; the `derives-from` edge kind is accessed as `n.in_degree.derives_from`, since a hyphen is not a valid property identifier), and they seed the sentinel/hot-node detection that bounds traversal fan-out (see docs/04-dataflow-and-provenance.md DF-1.4 and docs/05-queries.md Q-3/Q-13). **Status: core-extension** (computed from Phase 1; the grouped count is available as soon as the edge tables exist).
+- `confidence`: **Planned — not a node attribute.** Confidence is an **edge** attribute. The
+  weakest-confidence-along-a-path value that queries actually use is computed at query time and
+  never stored per node; CQL rejects `n.confidence` with a plan error that says so and points at
+  `r.confidence`.
+- `in_degree` / `out_degree`: **Planned — not stored on the node record, and not queryable.**
+  `NodeRecord` has no such fields; degrees are computed on demand as plain totals inside
+  `cgx symbols`' ranking pass, and CQL rejects `n.in_degree` / `n.out_degree` explicitly (the
+  reject test cites this very section). There is also no `coerce` edge kind — `Coercion` is an
+  `ImplicitKind`, not an `EdgeKind`. Use `cgx symbols --rank inbound|outbound|total` to rank hub
+  nodes today. The design follows: per-edge-kind inbound and outbound edge counts, computed at index time. Each is a map keyed by edge kind — at minimum `calls`, `derives-from`, and `coerce` — recording how many edges of that kind enter (`in_degree`) or leave (`out_degree`) the node. The count is a cheap grouped count over the edge tables already present (no extra traversal) and is recomputed when the node's edges change. These attributes are **structural only**: they record graph shape and are explicitly **not** coupled to `confidence` (a high-degree node is not more or less confidently resolved for being a hub). They are queryable and filterable like any other node attribute (e.g. `MATCH (n) WHERE n.in_degree.calls > 5000`; the `derives-from` edge kind is accessed as `n.in_degree.derives_from`, since a hyphen is not a valid property identifier), and they seed the sentinel/hot-node detection that bounds traversal fan-out (see docs/04-dataflow-and-provenance.md DF-1.4 and docs/05-queries.md Q-3/Q-13). **Status: core-extension** (computed from Phase 1; the grouped count is available as soon as the edge tables exist).
 - `signature`: nullable structured record on `function`/`method`/`lambda` kinds (see below):
   - `params`: ordered list of `{name, type_text, has_default: bool, variadic: bool}` — `type_text` is the declared type as written in source (Tier 1) or the SCIP-resolved type (Tier 2+), with the source recorded in provenance.
   - `return_type_text`: string or null.
@@ -89,7 +101,7 @@ Every symbol node carries:
 
 ### GM-1.4 — Call-site nodes
 
-**Identity.** A call-site node's identity is `(caller symbol id, file, line, col)` → stable `site_id`. The `site_id` is derived deterministically from the blob OID plus byte offset of the call expression — not from insertion order — so it is stable across re-indexes of an unchanged blob.
+**Identity.** A call-site node's identity is `(caller symbol id, file, line, col)` → stable `site_id`. The `site_id` is an FNV-1a hash of `(caller_fqn, file, line, col)` — not of a blob OID and byte offset, and not of insertion order. The property the original wording was reaching for holds: it is deterministic and stable across re-indexes of an unchanged blob.
 
 **Subordinate node kind.** Call-site nodes are subordinate: they never appear in `nodes(path)` and are not matched by default symbol patterns. Call-graph paths remain sequences of symbol nodes. Site facts are reached through the edge: `r.site.lock_set`, `r.site.suspends`. `position_in(n, path)` is defined over the symbol-node sequence of a path; call-site nodes never appear in `nodes(path)`. Site-level ordering within one caller uses `site.ordinal` (lexical) or, when populated, CFG dominance — never path position.
 
@@ -126,10 +138,14 @@ Edges express typed relations between symbols. Every edge is directed
 | `calls:callback` | Invocation via a function-value argument | `sorted(key=fn)` |
 | `calls:async` | Logical call across an async suspension boundary | `.await` on an `async fn` |
 | `calls:indirect` | Call via function pointer without resolved target | `(*fp)(args)` |
-| `calls:super` | Statically-bound delegation to a named ancestor's body, bypassing virtual dispatch | `super().m()`, `Base::m()` |
+| `calls:super` *(Planned — see GM-21)* | Statically-bound delegation to a named ancestor's body, bypassing virtual dispatch | `super().m()`, `Base::m()` |
+
+**Six of these seven are shipped `EdgeKind` variants; `calls:super` is not.** It is Theme-13
+syntax the CQL parser recognises and deliberately rejects (`CALLS:super` → plan error), so a
+query written against it fails loudly rather than returning an empty result. See GM-21.
 
 Virtual and indirect call edges carry a `candidate_set` attribute listing all
-symbols the edge may resolve to at runtime, ordered by estimated probability. A `calls:super` edge has a single resolved target and a `bypassed_override` attribute naming the override virtual dispatch would otherwise select.
+symbols the edge may resolve to at runtime, ordered by estimated probability. A `calls:super` edge would have a single resolved target and a `bypassed_override` attribute naming the override virtual dispatch would otherwise select.
 
 ### GM-2.2 — Data-flow and structural edges
 
@@ -323,6 +339,15 @@ does not silently drop these edges; it emits a cut-marker edge instead:
 | `via-FFI` | Call crosses a foreign-function boundary (JNI, Python C extensions, Rust `extern "C"`) |
 | `unresolved` | Resolution was attempted and produced no candidates (the symbol is genuinely unknown) |
 | `unexpanded-macro` | Call edges may exist inside code generated by an unexpanded proc macro at this site; expansion was not performed. **Status: core-extension** (emitted from Phase 1). |
+| `opaque-call` | The callee's body is not available to the analysis, so its effects and flows are unknown |
+| `truncated-access-path` | A field-access path was cut at the modelled depth (field sensitivity is depth-1) |
+| `summary-budget-exceeded` | An IFDS summary computation hit its budget and stopped short |
+
+**Nine markers, not six.** The last three landed with the v0.3 dataflow/IFDS work and are
+emitted by it. Note also that the serialised forms are kebab-case and lowercase throughout —
+`via-di` and `via-ffi`, not `via-DI`/`via-FFI` — so a query or a `jq` filter must match the
+lowercase token. `via-di` in particular is **never emitted today**: it is a real marker, but
+nothing detects DI containers, so no edge carries it (see GM-17).
 
 A cut-marker edge is still a queryable fact. Security engineers searching for
 all paths to a sink will filter *in* `reflective` edges; software engineers
@@ -343,8 +368,12 @@ provenance {
   file:     string    # repo-relative path
   line:     int       # 1-based line of the call site or definition
   col:      int?      # optional column (available when SCIP provides it)
-  rule:     string    # name of the producing rule, e.g. "scope-graph-ref",
-                      #   "scip-occurrence", "cha-override", "heuristic-sentinel"
+  rule:     string    # name of the producing rule. Shipped values include
+                      #   "scope-ref", "import-ref", "indirect", "derives-from"
+                      #   (cgx-resolve/src/link.rs, ifds.rs), "cha-trait-set"
+                      #   (cha.rs), "rta-pruned" (rta.rs), "sig-compat" (sig.rs),
+                      #   "interprocedural", "name-method" and "name-arity".
+                      #   "scip-occurrence" ships on the SCIP path.
   tier:     int       # resolution tier (0–4) used
   index_id: string    # content-addressed blob OID of the source file at index time
 }
@@ -353,11 +382,40 @@ provenance {
 The `index_id` field links the fact to the exact version of the source file that
 produced it, enabling staleness detection when the file changes.
 
+**`cha-override` and `heuristic-sentinel` are not rule names cgx emits** — but not because CHA
+is unbuilt. **CHA ships and runs on every index**: `crates/cgx-resolve/src/cha.rs` narrows
+name-method dispatch candidate sets against the trait/class hierarchy, stamps the surviving
+edges `rule = "cha-trait-set"` at `Tier::ChaRta`, and is invoked as `apply_cha()` on both
+indexing paths — the same pipeline position GM-12.3 describes the effect closure running after.
+RTA follows it and re-stamps pruned edges `rule = "rta-pruned"`. What does not exist is the
+*spelling* `cha-override`, and the sentinel heuristic behind `heuristic-sentinel` (see Q-13 in
+`docs/05-queries.md`, where the fan-out/sentinel flags are Planned).
+
+To see the rule and tier on a real edge, use `cgx explain <SYMBOL>` (GM-6.2), which prints
+`tier=` and `rule=` per incident edge.
+
 ### GM-6.2 — Querying provenance
 
-Every query result can be returned with `--evidence` to show the provenance
-record alongside each fact. This is the basis for the "explain" capability
-described in docs/07-interfaces.md.
+*(Runs shown here are against the shared example repository defined in [`docs/05-queries.md` → "The example repository"](05-queries.md#the-example-repository); its recipe reproduces tree OID `7380e245ab98db2dfed12ed3ee3b005f0fbf7036` exactly.)*
+
+**There is no `--evidence` flag.** Provenance is surfaced by a dedicated subcommand,
+`cgx explain <SYMBOL>`, which prints every direct incident edge of one symbol with its
+condition, confidence, resolution tier, producing rule and call site:
+
+```console
+$ cgx explain helper --repo .
+rust_sample::helper  (src/main.rs:20)
+  kind: function
+  callers: 1, callees: 0
+  edges:
+    <- rust_sample::middle  (src/main.rs:15)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/main.rs:15
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+That is narrower than a `--evidence` modifier on every query would be — it is one symbol and
+one hop, not a provenance record attached to each row of an arbitrary result — but it is the
+shipped mechanism, and it is the only place the resolution tier is exposed on the CLI.
+`tier=` takes one of `name_syntactic`, `scope_graph`, `scip`, `cha_rta`, `points_to`.
 
 ---
 
@@ -374,15 +432,32 @@ configuration:
 | Language | Auto-detected entrypoints |
 |---|---|
 | Rust | `fn main()`, `#[test]` functions, `#[tokio::main]` / async entry |
-| Java | `public static void main(String[])`, `@Test` methods, Spring `@Controller`/`@RestController` request handlers |
-| Python | `if __name__ == "__main__"` block, pytest functions named `test_*`, Django/Flask route functions |
+| Java | `public static void main(String[])`, `@Test` methods |
+| Python | `if __name__ == "__main__"` block, pytest functions named `test_*` |
 | Go | `func main()` in package `main`, `func Test*(*testing.T)` |
-| JavaScript / TypeScript | Top-level `export default`, Express/Fastify route handlers, Jest `test()`/`it()` calls |
-| Any | Any symbol explicitly declared as an entrypoint (see GM-7.2) |
+| JavaScript / TypeScript | Top-level `export default`, Jest `test()`/`it()` calls |
 
-### GM-7.2 — Explicit entrypoint declaration
+**Every framework/HTTP-handler row is Planned and has been removed from the table above** —
+Spring `@Controller`/`@RestController`, Django/Flask routes, Express/Fastify handlers. The
+`EntrypointKind::HttpHandler` variant is defined in `crates/cgx-core/src/node.rs` and is
+constructed **nowhere**: it has zero producers across all five language adapters, so no symbol
+in any indexed repository carries it. `EntrypointKind::Declared` is likewise never constructed
+(see GM-7.2).
 
-Users can declare entrypoints via a configuration file or CLI flag. This is
+The practical consequence lands on `cgx unused`: a handler invoked only by a web framework's
+dispatcher is not recognised as a root, so its entire call tree can be reported as unreachable.
+That is the reason `unused` answers carry a `| scope:` tail naming what was actually searched.
+
+### GM-7.2 — Explicit entrypoint declaration — **Planned**
+
+Neither half of this exists. `cgx.toml` parsing is a hand-rolled single-key line scanner that
+understands only `[index] data_flow = <bool>` — cgx carries no `toml` dependency by design — so
+an `[[entrypoints]]` table is silently ignored rather than rejected. There is no
+`--entrypoint` flag on `cgx index` or on any query subcommand; passing one is a clap parse
+error, exit 2. Until this ships, the auto-detected set in GM-7.1 is the whole entrypoint set
+and it cannot be extended.
+
+The design: users declare entrypoints via a configuration file or CLI flag. This is
 necessary when the framework is not auto-detected (e.g. a custom IoC container,
 an embedded callback system, a generated main).
 
@@ -464,7 +539,13 @@ type-aware resolution is wide.
 Python follows the same pattern as JavaScript; SCIP (`scip-python` via
 pyright) provides type narrowing where available.
 
-### GM-8.5 — C / C++
+### GM-8.5 — C / C++ — **Planned; no C or C++ adapter exists**
+
+Unlike GM-8.1 through GM-8.4, this section describes a language cgx **cannot index at all**.
+There is no `cgx-lang-c` or `cgx-lang-cpp` crate and no C grammar dependency in the workspace;
+the heuristics below (sentinel checks, FFI, macro expansion, vtable dispatch) are the design
+for an adapter that has not been written. The same C sentinel-check row appears unhedged in
+GM-3.1 and should be read the same way.
 
 C has no language-level exceptions; failure paths are signalled by return-value
 convention. `cgx` applies heuristic rules:
@@ -645,21 +726,26 @@ effects that function may exhibit, computed transitively over the call graph.
 
 ### GM-12.1 — Effect lattice
 
-The effect lattice has exactly the following values:
+**The shipped `Effect` enum has seven variants, not eleven.** `pure` is the absence of any
+variant rather than a variant of its own; `reads-global`, `writes-global` and `io.db` do not
+exist anywhere in the workspace and are Planned.
 
-| Effect | Meaning |
-|---|---|
-| `pure` | No side effects; return value depends only on arguments |
-| `reads-global` | Reads module-level or process-global mutable state |
-| `writes-global` | Writes module-level or process-global mutable state |
-| `io.file` | File system read or write |
-| `io.net` | Network socket read or write |
-| `io.db` | Database read or write |
-| `io.proc` | Subprocess execution or inter-process communication |
-| `spawns` | Initiates a detached concurrent task |
-| `dynamic-code` | Executes dynamically specified code (`eval`, `exec`, `dlopen`, `Class.forName`) |
-| `nondeterministic` | Depends on time, randomness, or environment variables |
-| `blocking` | May block the calling thread (sync I/O, `thread::sleep`, `std::mutex::lock`) |
+| Effect | Status | Meaning |
+|---|---|---|
+| `blocking` | shipped | May block the calling thread (sync I/O, `thread::sleep`, `std::mutex::lock`) |
+| `spawns` | shipped | Initiates a detached concurrent task |
+| `io.file` | shipped | File system read or write |
+| `io.net` | shipped | Network socket read or write |
+| `io.proc` | shipped | Subprocess execution or inter-process communication |
+| `dynamic-code` | shipped | Executes dynamically specified code (`eval`, `exec`, `dlopen`, `Class.forName`) |
+| `nondeterministic` | shipped | Depends on time, randomness, or environment variables |
+| `pure` | — | Not a variant: an empty effect set *is* purity |
+| `reads-global` | **Planned** | Reads module-level or process-global mutable state |
+| `writes-global` | **Planned** | Writes module-level or process-global mutable state |
+| `io.db` | **Planned** | Database read or write |
+
+The two `-global` values matter beyond this table: `docs/04-dataflow-and-provenance.md` DF-17
+builds its mutability model on `writes-global` as though GM-12 already had it. It does not.
 
 `pure` is the bottom element: a function declared `pure` may not have any other
 effect. The remaining values are not totally ordered; a function may carry any
@@ -690,10 +776,32 @@ handler's spawned task doing file I/O independently?").
 
 ### GM-12.3 — Effect set storage
 
-Effect sets are stored as a bit vector on the function node. The full
-union-over-reachable-callees is pre-computed at index time and stored as a
-`transitive_effects` attribute, separate from the `own_effects` attribute
-(direct effects only). Both are queryable.
+Effect sets are stored as a bit vector on the function node, and both attributes are real and
+populated.
+
+- **The transitive closure ships and runs on every index.** `crates/cgx-resolve/src/effects.rs`
+  computes it as a fixpoint over strongly-connected components — an iterative Tarjan, so mutual
+  recursion terminates and every member of a cycle shares one transitive set — and
+  `cgx-index/src/pipeline.rs` wraps it as `apply_effects()`, which `cgx-index/src/lib.rs` invokes
+  on both indexing paths. It runs
+  **last**, after the SCIP/CHA/RTA/signature confidence passes have settled, so the closure rides
+  the improved edge precision; it mutates only node effect attributes, so no re-canonicalization
+  is needed. `crates/cgx-index/tests/effects_closure.rs` asserts population end-to-end through
+  the pipeline.
+
+  The propagation rule is GM-12.2's, enforced: effects flow over the call family but **not** over
+  `Spawns`, so a function that only launches work carries `spawns` without inheriting its task's
+  `io.file`.
+
+  *(The doc comment on the `transitive_effects` field in `cgx-core/src/node.rs` still says
+  "Unpopulated in Phase 1 — always empty until the P8b closure pass fills it." That comment is
+  stale: P8b landed. Do not take it as the status of the field.)*
+
+- **What is missing is the query surface, not the computation.** Neither attribute is reachable
+  from CQL: `transitive_effects` is rejected with an explicit not-supported plan error, and
+  `own_effects` falls through to the generic unknown-node-property error. The effects are
+  computed and stored on every index; there is currently no way to ask about them. Effect
+  *queries* are a later phase than effect *extraction*.
 
 ### GM-12.4 — Cross-language effect lowering
 
@@ -726,9 +834,15 @@ The `release` field accepts a list: any one of the listed symbols satisfies the
 release obligation. This models transactions (either `commit` or `rollback`
 closes the resource) and multiple close paths.
 
-### GM-13.2 — Built-in per-language defaults
+### GM-13.2 — Built-in per-language defaults — **Planned**
 
-`cgx` ships with built-in defaults for common resource pairs. These are active
+Despite the present tense below, **no resource-pair machinery exists**: there is no
+`ResourcePair` type in `cgx-core`, no acquire/release harvesting in any language adapter, and
+no `cgx.toml` table to configure one (the parser reads a single key, `[index] data_flow`). The
+table is the intended default set, not a shipped one. This section's own `Status: schema-room`
+header is the accurate signal; the present-tense body was not.
+
+`cgx` would ship with built-in defaults for common resource pairs, active
 without configuration:
 
 | Language | Acquire | Release |
@@ -783,9 +897,17 @@ n-state automata without restructuring the node/edge model.
 
 ## GM-14 — Code-Trust Boundaries
 
-**Status:** `schema-room` — the attributes described here extend the existing
+**Status:** roadmap — and, unusually for a `schema-room` section, **the room has not been
+reserved either.** `unsafe_region` and `ffi_language` do not exist on `NodeRecord` or
+`EdgeRecord`, not even as placeholder fields; the `dependency{package, version, ecosystem}`
+attributes are likewise absent from `cgx-core`. The `via-ffi` cut marker (GM-5.3) is real and is
+the only part of this section with a shipped counterpart. Read "must be reserved now" as a
+statement of intent that has not been acted on, and the present-tense phrasings below ("are
+annotated", "is queryable") as design.
+
+The attributes described here would extend the existing
 cut-marker and confidence machinery (GM-5) with queryable metadata; they must
-be reserved now so that CVE-reachability and dependency-graph queries (Q-25)
+be reserved so that CVE-reachability and dependency-graph queries (Q-25)
 resolve correctly.
 
 Code-trust boundaries are regions or transitions in the call graph where the
@@ -939,9 +1061,21 @@ class.
 | `keep-alive` | The annotated field or method is used reflectively or by serialization, even if no static call site exists | Suppresses DF-8 dead-member false positives on annotated members |
 | `contract` | The annotation carries a nullability, precondition, or type contract | Feeds DF-14 (nullability and optionality flow) |
 
-### GM-15.2 — Lowering to graph facts
+### GM-15.2 — Lowering to graph facts — **Planned; no lowering exists**
 
-The lowering is performed at index time by the active framework packs. Each
+**GM-15 as a whole is unimplemented, and its `Status: core-extension` header overstated it more
+than any other section in this document.** A repo-wide grep of `crates/**/*.rs` finds zero
+occurrences of `semantic_class`, `FrameworkPack`, `negative-guard`, `keep-alive`,
+`generated-member`, `PreAuthorize`, `Spring`, `Guice`, `NestJS`, `FastAPI` or `Django`. There
+is no annotation-to-semantic-class mapping, no metadata-fact record, and no framework-pack
+mechanism to host one. The `@PreAuthorize` worked example below does not run.
+
+What this costs the reader is worth stating plainly, because the missing facts are load-bearing
+elsewhere: `keep-alive` is what would suppress `cgx unused` false positives on
+reflectively-used members, and `negative-guard` is what the "which endpoints disable
+authentication" query family would filter on. Neither suppression happens today.
+
+The design follows. The lowering would be performed at index time by the active framework packs. Each
 class maps to a concrete graph-fact change:
 
 - `entrypoint`: the symbol node's `kind` is promoted to (or additionally tagged
@@ -1029,11 +1163,38 @@ values:
 Per-language mapping of each construct to an `implicit:<kind>` edge is
 specified in docs/08-language-support.md (LS-8).
 
-### GM-16.2 — Relationship to resource lifecycle pairs
+### GM-16.2 — Relationship to resource lifecycle pairs — **Planned**
 
-The constructs `context-enter` / `context-exit`, `defer`, and `drop` are the
+`ImplicitKind` is a real twelve-variant enum, but **only two variants are ever constructed
+anywhere in the workspace**: Go's `Defer`, and one `Iterator` site in the Rust adapter. No
+adapter harvests `drop`, `context-enter`/`context-exit`, `deref`, `coercion`, `operator`,
+`property`, `static-init` or `conversion`. The harvest described below is therefore doubly
+unbuilt: the kinds are not produced, and GM-13's resource-pair mechanism does not exist to
+receive them.
+
+**Nor is there any query surface for them, and that is the good news.** `implicit` is not part
+of the CQL vocabulary at all, so a query that tries to filter on one **fails loudly** rather
+than returning a misleading empty result:
+
+```console
+$ cgx query 'MATCH (a)-[r:IMPLICIT]->(b) RETURN a.fqn' --repo .
+cgx: plan error: unknown edge type `IMPLICIT`
+$ cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE r.implicit = "defer" RETURN a.fqn' --repo .
+cgx: plan error: unknown edge property `implicit`
+```
+
+Both are exit 2. This is the failure mode the language is supposed to have for an unbuilt
+feature — the reader is told, rather than handed zero rows to misread.
+
+**Rust's one `Iterator` construction produces no edge either, for a reason worth knowing.** It
+fires on every `for` loop, but its target is `core::iter::Iterator::next` — a stdlib symbol that
+is never in the indexed repository. The reference therefore resolves to nothing and is counted
+as a dangling ref in `unresolved_calls`, not materialised as an edge. So Go's `defer` is the
+only implicit-call construct that reaches the graph at all.
+
+The design: the constructs `context-enter` / `context-exit`, `defer`, and `drop` are the
 **language-native declarations of GM-13 resource pairs**. Framework packs and
-per-language rules harvest these syntax forms automatically:
+per-language rules would harvest these syntax forms automatically:
 
 - Python `with` blocks desugar to `(__enter__, __exit__)` pairs — `cgx` records
   them as resource pair instances without user configuration.
@@ -1095,7 +1256,13 @@ The `established-by` value records the evidence class:
 
 ### GM-17.3 — Relationship to cut markers
 
-Mediated call edges that cannot be resolved to a unique callee retain the
+**GM-17 is Planned in its entirety.** `EstablishedBy` is a real four-variant enum on
+`EdgeRecord` (`established_by: Option<EstablishedBy>`), but every construction site in the
+workspace sets it to `None`; the only place a non-`None` value appears is a round-trip
+serialization test. No DI, annotation, event-bus or registry detection logic exists to set it.
+The `via-di` cut marker is in the same position: defined, never emitted.
+
+In the design, mediated call edges that cannot be resolved to a unique callee retain the
 `via-DI` cut marker (GM-5.3) alongside the `established-by` attribute. The cut
 marker signals that the edge required external evidence; the `established-by`
 attribute records what evidence was used. Both are independently queryable.
@@ -1355,9 +1522,15 @@ path-infeasibility exists on other grounds.
 
 ---
 
-## GM-21 — `calls:super` Edge Kind
+## GM-21 — `calls:super` Edge Kind — **Planned (not yet shipped)**
 
-**Status:** core-extension — the `inherits`/`overrides` edges and the call-site lowering already exist; this is a re-classification of an existing call edge plus one resolved attribute. No new entity kind required.
+**Status:** roadmap. The premise is sound — `inherits`/`overrides` are real `EdgeKind` variants
+and the call-site lowering exists, so this really is a re-classification rather than a new
+entity kind — but the re-classification has not been done. `EdgeKind` has no `CallsSuper`
+variant, and `CALLS:super` is in the CQL parser's recognised-but-deliberately-unbuilt Theme-13
+set alongside `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD` and `FULFILLS`: it parses, then
+plan-errors. That is the intended failure mode for this whole group — a deferred feature
+announces itself rather than returning zero rows.
 
 A `calls:super` edge denotes a statically-bound delegation to a *named ancestor's* method body that deliberately bypasses virtual dispatch. The edge's target is the resolved ancestor body (single target, not a candidate set), and it carries a `bypassed_override` attribute = the FQN of the override that virtual dispatch *would* have selected for the receiver's static type (when one exists).
 

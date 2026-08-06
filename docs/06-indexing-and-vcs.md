@@ -1,8 +1,7 @@
 # 06 — Indexing and VCS Integration
 
-**Status:** Feature specification (pre-implementation)
+**Status:** Mixed — IX-1, IX-2, IX-3 and IX-9 are substantially shipped (see the IX-0 envelope section below and the per-section status notes); IX-4 through IX-8 are design ahead of implementation, and IX-8's shipped location is *not* the one it decides on.
 **Audience:** Engineers building or operating `cgx`; contributors; CI/CD integrators
-**Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/03-code-graph-model.md (GM-) · docs/09-architecture.md (AR-) · docs/05-queries.md
 
 ---
@@ -17,6 +16,7 @@ eager indexing and for pruning stale entries, but normal use requires neither.
 
 This document specifies:
 
+- IX-0: The freshness envelope — how every answer reports its own index currency
 - IX-1: Content-addressed index structure (blob OID and tree OID layers)
 - IX-2: Per-query staleness check and synchronous delta re-index
 - IX-3: Dirty-working-tree handling
@@ -26,6 +26,79 @@ This document specifies:
 - IX-7: Concurrent CLI access
 - IX-8: Index location
 - IX-9: Edge age and author attribution
+- IX-10: Index-free history queries (`cgx coupling`)
+
+---
+
+## IX-0: The Freshness Envelope
+
+*(Runs shown here are against the shared example repository defined in [`docs/05-queries.md` → "The example repository"](05-queries.md#the-example-repository); its recipe reproduces tree OID `7380e245ab98db2dfed12ed3ee3b005f0fbf7036` exactly.)*
+
+Index currency is not something a reader has to infer from a warning or a timestamp. **Every
+answer that consults the index reports its own freshness**, as the last line of `human` output,
+as a `freshness` object in `json`, and as a `cgx/index-freshness` note in `sarif`.
+
+```
+freshness: current | indexed tree 7380e24, working tree clean
+freshness: stale   | indexed tree 7380e24, 1 dirty file
+freshness: unknown | indexed tree unknown (HEAD unknown), working tree not inspected
+```
+
+```json
+"freshness": {
+  "indexed_tree": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
+  "head_tree":    "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
+  "matches_head": true,
+  "dirty_files_base": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
+  "dirty_files":  0,
+  "stale":        false
+}
+```
+
+### The verdict word is conservative by construction
+
+`current` requires **both** halves to have been established clean: the indexed tree matches
+HEAD's tree, *and* the working tree was inspected and found undivergent. Anything left
+uninspected reads `unknown`, never `current`. An envelope never claims currency it did not check.
+
+### `matches_head` is three-valued, and `null` is the ordinary case over MCP
+
+`true` / `false` / `null`. Over MCP the default is `include_dirty: true`, and under that default
+**any indexed repository returns `null`** with a verdict of `unknown` — because the working-tree
+enumeration and the dirty-file count apply different ignore rules and disagree. A freshly
+indexed, clean repository reports `"matches_head": null`, `"dirty": true`,
+`"dirty_files_analyzed": 3` over MCP while the CLI reports `matches_head: true` and a `current`
+verdict for the same tree.
+
+**A client that treats `matches_head` as a boolean is wrong in the common case, not the edge
+case.** Read the verdict, or read `stale`; treat `null` as "not established," never as "false."
+
+### `--at` changes what `dirty_files` counts
+
+Without `--at`, `dirty_files` is uncommitted changes. **Under `--at <ref>`, divergence is
+measured against the *pinned* tree**, so files changed by commits between that ref and the
+working tree count as dirty and the verdict reads `stale`. That is correct — the answer really
+was computed against a tree the working directory no longer matches — but "dirty_files =
+uncommitted changes" is only true without `--at`.
+
+### Which commands carry it
+
+Not all of them, and the exceptions are principled rather than oversights:
+
+| Surface | Freshness | Why |
+|---|---|---|
+| `callers`, `callees`, `reaches`, `paths`, `unused`, `flows-to`, `flows-from`, `query` | yes | answered from the index |
+| `explain`, `search`, `symbols` | yes | read the index, so its currency is in question |
+| `coupling` | **no** | reads committed git history only; never opens the index (IX-10) |
+| `diff` (both modes) | **no** | both sides come from committed trees |
+| `doctor` | **no** | reports *on* the index rather than from it |
+| any command under `--format dot\|mermaid\|d2` | **omitted by design** | emitting a graph does not justify a working-tree walk, so an uninspected envelope is substituted |
+
+The freshness envelope is the audit identity for a CLI answer: `indexed_tree` plus `head_tree`
+is enough to reproduce the exact graph an answer came from. There is no separate
+`graph_version` key on the CLI. The **MCP** surface does carry one
+(`"7380e24+dirty.0a12fb8d97d6"` — indexed tree plus an overlay digest when a working-tree
+overlay is in play).
 
 ---
 
@@ -107,37 +180,62 @@ cache validity signal.
 A "dirty" working tree contains uncommitted modifications: staged or unstaged
 changes not yet reflected in any git commit.
 
-### Default behavior
+### Default behavior — shipped, but not via a warning
 
-By default, `cgx` indexes and queries the committed state of HEAD. Dirty files
-are not indexed. If dirty files exist, `cgx` emits a warning on stderr:
+By default the **CLI** indexes and queries the committed state of HEAD; dirty files are not
+indexed. What ships in place of the stderr warning below is the freshness envelope (IX-0),
+which carries the same information on every answer rather than once per invocation and
+survives being piped:
+
+```console
+$ echo '// edit' >> src/main.rs
+$ cgx callers helper --repo .
+rust_sample::helper  src/main.rs:20
+└─ rust_sample::middle  src/main.rs:15
+   └─ rust_sample::main  src/main.rs:1
+approximation: exact (within modeled graph)
+freshness: stale | indexed tree 7380e24, 1 dirty file
+```
+
+Nothing is written to stderr. Queries still succeed and return results for the committed state;
+the `stale` verdict and the dirty-file count are how the caller learns that.
+
+*(The stderr warning described immediately below was not built. Its text is retained for the
+record.)*
 
 ```
 warning: 3 files have uncommitted modifications; results reflect committed state only
 ```
 
-Queries still succeed and return results for the committed state.
+### `--include-dirty` — **CLI: not shipped. MCP: shipped and on by default**
 
-### `--include-dirty` opt-in
+There is **no `--include-dirty` flag on any CLI subcommand**; passing it is a clap parse error,
+exit 2. The working-tree overlay this section describes exists, but only on the MCP surface,
+where every graph-backed tool takes `include_dirty` with a schema default of `true`. The
+asymmetry is deliberate — an agent editing a file wants to see its own uncommitted change; a
+CI gate wants the committed state — but a doc that presents `--include-dirty` as a CLI flag
+sends a reader to a parse error.
 
-With `--include-dirty`, `cgx` hashes each dirty file's current content (outside
+The mechanism below is accurate for the MCP path.
+
+With `include_dirty`, `cgx` hashes each dirty file's current content (outside
 git, using the same SHA computation as git would) and uses the resulting
 synthetic blob OID as the cache key. Facts for dirty blobs are flagged
 internally as `dirty=true` and are not written to the persistent index (they are
 held in a transient in-memory overlay for the duration of that invocation).
 
-**UX trade-off:** `--include-dirty` gives current results for files being
+**UX trade-off:** `include_dirty` gives current results for files being
 actively edited but adds analysis overhead proportional to the number of dirty
 files and does not persist across invocations. The default (committed-state-only)
 is more predictable for CI use and avoids stale in-memory facts from prior
-`--include-dirty` runs polluting the persistent index.
+`include_dirty` runs polluting the persistent index.
 
 There is no option to refuse queries when the working tree is dirty; that would
 be the worst UX for interactive use.
 
 ### MCP overlay lifetime
 
-When `cgx` runs as an MCP STDIO server (`cgx mcp`), the `--include-dirty`
+When `cgx` runs as an MCP STDIO server (`cgx mcp`), the `include_dirty`
 semantics are extended to a per-tool-call overlay lifetime:
 
 - **On each tool call with `include_dirty: true`** (the MCP default — see
@@ -360,9 +458,41 @@ event that is handled correctly by the locking protocol above.
 
 ## IX-8: Index Location
 
-### Decision: XDG cache directory
+### Shipped: `.cgx/` in the repository root
 
-The index lives at:
+**The implementation does not follow the XDG decision recorded below.** `cgx index` writes
+into the repository root, and `~/.cache/cgx/` is never created:
+
+```console
+$ cgx index .
+$ ls -a .cgx/
+.gitignore  HEAD.json  index.db
+$ cat .cgx/HEAD.json
+{
+  "graph_key": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
+  "graph_id": 1,
+  "total_files": 1,
+  "unsupported_files": 0
+}
+$ cat .cgx/.gitignore
+*
+$ git status --porcelain      # empty — the self-ignoring .gitignore keeps the tree clean
+```
+
+Three files: `index.db` (the SQLite store — `rusqlite`, bundled, WAL), `HEAD.json` (the
+pointer naming the indexed tree OID and graph id), and a `.gitignore` containing `*`, which
+is how `.cgx/` avoids the "polluted by `git status`" objection the table below raises against
+this very location. `cgx index` also garbage-collects superseded graphs, keeping exactly one.
+
+The rest of this section is the **original design decision**, retained because the trade-offs
+it records are still the ones that matter if the location is ever revisited. It is not a
+description of shipped behaviour. In particular there is no `<repo-id>` hash, no
+`.git/cgx/config` pointer file, and worktrees of the same repository each get their own
+`.cgx/` rather than sharing one cache.
+
+### Decision (design, not shipped): XDG cache directory
+
+The index would live at:
 
 ```
 ~/.cache/cgx/<repo-id>/
@@ -460,14 +590,14 @@ cgx diff main HEAD --newer-than
 
 ```bash
 # New edges into sensitive sinks introduced by this branch
-# cgx diff --base main --head HEAD ./ \
+# cgx diff main HEAD --repo . \
 #     --calls-to-sink-class sql \
 #     --calls-to-sink-class shell \
 #     --calls-to-sink-class eval \
 #     --format sarif > new-sink-edges.sarif
 
 # Newest edges into sql sinks across all branches (review prioritization)
-# cgx diff --base HEAD~30 --head HEAD ./ \
+# cgx diff HEAD~30 HEAD --repo . \
 #     --calls-to-sink-class sql \
 #     --order introducing_commit \
 #     --format json | jq '.[] | {edge, introducing_author, introducing_commit}'
@@ -517,7 +647,7 @@ The CI integration below uses `--calls-to-sink-class` and `--assert-empty` with 
 - name: Security diff gate
   run: |
     PR_COMMITS=$(git log origin/main..HEAD --format='%H')
-    cgx diff --base origin/main --head HEAD ./ \
+    cgx diff origin/main HEAD --repo . \
         --calls-to-sink-class sql \
         --calls-to-sink-class shell \
         --calls-to-sink-class eval \
@@ -532,3 +662,103 @@ The CI integration below uses `--calls-to-sink-class` and `--assert-empty` with 
 ```
 
 Each SARIF finding carries `introducing_author` in the `properties` bag, enabling GitHub's code-scanning UI to assign the finding to the commit author for review.
+
+---
+
+## IX-10: Index-Free History Queries (`cgx coupling`)
+
+Not every VCS question needs a call graph. **`cgx coupling` reads committed git history and
+nothing else** — no extraction, no linking, no `.cgx/`, no auto-index. It reports, for every
+pair of files touched by the same commit in an explicit rev range, the co-change count and each
+file's own change count.
+
+```console
+$ cgx coupling HEAD~4 HEAD --repo .
+HEAD~4 (7ef5392)..HEAD (d3429b0)
+4 commits considered · 0 merge excluded · 0 root excluded · 0 oversized excluded
+cochanges  a-changes  b-changes  files
+        4          4          4  src/main.rs  tests/t.rs
+approximation: over- and under-approximate — co-change is attributed at file granularity; …
+```
+
+`<BASE>` is exclusive, `<HEAD>` inclusive. `--min-cochanges` (default 2), `--limit` (default 50)
+and `--max-files-per-commit` (default 50) bound the report. `--format` accepts `human` and
+`json`; the other four are exit 2.
+
+### Why it carries an approximation contract but no freshness envelope
+
+This is the clearest illustration of the two envelopes being independent (IX-0). `coupling`
+**is** approximate — in several separate, *named* ways — so it carries the contract. It **never
+opens the index**, so there is no index currency to report and the freshness envelope is
+absent rather than empty. The MCP dispatch test encodes exactly this: `coupling` is the sole
+member of its `INDEX_FREE_TOOLS` list, the closed set of tools exempt from the
+freshness-on-every-answer invariant.
+
+**The four reasons the worked example above emits**, and what each does to a row:
+
+| Reason code | Direction | Consequence |
+|---|---|---|
+| `file-level-granularity` | over | A pair may co-change because *unrelated* symbols in those files were edited together. File-level signal, not symbol-level. |
+| `bounded-rev-range` | under | Only single-parent commits inside `BASE..HEAD` were walked. Merges and root commits are excluded, and coupling outside the range is invisible. |
+| `renames-not-tracked` | over | Rename detection is deliberately off so the walk cannot depend on ambient `diff.*` config — a determinism requirement. A rename reads as an unrelated delete plus add. |
+| `cochange-threshold` | under | Pairs below `--min-cochanges` are not reported at all. |
+
+**The full set is larger and conditional.** Seven further codes appear only when their condition
+holds: `merge-commits-excluded`, `root-commits-excluded`, `large-commit-excluded`,
+`result-limit`, `shallow-repository`, `history-boundary` and `empty-rev-range`. Consume the
+`reasons` array keyed on `code` rather than assuming a fixed set — a new code can land without
+any existing one changing.
+
+### The shallow-clone trap, and how to detect it
+
+The census line (`N commits considered · …`) is not decoration; it is how you confirm the range
+you asked for is the range that was walked. **On a shallow clone it will not be.** The walk
+paints the base commit's full ancestry eagerly and stops at the graft, so a range that appears
+to sit well inside `--depth N` can return an **empty answer at exit 0** — a clean-looking
+result that means "no history to walk," not "no coupling here."
+
+`fetch-depth: 1` is the default for `actions/checkout`, which is precisely the environment
+where this fires, and a CI job gating on exit code alone reads a false negative.
+
+**The answer says so — in both formats.** Human output carries a dedicated `degraded:` line,
+emitted whenever the walk truncated or the repository is shallow. Reproduced on a
+`git clone --depth 2`:
+
+```console
+$ cgx coupling HEAD~1 HEAD --repo .
+HEAD~1 (ae36d86)..HEAD (d3429b0)
+0 commits considered · 0 merge excluded · 0 root excluded · 0 oversized excluded
+degraded: walk truncated at a history boundary (missing or unreadable object) · shallow clone — deepen the clone to see more history
+(no co-changed pairs)
+approximation: over- and under-approximate — …
+$ echo $?
+0
+```
+
+That is the failure in full: **zero commits considered, zero pairs, exit 0** — and the
+`degraded:` line is the only thing distinguishing it from a genuine "these files never
+co-change." Note the range itself was valid; the graft, not the range, is why nothing was
+walked.
+
+For scripts, the same condition is a named under-approximation reason:
+
+```json
+{ "direction": "under",
+  "code": "shallow-repository",
+  "detail": "the repository is a shallow clone; history before the graft boundary is absent and its co-changes are not counted" }
+```
+
+Gate on the reason code rather than the exit status:
+
+```bash
+cgx coupling "$BASE" HEAD --repo . --format json > coupling.json
+jq -e '.approximation.reasons | any(.code == "shallow-repository")' coupling.json \
+  && { echo "refusing to trust coupling on a shallow clone"; exit 1; }
+```
+
+`history-boundary` (the walk stopped at a missing or unreadable object) and `empty-rev-range`
+warrant the same guard. `git fetch --unshallow` before running is the other fix. The report's
+top-level `shallow_repository` and `truncated_at_history_boundary` booleans carry the same
+signal if you prefer a field lookup to a reason scan — and `commits_considered` remains a useful
+sanity check, but it is the weaker one, because it cannot distinguish "no history" from
+"no co-changes".

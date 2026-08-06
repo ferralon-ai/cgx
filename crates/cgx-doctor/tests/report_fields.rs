@@ -78,7 +78,65 @@ fn all_possible_confidence_anomaly() {
         "should flag all-possible when no certain/probable edges: {:?}",
         rep.anomalies
     );
-    assert_eq!(rep.trust, TrustLevel::Moderate);
+    // 100% possible-share also trips HighPossibleShare (>85%), so this now
+    // carries two anomalies — a stricter, more accurate signal than before.
+    assert!(
+        rep.anomalies.contains(&AnomalyKind::HighPossibleShare),
+        "100% possible-share should also flag HighPossibleShare: {:?}",
+        rep.anomalies
+    );
+    assert_eq!(rep.trust, TrustLevel::Low);
+}
+
+#[test]
+fn mostly_possible_graph_is_not_high_trust() {
+    // The F5 defect: a graph where the overwhelming majority of call edges are
+    // name-guessed (`possible`) but a small sliver is `certain`/`probable`. The
+    // old `derive_trust` only capped trust below High for the literal 100%-possible
+    // case, so 9 possible + 1 certain (90% possible-share) returned High.
+    let graph = common::GraphBuilder::new()
+        .func("a")
+        .func("b")
+        .func("c")
+        .func("d")
+        .func("e")
+        .func("f")
+        .func("g")
+        .func("h")
+        .func("i")
+        .func("j")
+        .func("k")
+        .calls("a", "b") // certain — the 10% sliver
+        .calls_conf("a", "c", Confidence::Possible)
+        .calls_conf("a", "d", Confidence::Possible)
+        .calls_conf("a", "e", Confidence::Possible)
+        .calls_conf("a", "f", Confidence::Possible)
+        .calls_conf("a", "g", Confidence::Possible)
+        .calls_conf("a", "h", Confidence::Possible)
+        .calls_conf("a", "i", Confidence::Possible)
+        .calls_conf("a", "j", Confidence::Possible)
+        .calls_conf("a", "k", Confidence::Possible)
+        .build();
+
+    let rep = cgx_doctor::report::compute(&graph);
+
+    assert_eq!(rep.confidence.certain, 1);
+    assert_eq!(rep.confidence.possible, 9);
+    assert!(
+        !rep.anomalies.contains(&AnomalyKind::AllPossibleConfidence),
+        "a nonzero certain edge must not trip the literal all-possible anomaly: {:?}",
+        rep.anomalies
+    );
+    assert!(
+        rep.anomalies.contains(&AnomalyKind::HighPossibleShare),
+        "90% possible-share should flag HighPossibleShare: {:?}",
+        rep.anomalies
+    );
+    assert_ne!(
+        rep.trust,
+        TrustLevel::High,
+        "a 90%-possible graph must not report HIGH trust"
+    );
 }
 
 // ---------------------------------------------------------------------------

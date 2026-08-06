@@ -105,6 +105,11 @@ pub enum AnomalyKind {
     /// The unsupported-file share exceeds 50 %. Most source files are not covered
     /// by any registered adapter.
     HighUnsupportedShare,
+    /// The `possible`-confidence share of call edges exceeds 85 %. Even with a
+    /// nonzero sliver of `certain`/`probable` edges, an index this dominated by
+    /// name-guess resolution should not read as sound (see `AllPossibleConfidence`
+    /// for the 100 % case, which this generalises to majorities-of-guesses).
+    HighPossibleShare,
 }
 
 /// The full index-quality report for one stored graph (WP-12).
@@ -241,6 +246,15 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
     let total_files: Option<usize> = None;
     let unsupported_share: Option<f64> = None;
 
+    // --- Possible-confidence share ---
+    // Fraction of call edges resolved by name-guess only. `None` if there are no
+    // call edges (mirrors `unresolved_rate`'s `None`-on-empty convention).
+    let possible_share = if call_edge_count > 0 {
+        Some(confidence.possible as f64 / call_edge_count as f64)
+    } else {
+        None
+    };
+
     // --- Anomaly detection ---
     let mut anomalies = Vec::new();
 
@@ -259,6 +273,11 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
             anomalies.push(AnomalyKind::HighUnresolvedRate);
         }
     }
+    if let Some(share) = possible_share {
+        if share > 0.85 {
+            anomalies.push(AnomalyKind::HighPossibleShare);
+        }
+    }
 
     // --- Trust level ---
     let trust = derive_trust(
@@ -267,6 +286,7 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
         call_edge_count,
         &confidence,
         unresolved_rate,
+        possible_share,
         &anomalies,
     );
 
@@ -319,12 +339,18 @@ pub fn patch_index_stats(rep: &mut DoctorReport, total_files: usize, unsupported
         }
     }
     // Re-derive trust with updated anomaly set.
+    let possible_share = if rep.call_edge_count > 0 {
+        Some(rep.confidence.possible as f64 / rep.call_edge_count as f64)
+    } else {
+        None
+    };
     rep.trust = derive_trust(
         rep.node_count,
         rep.edge_count,
         rep.call_edge_count,
         &rep.confidence,
         rep.unresolved_rate,
+        possible_share,
         &rep.anomalies,
     );
 }
@@ -336,6 +362,7 @@ fn derive_trust(
     call_edge_count: usize,
     confidence: &ConfidenceBreakdown,
     unresolved_rate: Option<f64>,
+    possible_share: Option<f64>,
     anomalies: &[AnomalyKind],
 ) -> TrustLevel {
     // Hard low signals: no graph at all, or multiple structural anomalies.
@@ -358,6 +385,13 @@ fn derive_trust(
     // (the anomaly fires at >50%; 30–50% is still worth noting as moderate).
     if call_edge_count > 0 && confidence.certain == 0 && confidence.probable == 0 {
         return TrustLevel::Moderate;
+    }
+    // Majority-possible is moderate even short of the HighPossibleShare anomaly
+    // (that fires at >85%; 60–85% guess-dominated resolution is still not "sound").
+    if let Some(share) = possible_share {
+        if share > 0.60 {
+            return TrustLevel::Moderate;
+        }
     }
     TrustLevel::High
 }

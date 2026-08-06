@@ -421,7 +421,19 @@ fn scan_frontier(
     // in the forward direction (callees/reaches/unused frontiers). A backward
     // (callers) walk or a DerivesFrom-scoped walk does not traverse the missing
     // out-edge.
-    let count_dangling = dir == Direction::Forward && walker.filter.kinds.is_none();
+    //
+    // The scope test is "is this a call scope", not "did the caller leave the
+    // scope at its default". Testing `kinds.is_none()` conflated the two and let
+    // any explicit `kind` argument silence the fact on a walk following exactly
+    // the edges the fact is about — reachable today through MCP `callees`, whose
+    // `kind` array the CLI has no flag for. `NegativeScope::family_label` above
+    // already asks this question the right way; ask it the same way here.
+    let is_call_scope = walker
+        .filter
+        .kinds
+        .as_ref()
+        .is_none_or(|ks| ks.iter().all(|k| k.is_call()));
+    let count_dangling = dir == Direction::Forward && is_call_scope;
 
     let mut facts = FrontierFacts::default();
     for &node in &touched {
@@ -792,6 +804,56 @@ mod tests {
             "dangling refs on the touched frontier must surface: {c:?}"
         );
         assert!(c.scope.is_some());
+    }
+
+    /// The dangling-ref fact must survive an explicit **call-family** kind
+    /// filter. `kinds.is_none()` conflated "default scope" with "call scope", so
+    /// any `kind` argument silenced the fact — on a forward walk following
+    /// exactly the edges the fact is about. Only a non-call scope should silence
+    /// it, and `DerivesFrom` is the one that reaches this path in production
+    /// (`flows-to`/`flows-from`).
+    #[test]
+    fn kind_filter_silences_the_dangling_fact_only_outside_the_call_family() {
+        // (kinds the walk is scoped to, must the dangling fact still surface?)
+        let cases: &[(Option<&[EdgeKind]>, bool)] = &[
+            (None, true),
+            (Some(&[EdgeKind::Calls]), true),
+            (Some(&[EdgeKind::Calls, EdgeKind::CallsVirtual]), true),
+            (Some(&[EdgeKind::CallsIndirect]), true),
+            (Some(&[EdgeKind::Spawns]), true),
+            (Some(&[EdgeKind::DerivesFrom]), false),
+            (Some(&[EdgeKind::Calls, EdgeKind::DerivesFrom]), false),
+        ];
+
+        // `a` -> `b`, and `a`'s body also holds 2 calls that resolved to nothing.
+        let mut a = node(0, "a", 10, None);
+        a.unresolved_calls = 2;
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let edges = vec![edge(0, 0, 1, Confidence::Certain, &[], None)];
+        let view = GraphView::new(nodes, edges, Vec::<Candidate>::new());
+
+        for (kinds, expect_reason) in cases {
+            let mut filter = EdgeFilter::default();
+            if let Some(ks) = kinds {
+                filter = filter.with_kinds(ks.to_vec());
+            }
+            let w = PathWalker {
+                filter,
+                max_depth: None,
+                max_paths: None,
+                max_steps: None,
+            };
+            let results = callees(&view, NodeId(0), &w);
+            let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+            let has = c
+                .reasons
+                .iter()
+                .any(|r| r.code == "unresolved-external-calls");
+            assert_eq!(
+                has, *expect_reason,
+                "kinds {kinds:?}: expected dangling reason present={expect_reason}, got {c:?}"
+            );
+        }
     }
 
     #[test]

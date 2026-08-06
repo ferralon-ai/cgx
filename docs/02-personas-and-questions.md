@@ -3,10 +3,26 @@
 ## Audience
 
 This document maps the four `cgx` user personas to the 138 questions they need
-answered, spanning 13 themes and 112 NOVEL questions. It drives the feature list:
-every capability in [03-code-graph-model.md](03-code-graph-model.md) (feature prefix
-`GM-`) and [04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix
-`DF-`) traces back to at least one question here.
+answered, spanning 13 themes and 110 NOVEL questions (the Coverage Summary at the end
+is the authoritative count; Q69 and Q80 are re-gated as not answerable as specced). It
+drives the feature list: every capability in
+[03-code-graph-model.md](03-code-graph-model.md) (feature prefix `GM-`) and
+[04-dataflow-and-provenance.md](04-dataflow-and-provenance.md) (prefix `DF-`) traces
+back to at least one question here.
+
+**A question is not answered until its answer says how far it can be trusted.** Every
+traversal answer below carries an approximation contract and, where the index was
+consulted, an index-freshness envelope — so a persona reading a *negative* result ("no
+path from the handler to `exec`") gets the edge kinds, confidence floor, and depth bound
+it was proved under rather than a bare no. This matters most for the ACA and ASA
+personas, which act on answers without a human reading them. See
+[13-glossary.md](13-glossary.md) and [09-architecture.md](09-architecture.md) AR-13.
+
+**Which of these are answerable today** is not recorded per row here — the rows are the
+demand side, deliberately stable. [14-implementation-status-matrix.md](14-implementation-status-matrix.md)
+is the supply side, and [10-landscape.md](10-landscape.md) carries per-gap status
+markers. A `NOVEL` tag in the Coverage column means "no surveyed tool answers this," not
+"cgx answers this."
 
 ---
 
@@ -195,6 +211,22 @@ API. See [06-indexing-and-vcs.md](06-indexing-and-vcs.md) for the storage model.
 Edge-age and author attribution (IX-9) enables the security gate and branch-coverage
 questions below.
 
+**Two complementary temporal capabilities, and they answer different questions.**
+*Graph diff* (`cgx diff BASE HEAD`) compares two indexed graphs and answers what the
+code's *structure* did — which edges and nodes appeared, vanished, or changed attributes
+between two refs, and, with `--path-added`, whether a reachability path from a named
+source to a named sink is new at head. That is the mechanism behind Q54–Q60, Q99, Q107.
+*Co-change coupling* (`cgx coupling BASE HEAD`) never looks at the graph at all: it walks
+commit history and answers what the *team* did — which files keep being edited together.
+That is the mechanism closest to Q61, whose "neighborhood changed significantly" is a
+question about churn rather than about structure.
+
+Coupling's answer is file-level, not symbol-level, and says so in its own contract: a
+reported pair may have had unrelated symbols edited in the same commit. Read as "these
+files travel together," it is sound; read as "these functions are coupled," it
+over-claims. It also returns an **empty** result on a shallow clone rather than a partial
+one, which is the shape a CI job is most likely to misread as good news.
+
 | Q | Persona | Natural-Language Question | Capabilities | Coverage |
 |---|---------|--------------------------|--------------|---------|
 | Q54 | PSE | Which commit first introduced a call path from `handleUpload()` to `exec()`? | `graph-diff` + VCS attribution (GM-) | NOVEL |
@@ -204,7 +236,7 @@ questions below.
 | Q58 | SSE | Show the graph diff for PR #342: which new call edges were added, which were removed? | `graph-diff` (GM-) | NOVEL |
 | Q59 | PSE | Between last release and HEAD, which previously-unreachable dangerous functions became reachable? | `graph-diff` + `reachability` (GM-) | NOVEL |
 | Q60 | ACA | After my edit session, show me a diff of the call graph: what new edges exist, what edges were removed, any new reachability to flagged sinks? | `graph-diff` + `sink-enum` (GM-) | NOVEL |
-| Q61 | SSE | Which functions had their call-graph neighborhood change significantly in the last sprint? | `graph-diff` (GM-) | NOVEL |
+| Q61 | SSE | Which functions had their call-graph neighborhood change significantly in the last sprint? | `graph-diff` (GM-); `co-change coupling` for the churn half (file-level) | NOVEL |
 | Q99 | PSE | Does this branch introduce any new source→sink taint path, new `unsafe` region, or new call edge into a sensitive sink that was not present on `main`? | Q-7 `diff` subcommand; Q-25 dependency and CVE reachability; IX-9 edge age and author attribution; DF-12 sink classes | NOVEL (security gate combining graph diff with taint-class awareness and edge authorship; no existing tool answers this as a unified query) |
 | Q107 | SSE | Which `match`/`switch` sites in the changed files are missing a case for an enum variant that was added on this branch? | IX-9 edge age and author attribution; `graph-diff` (GM-) | NOVEL (branch-local exhaustiveness gap detection via call-graph diff combined with edge attribution; no existing tool surfaces this as a graph query) |
 

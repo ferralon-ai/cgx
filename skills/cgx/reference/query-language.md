@@ -21,8 +21,8 @@ is the gate:
 | CQL surface | Since | Status |
 |---|---|---|
 | `MATCH (a)-[:CALLS]->(b) … WHERE … RETURN … LIMIT` | v0.1 | **runs** |
-| Node props: `name`, `kind`, `file`, `line` | v0.1 | **runs** |
-| Edge props: `condition`, `confidence` | v0.1 | **runs** |
+| Node props: `name` (alias `fqn`), `kind`, `file`, `line` | v0.1 | **runs** |
+| Edge props: `condition`, `confidence`, `kind` | v0.1 | **runs** |
 | `IN […]`, `<>` comparisons | v0.1 | **runs** |
 | `ANY` / `NONE` quantifiers with **bounded** `*N` (anchor required; see note) | v0.1 | **runs** |
 | `@file.cql` query files | v0.1 | **runs** |
@@ -33,8 +33,9 @@ is the gate:
 | `MUST PASS THROUGH` / `AVOIDING` | v0.3 | deferred — error |
 | Path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 | deferred |
 | `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` | v0.3 | deferred — error |
-| `CALL cgx.pedigree(…)` / `cgx.mutation_fanout(…)` real rows | v0.3 | deferred — stub only |
-| `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `taint_label` props | v0.3 | deferred — plan error exit 2 |
+| `CALL cgx.pedigree(…)` / `cgx.mutation_fanout(…)` real rows | v0.3 | **runs** — see Part 1 |
+| `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class` **node** props | v0.3 | deferred — plan error exit 2 |
+| `taint_label`, `via`, `site` **edge** props | v0.3 | deferred — plan error exit 2 |
 | `NOT IN […]` | v0.3 | parse error exit 2 — use `NOT x = …` |
 
 ---
@@ -51,10 +52,12 @@ traverses it. Three adjacent facts, all verified against the binary:
   override syntax (empty otherwise). Treat them as runnable-but-thin, not as full analysis.
 - **The `CALLS:<subtype>` qualifier is NOT supported** (`[:CALLS:super]`, `[:CALLS:virtual]`
   → exit 2, "deferred, Theme-13"). Match the family with plain `[:CALLS]`.
-- **`path = (a)-[:CALLS*N]->(b)` requires an anchor when N > 1.** The `path = ` form
-  materializes every matched path in memory. On a large index, `CALLS*2` or higher without
-  a `WHERE a.fqn = "…"` (or `WHERE b.fqn = "…"`) anchor hangs. Always anchor at least one
-  endpoint when using path-variable quantifiers with `*2` or higher.
+- **Anchor `path = (a)-[:CALLS*N]->(b)` when N > 1.** The `path = ` form materializes every
+  matched path in memory, so on a large index an unanchored `CALLS*2`-or-higher enumerates a
+  great deal of work. It does **not** hang — the walk is step-budgeted and truncates with a
+  `PathCap`/`StepBudget` marker (see "Always bound var-length" below) — but it returns a
+  truncated, non-deterministic slice. Anchor at least one endpoint with
+  `WHERE a.fqn = "…"` (or `b.fqn`) so the result is complete and reproducible.
 
 ### Shell quoting rule
 
@@ -83,11 +86,27 @@ MATCH (a)-[:CALLS]->(b) RETURN a.name LIMIT 10
 
 ### Always bound var-length `CALLS*` / `DATA_FLOW*`
 
-A bare `*` (`MATCH (a)-[:CALLS*]->(b)`) used to hang by walking the full transitive
-closure from every anchor — on a dense `DATA_FLOW` graph this was the ~1.87M-row /
-~71s blowup. As of v0.3 an unbounded `*` is **capped by default**: depth 8 hops and
-~1024 result rows, after which the walk *truncates* and surfaces a `PathCap`
-truncation marker (it no longer hangs and never silently errors).
+A bare `*` (`MATCH (a)-[:CALLS*]->(b)`) used to blow up by walking the full transitive
+closure from every anchor — on a dense `DATA_FLOW` graph that produced ~1.87M rows in
+~71s. It terminated; it was just unusable. The two caps that fixed it ship on `main`,
+**after** the `0.3.0` bump:
+
+- a **depth** cap of 8 hops on a bare `*` (or an open-ended `*N..`);
+- a **row** cap of ~1024 on the *peer-set* branch — the form without `path =`, which
+  returns a table.
+
+A `0.3.0` binary predating those commits still walks the full closure, and
+`cgx --version` cannot tell you which you have. The `path = …` enumeration form is a
+different story: it has been budgeted by `DEFAULT_MAX_PATHS`/`DEFAULT_MAX_STEPS` since
+before the bump, so it terminates on any `0.3.0` binary.
+
+Two sharp edges on the row cap. An explicit `*N..M` raises or lowers the **depth** cap
+only — the ~1024-row cap applies whatever range you write, so `[:CALLS*1..20]` is still
+cut at ~1024. And that cap fires on the branch that returns a **table**, which is
+precisely the branch whose truncation marker the CLI drops: `cgx query` surfaces
+`[truncated]` / `truncation_reason` only for path-returning results. A row-capped table
+is therefore indistinguishable from a complete one. Do not read a table of roughly 1024
+rows as a complete answer — re-run it with a narrower anchor.
 
 The cap is a safety net, not a substitute for a real bound — it drops results past
 the cap. Always write the bound you mean, and raise it explicitly when you need more
@@ -119,6 +138,34 @@ MATCH (a)-[:DATA_FLOW*1..12]->(b) RETURN a.name
 |---|---|
 | `condition` | `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"` |
 | `confidence` | `"certain"`, `"probable"`, `"possible"` |
+| `kind` | the kebab-case edge-kind token — `"calls"`, `"calls-virtual"`, `"calls-closure"`, `"calls-callback"`, `"calls-async"`, `"calls-indirect"`, `"spawns"`, `"derives-from"`, … (same serde convention as node `kind`) |
+
+### Procedure calls: `cgx.pedigree` and `cgx.mutation_fanout`
+
+Both procedures are in v0.3 — they landed before the `0.3.0` bump, so every `0.3.0` binary has
+them and `cgx --version` gates them correctly. (Do not probe for them by calling one and looking
+for rows: an argument that matches no value node returns **zero rows**, not a plan error, so an
+empty result proves nothing about the binary.) Each takes one string argument naming a value node
+and walks `DerivesFrom` from it:
+
+| Procedure | Direction | YIELD columns |
+|---|---|---|
+| `cgx.pedigree(value)` | backward — what the value derives *from* | `source`, `confidence` |
+| `cgx.mutation_fanout(value)` | forward — what derives *from* the value | `mutator`, `confidence` |
+
+```cypher
+CALL cgx.pedigree("rust_sample::dataflow::flow_example::b#1") YIELD source, confidence
+WHERE confidence = "certain"
+RETURN source
+```
+
+Notes that matter in practice:
+
+- The walk is depth-capped at 8 hops (the same default bound as an unbounded `*`).
+- A `CALL … WHERE` filters the yielded stream, and a yielded column can drive a following `MATCH`.
+- An argument matching no node yields zero rows — an honest empty result, not an error.
+- Only the columns above exist. `YIELD effect`, `YIELD transform`, and `YIELD evidence` are
+  rejected by name at plan time and remain deferred.
 
 ### Copy-pastable runnable examples
 
@@ -140,8 +187,9 @@ cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE a.kind = "function" AND r.condition = 
 cgx query 'MATCH path = (a)-[:CALLS*1]->(b) WHERE a.fqn = "rust_sample::errors::handle_with_match" AND ANY(r IN relationships(path) WHERE r.condition = "exception") RETURN a.name, b.name LIMIT 5' --repo /path/to/rust-sample
 ```
 
-The anchor on `a.fqn` is required: `path = (a)-[:CALLS*N]->(b)` for N ≥ 2 materializes
-all paths on a large graph and hangs. Anchor at least one endpoint when using path-variable
+Anchor on `a.fqn`: `path = (a)-[:CALLS*N]->(b)` for N ≥ 2 materializes all paths on a large
+graph. The walk is budget-bounded so it truncates rather than hanging, but an unanchored result
+is an arbitrary truncated slice. Anchor at least one endpoint when using path-variable
 quantifiers with `*2` or higher.
 
 **Example 4 — NONE quantifier to exclude exception-path edges; historical graph**
@@ -188,10 +236,10 @@ RETURN a.name LIMIT 5
 |---|---|---|
 | `--repo <PATH>` | CWD | Repository root |
 | `--at <REF>` | HEAD | Pin query to git ref |
-| `--depth <N>` | 6 | Maximum traversal depth; `0` = unlimited (work-budgeted, may show `[truncated]`) |
+| `--depth <N>` | — | **Inert on `query`.** Accepted by the parser and then discarded — a CQL walk is bounded by the query's own `*N..M` syntax (or, for a bare `*`, the engine's default cap). Bound the walk in the query, not on the command line |
 | `--format <FMT>` | human | `human`, `json`, `sarif`, `dot`, `mermaid`, `d2` |
-| `--confidence <TIER>` | — | Floor filter: `possible`, `probable`, or `certain` |
-| `--tree <SHAPE>` | full | `full` or `spanning`; only affects human-format forest results (e.g. when a query returns callers-shaped output); ignored by `--format json/sarif/dot/mermaid/d2` |
+| `--confidence <TIER>` | — | **Inert on `query`.** Like `--depth`, parsed and discarded. Filter in the query instead — `WHERE r.confidence IN ["certain", "probable"]` (CQL compares the label, so spell out the tiers you want; there is no `>=` on confidence). It *is* a real floor filter on `callers`/`callees`/`paths`/`reaches`/`flows-*`/`unused` |
+| `--tree <SHAPE>` | full | **Inert on `query`** — parsed and discarded. On the neighbor-set commands it selects `full` or `spanning` for the human forest |
 | `--assert-empty` | off | CI: exit 1 if results found |
 | `--allow-vacuous` | off | Suppress exit 4 vacuity guard |
 | `--no-auto-index` | off | Error (exit 3) if index missing |
@@ -231,6 +279,7 @@ with a message ending in `(deferred)`.
 | `sanitizer_class` | node | v0.3 | plan error exit 2 |
 | `taint_label` | edge | v0.3 | plan error exit 2 |
 | `via` | edge | v0.3 | plan error exit 2 |
+| `site` | edge | v0.3 | plan error exit 2 (the call-site location is reachable via `cgx explain --format json`) |
 
 ### Deferred query clauses
 
@@ -238,9 +287,7 @@ with a message ending in `(deferred)`.
 |---|---|---|
 | `MUST PASS THROUGH` | v0.3 | `MATCH ALL path = (s)-[:CALLS*]->(t) MUST PASS THROUGH (guard {name:"…"}) RETURN path` |
 | `AVOIDING` | v0.3 | `MATCH ALL path = (s)-[:CALLS*]->(t) AVOIDING (node {name:"…"}) RETURN path` |
-| Path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 | Composed `WHERE` predicates over path sets; see `docs/05-queries.md` §Q-21 |
-| `CALL cgx.pedigree(value) YIELD source, confidence` | v0.3 | Procedure call returns real provenance rows |
-| `CALL cgx.mutation_fanout(value) YIELD mutator, confidence` | v0.3 | Procedure call returns outbound mutation rows |
+| Path-set algebra (`COMPLEMENT`/`INTERSECT`/`DIFFERENCE`) | v0.3 | Composed `WHERE` predicates over path sets; see `docs/05-queries.md` §Q-21. Unlike the two clauses above these have no dedicated interception — they fail as a generic **parse** error, not a "(deferred)" plan error |
 
 ### Version gate pattern
 
@@ -274,7 +321,7 @@ error exit 2). The example above omits them intentionally.
 | `NOT IN […]` | Parse error exit 2 | Use `NOT x = …` or repeated `AND NOT x = …` |
 | Node-only MATCH (no relationship) | Plan error exit 2 | Add `[:CALLS]->` or any valid relationship |
 | Deferred props (`entrypoint_class`, `taint_label`, …) | Plan error exit 2 | Still deferred at v0.3; gate on a later taint cycle |
-| `graph_query` MCP tool | Always ToolError | Use CLI `cgx query` instead; see `reference/mcp.md` |
+| Expecting `graph_query` (MCP) to error | It does not — it runs the same `cgx_cql::run` engine the CLI drives | Use it directly; see `reference/mcp.md` |
 
 Cross-references: `reference/output-and-exit.md` (exit codes, format samples),
 `reference/versions.md` (full version ladder), `reference/cli.md` (all

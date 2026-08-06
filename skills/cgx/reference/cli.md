@@ -23,12 +23,12 @@ most. Look up edge cases in `docs/commands/`.
 | `reaches` | Boolean reachability check with witness path, or full reachable-symbol enumeration | `--depth`, `--format`, `--confidence` |
 | `paths` | Enumerate every distinct call path from one symbol to another | `--depth` (default 6), `--format` |
 | `explain` | Full provenance for one symbol: definition, edge counts, all incident edges | `--format`, `--repo` |
-| `query` | Run a CQL (Cypher-subset) expression against the call or dataflow graph | `--at`, `--depth`, `--format` |
+| `query` | Run a CQL (Cypher-subset) expression against the call or dataflow graph | `--at`, `--format`, `--repo` (`--depth` is inert here — bound the walk in the query) |
 | `search` | Find symbols by FQN substring or regex (or `--all`); no graph walk | `--all`, `--kind`, `--regex`, `--limit` |
 | `symbols` | Rank symbols by reference count, with inbound/outbound edge breakdown (v0.3) | `--rank total\|inbound\|outbound`, `--top`, `--kind` |
 | `unused` | Symbols not reachable from any indexed entrypoint | `--kind`, `--format` |
 | `doctor` | Report on the quality and trust level of the current on-disk index | `--format` |
-| `diff` | Diff the call graph between two git refs | `--newer-than`, `--format` |
+| `diff` | Diff the call graph between two git refs; `--path-added` turns it into a structural PR gate | `--added`, `--kind`, `--edge-condition`, `--from`/`--to`, `--path-added` |
 | `mcp` | Start the MCP STDIO server for AI agents and IDE extensions | `--root` |
 
 ---
@@ -47,18 +47,48 @@ The depth limit is `--depth` on every CLI subcommand. `--max-depth` does **not**
 the CLI (the MCP `paths` tool uses the JSON property `max_depth`, but that is MCP-only).
 
 Default depth by command group:
-- `callers`, `callees`, `reaches`, `flows-to`, `flows-from`: **2**
-- `paths`, `query`: **6**
-- `--depth 0` on any command = unlimited (work-budgeted; may report `[truncated]`)
+- `callers`, `callees`, `flows-to`, `flows-from`, `reaches <from>` (enumerate-all form): **2**
+- `paths`: **6**
+- `reaches <from> <to>` (witness-path form) and `unused`: **unbounded** when `--depth` is unset —
+  they pass `--depth` through verbatim with no default, so only the walker's internal step budget
+  applies.
+- `query`: **`--depth` is accepted but has no effect.** A CQL traversal is bounded entirely by the
+  query's own hop syntax (`[:CALLS*1..8]`) or, for a bare `*`, by the engine's default cap. The same
+  is true of `--confidence` and `--tree` on `query`: they parse and are then discarded.
+
+### ⚠ `--depth 0` means *unlimited* only on `paths`
+
+`paths` translates `--depth 0` to "no depth limit". No other command does. Everywhere else `0` is
+taken literally as **zero hops** — and what a zero-hop walk *produces* differs per command:
+
+| Command | `--depth 0` |
+|---|---|
+| `paths` | unlimited (work-budgeted; may report `[truncated]`) |
+| `callers`, `callees`, `flows-to`, `flows-from`, `reaches <from>` | **zero results** — the walk expands no neighbors |
+| `reaches <from> <to>` | **`reachable: false`** — zero hops, so the answer is a false negative, not an empty result |
+| `unused` | **every non-entrypoint symbol** — zero hops makes nothing reachable, so the dead-code complement is the entire graph minus the declared entrypoints. Never pass `--depth 0` here |
+| `query` | no effect (see above) |
+
+The `unused` row is the dangerous one. `--depth 0` is the natural thing to reach for when you want
+"no limit", and on `unused` it does not fail loudly — it returns a full-repo dead-code report that
+is entirely false positives and looks like a rich, successful answer.
+
+To walk unbounded, omit `--depth` on `reaches <from> <to>`/`unused` (they are unbounded by default),
+or pass an explicitly large `--depth N` elsewhere. Never reach for `--depth 0` expecting "no limit".
 
 ### Phantom flags — never emit these
 
 These look plausible but cause exit 2 in the real binary:
 
-`--max-depth`, `--base`, `--head`, `--from`, `--to`, `--from-class`, `--to-class`,
+`--max-depth`, `--base`, `--head`, `--from-class`, `--to-class`,
 `--avoiding`, `--only-edge-condition`, `--dataflow`, `--calls-to-sink-class`,
 `--kind fn` (correct: `--kind function`), a trailing `./` positional in place of
 `--repo ./`.
+
+**`--from` / `--to` are real — but only on `cgx diff`**, where they are FQN glob post-filters and
+the anchors for `--path-added`. They are phantom on all 14 other subcommands. (`cgx diff --kind`
+also takes a *different* enum from `unused`/`search`/`symbols`: `calls`, `data-flow`, `overrides`,
+… — 19 edge-kind tokens, none of them `fn` or `function`.)
 
 ### Exit codes
 
@@ -67,15 +97,17 @@ These look plausible but cause exit 2 in the real binary:
 | 0 | Success (including empty results) |
 | 1 | `--assert-empty` triggered: results were found |
 | 2 | Bad symbol / CQL parse or plan error / bad flag value |
-| 3 | Index missing + `--no-auto-index` |
+| 3 | Index missing, corrupt, or unbuildable (most commonly hit via `--no-auto-index` against a repo with no `.cgx/`, but a corrupt `.cgx/index.db` also exits 3 regardless of that flag) |
 | 4 | `--assert-empty` vacuous: confidence filter excluded all results (suppress with `--allow-vacuous`) |
 
 ### CQL deferred clauses (exit 2 today)
 
 Taint properties (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) and
 the keywords `MUST PASS THROUGH` / `AVOIDING` are not implemented — they produce a plan
-or parse error (exit 2). `:CALLS` and `:DATA_FLOW` edges work. Node properties `name`,
-`kind`, `file`, `line`, edge properties `condition`, `confidence` work.
+or parse error (exit 2). Note `taint_label` is gated as an **edge** property, the other three as
+node properties — the exit code and plan error are the same either way. `:CALLS` and `:DATA_FLOW`
+edges work. Node properties `name` (alias `fqn`), `kind`, `file`, `line` and edge properties
+`condition`, `confidence`, `kind` work.
 
 ---
 

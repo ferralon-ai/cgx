@@ -71,7 +71,7 @@ In CQL queries, use plain `[:CALLS]` to match the entire call-edge family. The `
 | `throws` / `catches` | Callable may propagate / handle an exception type | present |
 | `reads-field` / `writes-field` | Method reads or writes a specific field | present |
 | `derives-from` | Value derivation (backbone of taint/pedigree). Edge orientation: **derived → source** (the derived node carries the outgoing edge to its source). Since v0.3. | **present (v0.3)** |
-| `spawns` | Detached async launch (caller does not await result). Since v0.3. | **present (v0.3)** |
+| `spawns` | Detached async launch (caller does not await result). Emitted as an *edge* by the Rust, Go, and Python frontends only; Java and TypeScript record a `spawns` **effect** on the enclosing symbol instead. | **present** |
 
 In CQL, `derives-from` edges are queryable as `[:DATA_FLOW]`. `DATA_FLOW` returns rows (exit 0). `PROVIDES_BODY` / `RESOLVES_TO` / `SHADOWS_FIELD` / `FULFILLS` edge types are still deferred — CQL plans using them return exit 2.
 
@@ -91,7 +91,13 @@ Every call edge carries exactly **one** edge-condition label. Compound labels ar
 | `conditional` | Taken only when an explicit boolean branch is true | `if`, `match` arm, ternary |
 | `loop` | Taken zero or more times inside a loop body | `for`, `while`, iterator body |
 | `exception` | Taken only during exceptional control flow | Java `catch`, Rust `Err(e)` arm / `?` on `Err`, Go `if err != nil`, C sentinel check |
-| `panic` | Taken on an unwinding/aborting path that cannot be recovered | Rust `panic!`/`unwrap`, Go `panic`, C `abort` path |
+| `panic` | Taken on an unwinding/aborting path that cannot be recovered | Rust `panic!`/`unwrap`/`expect` — **Rust only**, see below |
+
+**`panic` is emitted by the Rust frontend alone.** The label is part of the schema and the
+precedence rule below, but no other shipped adapter produces it: Go's `panic()`/`recover()`,
+Java's `Error`/`System.exit`, and the Python and TypeScript equivalents are not modeled. On a
+non-Rust repo, `--edge-condition panic` is empty because nothing emits the label, and the
+exceptional class there means `exception` alone.
 
 **Exceptional class.** `exception` and `panic` together form the **exceptional class**. Query predicates for "non-exception paths" exclude both. `ANY`/`NONE` quantifiers in CQL let you filter on this at the path level.
 
@@ -189,21 +195,22 @@ The `site` object on each `explain` edge contains `file` and `line`. Column info
 - Structural edges: `contains`, `imports`, `overrides`, `implements`, `inherits`, `references`, `instantiates`, `throws`, `catches`, `reads-field`, `writes-field`.
 - Data-flow edges: `derives-from` (queryable as `[:DATA_FLOW]` in CQL). Populated by default; skipped when index is built with `--no-dataflow`.
 - Detached-async edges: `spawns`.
-- Syntactic edge-condition labels (`always`, `conditional`, `exception`, `loop`, `panic`) on all call edges.
+- Syntactic edge-condition labels on every call edge: `always`, `conditional`, `exception`, `loop` from every shipped frontend; `panic` from the Rust frontend only (§ "Edge-condition labels").
 - Cut markers: `reflective`, `dynamic`, `via-DI`, `via-FFI`, `unresolved`, `unexpanded-macro`.
 
 ### Still deferred in v0.3 (CQL returns exit 2)
 
 | Feature | Status |
 |---|---|
-| `MUST PASS THROUGH` / `AVOIDING` path algebra | parse error — exit 2 |
-| Taint node properties (`source_class`, `sink_class`, `sanitizer_class`, `taint_label`) | plan error — exit 2 |
+| `MUST PASS THROUGH` / `AVOIDING` path algebra | **plan** error — exit 2, intercepted by name and reported as `(deferred)` |
+| Taint **node** properties (`entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`) | plan error — exit 2, `(no backing field on a symbol node)` |
+| Taint **edge** property (`taint_label`) — an edge property, not a node property | plan error — exit 2, `(no backing field on an edge)` |
 | `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` edge types | plan error — exit 2 |
 | `CALLS:<subtype>` qualifier syntax in CQL | plan error — exit 2 |
 | `NOT IN [...]` in CQL WHERE | parse error — exit 2 |
 | Lock sets, dominance facts on call-site nodes | schema-room |
 | Dependency edges (package/version) | not yet |
-| `r.site` edge property in CQL SELECT/WHERE | plan error — exit 2 |
+| `r.site` and `r.via` edge properties in CQL SELECT/WHERE | plan error — exit 2, `(no backing field on an edge)` |
 
 **Trust `reference/versions.md` for the authoritative capability ladder.**
 
@@ -216,6 +223,8 @@ The `site` object on each `explain` edge contains `file` and `line`. Column info
 3. **Is the path transient?** If the path includes an exceptional-class edge earlier, every subsequent `always` edge on the same path is exception-transient — the call only happens during error handling even though its own label says `always`.
 4. **Cut markers.** A `reflective` or `via-DI` edge means `cgx` could not statically resolve the target. The edge is still emitted; decide whether to include or exclude it for your question.
 5. **Empty result ≠ safe.** Exit 0 with no results means "no path found under these constraints" — not "the path is proven absent". Over-approximation (`possible` edges) means some real paths may be missing; under-approximation from filters means others are excluded.
+6. **Read the approximation contract — and know which answers have one.** `callers`, `callees`, `reaches`, `paths`, `flows-to`, `flows-from`, `unused`, and `query` state which direction they can be wrong: a trailing `approximation:` line in human output, an `approximation` object in JSON. A negative answer from one of those additionally carries `scope` — the edge kinds, confidence floor, and depth actually searched. Gate on the negative *with* its scope, never on the bare "no". `exact` is always relative to `modeled_graph` (external/unindexed callees, undescended closure bodies, and unexpanded macros sit outside it).
+7. **Where there is no contract, you supply the scope.** `index`, `explain`, `search`, `symbols`, `doctor`, and `diff` carry no `approximation` and no `scope`. This bites hardest on `cgx diff --path-added`, whose clean exit *is* an absence claim on a PR gate: rule 6's "gate on the negative with its scope" is not something the output can do for you there. Record the flags you gated with — `--from`/`--to`, `--kind`, `--edge-condition`, `--confidence` — because they *are* the scope, and nothing in the answer restates them. See `reference/output-and-exit.md` §1.2.
 
 ---
 

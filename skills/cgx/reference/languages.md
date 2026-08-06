@@ -14,6 +14,11 @@ Edge-condition labels (`always`, `conditional`, `exception`, `loop`, `panic`) an
 (`certain`, `probable`, `possible`) are defined in `reference/mental-model.md`. The sections below explain
 how each language's semantics map to those labels.
 
+**`panic` is Rust-only.** Every shipped frontend populates `always`, `conditional`, `loop`, and
+`exception`; only the Rust adapter emits `panic`. On a Go, Java, Python, or TypeScript repo,
+`--edge-condition panic` returns empty because the label is never produced — read that as "not
+modeled here", never as "no abort paths exist".
+
 ---
 
 ## Tiered language strategy
@@ -142,8 +147,11 @@ Go has no exceptions. Failure takes two forms:
 - **`if err != nil` branch** — ordinary data-conditioned failure branch. cgx labels these `exception` on
   the call edge, for the same cross-language-consistency reason as Rust's `?` operator (see
   `reference/mental-model.md` for the `exception` label definition).
-- **`panic()`** — non-recoverable abort unless an enclosing `defer` calls `recover()`. cgx labels `panic()`
-  paths `panic`; a `recover()` call inside a `defer` is labeled `exception`.
+- **`panic()`** — non-recoverable abort unless an enclosing `defer` calls `recover()`. **cgx does not
+  model this.** The Go adapter emits only `always`, `conditional`, `loop`, and `exception`; it recognises
+  neither `panic()` nor `recover()`, so a call on a panic path carries whatever condition its enclosing
+  syntax gives it (usually `always` or `conditional`). Filtering `--edge-condition panic` on a Go repo
+  returns empty because the label is never produced, not because no abort paths exist.
 
 **Dynamic dispatch — interface satisfaction**
 
@@ -178,9 +186,11 @@ available** (`planned`).
 
 **Closures and concurrency**
 
-Lambda and method-reference call edges are tracked as ordinary call edges. `ExecutorService.submit`,
-`CompletableFuture.runAsync`, and `Thread.start()` produce `spawns` edges. Concurrency/async hints are
-partial (`~`).
+Lambda and method-reference call edges are tracked as ordinary call edges. `Thread.start`,
+`ExecutorService.submit`/`execute`, and `CompletableFuture.supplyAsync`/`runAsync` record a `spawns`
+**effect** on the enclosing symbol — an `own_effects` node attribute, not a `spawns` edge. (Only the
+Rust, Go, and Python frontends emit `spawns` *edges*; TypeScript, like Java, records the effect.)
+Concurrency/async hints are partial (`~`).
 
 ---
 
@@ -270,8 +280,16 @@ Every edge carries an explicit confidence label — cgx never silently drops unc
 
 SCIP (Stack-based Index of Positions and Calls) is optional pre-computed resolution that upgrades
 heuristic (`possible`) edges to type-resolved (`probable` for dispatch candidate sets, `certain` for
-single-target direct calls). Supported generators: `scip-typescript`, `rust-analyzer --emit-scip`
-(`scip-rust`), `scip-python`.
+single-target direct calls). Supported generators: `scip-typescript` and `rust-analyzer --emit-scip`
+(`scip-rust`). **`scip-python` is not supported** — Python SCIP enrichment is planned, matching the
+Python section above.
+
+The `--scip` flag itself is language-agnostic: it accepts any `.scip` path and applies no
+language-based gating. What is *validated* is narrower — the symbol-mapping grammar is written and
+tested against `rust-analyzer`'s scheme and TypeScript's npm scheme only. Whether a `scip-go`,
+`scip-java`, or `scip-python` index would in fact upgrade any edge has not been established either
+way; "not yet available" in the per-language sections above means "unshipped and unvalidated", not
+"the flag rejects it".
 
 SCIP ingestion is not required; cgx falls back to heuristic resolution without it. The `--scip` flag is
 available on `cgx index` since v0.2.

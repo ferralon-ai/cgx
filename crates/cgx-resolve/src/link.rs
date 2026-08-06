@@ -389,9 +389,18 @@ fn resolve_ref(
 
     // --- Step 4: Tier-0 global name(+arity) fallback (Pass B tier 0). ---
     if opts.name_arity_fallback {
+        // Partition the short-name candidate set by language: a bare-name match
+        // against a def in a *different* language is never a real call. Genuine
+        // cross-language calls are FFI and carry their own `ViaFfi` cut marker
+        // (stamped by the frontend, independent of this fallback), so dropping the
+        // cross-language candidates removes only name-collision noise — not a
+        // precision/recall trade. The def's `lang` and the call site's `file.lang`
+        // both originate from the same per-file language tag, so the comparison is
+        // format-consistent by construction.
         let mut hits: Vec<&DefEntry> = table
             .defs_by_short(last)
             .iter()
+            .filter(|d| d.lang == file.lang)
             .filter(|d| d.kind.is_callable() || matches!(d.kind, SymbolKind::Type))
             .collect();
         if opts.arity_filter {

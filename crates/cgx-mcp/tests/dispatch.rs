@@ -812,14 +812,25 @@ fn tool_call_recipe(name: &str) -> Option<Value> {
     })
 }
 
-/// **Every** registered tool's response carries the freshness envelope.
+/// Tools that answer without ever consulting the index, and therefore must **not**
+/// carry an index-freshness envelope — describing the staleness of an index the
+/// answer never opened is exactly the false claim this cycle exists to remove.
+///
+/// This is a closed list on purpose. Adding to it is a contract decision, not a
+/// convenience: a tool belongs here only if it can answer with no `.cgx/` store in
+/// existence, which `coupling` proves separately in
+/// `mcp_coupling_answer_carries_the_contract`.
+const INDEX_FREE_TOOLS: &[&str] = &["coupling"];
+
+/// **Every graph-backed tool's** response carries the freshness envelope.
 ///
 /// Enumeration, not a spot check: the loop is driven by the live `tools/list`
-/// registry, so a twelfth tool added later is picked up automatically and fails
-/// this test two ways — no argument recipe, or a response without the envelope.
-/// A hand-written list of names could not do that.
+/// registry, so a new tool added later is picked up automatically and fails this
+/// test two ways — no argument recipe, or a response without the envelope. A
+/// hand-written list of names could not do that. `INDEX_FREE_TOOLS` is the one
+/// escape hatch and it is deliberately not the loop's driver either.
 #[test]
-fn every_registered_tool_carries_the_freshness_envelope() {
+fn every_graph_backed_tool_carries_the_freshness_envelope() {
     let (_t, repo) = init_repo();
     let resp = dispatch(&ServerConfig::default(), &req(1, "tools/list", json!({}))).expect("response");
     let tools = resp.result.expect("result")["tools"]
@@ -837,6 +848,9 @@ fn every_registered_tool_carries_the_freshness_envelope() {
 
     for t in &tools {
         let name = t["name"].as_str().expect("tool name");
+        if INDEX_FREE_TOOLS.contains(&name) {
+            continue;
+        }
         let args = tool_call_recipe(name).unwrap_or_else(|| {
             panic!(
                 "tool `{name}` is registered but this test has no argument recipe for it. \

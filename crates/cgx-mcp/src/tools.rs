@@ -562,11 +562,16 @@ fn with_contract(mut body: Value, contract: &ApproximationContract) -> Value {
 /// Attach the ADR-06 honesty metadata plus the index-freshness envelope to a
 /// result envelope.
 ///
-/// This is the one function **every** registered tool's response passes through —
+/// This is the one function every **graph-backed** tool's response passes through —
 /// deliberately not the `with_contract` sibling above, which `explain`/`search`/
-/// `symbols` skip. Anything that must ride on every answer without exception
-/// belongs here; `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and
-/// fails if a tool's response ever misses the `freshness` key.
+/// `symbols` skip. Anything that must ride on every graph-derived answer belongs
+/// here; `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and fails if
+/// such a tool's response ever misses the `freshness` key.
+///
+/// `coupling` does **not** pass through here, and that is the contract, not an
+/// oversight: it answers from committed git history with no index open, so an
+/// index-freshness envelope on its answer would describe a store it never read.
+/// The test's `INDEX_FREE_TOOLS` is the closed list of such tools.
 fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
     let obj = body.as_object_mut().expect("result body is an object");
     obj.insert("graph_version".into(), json!(session.graph_version));

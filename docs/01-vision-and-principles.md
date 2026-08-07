@@ -4,8 +4,9 @@
 
 `cgx` makes the call graph of a codebase a first-class queryable artifact —
 general-purpose across programming languages via a tiered adapter model (LS-1),
-implemented in Rust. Launch Tier-1 adapters: Rust and TypeScript/JavaScript; the
-tier system adds languages incrementally.
+implemented in Rust. Tier-1 adapters shipped: Rust, TypeScript/JavaScript, Go, Python,
+and Java; C# is the last Tier-1 language planned. The tier system adds languages
+incrementally, and a Tier-0 generic tree-sitter fallback covers files no adapter claims.
 Software engineers, security engineers, and AI coding/security agents ask structural
 and dataflow questions about source code; `cgx` answers them with file:line evidence,
 sub-second for indexed structural queries, from the command line or over MCP.
@@ -52,8 +53,9 @@ query, `cgx` produces the same output, always.
 ### Fast startup and response
 
 `cgx` delivers sub-second responses for indexed structural queries; heavier query
-classes carry separate measured budgets (docs/09 AR-11). The index is pre-built;
-query execution reads from the stored graph, not from re-parsing source.
+classes carry separate budgets (docs/09 AR-11 — targets, not yet benchmarked). The
+index is pre-built; query execution reads from the stored graph, not from re-parsing
+source.
 
 ### Index fully auto-managed; explicit override commands available
 
@@ -62,9 +64,16 @@ answering. Engineers may also call `cgx index` directly to control indexing. `cg
 
 ### STDIO MCP server mode
 
-`cgx` runs as a STDIO MCP server (`cgx mcp`) to expose its full query surface
-to AI coding and security agents. The MCP interface is not a restricted subset; it
-covers the same capabilities as the CLI.
+`cgx` runs as a STDIO MCP server (`cgx mcp`) to expose its query surface to AI coding
+and security agents. Every *query* capability the CLI has is reachable over MCP, and the
+two share one engine, so they cannot disagree about an answer.
+
+The MCP surface is nonetheless a **subset**: `index`, `doctor`, and `diff` have no MCP
+tool. The first two are operator commands rather than questions; `diff` is a genuine gap.
+The commitment is that no query answerable on the CLI is unanswerable over MCP — not that
+the two surfaces are identical. Where they deliberately differ, they differ in the
+agent's favour: `include_dirty` defaults to true over MCP, so an agent sees its own
+uncommitted edits, while the CLI answers over the committed tree.
 
 ### Implementation language: Rust
 
@@ -97,6 +106,35 @@ Every call or flow edge in the graph carries a confidence label:
 `cgx` never silently promotes a `possible` to `certain`. When confidence affects a
 query result, the label is visible in the output.
 
+### Every answer states how it can be wrong
+
+Per-edge confidence tells a reader how well-founded one fact is. It does not tell them
+what to conclude from the *answer*, and that is the harder question — especially for an
+automated consumer, which cannot supply the judgement a human reader supplies for free.
+So the answer carries its own statement:
+
+- **Which direction it can be wrong.** `over` (it may report edges or paths that cannot
+  occur), `under` (it may have missed some), `over_under`, or `exact` — with
+  machine-readable reasons derived from what the resolution and the walk actually did,
+  never from a static per-language table.
+- **What a negative answer was searched under.** "No path" is the answer most easily
+  mistaken for a proof. Every negative carries the edge kinds, confidence floor, and
+  depth bound it was computed with, so a consumer can gate on the negative *together
+  with* its scope.
+- **Which graph it ran over, and whether the tree has moved since.** Reported as
+  divergence from HEAD, never as an age or a timestamp — an index built ten seconds ago
+  against a since-rewritten tree is stale, and one built last week against an untouched
+  tree is fresh.
+
+Two rules make this honest rather than decorative. **`exact` is never unqualified**: it
+is always *within a stated modeled boundary*, so a bare unhedged "exact" is impossible to
+emit. And **a `null` never renders as the reassuring word** — where something was not
+established, the answer says `unknown`, not `current`.
+
+This is the principle the rest of the design serves. A tool that answers structural
+questions for an agent is only as useful as its worst silent failure, and the failure
+mode that matters is not a wrong answer — it is a bounded answer read as a complete one.
+
 ### Edge condition is labeled on every edge
 
 Every call edge carries an **edge condition**:
@@ -109,7 +147,8 @@ Every call edge carries an **edge condition**:
 
 The labels `exception` and `panic` together form the **exceptional class** (see docs/03-code-graph-model.md GM-3).
 
-This labeling enables exception-path queries that no other tool supports.
+This labeling enables exception-path queries that no tool in the 2026 survey supports;
+see docs/10-landscape.md Gap 1 for the per-tool evidence behind that claim.
 
 ### Path-relative transience, not global labeling
 

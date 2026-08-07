@@ -67,9 +67,22 @@ Caveats:
   return multiple symbols with the same short name across types; anchor to the full
   FQN with `WHERE base.fqn = "..."` to avoid false matches. See
   `reference/query-language.md`.
-- `OVERRIDES` coverage is limited to languages with explicit override syntax.
-  Implicit overrides (e.g., Python methods that shadow without a decorator) may
-  not appear until a future enrichment pass.
+- **Implicit overrides are populated today.** A Python method that shadows a base
+  method with no decorator produces an `OVERRIDES` edge — the relation is derived
+  from the class hierarchy, not from an `override`/`@Override` marker. Verified on
+  a two-class Python fixture with no decorators anywhere, run twice, identical:
+
+  ```
+  $ cgx query 'MATCH (a)-[:OVERRIDES]->(b) RETURN a.fqn, b.fqn'
+  a.fqn                          b.fqn
+  src::shapes::Square::area      src::shapes::Base::area
+  src::shapes::Square::describe  src::shapes::Base::describe
+  approximation: exact (within modeled graph)
+  freshness: current | indexed tree 37d7dcf, working tree clean
+  ```
+
+  Do not discount an empty `OVERRIDES` result on a Python codebase as "not enriched
+  yet" — treat it as the graph's actual answer and check the base FQN you filtered on.
 - `candidate_set` discrimination on virtual calls requires the `CALLS:virtual`
   edge sub-type and CHA/RTA narrowing, both **deferred past v0.3** (exit 2). At v0.3,
   confidence values are predominantly `possible` (over-approximated). See Q136.
@@ -124,8 +137,21 @@ Do not present these as runnable on any current binary.
 
 The following questions require **override-contract drift** analysis (Q-32),
 which composes `OVERRIDES` edges with `MUST PASS THROUGH`/`AVOIDING` path-set
-algebra. Both clauses are parse errors in v0.3 (exit 2, not plan errors — the
-keywords are not recognised by the parser).
+algebra. Both clauses are **plan errors**, not parse errors, and the rejection
+fires at the `ALL` token before `AVOIDING` is ever reached:
+
+```
+$ cgx query 'MATCH ALL path = (ep)-[:CALLS*]->(sink {name:"…"}) AVOIDING (audit {name:"audit_log"}) RETURN ep.name'
+error: `MATCH ALL … MUST PASS THROUGH/AVOIDING` (Q-20 guarded-cut) is not supported in this release (deferred)
+ --> query:1:7
+cgx: plan error: `MATCH ALL … MUST PASS THROUGH/AVOIDING` (Q-20 guarded-cut) is not supported in this release (deferred) (at bytes 6..9)
+```
+(Elided: the caret-view source line between the two error lines, and the query's own
+`sink` FQN.) Exit 2 either way — but the distinction is load-bearing for error handling:
+the parser **does** recognise these keywords, so a retry with different spelling or
+quoting will not help. This is a capability gap to report, not a typo to correct.
+Bare `AVOIDING` without `MATCH ALL` is a parse error, but that is not the construct's
+real syntax.
 
 | Question | Required feature |
 |---|---|

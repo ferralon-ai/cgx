@@ -21,14 +21,23 @@ Or as a single subgraph query (specified in docs/05 depth-limited blast radius e
 
 ```cgx
 cgx query '
-  MATCH (c)-[:CALLS*1..2]->(fn {name:"processPayment"})-[:CALLS*1..3]->(d)
+  MATCH p1 = (c)-[:CALLS*1..2]->(fn {name:"processPayment"})
+  MATCH p2 = (fn {name:"processPayment"})-[:CALLS*1..3]->(d)
   RETURN c.name, c.file, c.line,
          fn.name, fn.file, fn.line,
          d.name, d.file, d.line,
-         [r IN relationships((c)-[:CALLS*1..2]->(fn)) | r.condition] AS caller_edge_conditions,
-         [r IN relationships((fn)-[:CALLS*1..3]->(d)) | r.condition] AS callee_edge_conditions
+         [r IN relationships(p1) | r.condition] AS caller_edge_conditions,
+         [r IN relationships(p2) | r.condition] AS callee_edge_conditions
 ' --repo ./
 ```
+
+`relationships(...)` requires a **bound path variable** — `relationships((c)-[:CALLS*1..2]->(fn))`
+inline is an eval error ("argument must be a path, got a bool value"), not a path expression. Name
+each leg (`p1`, `p2`) in its own `MATCH` and pass the name. Two consequences of splitting into two
+`MATCH` clauses: (1) `fn` does not automatically stay bound to the first clause's match across the
+second — repeat the `{name:"processPayment"}` filter on `fn` in both, or the second `MATCH` free-binds
+`fn` to every node and the result is a cross product, not the intended subgraph; (2) live-verified
+above, the corrected form runs to completion, exit 0.
 
 **Breaking it down**
 
@@ -36,8 +45,8 @@ cgx query '
 |---|---|
 | `cgx callers processPayment --repo ./ --depth 2` | Walk 2 hops backward from `processPayment`; returns the functions that can reach it. |
 | `cgx callees processPayment --repo ./ --depth 3` | Walk 3 hops forward; returns the functions it can reach. |
-| `CALLS*1..2` / `CALLS*1..3` | Transitive edge traversal bounded by the hop counts. Combining both directions in one query gives the minimal context subgraph. |
-| `[r IN relationships(...) | r.condition]` | Project the edge-condition label on each edge in the path — tells the agent which edges are `always`, `conditional`, `exception`, etc. |
+| `CALLS*1..2` / `CALLS*1..3` | Transitive edge traversal bounded by the hop counts. Two `MATCH` clauses sharing the filtered `fn` give the minimal context subgraph. |
+| `[r IN relationships(p1) \| r.condition]` | Project the edge-condition label on each edge of the named path `p1` — tells the agent which edges are `always`, `conditional`, `exception`, etc. `relationships()` only accepts a bound path name, never an inline pattern. |
 
 **Reading the result** — Two JSON blobs (or a combined result set) give the agent the full edit context. Edge conditions tell it which callees are exception-only (and therefore should not be called on the happy path). Token-efficient because the depth bounds prevent pulling in the entire reachable graph.
 

@@ -1,8 +1,13 @@
 # 04 — Dataflow and Provenance
 
-**Status:** Feature specification (pre-implementation)
+**Status:** Mixed, and the blanket "pre-implementation" banner this line used to carry
+undersold the file. **DF-1 (value pedigree), DF-3's edge model, DF-6's slicing and DF-17.3's
+mutation fan-out ship**: `cgx flows-from` / `cgx flows-to` are real subcommands (`Since: v0.3`),
+and `CALL cgx.pedigree(...)` / `CALL cgx.mutation_fanout(...)` are real CQL procedures backed by
+real `derives-from` BFS walks. Roughly ten of the numbered features (DF-4, DF-5, DF-7, and DF-9
+through DF-20) are genuinely unbuilt. Each section now says which it is rather than leaving one
+banner to cover both.
 **Audience:** Engineers using `cgx` for security analysis, dead-code detection, or impact analysis; contributors implementing the dataflow layer
-**Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/03-code-graph-model.md · docs/05-queries.md · docs/07-interfaces.md · docs/08-language-support.md
 
 ---
@@ -63,6 +68,53 @@ This answers questions such as:
   `db.execute()`?"
 - "Does the value returned by `transform()` derive, transitively, from any
   network-read symbol?"
+
+### DF-1.1a — The shipped pedigree surface, and one defect in it
+
+Pedigree ships on two surfaces, and **they disagree about direction**.
+
+*(Runs shown here are against the shared example repository defined in [`docs/05-queries.md` → "The example repository"](05-queries.md#the-example-repository); its recipe reproduces tree OID `7380e245ab98db2dfed12ed3ee3b005f0fbf7036` exactly.)*
+
+**The subcommands are correct.** `cgx flows-from <VALUE>` is the pedigree (backward: where did
+this come from); `cgx flows-to <VALUE>` is the forward slice (what does it flow into). Both
+operate on **value nodes** — SSA locals such as `rust_sample::middle::y#1` — not on function
+symbols; a function FQN has no `derives-from` edges. Discover value-node FQNs with `cgx search`.
+On an index built `--no-dataflow` the value nodes do not exist and both commands exit 2.
+
+For a value chain `v#0` → `y#1` → `return#1`:
+
+```console
+$ cgx flows-from 'rust_sample::middle::y#1' --repo .
+rust_sample::middle::y#1  src/main.rs:16
+└─ rust_sample::middle::v#0  src/main.rs:15  [probable]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+`v#0` is `y#1`'s source: correct. Note the `[probable]` band — the dataflow pass reconstructed
+that link without a precise type resolution, and the doc-level rule is that a `probable` edge is
+never restated as established fact.
+
+**The CQL procedures are inverted, and their column names say the opposite of what they
+return.** `CALL cgx.pedigree(v) YIELD source` returns the value's *consumers*, and
+`CALL cgx.mutation_fanout(v) YIELD mutator` returns its *sources*:
+
+```console
+$ cgx query 'CALL cgx.pedigree("rust_sample::middle::y#1") YIELD source, confidence RETURN source, confidence' --repo .
+source                         confidence
+rust_sample::middle::return#1  certain
+```
+
+`return#1` is what `y#1` flows *into* — the answer `flows-to` gives, under a column called
+`source`. The mirror holds: `cgx.mutation_fanout("rust_sample::middle::return#1")` yields
+`v#0` and `y#1`, which are its sources rather than values it mutates. The two procedures are
+consistent with each other and inverted relative to the subcommands.
+
+**This is a defect, documented rather than fixed.** Until it is corrected, read
+`cgx.pedigree` as a forward slice and `cgx.mutation_fanout` as a pedigree — or use the
+`flows-*` subcommands, whose direction is right. A query that filters `cgx.pedigree` results
+looking for untrusted sources is currently looking at consumers, and will produce a
+well-formed, wrong answer.
 
 ### DF-1.2 — Pedigree through transformations
 
@@ -148,7 +200,13 @@ it derives from degree (GM-1.3) alone and is not coupled to `confidence` (GM-5).
 For any callable (function or method), `cgx` builds a scope inventory: the
 complete set of values that cross the callable's boundary.
 
-### DF-2.1 — Inventory categories
+### DF-2.1 — Inventory categories — **Planned**
+
+None of these eight category identifiers exists in `crates/`. This section carries no `Status:`
+line, so by the document's own convention it reads as baseline; it is not. What ships in this
+space is the SSA value-node model — `fn::param#0`, `fn::local#1`, `fn::return#1` — which
+covers the `parameter` and `return` categories under different names and does not model the
+other six.
 
 | Category | Description | Examples |
 |---|---|---|
@@ -203,10 +261,22 @@ This reads: `doubled` is derived from `my_list`. Following `derives-from` edges
 backwards from a symbol yields its pedigree; following them forwards yields
 downstream usage (DF-6).
 
-### DF-3.2 — Transformation tags
+### DF-3.2 — Transformation tags — **Planned; the vocabulary below is not the shipped one**
 
-Every `derives-from` edge carries a **transformation tag** that characterises
-how the derived value relates to the source:
+Two separate corrections, and both matter to anyone writing a query.
+
+**The enum is different.** The `Transform` type in `crates/cgx-core/src/transform.rs` is
+`Copy, Projection, Arith, Concat, Composed, Branched, Aggregation, Parse, Serialize, Other` —
+not the `identity/mapped/aggregated/filtered/parsed/formatted/branched/composed` vocabulary
+below. `Composed`, `Branched` and `Other` are the only three names shared between the two lists.
+
+**And it is not queryable at all.** No frontend populates the field, and CQL rejects
+`r.transformation` outright: ``edge property `transformation` is not populated by the current
+frontend; DATA_FLOW transformation tags are deferred``. So the claim "every `derives-from` edge
+carries a transformation tag" is false in both directions — the tag vocabulary is wrong, and no
+edge carries one. Project `r.condition` instead when you need a per-hop label today.
+
+The intended vocabulary follows:
 
 | Tag | Meaning | Example |
 |---|---|---|
@@ -236,7 +306,13 @@ reachability.
 
 ---
 
-## DF-4 — Container and Collection Models
+## DF-4 — Container and Collection Models — **Planned (not yet shipped)**
+
+No container-model machinery exists: no built-in models, no `smashed-collection` tag, and no
+`[[container-models]]` table in the `cgx.toml` parser, which reads a single key
+(`[index] data_flow`). Because this section carries no `Status:` line of its own, the doc's
+convention would read it as shipped baseline; it is not. Note that this directly undercuts
+DF-1.2's headline example — pedigree does **not** currently see through `map`/`filter`/`fold`.
 
 Standard library container operations (`map`, `filter`, `fold`, `collect`,
 `flat_map`, etc.) are treated as transparent for pedigree and taint propagation.
@@ -296,7 +372,18 @@ ops    = [
 
 ---
 
-## DF-5 — Taint Analysis
+## DF-5 — Taint Analysis — **Planned (not yet shipped)**
+
+The sharpest status gap in this document, because it carries no `Status:` line and reads as
+baseline. Nothing here ships: CQL rejects `source_class`, `sink_class` and `sanitizer_class` as
+node properties ("not supported in this release … no backing field"), there is no
+`[[taint.*]]` table in the `cgx.toml` parser, and both `cgx-diff` and `cgx-resolve` describe
+taint in their own source comments as reserved schema room for a later slice. There are no
+default source/sink/sanitizer sets because there is no mechanism to hold them.
+
+What exists today in this space is DF-1's pedigree: an untyped `derives-from` walk that answers
+"where did this value come from" without any notion of trust classes. That is a genuinely
+useful primitive and it is not taint analysis.
 
 Taint analysis tracks whether a value originating at a **source** can reach a
 **sink** without passing through a **sanitizer**. Sources, sinks, and
@@ -417,11 +504,16 @@ answers impact-analysis questions:
 
 ### DF-6.3 — Slicing and edge conditions
 
-Slices can be restricted by edge condition. Passing `--on-exception-path`
-restricts the slice to paths containing at least one `exception` or `panic`
-edge, equivalent to "reachable via the failure path only." This directly
-supports the path-relative transience queries described in
-docs/03-code-graph-model.md GM-4.
+**There is no `--on-exception-path` flag.** The shipped way to restrict by edge condition is
+`cgx diff --edge-condition <label>` on the diff surface, and the `r.condition` predicate in CQL
+everywhere else — the latter is strictly more expressive, because a path-level predicate
+(`ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])`) is not the same
+thing as an edge-level filter, and "reachable via the failure path only" is a path-level
+question. `cgx flows-to` / `cgx flows-from` carry no edge-condition filter at all.
+
+The design: passing `--on-exception-path` would restrict the slice to paths containing at
+least one `exception` or `panic` edge. This directly supports the path-relative transience
+queries described in docs/03-code-graph-model.md GM-4.
 
 ### DF-6.4 — Context-sensitivity
 
@@ -434,7 +526,13 @@ infeasible path problem).
 
 ---
 
-## DF-7 — Instance-Level Analysis: Never-Referenced Members
+## DF-7 — Instance-Level Analysis: Never-Referenced Members — **Planned (not yet shipped)**
+
+No allocation-site abstraction and no never-referenced-member analysis exists; like DF-4 and
+DF-5 this section carries no `Status:` line and should not be read as baseline. The nearest
+shipped feature is `cgx unused`, which is a different and coarser analysis: it reports symbols
+(optionally narrowed by `--kind`) with no incoming call edge from the auto-detected entrypoint
+set, globally rather than per allocation site, and it has no confidence column of its own.
 
 `cgx` can answer the question: "Which properties or methods of *this specific
 instance* are never referenced by any code reachable downstream from the point
@@ -1159,8 +1257,14 @@ for TOCTOU vulnerabilities.
 
 ### DF-17.2 — Effect-lattice extensions: writes-param and writes-receiver
 
-docs/03-code-graph-model.md GM-12 specifies the function effect system, which already includes
-`writes-global`. DF-17 extends the effect lattice with two finer-grained kinds:
+**Planned, and its stated premise is false.** GM-12's shipped `Effect` enum has seven variants
+and **`writes-global` is not among them** — it is one of the three values (`reads-global`,
+`writes-global`, `io.db`) that GM-12 documents but the code does not define. So DF-17.2 does not
+extend an existing lattice member; it depends on one that has to be built first.
+`writes-param`, `writes-receiver` and `EffectLattice` have zero occurrences in `crates/`.
+
+The design: docs/03-code-graph-model.md GM-12 specifies the function effect system, which would
+include `writes-global`. DF-17 extends the effect lattice with two finer-grained kinds:
 
 | Effect | Meaning |
 |---|---|
@@ -1245,7 +1349,11 @@ an argument, returned from a function, or placed in a collection. The `lambda` k
 anonymous callables; DF-18 generalises this to named functions used as values (Rust `let f =
 my_fn;`, Python `handler = process_order`, Go `var fn func(int) = compute`).
 
-Function values are represented as symbol nodes with `kind: function-value` in the dataflow graph.
+**Planned:** function values are represented as symbol nodes with `kind: function-value` in the
+dataflow graph. `SymbolKind` has ten variants — `Function, Method, Type, Field, Variable, Module,
+Constant, Macro, Lambda, Entrypoint` — and **no `FunctionValue` among them**, so `kind:
+"function-value"` matches nothing today. `Lambda` is real and covers the anonymous-callable case;
+the generalisation to named functions used as values is what has not landed.
 A `derives-from` edge with kind `copy` connects the original function symbol to the function-value
 node, establishing pedigree linkage.
 

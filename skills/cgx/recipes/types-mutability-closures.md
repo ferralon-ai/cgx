@@ -129,10 +129,17 @@ RETURN mutator.name, mutator.file, mutator.line,
 ORDER BY confidence DESC, mutator.file
 ```
 
-**Why this will work:** `cgx.mutation_fanout` is the outbound dual of pedigree: from
+**Why this will work:** `cgx.mutation_fanout` is designed as the outbound dual of pedigree: from
 a given program point it traverses alias edges (DF-16) and effect summaries (DF-17)
 to find every function that can write to the value between that point and a
 downstream check.
+
+**The procedure itself is not deferred** — only the `effect` YIELD column and the `scope` node
+property in the query above are (both exit 2). `CALL cgx.mutation_fanout(v) YIELD mutator` runs
+today over `derives-from` edges. What it returns is not what its column name says: it yields the
+values `v` **derives from** — its sources, the `cgx flows-from` answer — while `cgx.pedigree` yields
+consumers. The two are swapped relative to their names. See the direction table in
+`recipes/taint.md` before building on either.
 
 **Reading the result:** Focus on `certain` or `probable` mutators with effect
 `writes-param(0)` or `writes-receiver` — those directly overwrite the value through

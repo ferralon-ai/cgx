@@ -16,14 +16,15 @@ The full version ladder is in `reference/versions.md`.
 | Symbol discovery (`cgx search` — substring/regex FQN scan) | v0.2 | runs |
 | `DATA_FLOW` edges in CQL; `flows-to`/`flows-from` subcommands | v0.3 | runs (on by default — plain `cgx index` builds dataflow) |
 | `entrypoint_class`/`sink_class`/`source_class`/`sanitizer_class` node props | v0.3 | deferred — plan error exit 2 |
-| `MUST PASS THROUGH` / `AVOIDING` path-set algebra | v0.3 | deferred — plan error / parse error exit 2 |
-| `taint_label` edge property; `CALL cgx.pedigree(...)` | v0.3 | deferred — plan error exit 2 |
+| `MUST PASS THROUGH` / `AVOIDING` path-set algebra | v0.3 | deferred — **plan** error exit 2, fired at the `ALL` token |
+| `taint_label` edge property | v0.3 | deferred — plan error exit 2 |
+| `CALL cgx.pedigree(...)` / `CALL cgx.mutation_fanout(...)` | v0.3 | **runs today** — but direction-swapped vs. their names; see `recipes/taint.md` |
 | Full taint matrix, trust-boundary node props (`trust_zone`) | v0.3 | deferred |
 | CVE reachability (`query --cve`, dependency-edge `package`/`version` attribution) | v0.4 | not yet |
 
 **v0.1 boundary:** cgx answers *call-reachability* questions, not security-typed taint. `reaches A B` means "a call path exists from A to B", not "data can flow from A to B". The queries in this recipe are labelled clearly with which version they require.
 
-**v0.3 dataflow note:** `DATA_FLOW` edges and `flows-to`/`flows-from` run today. They represent structural value-derivation edges (SSA), not security-typed taint. Taint labels, source/sink/sanitizer classification, and `cgx.pedigree` remain deferred.
+**v0.3 dataflow note:** `DATA_FLOW` edges and `flows-to`/`flows-from` run today, on both the CLI and MCP. They represent structural value-derivation edges (SSA), not security-typed taint. Taint labels and source/sink/sanitizer classification remain deferred. `CALL cgx.pedigree(...)` is **not** deferred — it executes and returns rows; what it returns is a value's *consumers* under a column named `source`, the opposite of the name. Use `flows-to`/`flows-from` for provenance and see `recipes/taint.md` before relying on either procedure.
 
 For taint analysis proper, see `recipes/taint.md`.
 For CQL syntax constraints, see `reference/query-language.md`.
@@ -81,7 +82,32 @@ cgx paths my_crate::http::handle_request libfoo::parse_header --depth 8 --format
 
 **Why this works / breaking it down:** `reaches` returns a witness call path if one exists; `paths` enumerates all paths up to `--depth` hops. This confirms call reachability — not that data flows to the vulnerable call, and not that a sanitizer is absent. Those require the v0.3/v0.4 taint forms (see `recipes/taint.md`).
 
-**Reading the result:** Empty output from `reaches` (exit 0) means no call path exists — a strong negative. Non-empty output names the path and its edge-condition labels. An edge with condition `[if]` means the call is guarded by a runtime check; `[exc]` means an exception path. A `possible`-confidence edge on the path may be a false positive from unresolved dynamic dispatch. The reachability answer does not confirm whether a sanitizer or auth check stands between the caller and the sink — that requires the v0.3 taint form.
+**Reading the result:** Empty output from `reaches` (exit 0) means no call path was found **in what
+was searched** — and how strong a negative that is, is a question the answer itself carries. On an
+empty result the `approximation` object gains a `scope` naming the edge kinds, confidence floor and
+depth actually walked, and `direction` reports whether the search was cut short. Two negative
+answers on the shipped `fixtures/rust-sample` — same target, different sources, and only the second
+is worth anything:
+
+```
+$ cgx reaches rust_sample::async_calls::fetch_data rust_sample::panics::validate_positive --format json \
+    | jq -c '.approximation | {direction, reasons: [.reasons[].code]}'
+{"direction":"under","reasons":["unresolved-external-calls"]}
+
+$ cgx reaches rust_sample::conditions::dispatch rust_sample::panics::validate_positive --format json \
+    | jq -c '.approximation | {direction, reasons: [.reasons[].code]}'
+{"direction":"exact","reasons":[]}
+```
+(Elided by the `jq` filter itself: `modeled_graph` and the `scope` object.)
+
+`"direction": "under"` on an empty answer is **not** a strong negative — it says calls in the
+searched region resolved to no in-repo target and could not be followed, so a path may exist behind
+one of them. `"direction": "exact"` with `"reasons": []` is the strong negative, and even then it is
+exact *within* `modeled_graph`: external and unindexed callees, undescended closure bodies and
+unexpanded macros are outside it by construction. A vulnerability gate that reads exit 0 without
+reading the contract is asserting more than the tool said.
+
+Non-empty output names the path and its edge-condition labels. An edge with condition `[if]` means the call is guarded by a runtime check; `[exc]` means an exception path. A `possible`-confidence edge on the path may be a false positive from unresolved dynamic dispatch. The reachability answer does not confirm whether a sanitizer or auth check stands between the caller and the sink — that requires the v0.3 taint form.
 
 **Documented v0.3/v0.4 forms (not runnable today):**
 
@@ -212,7 +238,11 @@ ORDER BY hops, src.file, src.line
 ```
 
 ```cypher
--- Since: v0.3 (deferred: AVOIDING clause causes parse error exit 2 today)
+-- Since: v0.3 (deferred). This is a PLAN error, not a parse error, and it fires at the
+-- `ALL` token before AVOIDING or any taint property is reached:
+--   cgx: plan error: `MATCH ALL … MUST PASS THROUGH/AVOIDING` (Q-20 guarded-cut) is not
+--        supported in this release (deferred) (at bytes 6..9)
+-- The parser recognises these keywords; re-spelling or re-quoting will not help.
 MATCH ALL path = (src)-[:CALLS*]->(sink)
 WHERE src.trust_zone = "external"
   AND sink.trust_zone = "internal"
@@ -289,9 +319,9 @@ These capabilities are documented but produce errors or empty results until the 
 |---|---|---|---|
 | CVE reachability (Q82 full form) | Dependency-edge `package`/`version` attribution (GM-14) | v0.4 | not implemented |
 | Entrypoint-class × sink-class matrix (Q83) | `entrypoint_class`, `sink_class` node props; framework packs | v0.3 | plan error exit 2 |
-| Trust-boundary crossing (Q84 full form) | `trust_zone` node prop; `AVOIDING` clause | v0.3 | plan error / parse error exit 2 |
+| Trust-boundary crossing (Q84 full form) | `trust_zone` node prop; `AVOIDING` clause | v0.3 | plan error exit 2 (both) |
 | Sanitizer-negation on taint paths | `sanitizer_class` node prop | v0.3 | plan error exit 2 |
-| Security-typed taint: `taint_label`, `source_class`, `sink_class`, `cgx.pedigree` | Taint labels & framework packs | v0.3 | plan error exit 2 |
+| Security-typed taint: `taint_label`, `source_class`, `sink_class` | Taint labels & framework packs | v0.3 | plan error exit 2 |
 
 **Structural dataflow is available now (v0.3.0):** `flows-to`, `flows-from`, and `MATCH (a)-[:DATA_FLOW]->(b)` CQL return real rows from value-node FQNs. This is not security-typed taint — it is structural SSA derivation. Use `cgx search` to discover value-node FQNs (they appear as `fn::local#N`-style names). See `recipes/taint.md` for the full taint capability roadmap.
 

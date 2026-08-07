@@ -1,7 +1,7 @@
 ---
 title: Language Support
 audience: agents and engineers using cgx
-Last Updated: 2026-07-06
+Last Updated: 2026-08-06
 ---
 
 # Language Support
@@ -14,10 +14,17 @@ Edge-condition labels (`always`, `conditional`, `exception`, `loop`, `panic`) an
 (`certain`, `probable`, `possible`) are defined in `reference/mental-model.md`. The sections below explain
 how each language's semantics map to those labels.
 
-**`panic` is Rust-only.** Every shipped frontend populates `always`, `conditional`, `loop`, and
-`exception`; only the Rust adapter emits `panic`. On a Go, Java, Python, or TypeScript repo,
-`--edge-condition panic` returns empty because the label is never produced — read that as "not
-modeled here", never as "no abort paths exist".
+**⚠ `panic` is schema-only: no shipped frontend produces an observable `panic` edge.** Every
+frontend populates `always`, `conditional`, `loop`, and `exception`. The Rust adapter is the only
+one that *labels* anything `panic`, and none of those labels survives into the graph — see
+"The `panic` label never reaches the graph" under Rust below. A query filtered on
+`r.condition = "panic"` returns **zero rows on every repo in every language**, and does so at exit 0
+with `direction: "exact"`. Read that as "not modeled", never as "no abort paths exist".
+
+**One command is language-independent.** `cgx coupling` answers from committed git history and
+never parses source, so it returns a full answer on a repository written entirely in languages
+cgx has no adapter for — and on one that has never been indexed. Everything else in this file
+gates on the adapter; `coupling` does not.
 
 ---
 
@@ -28,13 +35,41 @@ tier, which controls how deeply cgx resolves call targets.
 
 | Tier | Description | Confidence ceiling (with SCIP) | Confidence ceiling (no SCIP) |
 |------|-------------|-------------------------------|------------------------------|
-| **1 — Deep semantics** | Full parse + language-specific scope graph; closure and higher-order tracking; error-path annotation | `certain` (intra-file + SCIP direct), `probable` (virtual/interface), `possible` (unresolvable dynamic) | `certain` (intra-file scope-ref only), `possible` (all other calls) |
-| **2 — Graph + heuristic** | tree-sitter parse + heuristic cross-file name matching; no type-based dispatch narrowing | `probable` (unique name), `possible` (overloaded or ambiguous) | `probable` (unique name), `possible` (overloaded or ambiguous) |
+| **1 — Deep semantics** | Full parse + language-specific scope graph; closure and higher-order tracking; error-path annotation | `certain` (intra-file + SCIP direct), `probable` (virtual/interface), `possible` (unresolvable dynamic) | `certain` (intra-file scope-ref), `probable` (**singleton** import binding or dispatch candidate set), `possible` (multi-candidate set, or the bare-name fallback) |
+| **2 — Graph + heuristic** | tree-sitter parse + heuristic cross-file name matching; no type-based dispatch narrowing | `possible` (all cross-file edges — see below) | `possible` (all cross-file edges — see below) |
 | **3 — Syntactic only** | tree-sitter parse; intra-file symbol inventory; no cross-file edges | `possible` (all edges) | `possible` (all edges) |
 
-Confidence above `possible` for cross-file or dispatch edges requires SCIP enrichment (Since: v0.2).
-Without SCIP, Tier 1 produces `certain` only for intra-file scope-ref calls; all other Tier 1 edges are
-`possible`.
+**Without SCIP, a Tier-1 edge is not automatically `possible` — the candidate-set size decides.**
+The resolver bands a candidate set by how many definitions survive, and only the *bare-name*
+fallback is clamped regardless of size. Read off the rule, not off the tier:
+
+| Resolution rule | Tier | Confidence, no SCIP |
+|---|---|---|
+| `scope-ref` — same-file lexical resolution of a direct call | scope-graph | `certain` |
+| `import-ref` — import binding resolving to **one** exported target | scope-graph | **`probable`** |
+| `import-ref` — import binding, several candidates | scope-graph | `possible` |
+| `name-method` — virtual/duck-typed receiver, **one** same-name method | scope-graph | **`probable`** |
+| `name-method` — virtual/duck-typed receiver, several same-name methods | scope-graph | `possible` |
+| `name-arity` — global short-name(+arity) fallback, **any** number of hits | name-syntactic | `possible` |
+| no candidate | — | edge dropped; `unresolved` cut marker recorded |
+
+The singleton rows are the common case on a real tree, so **`probable` cross-file edges are
+ordinary without SCIP**, not a sign SCIP ran. What SCIP adds is promotion of the *multi-candidate*
+rows and of cross-file direct calls to `certain`.
+
+The `name-arity` clamp is the one place size does not matter: a lone surviving bare-name hit is a
+name collision with one survivor, not a resolution, so it stays `possible`. That asymmetry is also
+the reason for the caveat in the Python section below — a singleton `name-method` keeps `probable`
+with no in-repo receiver type.
+
+**Tier 2's ceiling is `possible`, unique name or not.** A "heuristic cross-file name match" with no
+scope, import, or type corroboration is exactly the resolver's Tier-0 name(+arity) fallback, and
+that band is **clamped to `possible` even when a single definition survives** — a lone hit there is
+a name collision with one survivor, not a resolution. A Tier-2 language therefore has no route to
+`probable`: `probable` is reserved for a uniquely-resolved *import binding* or a singleton dispatch
+candidate set, both of which need the scope graph a Tier-2 adapter does not build. No Tier-2
+adapter ships today, so this describes the band a Tier-2 language would land in, not observed
+output.
 
 ---
 
@@ -53,12 +88,39 @@ Rust has no exceptions. Failure takes two forms:
   cgx labels these `exception` on the call edge. This is intentional: it makes cross-language queries for
   "failure-path-only edges" work uniformly (see `reference/mental-model.md` for the `exception` label
   definition).
-- **`panic!` / `unwrap` / `expect`** — non-recoverable abort. cgx labels these `panic` on the call edge,
-  keeping them distinct from recoverable `Result` failure.
+- **`panic!` and friends** — non-recoverable abort. The extractor labels a *reference* `panic` here,
+  but no such edge reaches the graph. See below.
 
 Reading the result: an edge labeled `exception` in a Rust graph means "this call only occurs when a
 `?`-propagated error or an explicit `Err` arm is taken." It does **not** mean stack-unwinding or a
-thrown object. An edge labeled `panic` means the code aborts if that path is taken.
+thrown object.
+
+**The `panic` label never reaches the graph — two independent reasons**
+
+Do not query for it. `panic` is a real value in the edge-condition schema and in the precedence
+rule, and the Rust extractor is the only place that ever assigns it, but nothing survives to be
+queried, for two reasons that each suffice on their own:
+
+1. **The label is macro-only.** `is_panic_macro` matches exactly ten macro names — `panic`,
+   `unreachable`, `todo`, `unimplemented`, `assert`, `assert_eq`, `assert_ne`, `debug_assert`,
+   `debug_assert_eq`, `debug_assert_ne`. **`unwrap` and `expect` are not in it**, and appear nowhere
+   in the Rust frontend: they are ordinary method calls and are never labelled `panic` at all. The
+   most common Rust abort idioms are therefore invisible to this label even in principle.
+2. **The labelled reference points out of the tree.** For the ten macros it does match, the
+   extractor emits a reference to `core::panicking::panic_fmt` — an **external** symbol. Resolution
+   finds no in-tree definition, so the reference is recorded as unresolved and the edge is dropped
+   before the graph is written.
+
+Verified by running, on a fresh six-function fixture using `panic!`, `assert!`, `todo!`, `.unwrap()`
+and `.expect()`: the index reports `12 nodes, 5 edges, 5 unresolved` — the five unresolved refs are
+the macro references to `core::panicking::panic_fmt`, and **all five surviving edges are
+`always`**. `MATCH (a)-[r:CALLS]->(b) WHERE r.condition = "panic" RETURN a.name, b.name` returns
+**0 rows at exit 0**.
+
+This is why a recipe that filters on the `panic` condition returns a clean empty result: the empty
+answer is a modelling gap wearing the appearance of a safety finding, not evidence that no abort
+paths exist. To reason about Rust abort paths today, query the *callee* (`unwrap`, `expect`, a
+panicking helper) by name rather than the edge condition.
 
 Path-relative transience applies: a call that is only reachable via an upstream `exception` or `panic`
 edge is exception-transient relative to that path, even if its own edge condition is `always`. This is
@@ -66,10 +128,20 @@ computed at query time, not stored per edge — see `reference/mental-model.md`.
 
 **Dynamic dispatch — `dyn Trait`**
 
-Rust direct intra-module calls resolve at `certain` (scope-ref rule). Cross-module calls (import-ref or
-name-method rule) resolve at `possible` without SCIP enrichment. `dyn Trait` object calls produce a
-candidate set of known implementations, labeled `possible` in the Phase-1 syntactic graph (no SCIP). A
-closure stored in an unknown variable or passed as an untyped callback also resolves at `possible`.
+Rust direct intra-module calls resolve at `certain` (scope-ref rule). Cross-module calls resolve by
+candidate-set size, not by being cross-module: an `import-ref` binding with a single exported target
+and a `name-method` set with a single same-name method both band **`probable`** without any SCIP
+enrichment; either with several surviving candidates bands `possible`. A call that reaches the
+global bare-name (`name-arity`) fallback bands `possible` however many hits it has. `dyn Trait`
+object calls produce a candidate set of known implementations — `possible` in the Phase-1 syntactic
+graph whenever more than one implementation is in scope. A closure stored in an unknown variable or
+passed as an untyped callback also resolves at `possible`.
+
+Live on the self-index corpus (18,431 nodes, `reference/mental-model.md` §2.2) with **no SCIP**, `cgx explain --format json` returns
+edges banded `('import-ref', 'probable', 'scope_graph')`, `('name-method', 'probable',
+'scope_graph')`, `('name-method', 'possible', 'scope_graph')`, `('name-arity', 'possible',
+'name_syntactic')` and `('scope-ref', 'certain', 'scope_graph')` — five distinct bands, three of
+them above `possible`.
 
 Since: v0.2 — SCIP enrichment promotes `dyn Trait` resolution from `possible` (heuristic scope-graph
 rule) to `probable` (CHA/RTA-backed candidate set). Cross-module direct calls are promoted to `certain`
@@ -97,9 +169,12 @@ TypeScript uses exceptions for synchronous errors and rejected promises for asyn
 
 **Dynamic dispatch — structural typing and interface dispatch**
 
-Direct intra-file calls (scope-ref rule): `certain`. Cross-file calls and import-resolved references:
-`possible` without SCIP enrichment. Interface implementations resolved via structural name match:
-`possible` in the Phase-1 syntactic graph. Generic type parameter calls and Proxy traps: `possible`.
+Direct intra-file calls (scope-ref rule): `certain`. Import-resolved references band by candidate-set
+size like every other language — **`probable`** when the binding resolves to one exported target,
+`possible` when several survive — and a cross-file call that falls through to the bare-name
+(`name-arity`) fallback is `possible` regardless. Interface implementations resolved via structural
+name match follow the same singleton/multi split. Generic type parameter calls and Proxy traps:
+`possible`.
 
 Since: v0.2 — SCIP enrichment via `scip-typescript` promotes structural-match edges from `possible`
 (heuristic) to `probable` (type-resolved), and cross-file direct calls to `certain` where SCIP gives a
@@ -150,8 +225,9 @@ Go has no exceptions. Failure takes two forms:
 - **`panic()`** — non-recoverable abort unless an enclosing `defer` calls `recover()`. **cgx does not
   model this.** The Go adapter emits only `always`, `conditional`, `loop`, and `exception`; it recognises
   neither `panic()` nor `recover()`, so a call on a panic path carries whatever condition its enclosing
-  syntax gives it (usually `always` or `conditional`). Filtering `--edge-condition panic` on a Go repo
-  returns empty because the label is never produced, not because no abort paths exist.
+  syntax gives it (usually `always` or `conditional`). A `r.condition = "panic"` filter on a Go repo
+  returns empty because the label is never produced, not because no abort paths exist — the same
+  end state as Rust, reached without the Rust adapter's two-step loss.
 
 **Dynamic dispatch — interface satisfaction**
 
@@ -206,19 +282,30 @@ the callee may not be statically resolvable — see dispatch below.
 
 **Dynamic dispatch — duck typing and attribute lookup**
 
-Unique-name-match calls resolve at `probable`. Attribute calls on a type-annotated variable resolve at
-`probable`; untyped attribute calls, `__call__`, and metaclass-mediated dispatch resolve at `possible`.
-SCIP enrichment for Python is **not yet available** (`planned`).
+A plain call whose short name matches exactly one definition anywhere in the index resolves at
+**`possible`**, not `probable`: with no scope, import, or receiver corroboration it reaches the
+resolver's Tier-0 name(+arity) fallback, whose band is clamped to `possible` even for a lone
+surviving hit. Attribute calls on a type-annotated variable resolve at `probable`; untyped
+attribute calls, `__call__`, and metaclass-mediated dispatch resolve at `possible` when several
+candidates survive. SCIP enrichment for Python is **not yet available** (`planned`).
 
 **Closures and concurrency**
 
 Decorator chains are tracked as call sequences. `asyncio.create_task`, `threading.Thread.start`, and
 `concurrent.futures.submit` produce `spawns` edges. Concurrency/async hints are partial (`~`).
 
-**Known cross-language caveat:** the resolver's tiered name/arity fallback (`cgx-resolve/src/link.rs`)
-can over-report `probable` where `possible` is more honest for ambiguous global name collisions. This
-affects all five shipped languages, not just Python, and is a tracked backlog item, not a Python-specific
-defect.
+**Known cross-language caveat — read this before trusting a `probable` on a method call.** The
+resolver demotes a same-name candidate set to `possible` only when it has **more than one**
+member. A method call on a receiver whose type was never resolved in-repo, where exactly one
+same-named method exists anywhere in the index, therefore keeps `probable` — and `probable` at
+the scope-graph tier is precisely the value that lets the approximation contract report
+`direction: "exact"`. A single coincidental name match elsewhere in the tree can produce an
+answer that presents as exact. Duck typing makes Python meet this most often, but it affects all
+five shipped languages and is a tracked resolver backlog item, not a Python-specific defect.
+Check `rule` and `tier` in `cgx explain --format json` before relying on such an edge.
+
+The *other* half of this — the bare global name(+arity) fallback over-reporting `probable` for a
+singleton — was fixed and is no longer live: that band is clamped to `possible`.
 
 ---
 
@@ -257,7 +344,9 @@ The table below shows how the confidence ceiling decreases with tier and dispatc
 
 **Without SCIP enrichment** (the default for a plain `cgx index`), the Phase-1 graph applies:
 - Intra-file scope-ref calls (same file, unambiguous target): `certain`
-- All other calls (cross-file import-ref, name-method, dispatch): `possible`
+- Cross-file `import-ref` and dispatch `name-method` sets: `probable` when **one** candidate
+  survives, `possible` when several do
+- The global bare-name (`name-arity`) fallback: `possible`, however many hits
 
 **With SCIP enrichment** (`cgx index --scip <file>`, Since: v0.2):
 - `dyn Trait` / interface dispatch candidate sets: promoted to `probable`
@@ -265,14 +354,25 @@ The table below shows how the confidence ceiling decreases with tier and dispatc
 
 | Call pattern | Tier 1 (with SCIP) | Tier 1 (no SCIP) | Tier 2 | Tier 3 |
 |---|---|---|---|---|
-| Direct intra-file call (scope-ref) | `certain` | `certain` | `probable` | `possible` |
-| Direct cross-file call (import-resolved) | `certain` | `possible` | `probable` | — |
-| Virtual / interface dispatch (resolved candidate set) | `probable` | `possible` | `possible` | — |
+| Direct intra-file call (scope-ref) | `certain` | `certain` | `possible` | `possible` |
+| Direct cross-file call (import-resolved), **single** target | `certain` | **`probable`** | `possible` | — |
+| Direct cross-file call (import-resolved), several candidates | `certain` | `possible` | `possible` | — |
+| Virtual / interface dispatch, **single** surviving candidate | `probable` | **`probable`** | `possible` | — |
+| Virtual / interface dispatch, several candidates | `probable` | `possible` | `possible` | — |
+| Global bare-name (`name-arity`) fallback, any number of hits | see note | `possible` | `possible` | `possible` |
 | Dynamic dispatch / reflection / `eval` | `possible` | `possible` | `possible` | — |
 | Async callback / closure via unknown capture | `probable` | `possible` | `possible` | — |
 
-Every edge carries an explicit confidence label — cgx never silently drops uncertain edges. It labels them
-`possible` and lets the caller decide whether to include them (`--confidence possible|probable|certain`).
+**Note on the SCIP column.** SCIP relabeling is **upgrade-only and per-occurrence**: it keys on the
+SCIP symbol class and definition count at the call site, not on which rule produced the edge, and it
+rewrites `confidence`/`tier`/`rule` only when the SCIP-derived band is *higher* than the edge's
+current one. A `name-arity` edge therefore reaches `certain` where SCIP maps its site to a single
+definition and stays `possible` where SCIP has nothing to say. Read `rule` in `cgx explain --format
+json`: `scip-occurrence` means SCIP set the band; anything else means it did not.
+
+Every edge carries an explicit confidence label — cgx never silently drops uncertain edges. It labels
+uncertain ones `possible` or `probable` and lets the caller decide whether to include them
+(`--confidence possible|probable|certain`).
 
 ---
 
@@ -304,11 +404,16 @@ with the <100ms warm startup target.
 1. **Which tier is this language?** — sets the confidence ceiling.
 2. **Is the edge condition `exception` in a Rust or Go codebase?** — means `Result`-branch or
    `if err != nil`, not an exception object. See `reference/mental-model.md` for the `exception` label.
-3. **Is the edge `possible`?** — the callee was not statically resolved. In Tier 1 this is `dyn Trait`,
-   closure-via-capture, or an untyped callback. Treat as a candidate, not a confirmed call.
-4. **Was the index built with `--scip`?** — without SCIP enrichment, cross-file calls and dispatch
-   candidate sets are `possible` regardless of call type. With SCIP, dispatch candidate sets are
-   promoted to `probable` and single-target direct calls to `certain`. The `--scip` flag has been
-   available since v0.2.
-5. **Is the call exception-transient on this path?** — computed at query time. Use edge-condition filters
+3. **Is the edge `possible`?** — the callee was not narrowed to one candidate. In Tier 1 this is a
+   multi-candidate `dyn Trait` set, closure-via-capture, an untyped callback, or the bare-name
+   fallback. Treat as a candidate, not a confirmed call.
+4. **Is the edge `probable`, and which rule produced it?** — `probable` without SCIP means a
+   *singleton* candidate set (`import-ref` or `name-method`), which is the ordinary cross-file case
+   and not a sign SCIP ran. A singleton `name-method` carries no in-repo receiver type, so read
+   `rule` and `tier` in `cgx explain --format json` before trusting it (see the Python caveat above).
+5. **Was the index built with `--scip`?** — SCIP is upgrade-only: it promotes multi-candidate
+   dispatch sets to `probable` and single-target direct calls to `certain`, and leaves everything it
+   cannot map alone. `rule: "scip-occurrence"` is the tell. The `--scip` flag has been available
+   since v0.2.
+6. **Is the call exception-transient on this path?** — computed at query time. Use edge-condition filters
    or the `ANY`/`NONE` CQL quantifiers. See `reference/mental-model.md`.

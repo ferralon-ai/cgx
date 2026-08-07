@@ -171,18 +171,38 @@ cgx query 'MATCH (a)-[:DATA_FLOW]->(b) WHERE a.fqn = "MyModule::my_fn::val#1" RE
 **CQL rules (v0.3):**
 - MATCH must contain at least one relationship — `MATCH (n) RETURN n` is a plan error (exit 2).
 - Always bound multi-hop traversals: `[:CALLS*4]` not `[:CALLS*]` (unbounded hangs).
-- **Do not use `MATCH path = (a)-[:CALLS*N]->` with N > 1.** Variable-length path binding with
-  `RETURN path` or `ANY(r IN relationships(path) WHERE ...)` hangs on large indices. Use `cgx paths`
-  for path enumeration; use a flat `[:CALLS*N]` (without the `path =` variable) for hop-count
-  filtering.
+- **Be wary of `MATCH path = (a)-[:CALLS*N]->` with N > 1.** Variable-length path binding with
+  `RETURN path` or `ANY(r IN relationships(path) WHERE ...)` materializes the whole path set before
+  any predicate or `LIMIT` applies, so the cost tracks the anchor's fan-out rather than the row
+  count you asked for. Measured on a 17,221-node / 29,735-edge index with `LIMIT 5` and a single
+  anchored endpoint: `CALLS*6` took ~1s from a 3-outbound-edge anchor, ~26s at out=98, ~45s at
+  out=130, and did not finish in 120s from one 92-outbound anchor. Check the anchor first with
+  `cgx symbols --rank outbound --top 10`. Use `cgx paths` for path enumeration between two named
+  endpoints, and a flat `[:CALLS*N]` (no `path =` variable) for hop-count filtering.
+  `recipes/reachability.md`, `recipes/failure-paths.md` and `recipes/taint.md` all build recipes on
+  this construct — the constraint applies there too.
 - String literals use double quotes; single quotes inside a query are a parse error.
 - Supported node properties: `fqn`, `name`, `kind`, `file`, `line`. Properties like `visibility`,
   `module`, `trust_zone` are not supported — filtering on them is a plan error
   (exit 2, `unknown node property '<x>'`), not an empty result.
 - `DATA_FLOW` edges are supported (v0.3) and present by default. On an index built with
   `cgx index --no-dataflow`, `DATA_FLOW` queries return empty results.
-- Deferred (exit 2): `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node props,
-  `MUST PASS THROUGH`, `AVOIDING`. These are plan or parse errors in v0.3.
+- Deferred (exit 2): `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node props are
+  plan errors. `MATCH ALL … MUST PASS THROUGH/AVOIDING` is also a **plan** error, rejected at the
+  `ALL` token — the parser recognises the keywords, so re-spelling will not help.
+- **Every answer ends with two lines you should read, not strip.** Human output from `query`,
+  `callers`, `callees`, `reaches`, `paths`, `unused` and `flows-*` carries an `approximation:` line
+  and then a `freshness:` line, in that order, as the last two lines; `--format json` carries the
+  same two as top-level `approximation` and `freshness` objects. `search` and `symbols` carry
+  `freshness` only; `explain` likewise; `cgx diff` and `cgx doctor` carry neither; `cgx coupling`
+  carries `approximation` and no `freshness`, because it never opens the index. An API-surface
+  audit that reports "no in-repo callers" without checking that the contract said `exact` is
+  reporting the walk, not the codebase.
+
+**Adjacent, different axis:** `cgx coupling <BASE> <HEAD>` measures *file-level* co-change from
+committed git history — which files move together over time, independent of the call graph. It
+answers a coupling question this recipe's call-graph queries cannot, and vice versa. See
+`recipes/vcs-diffs.md`.
   See `reference/query-language.md` for the full list.
 
 **Reading the result:** Edge condition and confidence on each hop affect interpretation — an

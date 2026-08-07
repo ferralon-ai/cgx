@@ -50,13 +50,21 @@ cgx query '
 
 **Personas:** SSE · **Status:** partial — caller enumeration is answerable-today; `count(distinct ...)` and `collect(distinct ...)` inside aggregates are deferred (v0.3 parse error)
 
-Extracting a module to a microservice severs all direct in-process call edges to it and replaces them with network calls. To plan this extraction, an engineer needs to know every module that calls into `PaymentProcessor` — these modules will require changes to switch from direct calls to client library calls.
+Extracting a module to a microservice severs all direct in-process call edges to it and replaces them with network calls. To plan this extraction, an engineer needs to know every module that calls into `PaymentProcessor` — these modules will require changes to switch from direct calls to client library calls. Call-graph callers are the *structural* half of that plan; the *historical* half — which files tend to get touched in the same commit as `PaymentProcessor`'s, whether or not a call edge connects them (a shared migration script, a feature-flag file, deployment config) — comes from `cgx coupling`, which is worth pulling before scoping the extraction, not after.
 
 **The query**
 
 ```cgx
 cgx callers PaymentProcessor --repo ./ --depth 5 --format json
 ```
+
+For the historical half, walk the commit range that matters (a release window, or the module's whole lifetime) and look for files that co-change with `payment_processor.rs` above the noise floor:
+
+```cgx
+cgx coupling v1.0.0 HEAD --repo ./ --min-cochanges 3
+```
+
+This reads committed history only — no index, no working tree — so it runs even before the module is indexed. A file that co-changes with `payment_processor.rs` at a high rate but never appears in the `cgx callers` output is exactly the case a pure call-graph analysis misses: something outside the call graph (a test fixture, a config schema, an IaC file) that extraction will also have to touch.
 
 The CQL form below uses `count(distinct ...)` and `collect(distinct ...)` inside aggregates, which are not supported in v0.3 (parse error, exit 2). `DISTINCT` inside aggregate functions is deferred; use `RETURN DISTINCT` at the top level instead.
 
@@ -79,8 +87,9 @@ cgx query '
 | `RETURN distinct caller.file AS module_file` | Group by file (module) rather than by individual function — gives the list of modules, not individual call sites. |
 | `count(distinct callee.name) AS distinct_entry_points_called` | How many different `PaymentProcessor` methods this module calls. A module that calls many methods has a deeper coupling and will require more migration work. — deferred in v0.3 (exits 2): `count(distinct ...)` inside aggregate functions is not supported; use `RETURN DISTINCT` at the top level instead. |
 | `collect(distinct callee.name) AS called_methods` | The specific methods called, for the migration checklist. — deferred in v0.3 (exits 2): `collect(distinct ...)` inside aggregate functions is not supported. |
+| `--min-cochanges 3` | Noise floor: only report file pairs that changed together at least 3 times in the range — a single shared commit (a repo-wide rename, say) is not a coupling signal. |
 
-**Reading the result** — Each row is a module (file) and the `PaymentProcessor` methods it depends on. Sort by `distinct_entry_points_called` descending to prioritize the highest-coupling modules for migration planning.
+**Reading the result** — Each row from `cgx callers`/the CQL form is a module (file) and the `PaymentProcessor` methods it depends on; sort by `distinct_entry_points_called` descending to prioritize the highest-coupling modules for migration planning. Each row from `cgx coupling` is a file pair with `cochanges`/`changes_a`/`changes_b` counts and carries its own `approximation:` line (file-granularity, bounded to the given rev range, renames not tracked as continuity) — read it as file-level co-change, not a same-symbol claim: two files can co-change because unrelated symbols in each were touched in the same commit. Cross-reference the two: a caller with high co-change *and* a direct call edge is a confirmed dependency; a high co-change file with no call edge is the hidden coupling extraction planning would otherwise miss.
 
 ---
 

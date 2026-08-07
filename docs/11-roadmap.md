@@ -2,7 +2,6 @@
 
 **Status:** Draft  
 **Audience:** Engineering team, stakeholders  
-**Working name:** `cgx` (placeholder; see `README.md`)  
 **Cross-references:** `docs/01-vision-and-principles.md`, `docs/02-personas-and-questions.md` (persona question themes), `docs/03-code-graph-model.md` (GM-), `docs/04-dataflow-and-provenance.md` (DF-), `docs/05-queries.md` (Q-), `docs/07-interfaces.md` (IF-), `docs/09-architecture.md`, `docs/10-landscape.md`
 
 ---
@@ -49,14 +48,14 @@ The ordering prioritizes:
 - Blob-OID content-addressed index shards (see `docs/06-indexing-and-vcs.md`)
 - Auto-index on first query if no index exists
 - `cgx index ./` — explicit index/update command
-- `cgx prune ./` — remove stale entries
+- `cgx prune ./` — remove stale entries *(**not shipped**: no `prune` subcommand exists; see the Phase 1 status note)*
 
 **CLI subcommands (Layer 1):**
-- `cgx callers <symbol> <path>` (Q-1)
-- `cgx callees <symbol> <path>` (Q-2)
-- `cgx paths --from <A> --to <B> <path>` with `--exclude-edge-condition` (Q-3)
-- `cgx unused <path>` with `--kind` (Q-4)
-- `cgx explain <symbol> <path>` (Q-6)
+- `cgx callers <symbol> --repo <path>` (Q-1)
+- `cgx callees <symbol> --repo <path>` (Q-2)
+- `cgx paths <from> <to> --repo <path>` (Q-3)
+- `cgx unused --repo <path>` with `--kind` (Q-4)
+- `cgx explain <symbol> --repo <path>` (Q-6)
 - `--depth N`, `--confidence`, `--at <ref>`, `--format` flags (IF-2, IF-3, IF-7)
 - TTY-aware output defaults (IF-2)
 - Exit-code contract 0/1/2/3/4 (IF-4); vacuity guard (exit 4) on `--assert-empty`
@@ -64,13 +63,13 @@ The ordering prioritizes:
 **MCP STDIO server (basic surface):**
 - `cgx mcp` starts STDIO server
 - Tools: `callers`, `callees`, `paths`, `unused`, `explain` (IF-11 through IF-15)
-- Resources: `cgx://symbols/{root}`, `cgx://schema/{root}` (IF-16)
+- Resources: `cgx://symbols/{root}`, `cgx://schema/{root}` (IF-16) *(**not shipped**: the server implements `initialize`, `tools/list`, and `tools/call` only; a `resources/list` call returns `method not found`)*
 - `structuredContent` per 2025-06-18 MCP spec (IF-17)
 - Pagination: `cursor` + `has_more` (IF-18)
 - **Dirty-overlay correctness (IX-3 MCP overlay)**: post-edit queries via MCP reflect the edit; `include_dirty` defaults true on all MCP tools; per-call content-addressed overlay never written to persistent index
 
 **Output formats:**
-- `text`, `tree`, `json`, `jsonl`, `csv` (IF-3)
+- `human` (TTY-friendly text, including the forest/tree view for `callers`/`callees`/`reaches`), `json`, `sarif` (IF-3)
 
 ### Exit criteria
 
@@ -93,6 +92,28 @@ Phase 1 is complete when:
 - Impact / Blast Radius (Q14–Q25): core callers/callees, basic blast radius
 - Dead / Unused Code (Q46–Q53): basic entrypoint-scoped unused
 - AI-Agent-Specific (Q68–Q75): MCP tool surface functional
+
+### Phase 1 status: shipped, with three deliverables retired
+
+Phase 1 shipped. Three items above did **not** land and are not merely late — each was
+superseded by something the implementation does differently:
+
+- **`cgx prune`** — no `prune` subcommand exists. Index growth is bounded by content
+  addressing instead: a blob's fragment is shared by every tree that contains that blob,
+  so a branch switch adds only the fragments whose content is new. Explicit GC has no
+  caller pressure yet. `prune --branches` (Phase 4) is unshipped for the same reason.
+- **MCP resources** (`cgx://symbols/{root}`, `cgx://schema/{root}`, IF-16) — the server
+  implements exactly three methods (`initialize`, `tools/list`, `tools/call`);
+  `resources/list` and `prompts/list` both return JSON-RPC `-32601 method not found`.
+  The tool surface carries the same information with pagination, which is what agents
+  actually call.
+- **The trailing positional `<path>` argument** — every query subcommand takes
+  `--repo <path>`, never a positional path. The forms above are corrected; older
+  examples elsewhere in the tree that use a positional path do not run.
+
+Also different from plan, in the other direction: the MCP tool surface is much wider than
+the five listed above — `reaches`, `search`, `symbols`, `flows_to`, `flows_from`,
+`graph_query`, and `coupling` were all added ahead of their planned phases.
 
 ---
 
@@ -222,11 +243,19 @@ indirect-call refs; closure sig-sets exist on the TypeScript frontend only).
 ### Deliverables
 
 **Graph diff (Q-7, Q-16):**
-- `cgx diff --base <ref> --head <ref> ./` — computes added/removed edges between two graph snapshots
-- `--calls-to <symbol>` filter — show only diff edges that reach a given target
+- `cgx diff <BASE> <HEAD> --repo <path>` — computes added/removed/changed edges and nodes between two graph snapshots
+- `--from` / `--to` glob filters — narrow the diff to edges whose source or destination FQN matches
 - `--edge-condition exception` filter — show only exception-path edge changes
+- `--kind <edge-kind>` filter — narrow to one or more of the 19 diffable edge kinds
+- `--path-added` — the structural PR gate: report a call/dataflow reachability path from `--from` to `--to` that exists at head and not at base
+- `--calls-to <symbol>` filter — show only diff edges that reach a given target
 - `--taint-class <class>` filter — show only diff edges on paths from sources of the specified class
 - `--at <ref>` on all subcommands (Phase 1 lays groundwork; full determinism verified here)
+
+**Co-change coupling (Q-54..Q-61 theme):**
+- `cgx coupling <BASE> <HEAD> --repo <path>` — for every pair of files changed in the same commit within an explicit rev range, the co-change count and each file's own change count
+- `--min-cochanges`, `--limit`, `--max-files-per-commit` knobs, each echoed into the answer so a report is self-describing
+- Reads committed git history only: no index, no parse, no language dependency
 - **IX-9 — Edge age and author attribution**: per-edge `introducing_commit` and `introducing_author` attributes populated from `git log`; enables Q99 (security diff gate: new source→sink paths on this branch) and Q107 (branch-local enum-variant gap detection)
 - **Q-25 — Dependency and CVE reachability queries**: `cgx query --cve <CVE-ID> ./` pattern using GM-14 dependency edges (from Phase 2) to resolve which entrypoints can reach the vulnerable function, with taint-source class on the path and cgx confidence tiers
 
@@ -254,6 +283,34 @@ indirect-call refs; closure sig-sets exist on the TypeScript frontend only).
 - Temporal / VCS (Q54–Q61): now addressable
 - Failure-Path Behavior (Q37–Q45): combined with VCS attribution ("which commit introduced this exception-path call")
 - AI-Agent-Specific: post-edit graph diff verification (Q20, Q60)
+
+### Phase 4 status: graph diff and coupling shipped; branch lifecycle did not
+
+**Shipped:**
+
+- **`cgx diff <BASE> <HEAD>`** with the full post-filter set (`--added`/`--removed`/`--changed`,
+  `--kind`, `--edge-condition`, `--from`, `--to`, `--newer-than`, `--require-anchor-match`) and
+  the `--path-added` structural gate, which exits 1 when a new path is found and 0 when clean.
+- **Path-shaped diff output** — `--path-added` additionally emits `dot`, `mermaid`, and `d2`.
+  These are deliberately *not* offered on the full diff: an added path is a graph walk, a full
+  diff is an edge/node bucket set. `sarif` is accepted by neither diff mode and exits 2.
+- **IX-9 edge age and author attribution** — `introducing_commit`, `introducing_author`, and
+  `author_time` are populated via `gix` blame on call-site lines, surfaced in
+  `--path-added --format json`. Not yet surfaced in any other output mode.
+- **`cgx coupling`** — file-level co-change over an explicit rev range, on both CLI and MCP.
+
+**Not shipped:** `--calls-to` and `--taint-class` on `diff`; `cgx prune --branches` and
+branch-lifecycle GC; Q-25 CVE reachability.
+
+**Two limits worth stating plainly, because both are silent:**
+
+- **`cgx diff` compares ref *tips*, not the merge-base.** A gate run on a branch whose fork
+  point trails `main` attributes paths introduced *on `main`* to the branch under review.
+  `BlameRepo::merge_base` exists and is tested but has no non-test caller.
+- **`cgx coupling` on a shallow clone returns an *empty* answer, not a partial one, at exit 0** —
+  including for a rev range that sits entirely inside the fetched depth. `actions/checkout`
+  defaults to `fetch-depth: 1`, so a CI job gating on exit code alone reads "no coupling here"
+  from a clone that simply has no history. Fetch full history before running it.
 
 ---
 
@@ -296,6 +353,41 @@ indirect-call refs; closure sig-sets exist on the TypeScript frontend only).
 **Persona question themes addressed:**
 - AI-Agent-Specific (Q68–Q81): full coverage
 - Threat Modeling / DFD (Q82–Q85): structured output for automated triage
+
+### Phase 5 status: partially shipped, and the agent-honesty half arrived early
+
+**Shipped:**
+
+- **`graph_query` MCP tool (IF-10)** — the full Cypher subset over MCP, routing to `cgx_cql::run`,
+  the same engine `cgx query` drives. A `RETURN path` query surfaces a `paths` channel; a tabular
+  query surfaces `columns`/`rows`; parse, plan, and eval rejects map to an actionable
+  `invalid_params` error rather than to a wrong answer.
+- **Pagination (IF-18)** — `max_results` (default 20), `cursor`, `has_more` on every list-shaped
+  tool.
+- **`structuredContent` plus a `content` text mirror (IF-17)** on every `tools/call` response.
+
+**The answer contract — not in the original phasing, and it belongs here.** The capability this
+phase was really reaching for is *an agent being able to trust an answer without re-deriving it*.
+Two mechanisms deliver it, on both surfaces, and neither is MCP-only:
+
+- **The approximation contract (A3/A4)** states per answer which direction it can be wrong —
+  `over`, `under`, `over_under`, or `exact` — with machine-readable reasons derived from what the
+  resolution and the walk actually did, and, for a *negative* answer, the scope that was searched.
+  A "no path" result now carries the edge kinds, confidence floor, and depth bound it was proved
+  under, so a consumer can gate on the negative together with its scope.
+- **The index-freshness envelope** states which graph the answer was computed over and whether
+  the tree on disk has moved away from it. It carries divergence, never a timestamp — an index
+  built ten seconds ago against a rewritten tree is stale, one built last week against an
+  untouched tree is fresh, and a `now()`-derived field would break the determinism guarantee.
+
+Neither is universal, which is itself part of the contract: see the coverage table in
+[14 — Implementation Status Matrix](14-implementation-status-matrix.md) for exactly which
+surfaces carry which, and [09 — Architecture](09-architecture.md) AR-13 for the mechanism.
+
+**Not shipped:** `resource_link` responses for large result sets; `outputSchema` declarations;
+MCP prompts (`prompts/list` returns `method not found`); resource subscriptions and
+`notifications/resources/updated`; a `max_tokens` bound on `graph_query`. The `max_results`
+cap of 200 is not enforced — only the default of 20 exists.
 
 ---
 
@@ -365,11 +457,11 @@ The following risks are identified across all research findings. Each phase that
 
 **Source.** `docs/10-landscape.md`, researcher-4 findings.
 
-**Description.** The `stack-graphs` Rust crate was archived by GitHub on September 9, 2025. No upstream maintenance. `cgx` does not depend on `stack-graphs` as a live dependency. The architecture (`docs/09-architecture.md`) selects `tree-sitter-graph` (still actively maintained by the tree-sitter organization) for scope graph authoring. The compositional file-level graph design is adopted as architecture without taking the archived crate as a dependency.
+**Description.** The `stack-graphs` Rust crate was archived by GitHub on September 9, 2025. No upstream maintenance. `cgx` does not depend on `stack-graphs`. The compositional file-level graph design is adopted as architecture without taking the archived crate as a dependency.
 
-**Mitigation.** Use `tree-sitter-graph` directly. Implement scope graph rules per language using the tree-sitter-graph DSL. The algorithm from the stack-graphs paper (Creager/GitHub, arXiv 2211.01224) is usable without the crate.
+**Mitigation — retired; the risk closed differently than planned.** The recorded mitigation was to author scope-graph rules in the `tree-sitter-graph` DSL instead. **That was never adopted**: `tree-sitter-graph` is not a dependency of this workspace either. Resolution is a hand-rolled engine in `crates/cgx-resolve` — a global definition index, an import graph with re-export chasing, and a five-step resolution ladder (docs/09 AR-4). The algorithm from the stack-graphs paper (Creager/GitHub, arXiv 2211.01224) informs the model as prior art only. The risk is closed: there is no archived-crate exposure and no DSL-authoring cost per language, at the price of owning the resolution code outright.
 
-**Phase exposure.** Phase 1 (parsing and graph extraction design).
+**Phase exposure.** Closed at Phase 1.
 
 ---
 
@@ -379,9 +471,11 @@ The following risks are identified across all research findings. Each phase that
 
 **Description.** If SQLite is used as the query layer (the `--sql` alternative path), recursive CTEs for transitive closure can be slow on large graphs. SQLite does not have a native graph traversal engine; recursive CTEs are O(n²) without careful indexing.
 
-**Mitigation.** The primary query path uses an in-process graph engine (Cypher-subset evaluator or `ascent` Datalog) over `petgraph` or equivalent in-memory structures. SQLite is an optional `--sql` escape hatch, not the primary query engine. Index the `call_edges` table on `(caller, callee)` and `(callee, caller)`. For large codebases, cap recursive CTE depth at the `--depth` flag value.
+**Mitigation — held, by a simpler route than planned.** No recursive CTE is on any query path. `crates/cgx-query` walks a loaded in-memory `GraphView` with hand-written Rust graph algorithms; SQLite is a fact store, and `--sql` against the `v_*` views is an inspection escape hatch, not the engine. The mitigation as recorded named `ascent` Datalog over `petgraph`; **neither crate is a dependency** (docs/09 AR-5). Direct walks were chosen not for speed but because path-relative transience (GM-4) and spawn-domain reset (GM-9.2) are per-walk state that neither a CTE nor a relational fixed point can express.
 
-**Phase exposure.** Phase 1 (storage and query design), Phase 3 (graph query tool).
+The residual risk moved rather than vanished: it is now graph *load* time and per-query traversal cost on very large graphs, since nothing is materialized. See docs/09 AR-6 "Known scaling limits."
+
+**Phase exposure.** Phase 1 (storage and query design), ongoing as graph size grows.
 
 ---
 
@@ -471,9 +565,12 @@ The following risks are identified across all research findings. Each phase that
 
 ### Risk 10: Proc-macro blind spot in Rust indexing
 
-**Source.** ADR-07 (Phase-0 schema-freeze decisions); AR-3 (docs/09-architecture.md).
 
-**Description.** `syn` parses Rust source text but does not expand proc macros. Code
+
+**Description.** `cgx` runs no macro expander. (The Rust adapter parses with
+`tree-sitter-rust`; an earlier draft of AR-3 named `syn` here, but `syn` is not a
+dependency of any `cgx` crate — it appears in `Cargo.lock` only under derive-macro
+build tooling.) Code
 generated by proc macros (derive bodies, attribute-macro rewrites, function-like
 proc-macro output) is not indexed at Phase 1. Call edges into or out of generated
 code are therefore absent. Framework constructs that rely on generated bodies (e.g.
@@ -546,7 +643,7 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | Q-31 | Framework-aware queries | core-extension | Phase 3 | Phase 3 | Requires GM-15 metadata facts + GM-17 mediated edges + GM-18 reflection; metadata-guard-aware must-pass-through; framework-entrypoint reachability; tainted-reflection dispatch |
 | LS-8 | Per-language primitive harvest table | schema-room | Phase 1 (spec) | Phase 1 (basic), Phase 2 (refined) | Per-language mapping of implicit call kinds and resource-pair syntax; companion to LS-7; serves as the lowering reference for GM-16 and GM-19 |
 | docs/12 FW-1..6 | Framework pack design, semantic classes, per-framework mappings, mediated edges, build variance, reflection packs | schema-room | Phase 1 (schema) | Phase 3 (pack evaluation) | All sections `schema-room` per docs/12; pack config schema and metadata-fact representation reserved in Phase 1; built-in pack evaluation and user-extensible pack loading in Phase 3 |
-| `--sql` (Q-10) | SQL escape hatch (unstable, view-based — Q-10) | core-extension | Phase 1 | Phase 1 | `--sql` queries execute against versioned views only (`v_symbols`, `v_call_edges`, `v_call_sites`, `v_provenance`, `cgx_meta`); physical tables are not API; `view_schema_version` available via `cgx_meta` |
+| `--sql` (Q-10) | SQL escape hatch (unstable, view-based — Q-10) | core-extension | Phase 1 | Phase 1 | Scoped to the versioned views only — `v_symbols`, `v_call_edges`, `v_data_flow_edges`, `v_call_sites`, `v_provenance`, `cgx_meta`; physical tables are not API; `view_schema_version` available via `cgx_meta`. **Not shipped, and the flag misreports itself:** `--sql` is hidden, and its help says it "always exits 2." On `query` it does — a hard usage error before any work. On every other subcommand carrying it, it is accepted and silently discarded at exit 0. Reaching the views today means opening `.cgx/`'s SQLite directly |
 | GM-5.3 `unexpanded-macro` | Cut-marker for proc-macro blind spot | core-extension | Phase 1 | Phase 1 | Emitted from Phase 1 at every proc-macro invocation site; gap is queryable and counted by `cgx doctor` |
 | GM-21 | `calls:super` edge kind | core-extension | Phase 1 | Phase 1 | Statically-bound delegation to a named ancestor's body, bypassing virtual dispatch; single resolved target + `bypassed_override` attribute; re-classification of existing call edge |
 | GM-22 | Method-resolution order (linearization) | schema-room | Phase 1 | Phase 3 | Ordered MRO per type; language-specific linearization algorithms (Python C3, Scala, Ruby ancestry, C++ virtual-base); `resolves-to` derived edge; reserve now to avoid schema migration |
@@ -555,7 +652,10 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | GM-25 | Abstract-method fulfillment map | core-extension | Phase 1 | Phase 3 | `fulfills` derived edge from concrete method to abstract declaration; `unfulfilled_abstract` derived predicate per concrete type; derived from `is_abstract` + `overrides` + MRO |
 | Q-32 | Override-contract drift queries | core-extension | Phase 3 | Phase 3 | Exception-contract widening, dropped-base-guard, field-footprint drift; composed from `overrides` + exception edges + corrected Q-20 ∀-path must-pass-through; gated on corrected Q-20 |
 | GM-26 | Transitive `may-panic` effect | schema-room | Phase 1 (schema) | Phase 2/3 | Extends GM-12 effect lattice with one value (`may-panic`); `own_effects`/`transitive_effects` attributes reserved; populated after edge-confidence upgrade in Phase 2 and transitive-closure recompute |
-| Q-33 | Recursion / SCC / architecture-cycle queries | core-extension | Phase 1 (schema) | Phase 2 | `scc_id`/`scc_size` derived node attributes from petgraph `kosaraju_scc` (already in stack); exposes SCC membership, mutual-recursion detection, and architecture-cycle queries |
+| Q-33 | Recursion / SCC / architecture-cycle queries | core-extension | Phase 1 (schema) | Phase 2 | `scc_id`/`scc_size` derived node attributes. The SCC machinery is in the stack — an ordered, iterative Tarjan implementation in `crates/cgx-resolve/src/graph_alg.rs`, shared by the effect-closure and IFDS summary passes — but it is **not** `petgraph`'s `kosaraju_scc`; `petgraph` is not a dependency. No node attribute exposes SCC membership yet |
+| A3/A4 | Per-answer approximation contract and negative-completeness scope | core-extension | Phase 5 | Phase 5 | Direction (`over`/`under`/`over_under`/`exact`) + machine-readable reasons + `NegativeScope` on negative answers + a modeled-boundary carve-out that makes a bare `exact` impossible. Cross-surface (CLI and MCP), computed in `crates/cgx-query/src/contract.rs`. Carried by traversal answers; `explain`/`search`/`symbols` skip it by design |
+| Freshness envelope | Per-answer index-freshness divergence | core-extension | Phase 5 | Phase 5 | Indexed tree, HEAD tree, three-valued `matches_head`, dirty-file count. Divergence-based, never timestamped, so AR-10 determinism holds by construction. `null` means "not established", never zero. `coupling` deliberately carries none — it never opens the index |
+| Coupling | File-level co-change over a rev range | core-extension | Phase 4 | Phase 4 | `cgx coupling BASE HEAD` on CLI and MCP. Index-free and language-independent; file-granularity over-approximation and the rev-range boundary both ride in its own contract via a history-specific modeled boundary. Symbol-level coupling would require indexing every historic tree and is a separate capability |
 
 **Rationale for schema-room items appearing early.** GM-9, GM-10, GM-11, GM-13,
 GM-14, and LS-7 are marked `schema-room` because their graph representation (the

@@ -32,6 +32,24 @@ cgx unused --repo /path/to/repo     # explicit repo root
 
 **`unused` has no name/pattern filter.** There is no `--name`, `--path-filter`, `--type`, or glob argument. To find unused symbols matching a name or path pattern, run `unused` first, then filter its output with `grep` or `jq`. See the two-step recipes below.
 
+**A bare `cgx unused` is dominated by SSA value nodes, not functions.** Dataflow is on by default, so the graph contains a `<fn>::<local>#<ver>` variable node for every local, and almost none of them has an incoming call edge. On the shipped `fixtures/rust-sample` the default answer is 462 symbols:
+
+```
+$ cgx unused --format json | jq -r '.results[].kind' | sort | uniq -c | sort -rn
+ 273 variable
+ 102 function
+  36 method
+  18 type
+  18 module
+  13 lambda
+   1 macro
+   1 constant
+```
+
+**Always pass `--kind`** for a dead-code review. An `unused` example that shows only functions was produced with `--kind function` or against a `--no-dataflow` index.
+
+**`--depth` on `unused` is a trap, and `--depth 0` is the worst setting.** `unused` defaults to an *unbounded* entrypoint walk; passing `--depth 0` bounds it to depth 0, so almost nothing is reachable and almost everything is reported unused. On the same fixture: 479 symbols at `--depth 0` versus 462 unset — `--depth 0` **inflates** the dead-code set with false positives. The CLI's `--help` text calls `0` unlimited; that is true only for `cgx paths`. Leave `--depth` off.
+
 ---
 
 ## Recipes
@@ -211,6 +229,18 @@ The CQL form for Q50/Q53 parses but fails at the plan step (exit 2) because `sin
 **Dynamic dispatch and false positives.** `unused` is relative to the indexed call graph. A symbol reachable only via a `dyn Trait` vtable may appear as unused because the edge is `possible`-confidence or absent entirely. SCIP enrichment (v0.2+) sharpens `certain`/`probable` edges for CHA/RTA-resolved dynamic dispatch. Manually verify any symbol before deletion if its type implements a trait used as a trait object.
 
 **The indexed graph is the scope.** `unused` does not know about external callers — library consumers in other repositories, FFI callers, or dynamically-loaded plugins. A public symbol with no in-graph callers is dead to THIS codebase's index; it may still be part of a public API surface.
+
+**Read `approximation` — it answers "really dead, or just externally called?" directly.** `unused` is an inherently negative claim, so it *always* carries both a reason list and a `scope`. On the shipped fixture:
+
+```
+$ cgx unused --format json | jq -c '.approximation'
+{"direction":"under","modeled_graph":"…","reasons":[{"code":"unresolved-external-calls","detail":"29 call(s) in the searched region resolved to no in-repo target (external/unindexed callee; no SCIP) and could not be followed","direction":"under"}],"scope":{"confidence_floor":"possible","max_depth":null,"searched_edge_kinds":["calls","calls-virtual","calls-closure","calls-callback","calls-async","calls-indirect"]}}
+```
+(Elided: the `modeled_graph` sentence, shown in full in `reference/output-and-exit.md`.)
+
+Two codes matter most here and they are *different facts*, routinely conflated: `unresolved-external-calls` counts references that produced **no edge at all** (a call whose short name matches nothing in the index), while `unresolved-call` counts a cut-marked edge on the frontier. A non-zero count of either means the walk could not follow calls that might reach a symbol on your list — so the list is an over-report of deadness, quantified. `dynamic-dispatch` and `reflective-dispatch` reasons say the same thing for vtable and reflection sites. A run with `"reasons": []` is the only one where the list is complete within the modeled graph.
+
+`scope` tells you what the walk covered: `confidence_floor: "possible"` means no confidence filtering was applied, and `max_depth: null` means the entrypoint walk was unbounded. Both change if you pass `--confidence` or `--depth`, and both weaken the claim.
 
 **No `prune`/`clean` subcommand.** To rebuild the index after removing dead code: `cgx index .`
 

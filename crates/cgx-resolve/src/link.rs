@@ -369,7 +369,7 @@ fn resolve_ref(
 
     // --- Step 3: virtual / duck-typed dispatch — same-name method candidate set. ---
     if virtual_receiver {
-        let hits = method_candidates(table, last);
+        let hits = method_candidates(table, last, &file.lang);
         if !hits.is_empty() {
             emit_candidate_set(
                 edges,
@@ -1172,12 +1172,17 @@ impl ImportBinding {
 }
 
 /// Same-name method candidates for virtual dispatch (GM-8.4): all `Method` (and
-/// abstract trait-method) defs whose short name matches.
-fn method_candidates(table: &SymbolTable, name: &str) -> Vec<DefEntry> {
+/// abstract trait-method) defs whose short name matches, restricted to the call
+/// site's language — a bare-name match against a def in a *different* language is
+/// never a real virtual call (same reasoning as the Step-4 `name-arity` filter:
+/// genuine cross-language calls are FFI and carry their own `ViaFfi` cut marker,
+/// stamped by the frontend independent of this dispatch path).
+fn method_candidates(table: &SymbolTable, name: &str, lang: &str) -> Vec<DefEntry> {
     table
         .defs_by_short(name)
         .iter()
         .filter(|d| matches!(d.kind, SymbolKind::Method | SymbolKind::Function))
+        .filter(|d| d.lang == lang)
         .cloned()
         .collect()
 }

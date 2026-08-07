@@ -287,6 +287,22 @@ fn below_floor_reason(floor: Confidence, count: usize) -> ApproxReason {
     }
 }
 
+/// The `--max-candidates` fan-out cap dropped edges from the searched frontier:
+/// an *under*-completeness fact (the answer may now miss a real caller/callee that
+/// lived in a large over-approximated candidate set). Counts only edges that would
+/// otherwise have passed the confidence floor — the below-floor exclusion is
+/// reported separately, so the two counts partition the excluded edges.
+fn dropped_max_candidates_reason(max: u32, count: usize) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "dropped-max-candidates",
+        detail: format!(
+            "{count} edge(s) in a candidate set larger than {max} were excluded from the search \
+             (--max-candidates fan-out cap)"
+        ),
+    }
+}
+
 fn depth_limit_reason(depth: u32) -> ApproxReason {
     ApproxReason {
         direction: ReasonDirection::Under,
@@ -343,6 +359,10 @@ struct FrontierFacts {
     /// Edges of the searched family that sit below the confidence floor (excluded
     /// from the walk but a real, unfollowed source of edges).
     below_floor: usize,
+    /// Edges of the searched family that pass the confidence floor but were dropped
+    /// by the `--max-candidates` fan-out cap (their candidate group exceeds the
+    /// limit) — the completeness cost of the fan-out dial.
+    dropped_max_candidates: usize,
     /// A reached node at the depth horizon had an admitted neighbor beyond it.
     depth_truncated: bool,
 }
@@ -358,6 +378,11 @@ impl FrontierFacts {
         }
         if self.below_floor > 0 {
             reasons.push(below_floor_reason(walker.filter.min_confidence, self.below_floor));
+        }
+        if self.dropped_max_candidates > 0 {
+            if let Some(max) = walker.filter.max_candidates {
+                reasons.push(dropped_max_candidates_reason(max, self.dropped_max_candidates));
+            }
         }
         if self.depth_truncated {
             if let Some(d) = walker.max_depth {
@@ -407,12 +432,14 @@ fn scan_frontier(
     }
 
     // A kind-only filter: every edge of the searched family regardless of the
-    // confidence floor or condition restriction, so cuts and below-floor edges
-    // the *walk* skipped are still seen as honest incompleteness sources.
+    // confidence floor, condition restriction, or fan-out cap, so cuts,
+    // below-floor, and max-candidates-dropped edges the *walk* skipped are still
+    // seen as honest incompleteness sources.
     let scan_filter = EdgeFilter {
         min_confidence: Confidence::Possible,
         condition: ConditionFilter::Any,
         kinds: walker.filter.kinds.clone(),
+        max_candidates: None,
     };
     let floor = walker.filter.min_confidence;
 
@@ -435,6 +462,16 @@ fn scan_frontier(
             }
             if er.edge.confidence < floor {
                 facts.below_floor += 1;
+            } else if let (Some(max), Some(group)) =
+                (walker.filter.max_candidates, er.edge.candidate_group)
+            {
+                // Passes the confidence floor but the fan-out cap dropped it: the
+                // completeness cost of `--max-candidates`. The `else` keeps this
+                // disjoint from `below_floor` so an excluded edge is attributed to
+                // exactly one reason.
+                if view.candidate_group_size(group) > max {
+                    facts.dropped_max_candidates += 1;
+                }
             }
         }
         if walker.max_depth == Some(depth_of[node_ix]) {
@@ -840,6 +877,115 @@ mod tests {
         assert_eq!(c.direction, ApproxDirection::Under);
         assert!(c.reasons.iter().any(|r| r.code == "below-confidence-floor"));
         assert!(c.scope.is_some(), "empty neighbor answer is negative");
+    }
+
+    // `a` over-approximates one call site to a 3-way candidate set {b,c,d} plus a
+    // single resolved call to `e`. The candidate table (not the edge count) is the
+    // source of truth for the group's fan-out.
+    fn fanout_view() -> GraphView {
+        let nodes = vec![
+            node(0, "a", 10, None),
+            node(1, "b", 20, None),
+            node(2, "c", 30, None),
+            node(3, "d", 40, None),
+            node(4, "e", 50, None),
+        ];
+        let edges = vec![
+            edge(0, 0, 1, Confidence::Possible, &[], Some(0)),
+            edge(1, 0, 2, Confidence::Possible, &[], Some(0)),
+            edge(2, 0, 3, Confidence::Possible, &[], Some(0)),
+            edge(3, 0, 4, Confidence::Certain, &[], None),
+        ];
+        let candidates = vec![
+            Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
+            Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
+            Candidate { candidate_group: 0, dst: NodeId(3), rank: 2 },
+        ];
+        GraphView::new(nodes, edges, candidates)
+    }
+
+    fn fanout_walker(max_candidates: Option<u32>) -> PathWalker {
+        let mut filter = EdgeFilter::calls();
+        if let Some(n) = max_candidates {
+            filter = filter.with_max_candidates(n);
+        }
+        PathWalker {
+            filter,
+            max_depth: None,
+            max_paths: None,
+            max_steps: None,
+        }
+    }
+
+    #[test]
+    fn max_candidates_drops_large_group_and_reports_exclusion() {
+        // Fan-out cap of 2 drops the 3-way candidate set (b,c,d); only the singly
+        // resolved `e` survives, and the contract states what it excluded.
+        let view = fanout_view();
+        let w = fanout_walker(Some(2));
+        let results = callees(&view, NodeId(0), &w);
+        let names: Vec<&str> = results.iter().map(|r| r.node.fqn.as_str()).collect();
+        assert_eq!(names, vec!["e"], "the 3-way set is dropped, the singleton kept");
+
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        let reason = c
+            .reasons
+            .iter()
+            .find(|r| r.code == "dropped-max-candidates")
+            .expect("the excluded fan-out is reported");
+        assert_eq!(reason.direction, ReasonDirection::Under);
+        assert!(
+            reason.detail.contains('3') && reason.detail.contains('2'),
+            "reports 3 excluded edges over the cap of 2: {}",
+            reason.detail
+        );
+        // Every surviving result is certain (no candidate group), so the answer is
+        // not over; the only known error is the under from the dropped set.
+        assert_eq!(c.direction, ApproxDirection::Under);
+    }
+
+    #[test]
+    fn max_candidates_at_or_above_group_size_keeps_it() {
+        // A cap of 3 admits the size-3 set: all four callees survive and the
+        // surviving candidate edges make the answer over, with no dropped-set under.
+        let view = fanout_view();
+        let w = fanout_walker(Some(3));
+        let results = callees(&view, NodeId(0), &w);
+        assert_eq!(results.len(), 4, "size-3 set is within the cap of 3");
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        assert!(
+            !c.reasons.iter().any(|r| r.code == "dropped-max-candidates"),
+            "nothing excluded: {c:?}"
+        );
+        assert_eq!(c.direction, ApproxDirection::Over);
+    }
+
+    #[test]
+    fn max_candidates_below_floor_edges_are_not_double_counted() {
+        // An edge that is both below the confidence floor and over the fan-out cap
+        // is attributed to the confidence exclusion only (the two counts partition
+        // the excluded edges).
+        let view = fanout_view();
+        let mut filter = EdgeFilter::calls()
+            .with_min_confidence(Confidence::Certain)
+            .with_max_candidates(2);
+        filter.max_candidates = Some(2);
+        let w = PathWalker {
+            filter,
+            max_depth: None,
+            max_paths: None,
+            max_steps: None,
+        };
+        let results = callees(&view, NodeId(0), &w);
+        // Only `e` (certain) passes the floor; the possible candidate set is below
+        // it and never reaches the fan-out clause.
+        assert_eq!(results.iter().map(|r| r.node.fqn.as_str()).collect::<Vec<_>>(), vec!["e"]);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        assert!(c.reasons.iter().any(|r| r.code == "below-confidence-floor"));
+        assert!(
+            !c.reasons.iter().any(|r| r.code == "dropped-max-candidates"),
+            "below-floor edges are not also counted as fan-out drops: {c:?}"
+        );
     }
 
     #[test]

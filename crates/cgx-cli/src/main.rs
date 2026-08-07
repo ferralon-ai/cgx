@@ -493,6 +493,13 @@ struct QueryArgs {
     /// Minimum confidence floor (`possible`, `probable`, `certain`).
     #[arg(long, value_enum)]
     confidence: Option<ConfidenceArg>,
+    /// Drop call edges from an over-approximated candidate set larger than `N`
+    /// targets — the fan-out dial, orthogonal to `--confidence`. A single resolved
+    /// call (no candidate set) is never dropped; only name-collision / dynamic
+    /// dispatch fan-outs above the cap are. The approximation contract reports how
+    /// many edges this excluded (`dropped-max-candidates`).
+    #[arg(long = "max-candidates", value_name = "N")]
+    max_candidates: Option<u32>,
     /// CI assertion: require zero results (exit 1 if any are found).
     #[arg(long)]
     assert_empty: bool,
@@ -887,6 +894,9 @@ fn build_flow_walker(args: &QueryArgs) -> PathWalker {
     let mut filter = EdgeFilter::default().with_kinds(vec![EdgeKind::DerivesFrom]);
     if let Some(c) = args.confidence {
         filter = filter.with_min_confidence(c.into());
+    }
+    if let Some(n) = args.max_candidates {
+        filter = filter.with_max_candidates(n);
     }
     PathWalker {
         filter,
@@ -1995,6 +2005,9 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
     if let Some(c) = args.confidence {
         filter = filter.with_min_confidence(c.into());
     }
+    if let Some(n) = args.max_candidates {
+        filter = filter.with_max_candidates(n);
+    }
     PathWalker {
         filter,
         max_depth: args.max_depth,
@@ -2047,6 +2060,9 @@ fn build_paths_walker(args: &QueryArgs) -> PathWalker {
     let mut filter = EdgeFilter::calls();
     if let Some(c) = args.confidence {
         filter = filter.with_min_confidence(c.into());
+    }
+    if let Some(n) = args.max_candidates {
+        filter = filter.with_max_candidates(n);
     }
     PathWalker {
         filter,

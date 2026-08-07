@@ -93,11 +93,24 @@ fn neighbor_tool(name: &str, description: &str) -> Value {
                 "cursor":         { "type": "string" },
                 "edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "confidence":     { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_candidates": max_candidates_prop(),
                 "kind":           edge_kind_prop(),
                 "include_dirty":  include_dirty_prop()
             },
             "required": ["symbol", "root"]
         }
+    })
+}
+
+/// Schema for the `max_candidates` fan-out cap (F2): drop call edges belonging to
+/// an over-approximated candidate set larger than N targets. Orthogonal to
+/// `confidence`; the excluded edges are reported in the answer's approximation
+/// contract (`dropped-max-candidates`).
+fn max_candidates_prop() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract"
     })
 }
 
@@ -125,6 +138,7 @@ fn reaches_tool() -> Value {
                 "root":          { "type": "string", "description": "Repository root path" },
                 "depth":         { "type": "integer", "description": "Max traversal depth (from→* form)", "default": DEFAULT_FOREST_DEPTH },
                 "confidence":    { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_candidates": max_candidates_prop(),
                 "max_results":   { "type": "integer", "default": DEFAULT_MAX_RESULTS },
                 "cursor":        { "type": "string" },
                 "include_dirty": include_dirty_prop()
@@ -209,6 +223,7 @@ fn paths_tool() -> Value {
                 "exclude_edge_condition": { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "only_edge_condition":    { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
                 "confidence":             { "type": "string", "enum": ["certain","probable","possible"] },
+                "max_candidates":         max_candidates_prop(),
                 "cursor":                 { "type": "string" },
                 "include_dirty":          include_dirty_prop()
             },
@@ -435,6 +450,9 @@ fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
     if let Some(c) = opt_str(args, "confidence") {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
+    if let Some(n) = opt_u32(args, "max_candidates")? {
+        filter = filter.with_max_candidates(n);
+    }
     Ok(filter)
 }
 
@@ -637,6 +655,9 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
     if let Some(c) = opt_str(args, "confidence") {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
+    if let Some(n) = opt_u32(args, "max_candidates")? {
+        filter = filter.with_max_candidates(n);
+    }
     let walker = PathWalker {
         filter,
         max_depth: Some(opt_u32(args, "max_depth")?.unwrap_or(DEFAULT_PATHS_MAX_DEPTH)),
@@ -767,6 +788,9 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
     let mut filter = EdgeFilter::calls();
     if let Some(c) = opt_str(args, "confidence") {
         filter = filter.with_min_confidence(parse_confidence(c)?);
+    }
+    if let Some(n) = opt_u32(args, "max_candidates")? {
+        filter = filter.with_max_candidates(n);
     }
 
     match opt_str(args, "to").filter(|s| !s.is_empty()) {

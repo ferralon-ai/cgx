@@ -146,5 +146,9 @@ fn anomaly_message(kind: &AnomalyKind) -> &'static str {
             "unsupported-file share >50% — most source files were skipped; \
              check adapter registration"
         }
+        AnomalyKind::HighPossibleShare => {
+            "possible-confidence share >85% of call edges — resolution is dominated \
+             by name guesses even with some certain/probable edges present"
+        }
     }
 }

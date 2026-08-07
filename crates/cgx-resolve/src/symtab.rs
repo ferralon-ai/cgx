@@ -19,6 +19,11 @@ pub struct DefEntry {
     pub kind: SymbolKind,
     /// Callee arity from the signature, when the surface pinned it (ADR-04).
     pub arity: Option<u8>,
+    /// Source language tag (`"rust"`, `"typescript"`, …), copied from the def's
+    /// [`NodeRecord::lang`]. Lets the Step-4 fallback restrict its candidate set to
+    /// same-language defs: a name collision across languages is never a real call
+    /// (genuine cross-language calls are FFI and carry their own `ViaFfi` marker).
+    pub lang: String,
 }
 
 /// One import binding visible somewhere in a file: a local name (possibly an
@@ -74,6 +79,7 @@ impl SymbolTable {
                 fqn: n.fqn.clone(),
                 kind: n.kind,
                 arity: n.signature.as_ref().map(|s| s.params.len().min(255) as u8),
+                lang: n.lang.clone(),
             };
             t.by_fqn.insert(n.fqn.clone(), entry.clone());
             t.by_short

@@ -1635,3 +1635,97 @@ fn mcp_coupling_answer_carries_the_contract() {
         "coupling must not trigger an index"
     );
 }
+
+/// A fixture whose `helper` body holds two calls the resolver leaves dangling:
+/// `Duration::from_secs` and `.as_secs()` are external, so no in-repo callable
+/// carries those short names and Step 5 stamps `helper.unresolved_calls`. `main`
+/// reaches `helper`, so a forward walk from `main` touches the stamped node.
+const SRC_UNRESOLVED: &str = r#"
+fn main() {
+    let _ = helper();
+}
+
+fn helper() -> u64 {
+    let d = std::time::Duration::from_secs(1);
+    d.as_secs()
+}
+"#;
+
+fn init_unresolved_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), SRC_UNRESOLVED).unwrap();
+
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "cgx-test"]);
+    run_git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "author.name=cgx-test",
+            "-c",
+            "author.email=cgx@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            "--date=2020-01-01T00:00:00Z",
+        ],
+    );
+    (tmp, repo)
+}
+
+/// The reachable form of the defect. `kind` is an MCP-only argument — the CLI has
+/// no `--kind` flag — and it used to silence the dangling-ref fact outright: the
+/// same anchor answered `under [unresolved-external-calls]` without it and a bare
+/// `exact []` with `kind:["calls"]`, on a forward walk following exactly the
+/// edges the fact is about.
+#[test]
+fn a_call_kind_filter_does_not_silence_the_dangling_ref_fact() {
+    let (_t, repo) = init_unresolved_repo();
+
+    let codes = |args: Value| -> Vec<String> {
+        call_tool(&repo, "callees", args)["approximation"]["reasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .map(|r| r["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let baseline = codes(json!({ "symbol": "main" }));
+    assert!(
+        baseline.iter().any(|c| c == "unresolved-external-calls"),
+        "baseline must carry the dangling-ref reason: {baseline:?}"
+    );
+
+    for kind in [json!(["calls"]), json!(["calls", "calls_virtual"])] {
+        let filtered = codes(json!({ "symbol": "main", "kind": kind }));
+        assert!(
+            filtered.iter().any(|c| c == "unresolved-external-calls"),
+            "kind {kind} must not silence the dangling-ref fact: {filtered:?}"
+        );
+    }
+}
+
+/// The other side of the same predicate: a `DerivesFrom` scope is not a call
+/// scope, so `flows_to` still reads no unresolved-call fact.
+#[test]
+fn mcp_flows_to_does_not_report_the_dangling_ref_fact() {
+    let (_t, repo) = init_unresolved_repo();
+    let structured = call_tool(&repo, "flows_to", json!({ "symbol": "helper" }));
+    let codes: Vec<&str> = structured["approximation"]["reasons"]
+        .as_array()
+        .expect("reasons")
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        !codes.contains(&"unresolved-external-calls"),
+        "a DerivesFrom-scoped walk must not read the dangling-ref fact: {codes:?}"
+    );
+}

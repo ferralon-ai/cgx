@@ -59,7 +59,7 @@ Each edge line also carries:
 | Flag | Value | Default | Meaning |
 |------|-------|---------|---------|
 | `--repo <REPO>` | path | CWD | Path to the indexed repository root. |
-| `--format <FORMAT>` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. `sarif` is accepted by the parser but is not meaningful for a single-symbol lookup; prefer `human` or `json`. `dot`, `mermaid`, and `d2` are accepted by the parser but render as human output (explain has no path-shaped results to graph). |
+| `--format <FORMAT>` | `human\|json` | `human` | Output format. Only `json` differs from the default: `sarif`, `dot`, `mermaid`, and `d2` are accepted, silently render the human view, and exit 0. Nothing rejects them, so do not treat a zero exit from `--format sarif` as proof you received SARIF. |
 | `--no-auto-index` | — | off | Require an explicit `cgx index` first. Without this flag cgx auto-indexes on first use. When set and no `.cgx/` index exists, the command exits with code 3. |
 | `-h, --help` | — | — | Print help. |
 
@@ -67,13 +67,20 @@ Each edge line also carries:
 `--assert-empty`, `--allow-vacuous`. These appear on traversal commands
 (`callers`, `callees`, `paths`, etc.) but not here.
 
+**Freshness, no approximation.** Every answer ends with the index-freshness envelope
+(`--format json`: a top-level `freshness` key). `explain` carries no approximation
+contract: it reports one symbol's recorded incident edges rather than walking a
+frontier, so there is nothing to over- or under-approximate. Each edge states its own
+confidence and resolution tier instead, which is the per-edge form of the same
+honesty. See [Reading an answer](README.md#reading-an-answer).
+
 ## Examples
 
 ### Common case: explain a function with callers and callees
 
 ```
 cgx explain rust_sample::conditions::dispatch \
-  --repo /path/to/rust-sample
+  --repo /path/to/worktree
 ```
 
 ```
@@ -87,6 +94,7 @@ rust_sample::conditions::dispatch  (fixtures/rust-sample/src/conditions.rs:42)
     -> rust_sample::conditions::log_info  (fixtures/rust-sample/src/conditions.rs:4)  [conditional]  [certain]  tier=scope_graph  rule=scope-ref  site=fixtures/rust-sample/src/conditions.rs:42
     -> rust_sample::conditions::log_warn  (fixtures/rust-sample/src/conditions.rs:8)  [conditional]  [certain]  tier=scope_graph  rule=scope-ref  site=fixtures/rust-sample/src/conditions.rs:42
     -> rust_sample::conditions::log_error  (fixtures/rust-sample/src/conditions.rs:12)  [conditional]  [certain]  tier=scope_graph  rule=scope-ref  site=fixtures/rust-sample/src/conditions.rs:42
+freshness: current | indexed tree 5ea331d, working tree clean
 ```
 
 The three incoming edges are `cha_rta` (`sig-compat`) matches at `possible`
@@ -98,7 +106,7 @@ callees are `scope_graph` (`scope-ref`) at `certain` confidence with condition
 
 ```
 cgx explain rust_sample::conditions::dispatch \
-  --repo /path/to/rust-sample \
+  --repo /path/to/worktree \
   --format json
 ```
 
@@ -137,6 +145,14 @@ direction) showing all fields:
     }
   ],
   "file": "fixtures/rust-sample/src/conditions.rs",
+  "freshness": {
+    "dirty_files": 0,
+    "dirty_files_base": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "head_tree": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "indexed_tree": "5ea331d1c4fb42f4a1469ae5c4ced68dae74ef6a",
+    "matches_head": true,
+    "stale": false
+  },
   "kind": "function",
   "line": 42,
   "symbol": "rust_sample::conditions::dispatch"
@@ -145,12 +161,15 @@ direction) showing all fields:
 
 The `condition` field carries the raw string (`"always"`, `"conditional"`, etc.).
 The `direction` field is `"incoming"` for callers and `"outgoing"` for callees.
+`freshness` is the index-freshness envelope — the same object every other command's
+JSON carries, and the same information as the trailing `freshness:` line in the
+human view.
 
 ### Explain a function with only callers
 
 ```
 cgx explain rust_sample::dataflow::flow_example \
-  --repo /path/to/rust-sample
+  --repo /path/to/worktree
 ```
 
 ```
@@ -161,15 +180,16 @@ rust_sample::dataflow::flow_example  (fixtures/rust-sample/src/dataflow.rs:5)
     <- ts_sample::closures::closureVariable  (fixtures/ts-sample/src/closures.ts:6)  [always]  [possible]  tier=cha_rta  rule=sig-compat  site=fixtures/ts-sample/src/closures.ts:6
     <- ts_sample::closures::nestedClosures  (fixtures/ts-sample/src/closures.ts:57)  [always]  [possible]  tier=cha_rta  rule=sig-compat  site=fixtures/ts-sample/src/closures.ts:57
     <- ts_sample::closures::nestedClosures::outer  (fixtures/ts-sample/src/closures.ts:58)  [always]  [possible]  tier=cha_rta  rule=sig-compat  site=fixtures/ts-sample/src/closures.ts:58
+freshness: current | indexed tree 5ea331d, working tree clean
 ```
 
-`callees: 0` and no outgoing edges confirm this function makes no direct calls.
+`callees: 0` and no outgoing edges confirm this function makes no direct calls — within the modeled graph. `explain` reports the edges the resolver actually recorded, so "no callees" here means no in-repo callee was resolved, not that the function calls nothing at runtime.
 
 ### Bad symbol: no match
 
 ```
 cgx explain nonexistent::bad::symbol \
-  --repo /path/to/rust-sample
+  --repo /path/to/worktree
 ```
 
 ```

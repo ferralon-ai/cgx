@@ -42,9 +42,15 @@ pub enum ConditionFilter {
 /// The static per-edge admission predicate (Q-11 edge condition, Q-18 confidence,
 /// plus edge-kind scoping).
 ///
-/// `admits` is the only method walks call; everything is a plain comparison so the
-/// filter adds no allocation and no nondeterminism. The default admits every
-/// call-family edge at any confidence.
+/// `admits` is the per-edge predicate walks consult; everything in it is a plain
+/// comparison so it adds no allocation and no nondeterminism. The default admits
+/// every call-family edge at any confidence.
+///
+/// One clause — [`max_candidates`](Self::max_candidates) — is a property of the
+/// candidate *group*, not of any single edge, so it cannot be decided from an
+/// `EdgeRecord` alone: [`admits`](Self::admits) deliberately ignores it, and it is
+/// enforced by [`GraphView::neighbors`](crate::GraphView::neighbors), the single
+/// adjacency primitive every walk consults, which owns the candidate table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeFilter {
     /// Minimum confidence an edge must carry (Q-18). `Possible` admits all.
@@ -56,6 +62,17 @@ pub struct EdgeFilter {
     /// (`Contains`, `Imports`, …) are never traversed by the call-graph walks
     /// unless explicitly requested here.
     pub kinds: Option<Vec<EdgeKind>>,
+    /// When `Some(n)`, drop any edge that belongs to an over-approximated candidate
+    /// set of size `> n` (F2 `--max-candidates`): the fan-out dial orthogonal to
+    /// the confidence floor. An edge with no candidate group is a single resolved
+    /// target (fan-out 1) and is never dropped. `None` = no fan-out cap.
+    ///
+    /// This is a group-global property; [`admits`](Self::admits) cannot see it, so
+    /// it is enforced in [`GraphView::neighbors`](crate::GraphView::neighbors),
+    /// which holds the candidate table. Filtering large groups changes an answer's
+    /// *completeness* — the approximation contract reports the excluded edges
+    /// (`dropped-max-candidates`).
+    pub max_candidates: Option<u32>,
 }
 
 impl Default for EdgeFilter {
@@ -64,6 +81,7 @@ impl Default for EdgeFilter {
             min_confidence: Confidence::Possible,
             condition: ConditionFilter::Any,
             kinds: None,
+            max_candidates: None,
         }
     }
 }
@@ -100,7 +118,20 @@ impl EdgeFilter {
         self
     }
 
-    /// Whether `edge` passes every clause of this filter.
+    /// Cap the over-approximated candidate-set fan-out (`--max-candidates`). Edges
+    /// in a candidate group larger than `n` are dropped by
+    /// [`GraphView::neighbors`](crate::GraphView::neighbors); see
+    /// [`max_candidates`](Self::max_candidates).
+    pub fn with_max_candidates(mut self, n: u32) -> Self {
+        self.max_candidates = Some(n);
+        self
+    }
+
+    /// Whether `edge` passes every *per-edge* clause of this filter (kind,
+    /// confidence, condition). The [`max_candidates`](Self::max_candidates) clause
+    /// is a candidate-group property this predicate cannot decide from an edge
+    /// alone; it is applied by
+    /// [`GraphView::neighbors`](crate::GraphView::neighbors).
     pub fn admits(&self, edge: &EdgeRecord) -> bool {
         match &self.kinds {
             Some(kinds) => {

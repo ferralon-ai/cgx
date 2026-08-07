@@ -148,7 +148,7 @@ cgx query '
 
 Trust boundaries are the lines between zones of different trust level: an HTTP handler is untrusted-input territory; the database write layer should only receive validated, trusted data. Functions that cross these boundaries without annotation are implicit trust elevations — potentially the entry points for injection attacks.
 
-**Why not answerable today** — This query requires `trust_zone`, `trust_boundary_annotated`, and `sanitizer_class` node properties. All three produce a plan error (exit 2) in v0.3.0: `trust_zone` and `trust_boundary_annotated` are unknown node properties; `sanitizer_class` is not supported in this release (no backing field on a symbol node). The `NONE(n IN nodes(...))` path-predicate form is also not a supported CQL construct in v0.3.0. This entry will become answerable when the security-taint schema ships.
+**Why not answerable today** — This query requires `trust_zone`, `trust_boundary_annotated`, and `sanitizer_class` node properties. All three produce a plan error (exit 2) in v0.3.0: `trust_zone` and `trust_boundary_annotated` are unknown node properties; `sanitizer_class` is not supported in this release (no backing field on a symbol node). `NONE(n IN nodes(path) WHERE …)` itself is a supported, working CQL construct — live-verified, exit 0 — so it is not what blocks this query; the actual second blocker inside the `NONE` clause is `n.sanitizer_class IS NOT NULL`, whose `IS NOT NULL` predicate is deferred (`IS EMPTY`/`IS NULL` require type reconstruction, not shipped) independent of `sanitizer_class` itself being missing. This entry will become answerable when the security-taint schema ships.
 
 **Illustrative query (non-runnable in v0.3.0)**
 
@@ -176,7 +176,7 @@ cgx query '
 | `src.trust_zone = "untrusted"` | The source node is in an untrusted zone (e.g., populated from a network source class). Requires deferred taint schema. |
 | `dst.trust_zone = "trusted"` | The destination node is in a trusted zone (e.g., a database write function). Requires deferred taint schema. |
 | `fn.trust_boundary_annotated = false` | The crossing function carries no explicit trust-boundary annotation (GM-14 code-trust boundaries). Requires deferred taint schema. |
-| `NONE(n IN nodes(...) WHERE n.sanitizer_class IS NOT NULL)` | No sanitizer appears on the path from the untrusted source to the crossing function. Both the `NONE` path-predicate form and `sanitizer_class` are deferred. |
+| `NONE(n IN nodes(...) WHERE n.sanitizer_class IS NOT NULL)` | No sanitizer appears on the path from the untrusted source to the crossing function. The `NONE` path-predicate form itself works today; what's deferred inside it is `sanitizer_class` (no backing field) and the `IS NOT NULL` predicate (requires type reconstruction). |
 
 **Reading the result** — Each row is a function that moves data across a trust boundary without annotation or sanitization. These are the highest-priority candidates for adding input validation. The `untrusted_src` and `trusted_dst` columns name the specific endpoints of the boundary crossing.
 

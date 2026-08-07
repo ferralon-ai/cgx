@@ -1,8 +1,12 @@
 # 12 — Language Primitives and Frameworks
 
-**Status:** Feature specification (pre-implementation)
+**Status:** Feature specification — **nothing in this document is implemented.** Verified by
+repo-wide grep of `crates/**/*.rs`: zero occurrences of `FrameworkPack`, `framework_pack`,
+`ReflectionPack`, `reflection_pack`, `semantic_class`, `literal_pedigree`, or any framework name
+this document names (`Spring`, `axum`, `actix`, `NestJS`, `Guice`, `Django`, `FastAPI`). The
+schema fields these features would populate exist and are never populated. Read this as the
+design for the metadata-fact layer, not as a description of behaviour.
 **Audience:** Engineers extending `cgx` with framework support; security engineers writing framework-aware queries; contributors implementing the metadata-fact layer
-**Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/03-code-graph-model.md (GM-15, GM-16, GM-17, GM-18, GM-19) · docs/04-dataflow-and-provenance.md (DF-14, DF-20) · docs/05-queries.md (Q-31) · docs/08-language-support.md (LS-8)
 
 ---
@@ -27,13 +31,22 @@ This document specifies:
 - FW-5: Build-configuration variance
 - FW-6: Reflection packs
 
-**Launch scope (ADR-09).** Built-in framework packs ship for the Tier-1 launch
-languages: tokio/axum/serde (Rust) and Express/Node + one TypeScript web framework
-(NestJS). Spring (Java), Flask/Django (Python), Rails (Ruby), and packs for other
-non-launch languages are `Status: roadmap` — their pack entries are specified below
-as worked mappings (for design completeness and future implementation), but are not
-built-in at launch. Worked-mapping tables for roadmap-language frameworks remain in
-this document as specifications; each roadmap section carries a status note.
+**Launch scope (ADR-09) — the plan, not the state.** ADR-09 scoped built-in packs for
+tokio/axum/serde (Rust) and Express/NestJS (TypeScript) at launch, with Spring (Java),
+Flask/Django (Python) and Rails (Ruby) as roadmap.
+
+**No pack of either kind was built.** There is no framework-pack mechanism in the workspace:
+no pack schema, no manifest scanning, no annotation-to-semantic-class lowering, no
+`[framework_packs]` table in the `cgx.toml` parser (which reads exactly one key,
+`[index] data_flow`). The distinction this paragraph draws between "launch packs" and "roadmap
+packs" is therefore not a distinction a user can observe — both are unbuilt, and the
+per-language status notes below should be read that way.
+
+What *does* ship, and is easy to mistake for a pack: the Rust adapter matches the bare
+`#[tokio::main]` attribute to mark an `AsyncMain` entrypoint, and emits a
+`CutMarker::UnexpandedMacro` for any non-builtin derive. Both are generic language-level
+detection with no framework knowledge — `#[derive(Serialize)]` produces the same
+unexpanded-macro marker as any other derive, not a serde-specific fact.
 
 The graph primitives that these features lower to are defined in
 docs/03-code-graph-model.md (GM-15 through GM-19). This document maps framework
@@ -102,12 +115,19 @@ state (e.g. `@ConditionalOnProperty`) are `probable`.
 
 The `evidence` field names what the producing rule cites. Values: `annotation-present`,
 `attribute-present`, `struct-tag-present`, `config-file`, `registration-site`.
-This value is stored in the GM-6 provenance record so that `--evidence` output
-can name the specific annotation that justified the fact.
+This value would be stored in the GM-6 provenance record so the specific annotation that
+justified the fact can be named. Note there is no `--evidence` flag on any subcommand; the
+shipped way to read an edge's provenance — its tier, its resolution rule and its site — is
+`cgx explain <SYMBOL>`.
 
-### FW-1.3 — Built-in packs
+### FW-1.3 — Built-in packs — **Planned; none of this exists**
 
-`cgx` ships built-in packs for the frameworks enumerated in FW-3. Built-in packs
+No pack is compiled into the binary, and no manifest is inspected. `cgx.toml` parsing is a
+hand-rolled single-key line scanner (`[index] data_flow = <bool>`) — cgx carries no `toml`
+dependency by design — so the `[framework_packs]` table below is silently ignored rather
+than rejected. The design follows.
+
+`cgx` would ship built-in packs for the frameworks enumerated in FW-3. Built-in packs
 are compiled into the binary and active by default for any indexed project that
 imports the relevant framework.
 
@@ -291,7 +311,8 @@ These synthetic nodes carry `macro_origin` = the generator name (GM-14.5).
   facts are available at Phase 1 without expansion.
 - **Generated-body call edges (unexpanded-macro blind spot until `--rust-expand`):**
   call edges *into* or *within* the generated method bodies (e.g., the `serialize`
-  impl body) are absent until `cgx index --rust-expand` is used. Each affected call
+  impl body) are absent; `cgx index --rust-expand` is **Planned** and no such flag exists
+  today (`cgx index` accepts only `[PATH]`, `--scip` and `--no-dataflow`). Each affected call
   site emits an `unexpanded-macro` cut-marker (GM-5.3, Status: core-extension,
   Phase 1) so the gap is auditable.
 
@@ -355,7 +376,7 @@ belongs to, the confidence, and the resulting graph fact or edge modification.
 
 ### FW-3.1 — Spring (Java)
 
-**Status: roadmap** — Java is a planned Tier-1 language (not a launch language per ADR-09). This is the most complete worked mapping and serves as the design specification for when the Java adapter ships.
+**Status: roadmap** — but not for the reason ADR-09 gave. **The Java adapter has since shipped** (`crates/cgx-lang-java`, ~1,900 lines, registered in `cgx-index`, at parity with the Go column in `docs/14`). What is unbuilt is the framework layer: there is no Spring-specific code anywhere in `cgx-lang-java`, and no pack mechanism for it to plug into. This is the most complete worked mapping and serves as the design specification for the pack, not for the adapter.
 
 Spring is the canonical annotation-heavy framework: security, transactions, async,
 caching, scheduling, and messaging are all annotation-driven. This is the most
@@ -416,7 +437,7 @@ complete worked mapping.
 
 ### FW-3.2 — Flask and Django (Python)
 
-**Status: roadmap** — Python is a planned Tier-1 language (not a launch language per ADR-09). This worked mapping is the design specification for when the Python adapter ships.
+**Status: roadmap** — again, not the adapter. **The Python adapter has shipped** (`crates/cgx-lang-python`, registered, at Go-column parity). The Flask/Django pack has not, and neither has the mechanism that would host it. This worked mapping is the design specification for the pack.
 
 Python web frameworks use decorators and URL-config for entrypoints; security is
 decorator-driven.
@@ -444,7 +465,7 @@ decorator-driven.
 
 ### FW-3.3 — ASP.NET Core (C#)
 
-**Status: roadmap** — C# is a planned Tier-1 language (not a launch language per ADR-09). This worked mapping is the design specification for when the C# adapter ships.
+**Status: roadmap** — C# is the one language in this document where the adapter really is the blocker: no `cgx-lang-csharp` crate exists. Both the adapter and the ASP.NET pack are unbuilt.
 
 ASP.NET attributes decorate controller actions. The security model uses attribute-based
 authorization filters evaluated before the action body executes.
@@ -501,7 +522,7 @@ constructor parameters at module startup — the canonical mediated-edge scenari
 
 ### FW-3.5 — tokio and actix-web (Rust)
 
-**Status: core-extension (launch pack)** — Rust is a Tier-1 launch language (ADR-09). This section is a Phase-1 implementation commitment; tokio/axum/serde/actix-web packs ship built-in at launch.
+**Status: roadmap** — Rust is a Tier-1 launch language (ADR-09) and this section is the Phase-1 design commitment, but **no tokio/axum/serde/actix-web pack is built**: zero `axum` or `actix` hits anywhere in `crates/`, and the two things the Rust adapter does with attributes (`#[tokio::main]` → `AsyncMain` entrypoint, non-builtin derive → `CutMarker::UnexpandedMacro`) are generic language-level matches, not framework knowledge. Read the mapping below as the specification.
 
 Rust async frameworks use procedural macro attributes. Most Rust metadata is
 compile-time and fully statically verifiable — pack entries for Rust carry
@@ -529,7 +550,7 @@ compile-time and fully statically verifiable — pack entries for Rust carry
 | `#[serde(rename = "x")]`, `#[serde(skip)]`, `#[serde(default)]` | `keep-alive` | `certain` | serde accesses this field; suppress dead-member finding |
 | `#[serde(skip_serializing_if = "Option::is_none")]` | `keep-alive` | `certain` | Field accessed by generated serializer |
 
-**Confidence note for Rust.** Rust procedural macros are evaluated at compile time by the compiler. Their annotation-derived facts (entrypoints, generated-member class, keep-alive) are harvested unexpanded and carry `certain` confidence. Generated-body call edges within derived implementations (e.g., the body of `serialize()`) are a proc-macro blind spot until `cgx index --rust-expand` is used; affected call sites emit an `unexpanded-macro` cut-marker (GM-5.3). SCIP enrichment (Phase 2) provides the post-expansion graph and resolves these edges at `certain` confidence when available.
+**Confidence note for Rust.** Rust procedural macros are evaluated at compile time by the compiler. Their annotation-derived facts (entrypoints, generated-member class, keep-alive) are harvested unexpanded and carry `certain` confidence. Generated-body call edges within derived implementations (e.g., the body of `serialize()`) are a proc-macro blind spot; the `cgx index --rust-expand` flag that would lift it is Planned and does not exist today, so the blind spot is unconditional; affected call sites emit an `unexpanded-macro` cut-marker (GM-5.3). SCIP enrichment (Phase 2) provides the post-expansion graph and resolves these edges at `certain` confidence when available.
 
 ---
 
@@ -701,8 +722,11 @@ it so that the unresolved case is not silently discarded.
 
 Framework-specific reflection patterns — e.g. Spring's `BeanFactory.getBean("beanName")`,
 JPA's `entityManager.find(MyEntity.class, id)`, Go's `reflect.TypeOf(x).Method(i)` —
-can be declared as reflection pack entries. Built-in packs for Spring, JPA, and Go
-`reflect` cover the common cases.
+can be declared as reflection pack entries. **Planned:** built-in packs for Spring, JPA and
+Go `reflect`. None exists — there is no reflection-pack mechanism, and the GM-18
+string-literal-pedigree foundation it depends on is not built either. What ships is the
+generic `CutMarker::Reflective` tag on reflection-shaped call sites: a marker that says *cgx
+could not resolve this*, which is the opposite of a pack that resolves it.
 
 ---
 

@@ -1,6 +1,6 @@
 # Question Cookbook — Index
 
-This directory contains 13 theme files totalling 138 answered questions drawn from the 138-question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme.
+This directory contains 13 theme files totalling 139 answered questions drawn from the question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme.
 
 ---
 

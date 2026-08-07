@@ -26,7 +26,7 @@ Specified in docs/05 Canonical Example 3.
 |---|---|
 | `--kind method` | Restrict the unused search to methods (not standalone functions or fields). |
 
-**Reading the result** — Each row is a method with no caller anywhere in the indexed codebase. `cgx unused` does not accept an `--entrypoint` filter flag; it reports all symbols not reachable from any declared entrypoint in the graph. Results are `certain` confidence when no call edge exists; `probable` when dynamic dispatch is possible.
+**Reading the result** — Each row is a method with no caller anywhere in the indexed codebase. `cgx unused` does not accept an `--entrypoint` filter flag; it reports all symbols not reachable from any declared entrypoint in the graph. Each row is `file`/`fqn`/`kind`/`line` only — there is no per-row confidence label. `--confidence` on `unused` sets a floor on which edges the reachability walk itself is allowed to traverse (default `possible`, so a `probable`-confidence call edge is enough to make a method reachable and drop it from the results); raise the floor with `--confidence certain`/`--confidence probable` to see which methods become "unreachable" once weaker edges stop counting.
 
 ---
 
@@ -51,7 +51,7 @@ cgx callers my_module::authenticate --repo PATH --confidence probable
 
 A zero-result `cgx callers` response confirms the function is unreachable. CQL v0.3 cannot express "find functions with zero callers" in a single query (standalone `MATCH (fn)` without a relationship is a plan error; `NOT EXISTS` is deferred). Use `cgx unused --kind function` for the bulk scan, then `cgx callers` to verify specific symbols.
 
-Note: CQL does not support `CONTAINS`, `STARTS WITH`, or multi-condition node-property inline predicates (e.g. `{kind:"function", name:...}`). Name filtering requires exact FQN from `cgx search`.
+Note: CQL does not support `CONTAINS` or `STARTS WITH` as predicates (both are parser rejections, exit 2). Multi-condition inline node-property predicates like `{kind:"function", name:"my_module::authenticate"}` do work — the limitation is substring/prefix matching, not the number of properties in one `{…}` block. Name filtering therefore requires an exact FQN from `cgx search`, not a pattern.
 
 **Breaking it down**
 

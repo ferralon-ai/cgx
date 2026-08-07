@@ -22,32 +22,45 @@ This shows all call edges added or removed over the last 50 commits. To confirm 
 cgx paths 'handleUpload' 'exec' --repo ./
 ```
 
-For authorship lookup on the edges (requires IX-9 edge attribution — not in v0.3.0 base):
+For authorship lookup, use `cgx diff --path-added` rather than CQL — IX-9 attribution is real and
+shipped, but it is a `diff --path-added` output field, not a CQL edge property. `r.introducing_commit`
+is not registered in the CQL schema at all (`plan error: unknown edge property`, exit 2) — `cgx diff`
+bypasses the CQL/query renderer entirely and prints its own JSON:
 
 ```cgx
-cgx query --at HEAD '
-  MATCH (caller)-[r:CALLS*]->(sink {name:"exec"})
-  WHERE caller.name CONTAINS "handleUpload"
-    AND r.introducing_commit IS NOT NULL
-  RETURN caller.name, caller.file, caller.line,
-         sink.name,
-         r.introducing_commit,
-         r.introducing_author
-  ORDER BY r.introducing_commit
-' --repo ./
+cgx diff HEAD~50 HEAD --repo ./ --path-added \
+  --from '**handleUpload' --to '**exec' --format json
 ```
 
-Specified in docs/05 Worked Example 6 (branch-diff security gate); IX-9 provides edge attribution.
+`--from`/`--to` are FQN globs (`*` matches within one `::`-segment, `**` crosses segments) —
+`--from 'handleUpload'` with no wildcard requires the *entire* FQN to equal that literal and will
+silently zero-match on a real, module-qualified symbol.
+
+```json
+{
+  "kind": "path-added",
+  "semantics": "call/dataflow reachability (not a soundness/security guarantee)",
+  "added_paths": [
+    { "from": "…handleUpload", "to": "…exec", "via": ["…handleUpload", "…exec"],
+      "introducing_commit": "…", "introducing_author": "…",
+      "introducing_email": "…", "author_time": 1786049531 }
+  ]
+}
+```
+
+Exits 1 when a new path is found (as here), 0 when clean. `--from`/`--to` are FQN globs, not file
+paths — pass `--require-anchor-match` in CI so a zero-match anchor (e.g. a renamed sink) fails closed
+instead of reporting a false-clean 0.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
 | `cgx diff HEAD~50 HEAD --repo ./` | Compare the graph 50 commits ago to today; BASE and HEAD are positional arguments. Walk back further if the path is older. |
-| `r.introducing_commit IS NOT NULL` | Filter to edges attributed to a specific commit by IX-9 (requires IX-9 — not in v0.3.0 base). |
-| `r.introducing_author` | The git author identity stored at index time via `git blame` on the call-site line (requires IX-9). |
+| `--path-added --from … --to …` | Runs the CH-11 structural gate: report a reachability path from `--from` to `--to` that exists at HEAD but not at BASE. |
+| `introducing_commit` / `introducing_author` | The git commit and author identity attributed to the path via `git blame`-based attribution (IX-9), read straight from the JSON — not a CQL `r.` property. |
 
-**Reading the result** — The diff output shows edges added (`+`) and removed (`-`) over the commit range. `cgx paths` confirms whether the path exists at HEAD. With IX-9, the earliest `introducing_commit` value on any edge on the path from `handleUpload` to `exec` is the commit that first established that link. Cross-reference with `git show <commit>` for the full diff.
+**Reading the result** — The plain `cgx diff` output shows edges added (`+`) and removed (`-`) over the commit range. `--path-added` narrows to a single reachability question and, on a hit, names the commit that first established the `handleUpload` → `exec` link via `introducing_commit`. Cross-reference with `git show <introducing_commit>` for the full diff. A clean result (exit 0, `added_paths: []`) with a zero-match anchor warning on stderr means the symbol isn't indexed, not that no path exists — use `--require-anchor-match` to fail closed on that case.
 
 ---
 
@@ -209,8 +222,11 @@ Functions in dangerous sink classes (`shell`, `eval`, `exec`) that were previous
 
 **The query (structural — answerable today)**
 
+`cgx diff` rejects `--format sarif` (exit 2, both diff modes, since PR #38) — it is not a real option
+here. Use `--format json`:
+
 ```cgx
-cgx diff v1.0.0 HEAD --repo ./ --newer-than --format sarif > newly-added-edges.sarif
+cgx diff v1.0.0 HEAD --repo ./ --newer-than --format json > newly-added-edges.json
 ```
 
 To check reachability of a specific known-dangerous function by name at each ref:
@@ -296,10 +312,10 @@ Or more precisely using a sprint-start tag:
 cgx diff sprint-start HEAD --repo ./
 ```
 
-To find functions whose call-graph neighborhood changed, compare callers at each ref for symbols of interest. The `introducing_commit` edge property and `--param` binding used in the illustrative CQL below require IX-9 (not in v0.3.0 base) and a `--param` flag that does not exist in v0.3.0 — treat these as illustrative only:
+To find functions whose call-graph neighborhood changed, compare callers at each ref for symbols of interest. `--param` is not a v0.3.0 `cgx query` flag. `fn.introducing_commit`/`r.introducing_commit` in the illustrative CQL below do not exist as CQL node or edge properties at all (`plan error: unknown node/edge property`) — IX-9 attribution ships, but only as a field of `cgx diff --path-added --format json`'s `added_paths[]` entries; it was never wired into `MATCH`/`RETURN`, and there is no future version where this becomes runnable rather than a permanent architectural gap. Treat the block below as illustrative only:
 
 ```cgx
--- ILLUSTRATIVE: requires IX-9 + --param support (not in v0.3.0)
+-- ILLUSTRATIVE: fn/r.introducing_commit are not CQL properties (IX-9 is diff-only); --param does not exist
 -- cgx query '
 --   MATCH (fn)
 --   WHERE fn.introducing_commit IN $sprint_commits
@@ -320,13 +336,13 @@ To find functions whose call-graph neighborhood changed, compare callers at each
 | Fragment | What it means |
 |---|---|
 | `cgx diff sprint-start HEAD` | BASE and HEAD are positional arguments; shows all edges added or removed over the sprint. |
-| `fn.introducing_commit IN $sprint_commits` | Requires IX-9 (not in v0.3.0). Filters to functions first introduced during the sprint. |
-| `r.introducing_commit IN $sprint_commits` | Requires IX-9. At least one call edge on the function was added during the sprint. |
+| `fn.introducing_commit IN $sprint_commits` | Not a CQL node property — IX-9 attribution never reaches `MATCH`/`RETURN`; illustrative only. |
+| `r.introducing_commit IN $sprint_commits` | Not a CQL edge property either, same reason. |
 | `--param sprint_commits=...` | Not a v0.3.0 flag; `cgx query` does not accept `--param` in this release. |
 | `count { (fn)<-[:CALLS]-() }` | Count the number of callers the function currently has. |
 | `caller_count + callee_count >= 3` | Threshold for "significant change" — tune to your codebase's typical churn rate. |
 
-**Reading the result** — The structural diff (`cgx diff sprint-start HEAD`) lists all edges added or removed during the sprint. With IX-9 edge attribution (not in v0.3.0), the full CQL form would rank functions by how many new edges touch them. Without IX-9, use the diff output to identify heavily-modified call sites and prioritize reviewing functions with many new callers (increased blast radius) or many new callees (expanded responsibility).
+**Reading the result** — The structural diff (`cgx diff sprint-start HEAD`) lists all edges added or removed during the sprint. Ranking functions by how many new edges touch them cannot be done in one CQL query, because IX-9 attribution lives only in `cgx diff --path-added`'s JSON, not in the graph CQL runs against — that boundary is permanent, not a v0.4 gap. Use the diff output directly to identify heavily-modified call sites, and prioritize reviewing functions with many new callers (increased blast radius) or many new callees (expanded responsibility).
 
 ---
 
@@ -338,8 +354,12 @@ This is the unified security gate for a pull request. In v0.3.0, `source_class`,
 
 **The query (structural gate — answerable today)**
 
+`cgx diff` rejects `--format sarif` outright (exit 2, "sarif format is not supported by `cgx diff`
+— use --format human|json") in both diff modes since PR #38 — it is not a CI-integration option here
+at all. Use `--format json` and consume the added/removed/changed edge lists directly:
+
 ```cgx
-cgx diff main HEAD --repo ./ --newer-than --format sarif > security-gate.sarif
+cgx diff main HEAD --repo ./ --newer-than --format json > security-gate.json
 ```
 
 Use `--assert-empty` via `cgx callers` or `cgx reaches` to create specific CI gates:
@@ -360,7 +380,8 @@ cgx reaches 'handleRequest' 'eval' --at HEAD --repo ./ --assert-empty
 --     --calls-to-sink-class shell \
 --     --assert-empty
 
--- NOT VALID in v0.3.0: unsafe_region, sink_class, and --param not supported
+-- NOT VALID: unsafe_region, sink_class, and --param not supported; r.introducing_commit is not
+-- a CQL edge property at all — IX-9 attribution never leaves cgx diff --path-added's own JSON
 -- cgx query --at HEAD '
 --   MATCH (a)-[r:CALLS]->(b)
 --   WHERE b.unsafe_region = true
@@ -368,7 +389,11 @@ cgx reaches 'handleRequest' 'eval' --at HEAD --repo ./ --assert-empty
 -- ' --repo ./
 ```
 
-Specified in docs/05 Worked Example 6; edge attribution requires IX-9 (core-extension, not in v0.3.0 base).
+Specified in docs/05 Worked Example 6. The taint-typed and `unsafe_region` filters are genuinely
+future work (core-extension); combining them with `introducing_commit` inside a single CQL query is
+not — that combination is permanently out of reach for CQL, since IX-9 attribution is a `cgx diff
+--path-added` JSON field only, never a graph property. Use `cgx diff --path-added --from … --to …
+--format json` (Q54) for the attribution half instead.
 
 **Breaking it down**
 
@@ -378,7 +403,7 @@ Specified in docs/05 Worked Example 6; edge attribution requires IX-9 (core-exte
 | `cgx reaches ... --assert-empty` | Exits 1 if the path exists (assertion failed), 0 if the path is absent, or 4 if the symbol pattern matched nothing (vacuous; add `--allow-vacuous` to convert 4 → 0) — use as a targeted CI gate per dangerous function. |
 | `--new-paths-only` / `--from-class` / `--to-class` / `--calls-to-sink-class` (deferred) | Not valid flags on `cgx diff` in v0.3.0. |
 | `b.unsafe_region` / `sink_class` / `source_class` (deferred) | Taint classification and unsafe-region properties — not in v0.3.0; produce plan error exit 2. |
-| `r.introducing_commit` / `--param` (deferred) | Edge attribution requires IX-9; `--param` binding not available in v0.3.0. |
+| `r.introducing_commit` / `--param` (deferred) | `r.introducing_commit` is not a CQL edge property (IX-9 attribution is `diff --path-added`-only, permanently); `--param` binding not available in v0.3.0. |
 
 **Reading the result** — A non-empty `--newer-than` diff (exit 0 with output) means the branch added new call edges; review them for paths to dangerous operations. Each `cgx reaches --assert-empty` that exits 1 flags a specific dangerous reachability; exit 0 means the path is absent; exit 4 means the symbol pattern matched nothing (add `--allow-vacuous` to suppress in CI).
 

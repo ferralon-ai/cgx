@@ -22,6 +22,28 @@ The command has two modes:
 
 **Index requirement:** `diff` re-indexes the repository internally at each ref; it does not require a pre-built `.cgx/` index and does not read one. Run from inside the target git repository or pass `--repo`.
 
+> **Known defect — `cgx diff` destroys the persisted dataflow layer.** Running `cgx diff` against a
+> repository whose `.cgx/` index was built with dataflow (the default) leaves that index with **zero
+> SSA value nodes**. It exits 0 and prints no warning. Both diff modes do it.
+>
+> Observed on a `fixtures/rust-sample` index: 276 value nodes before `cgx diff HEAD~1 HEAD`, **0**
+> after; total nodes 489 → 213.
+>
+> The damage is silent in three directions at once. [`cgx flows-to`](flows-to.md) and
+> [`cgx flows-from`](flows-from.md) then exit 2 with `no symbol matched pattern …`, which reads like
+> a mistyped FQN rather than data loss. A `[:DATA_FLOW]` [`cgx query`](query.md) returns zero rows
+> **while reporting `approximation: exact (within modeled graph)`** — an exactness claim over a layer
+> that is no longer there. And [`cgx doctor`](doctor.md) still reports `trust: HIGH — index looks
+> sound`.
+>
+> **Recovery:** re-run [`cgx index`](index.md). Verified to restore the layer in full (276 value
+> nodes, `flows-to` working again); the rebuild is cheap because extraction is content-addressed and
+> cached — only the dataflow pass recomputes.
+>
+> Until this is fixed, treat `cgx diff` as invalidating the dataflow layer: re-index before any
+> `flows-to`, `flows-from`, or `DATA_FLOW` query that follows a `diff` on the same repository, or run
+> `diff` against a throwaway clone.
+
 ## Arguments
 
 | Name | Required | Meaning |
@@ -36,7 +58,29 @@ The command has two modes:
 | Flag | Value | Default | Meaning |
 |------|-------|---------|---------|
 | `--repo` | path | CWD | Path to the git repository to diff. Must be a git working tree; `.cgx/` is not required. |
-| `--format` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. `dot`, `mermaid`, and `d2` are path-shaped renderers; use `human`, `json`, or `sarif` for diff and gate output. |
+| `--format` | per mode — see below | `human` | Output format. The accepted set differs by mode; anything outside it is rejected with exit 2 **before** any indexing happens. |
+
+**Format support is an allow-list per mode, not a single list.** A full `cgx diff` is a set of edge and node buckets; `--path-added` is a graph walk. Only the second is path-shaped, so only the second accepts the graph renderers — and neither accepts `sarif`, which is not implemented for either shape.
+
+| Mode | Accepted | Rejected (exit 2) |
+|------|----------|-------------------|
+| full diff (default) | `human`, `json` | `sarif`, `dot`, `mermaid`, `d2` |
+| `--path-added` | `human`, `json`, `dot`, `mermaid`, `d2` | `sarif` |
+
+```
+$ cgx diff HEAD~1 HEAD --format sarif --repo /path/to/my-repo
+cgx: sarif format is not supported by `cgx diff` — use --format human|json
+$ echo $?
+2
+$ cgx diff HEAD~1 HEAD --path-added --from '**::handler::*' --to '**::command::run' --format sarif --repo /path/to/my-repo
+cgx: sarif format is not supported by `cgx diff --path-added` — use --format human|json|dot|mermaid|d2
+$ echo $?
+2
+```
+
+The rejection is deliberate: an unimplemented format fails loudly rather than falling through to human text with a zero exit, which is what a CI job piping `--format sarif` into a SARIF consumer needs.
+
+**`diff` carries no approximation contract and no freshness envelope,** in either mode and either format. It never reads the on-disk index — it builds a graph at each ref itself — so there is no index freshness to report, and a graph-to-graph delta is not a traversal answer. See [Reading an answer](README.md#reading-an-answer).
 
 ### S0 post-filters (diff mode)
 
@@ -50,8 +94,19 @@ These flags narrow the diff output after the graph comparison is computed. They 
 | `--newer-than` | — | off | no | Sugar for `--added`; retained for compatibility. |
 | `--kind` | edge-kind | (any) | **yes** | Keep only edges of this kind. Repeatable: an edge matches if its kind is any of those given. `data-flow` maps to the `DerivesFrom` dataflow edge. Possible values: `calls`, `calls-virtual`, `calls-closure`, `calls-callback`, `calls-async`, `calls-indirect`, `spawns`, `contains`, `imports`, `data-flow`, `overrides`, `implements`, `inherits`, `references`, `instantiates`, `throws`, `catches`, `reads-field`, `writes-field`. |
 | `--edge-condition` | condition | (any) | no | Keep only edges with exactly this edge condition. For changed edges, an edge matches if either side's condition matches. Possible values: `always`, `conditional`, `loop`, `exception`, `panic`. |
-| `--from` | glob | (any) | no | Keep only edges whose source FQN matches this glob (e.g. `'*::handler::*'`). With `--path-added`, this is the path source anchor. |
+| `--from` | glob | (any) | no | Keep only edges whose source FQN matches this glob (e.g. `'**::handler::*'`). With `--path-added`, this is the path source anchor. |
 | `--to` | glob | (any) | no | Keep only edges whose destination FQN matches this glob. With `--path-added`, this is the path sink anchor. |
+
+**Glob syntax — `*` does not cross `::`.** The matcher is segment-aware, and this is the single most common reason an anchor silently matches nothing:
+
+| Token | Matches |
+|-------|---------|
+| `**` | any run of characters, **including** `::` separators |
+| `*` | any run of characters containing **no** `::` |
+| `?` | exactly one non-separator character |
+| anything else | itself, literally |
+
+So `'*::command::run'` does **not** match `my_crate::sys::command::run` — `*` cannot span `my_crate::sys`. Write `'**::command::run'`. A glob with a fixed number of `*`-separated segments only matches FQNs of exactly that depth; when in doubt, use `**`.
 
 **Bucket-flag rule:** If none of `--added`, `--removed`, `--changed`, or `--newer-than` are passed, all buckets print. Passing any bucket flag restricts output to that bucket only; multiple bucket flags combine as a union.
 
@@ -72,7 +127,7 @@ These flags narrow the diff output after the graph comparison is computed. They 
 |------|-----------|
 | `0` | Diff completed (diff mode), or gate ran and found no new path (gate mode). Includes the no-diff case. |
 | `1` | Gate mode (`--path-added`): at least one new reachability path was found. Output names the path(s) and the introducing commit. |
-| `2` | Usage or anchor error: an unresolvable git ref, a malformed option, or `--path-added` missing `--from`/`--to`. Also fires when `--require-anchor-match` is set and an anchor glob matches zero graph nodes. |
+| `2` | Usage or anchor error: an unresolvable git ref, an inaccessible `--repo`, a malformed option, a `--format` the selected mode does not implement, or `--path-added` missing `--from`/`--to`. Also fires when `--require-anchor-match` is set and an anchor glob matches zero graph nodes. |
 | `3` | Graph error: missing or corrupt index data during ref resolution. |
 
 Diff mode does not support `--assert-empty`, so exit codes 1 and 4 from the standard assertion contract are not applicable. Gate mode reuses exit code 1 (the existing `AssertionFailed` convention) to mean "new path found."
@@ -90,9 +145,14 @@ A `--from` or `--to` glob matches against resolved FQNs in the head graph. If th
 **Default behavior (warning, not error):** When an anchor matches zero nodes, `cgx` emits a stderr warning:
 
 ```
-cgx: warning: --to glob "std::process::Command::*" matched 0 nodes in the head graph
-— a "clean" result means the symbol is not indexed (external/std symbols are not
-graph nodes without SCIP index data), NOT that no path exists
+cgx: warning: --to glob "**::command::run" matched 0 nodes in the head graph — a "clean" result means the symbol is not indexed (external/std symbols are not graph nodes without SCIP index data), NOT that no path exists
+(no new call/dataflow reachability path)
+```
+
+*(Wrapped here for width; the warning is one line.)* Under `--require-anchor-match` the same condition is a hard error instead, and no result is printed at all:
+
+```
+cgx: --to glob "**::command::run" matched 0 nodes in the head graph — a "clean" result means the symbol is not indexed (external/std symbols are not graph nodes without SCIP index data), NOT that no path exists (--require-anchor-match is set, so this is a hard error)
 ```
 
 The exit code remains 0. The silent false-negative is gone; the warning makes it visible.
@@ -117,16 +177,22 @@ The exit code remains 0. The silent false-negative is gone; the warning makes it
 {
   "added_edges": [
     {
-      "src": "my_crate::handler::process",
-      "dst": "my_crate::sys::Command::run",
+      "dst": "my_crate::handler::run_command",
+      "file": "src/handler.rs",
       "kind": "Calls",
-      "file": "src/handler.rs"
+      "src": "my_crate::handler::process_request"
+    },
+    {
+      "dst": "my_crate::sys::command::run",
+      "file": "src/handler.rs",
+      "kind": "Calls",
+      "src": "my_crate::handler::run_command"
     }
   ],
   "added_nodes": [
     {
-      "fqn": "my_crate::handler::process",
-      "file": "src/handler.rs"
+      "file": "src/handler.rs",
+      "fqn": "my_crate::handler::run_command"
     }
   ],
   "changed_edges": [],
@@ -135,31 +201,47 @@ The exit code remains 0. The silent false-negative is gone; the warning makes it
 }
 ```
 
+All five buckets are always present, empty when there is nothing in them. A `changed_edges` entry carries an extra `changes` object naming which of `condition`, `confidence`, or `tier` moved.
+
 ### Gate mode (`--path-added --format json`)
 
 ```json
 {
-  "kind": "path-added",
-  "semantics": "call/dataflow reachability (not a soundness/security guarantee)",
   "added_paths": [
     {
+      "author_time": 1786048703,
       "from": "my_crate::handler::process_request",
-      "to": "my_crate::sys::Command::run",
+      "introducing_author": "Dev Name",
+      "introducing_commit": "6c77e0e16e3bc3eedaff156203c8f50837a8e073",
+      "introducing_email": "dev@example.com",
+      "to": "my_crate::sys::command::run",
       "via": [
         "my_crate::handler::process_request",
         "my_crate::handler::run_command",
-        "my_crate::sys::Command::run"
-      ],
-      "introducing_commit": "a1b2c3d",
+        "my_crate::sys::command::run"
+      ]
+    },
+    {
+      "author_time": 1786048703,
+      "from": "my_crate::handler::run_command",
       "introducing_author": "Dev Name",
+      "introducing_commit": "6c77e0e16e3bc3eedaff156203c8f50837a8e073",
       "introducing_email": "dev@example.com",
-      "author_time": 1580515200
+      "to": "my_crate::sys::command::run",
+      "via": [
+        "my_crate::handler::run_command",
+        "my_crate::sys::command::run"
+      ]
     }
-  ]
+  ],
+  "kind": "path-added",
+  "semantics": "call/dataflow reachability (not a soundness/security guarantee)"
 }
 ```
 
-The `semantics` field is always present and always carries the reachability caveat. The `via` array lists the node FQNs on the shortest witness path at `HEAD`. `introducing_commit` is the git commit SHA that first established the path; it is present on the path even when `--format human` is used.
+The `semantics` field is always present and always carries the reachability caveat. The `via` array lists the node FQNs on the shortest witness path at `HEAD`. `introducing_commit` is the full 40-character SHA of the commit blamed for the call site that established the path; the human view abbreviates it to 12 characters. Every anchor pair that gained a path is reported, so a single new call site can produce several `added_paths` entries — here both `process_request → run` and the shorter `run_command → run`.
+
+> **Known limitation.** `introducing_commit` is derived by blaming the call site's location, and on a call added at `HEAD` it can report the *base* commit rather than the commit that introduced the call. Treat the attribution as a pointer for review, not as provenance you can gate on; `via`, `from`, and `to` are the reliable fields.
 
 ## Examples
 
@@ -170,11 +252,14 @@ cgx diff HEAD~1 HEAD --repo /path/to/my-repo
 ```
 
 ```
-+ edge  my_crate::handler::process  ->  my_crate::logger::log_warn  (src/handler.rs)
-+ node  my_crate::handler::process
++ edge  my_crate::handler::process_request  ->  my_crate::handler::run_command  (src/handler.rs)
++ edge  my_crate::handler::run_command  ->  my_crate::sys::command::run  (src/handler.rs)
++ node  my_crate::handler::run_command
 ```
 
-Each `+ edge` line names the caller FQN, the callee FQN, and the source file. Each `+ node` line records a symbol that exists at `HEAD` but not at `BASE`.
+Each `+ edge` line names the caller FQN, the callee FQN, and the source file. Each `+ node` line records a symbol that exists at `HEAD` but not at `BASE`. `-` marks removals and `~` marks a changed edge — one present on both sides whose condition, confidence, or tier moved.
+
+*(The examples in this section were run against a two-commit fixture crate named `my_crate`, in which the head commit adds a `run_command` helper that shells out through `sys::command::run`.)*
 
 ### Show only newly added edges (`--added`)
 
@@ -187,10 +272,10 @@ Equivalent to `--newer-than` (retained for compatibility). Only added edges are 
 ### Filter added call-family edges by source module
 
 ```
-cgx diff main HEAD --added --kind calls --from '*::handler::*' --repo /path/to/my-repo
+cgx diff main HEAD --added --kind calls --from '**::handler::*' --repo /path/to/my-repo
 ```
 
-Returns only call edges added at `HEAD` whose source FQN matches `*::handler::*`.
+Returns only call edges added at `HEAD` whose source FQN matches `**::handler::*`. Because this sets an edge predicate, node output is suppressed — see the bucket rule above.
 
 ### Filter to dataflow edges added on this branch
 
@@ -209,34 +294,69 @@ Returns edges (added or removed) where the edge condition is `exception`. Useful
 ### Gate mode: detect a new handler-to-exec path
 
 ```
-cgx diff main HEAD \
+cgx diff HEAD~1 HEAD \
     --path-added \
-    --from '*::handler::*' \
-    --to '*::sys::Command::*' \
+    --from '**::handler::*' \
+    --to '**::command::run' \
     --require-anchor-match \
     --repo /path/to/my-repo
 ```
 
-Exit 0 means no new reachability path was introduced. Exit 1 means a new path was found; the output names the path and the introducing commit. Exit 2 means the anchor matched no nodes (with `--require-anchor-match`).
+```
+2 new call/dataflow reachability path(s) [reachability, not a security guarantee]:
++ path  my_crate::handler::process_request  ->  my_crate::handler::run_command  ->  my_crate::sys::command::run  [introduced by 6c77e0e16e3b (Dev Name)]
++ path  my_crate::handler::run_command  ->  my_crate::sys::command::run  [introduced by 6c77e0e16e3b (Dev Name)]
+cgx: path-added gate: 2 new call/dataflow reachability path(s) found
+```
+
+Exit 1 — a new path was found. Exit 0 means no new reachability path was introduced. Exit 2 means an anchor matched no nodes (with `--require-anchor-match`).
+
+Note the `[reachability, not a security guarantee]` banner on the header line. It is not decoration: the gate proves a path exists in the modeled graph, and nothing about whether that path is feasible at runtime or whether the sink is dangerous. A passing gate is also bounded by what got indexed — see [Zero-match anchors](#zero-match-anchors-and-the-scip-caveat).
 
 ### Gate mode: JSON output for CI artifact upload
 
 ```
-cgx diff main HEAD \
+cgx diff HEAD~1 HEAD \
     --path-added \
-    --from '*::handler::*' \
-    --to '*::sys::Command::*' \
+    --from '**::handler::*' \
+    --to '**::command::run' \
     --require-anchor-match \
     --format json \
     --repo /path/to/my-repo
 ```
+
+The shape is under [Gate mode](#gate-mode---path-added---format-json) above; exit 1 accompanies a non-empty `added_paths`.
+
+### Gate mode: render the new path as a graph
+
+```
+cgx diff HEAD~1 HEAD \
+    --path-added \
+    --from '**::handler::*' \
+    --to '**::command::run' \
+    --format dot \
+    --repo /path/to/my-repo
+```
+
+```
+digraph cgx {
+  rankdir=LR;
+  n0 [label="my_crate::handler::process_request"];
+  n1 [label="my_crate::handler::run_command"];
+  n2 [label="my_crate::sys::command::run"];
+  n0 -> n1;
+  n1 -> n2;
+}
+```
+
+Exit 1 (a path was found; the gate status still goes to stderr). This is the same emitter [`cgx paths`](paths.md) uses, so a `--path-added` graph and a `cgx paths` graph over the same nodes are byte-identical — with one difference: an added path carries no edge condition, so these edges are always unlabelled. `mermaid` and `d2` render the same walk in their own syntax.
 
 ### No changes between refs
 
 When the call graph is identical at both refs:
 
 ```
-cgx diff d34930c HEAD~1 --repo /path/to/my-repo
+cgx diff HEAD HEAD --repo /path/to/my-repo
 ```
 
 ```

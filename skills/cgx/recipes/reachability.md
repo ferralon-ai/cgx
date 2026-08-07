@@ -50,6 +50,25 @@ cgx query '
 `--depth` (default 6). The CQL form scans backwards from named sinks and can cover several sinks
 in one query; bound the hops (`*4`) — unbounded `CALLS*` hangs.
 
+**Anchoring and bounding are necessary, not sufficient — and `LIMIT` does not rescue you.**
+`MATCH path = (…)-[:CALLS*N]->(…)` binds a path variable, which materializes the whole path set
+before any `WHERE`, quantifier or `LIMIT` is applied. Cost is driven by the anchor's fan-out and by
+N, not by how many rows you asked for. Measured this cycle on a 17,221-node / 29,735-edge index of
+cgx's own `crates/` tree, anchored on a single symbol, with `LIMIT 5`:
+
+| Anchor (outbound degree) | `CALLS*6` + `ANY(...)`, path-bound |
+|---|---|
+| `cgx_cli::emit` (out=3) | ~1s |
+| `cgx_lang_rust::effects::effects_of_call` (out=98) | ~26s |
+| `cgx_lang_java::effects::effects_of_call` (out=130) | ~45s |
+| `cgx_resolve::rta::run_rta` (out=92) | did not finish in 120s |
+
+From the caller's side a two-minute query is indistinguishable from a hang. Before writing an
+`N ≥ 5` path-bound query, check the anchor with `cgx symbols --rank outbound --top 10`; if it is
+high-fanout, use `cgx paths <from> <to> --depth N` instead — it enumerates paths between two named
+endpoints without materializing a path set over the whole reachable frontier. `api-contracts.md`
+carries the same warning for the same construct.
+
 **Reading the result.** Each result row is a confirmed reachable call chain, not a guarantee of
 exploitability. Check edge conditions: an `[exc]`-only path (every edge has `condition = "exception"`)
 means the shell sink is only reachable during error handling. Use `--confidence certain` to suppress
@@ -97,6 +116,26 @@ cgx query '
   RETURN h.name, h.file, h.line, sink.name, sink.file, sink.line, length(path) AS hops
 ' --format sarif > authz-bypass.sarif
 ```
+
+**What the SARIF actually contains.** Beyond one `note` result per row (`ruleId: "cgx/query"`), every
+cgx SARIF document carries two standing notes that a security pipeline should surface rather than
+filter out:
+
+- **`cgx/approximation-contract`** — `message.text` is the human `approximation:` line and
+  `properties` is the structured contract (`direction`, `reasons`, `modeled_graph`, and `scope` on a
+  negative answer).
+- **`cgx/index-freshness`** — `message.text` is the human `freshness:` line and `properties` is the
+  six-key envelope (`indexed_tree`, `head_tree`, `matches_head`, `dirty_files_base`, `dirty_files`,
+  `stale`).
+
+`tool.driver.rules` always declares five ids: `cgx/<subcommand>`, `cgx/vacuous-assertion`,
+`cgx/truncated`, `cgx/approximation-contract`, `cgx/index-freshness`. A clean bypass report whose
+freshness note says `stale` was computed against a tree that is not what you shipped — that is the
+finding, not the empty result list.
+
+`sarif` is accepted on `callers`, `callees`, `reaches`, `paths`, `unused`, `flows-to`, `flows-from`
+and `query`. It is **rejected (exit 2)** on `search`, `symbols` and `cgx diff` in both diff modes,
+and `explain`/`doctor` silently render human text for it instead.
 
 **Why this works.** `NONE(n IN nodes(path) WHERE n.name = "require_admin")` is a negative path
 constraint: it keeps only paths that never visit the check. Zero results means every path passes
@@ -191,6 +230,12 @@ handling. (`<expr> NOT IN [...]` is a parse error (exit 2); use `NOT <expr> IN [
 **Reading the result.** Results here warrant review: is a cryptographic primitive being invoked only
 when something has already gone wrong? See `reference/mental-model.md` for the full edge-condition
 vocabulary (`always`/`conditional`/`exception`/`loop`/`panic`).
+
+**The `"panic"` half of these predicates is inert today.** Four of the five conditions are populated;
+`panic` is declared in the schema and emitted by no frontend, so every row these queries return came
+from `exception` alone, and no query can select panic-conditioned edges. Keeping `panic` in the
+predicate costs nothing and stays correct if that changes — but do not read "no panic path" out of
+an empty result. See `recipes/failure-paths.md`.
 
 **Cookbook note.** Q4 shows `--only-edge-condition exception` — that flag does not exist. Use the CQL
 `NONE` form above.
@@ -364,6 +409,8 @@ column shows the minimum version for each pattern; `deferred` means the pattern 
 | Collect per-hop conditions | `[e IN relationships(path) \| e.condition] AS conditions` | v0.1 |
 | CI assertion gate | `--assert-empty` (exit 1 if results) | v0.1 |
 | Bounded multi-hop | `[:CALLS*N]` — always provide N; bare `*` hangs | v0.1 |
+| Path-bound multi-hop | `MATCH path = …-[:CALLS*N]->…` — anchor *and* keep N small; cost scales with anchor fan-out, and `LIMIT` does not bound the work | v0.1 |
+| Path has at least one panic edge | not answerable — `panic` is schema-present and never emitted; see `recipes/failure-paths.md` | — |
 | Structural dataflow (forward/backward) | `[:DATA_FLOW]`, `flows-to`/`flows-from` CLI | v0.3 |
 | Security-typed taint (source/sink/sanitizer class) | `source_class`, `sink_class`, `sanitizer_class`, `taint_label` — plan error (exit 2) today | deferred |
 | Must-pass-through | `MATCH ALL … MUST PASS THROUGH` — plan error (exit 2) today | deferred |

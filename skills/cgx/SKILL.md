@@ -4,18 +4,27 @@ description: >-
   Use when answering structural or call-graph questions about a codebase with the cgx tool (CLI or MCP):
   who calls a function, what a function calls, whether one symbol reaches another, the call paths between
   two symbols, dead or unused code, the blast radius of a change, exception/failure paths, taint or data
-  provenance, framework entrypoints, inheritance/overrides, or call-graph diffs between git refs. Also use
-  when a cgx command failed unexpectedly (exit code 2, a CQL parse/plan error, a hanging query, or
-  "no symbol matched").
+  provenance, framework entrypoints, inheritance/overrides, call-graph diffs between git refs, or which
+  files historically change together. Also use when interpreting a cgx answer — its confidence labels,
+  approximation contract, or index-freshness envelope — or when a cgx command failed unexpectedly
+  (exit code 2, a CQL parse/plan error, a hanging query, or "no symbol matched").
 ---
 
 # cgx — deterministic call-graph tool
 
 cgx is a general-purpose, deterministic call-graph and code-graph tool for source code in any language,
-implemented in Rust. No daemon, fast startup, usable as a **human/agent CLI** (the initial focus) and over a
-**STDIO MCP server**. Every answer carries `file:line` evidence and a labeled confidence
+implemented in Rust. No daemon, fast startup, usable as a **human/agent CLI** (16 subcommands) and over a
+**STDIO MCP server** (12 tools). Every answer carries `file:line` evidence and a labeled confidence
 (`certain`/`probable`/`possible`). **No LLM is in the answer path** — answers are deterministic and
-reproducible. cgx tells you about *structure and reachability*; it does not run the code.
+reproducible: the same query against the same graph returns byte-identical output. cgx tells you about
+*structure and reachability*; it does not run the code.
+
+**Every answer also says how far it can be wrong, and what it was computed over.** A graph answer
+carries an `approximation` contract — which direction it can err (`exact`/`over`/`under`/`over_under`),
+why, and on an answer that asserts an absence the `scope` actually searched — plus a `freshness` envelope saying how far
+the indexed graph sits from your working tree. Neither is universal: both sets are listed in
+`reference/output-and-exit.md` §1.2–1.3, and **a command that carries no contract is not claiming its
+answer is exact**. Read both before acting on a result, especially an empty one.
 
 ## STEP 0 — Always check the version first
 
@@ -39,7 +48,11 @@ cgx search --all                       # list every symbol (no pattern; Since: v
 ```
 
 The index auto-builds on first query into `.cgx/`; force a rebuild with `cgx index .`.
-There is no `prune`/`clean`.
+There is no `prune`/`clean`. Two exceptions to "auto-builds": **`cgx doctor` never auto-indexes**
+(exit 3 on an unindexed repo — run `cgx index .` first), and **`cgx coupling` needs no index at
+all** (it reads committed git history). Over MCP nothing touches `.cgx/`: each tool call indexes
+into a fresh in-memory store, so `root` must be inside a git repo but needs no `.cgx/` and gets
+none.
 
 ## Mental model — read before interpreting any result
 
@@ -55,11 +68,12 @@ answer means.
 | Find who calls / what calls a symbol; whether/how X reaches Y; enumerate call paths | `recipes/reachability.md` |
 | Assess impact / blast radius of changing a symbol; what could break | `recipes/impact.md` |
 | Find dead / unused / unreachable code | `recipes/dead-code.md` |
-| Rank symbols by importance / find graph hubs / attack-surface entry points (`cgx symbols`, ref-count + edge breakdown) *(v0.3)* | `reference/cli.md` (`symbols`) |
+| Rank symbols by importance / find graph hubs / attack-surface entry points *(v0.3)* | `reference/cli.md` (`symbols`) |
 | Reason about exception / panic / failure paths; ∀-path "must pass through" | `recipes/failure-paths.md` |
 | Trace data provenance; forward/backward value flows (`flows-to`/`flows-from`, `[:DATA_FLOW*]`) *(v0.3, on by default)* | `recipes/taint.md` |
 | Map the public API surface / contracts | `recipes/api-contracts.md` |
 | See what changed in the call graph between commits/branches | `recipes/vcs-diffs.md` |
+| Find which files historically change together; gauge co-change coupling over a commit range | `recipes/vcs-diffs.md` |
 | Drive cgx as an AI agent (MCP tools, token-efficient queries) | `recipes/ai-agent.md` + `reference/mcp.md` |
 | Build a threat model / data-flow diagram *(v0.3)* | `recipes/threat-modeling.md` |
 | Reason about concurrency, locks, async safety *(v0.3)* | `recipes/concurrency.md` |
@@ -85,6 +99,18 @@ answer means.
   (`*1..12`) when you need more reach.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
+- **`--depth 0` does not mean "unlimited"** — except on CLI `paths`, and the shared `--depth` help
+  text claims otherwise on all eight commands that take it. Everywhere else `0` is literally zero
+  hops: `callers`/`callees`/`reaches`/`flows-*` return nothing, and `unused` returns an inflated
+  dead-code report that looks like a rich, successful answer. Over MCP the sentinel is *inverted* —
+  `paths` `max_depth: 0` returns nothing. To walk wide, pass an explicitly large `--depth N`. See
+  `reference/cli.md`.
+- **An empty answer is not a finding.** Exit 0 with no results means "nothing found under these
+  constraints". Before reporting absence, read `approximation.direction` and `scope`, check
+  `truncated`, and check whether the thing you filtered on is actually emitted: **seven** structural
+  edge types and the `panic` edge condition all parse, plan, and return **zero rows on every repo**
+  (`reference/mental-model.md` §2.2 and §3). An empty `panic` result is a modelling gap wearing the
+  costume of a safety finding.
 - **Real flags, not the cookbook's:** `--repo ./` (not a trailing `./`);
   `--kind function` (not `--kind fn`); `cgx diff <BASE> <HEAD>` positional (not `--base/--head`). Flags like
   `--from-class`, `--avoiding`, `--only-edge-condition` **do not exist**.

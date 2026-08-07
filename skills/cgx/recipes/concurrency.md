@@ -63,13 +63,47 @@ detects thread spawn call sites (e.g. `std::thread::spawn`, `tokio::spawn`).
 cgx query 'MATCH (spawner)-[:SPAWNS]->(task) RETURN spawner.name, spawner.file, task.name, task.file LIMIT 20' --repo /path/to/repo
 ```
 
+Real output against the shipped `fixtures/rust-sample` (`src/spawn.rs`), run twice, byte-identical:
+
+```
+$ cgx query 'MATCH (a)-[:SPAWNS]->(b) RETURN a.fqn, b.fqn LIMIT 10'
+a.fqn                               b.fqn
+rust_sample::spawn::spawn_and_join  rust_sample::spawn::background_work
+rust_sample::spawn::spawn_if        rust_sample::spawn::background_work
+rust_sample::spawn::spawn_many      rust_sample::spawn::background_work
+rust_sample::spawn::spawn_on_error  rust_sample::spawn::background_work
+rust_sample::spawn::spawn_one       rust_sample::spawn::background_work
+approximation: exact (within modeled graph)
+freshness: current | indexed tree dd3ea2b, working tree clean
+```
+Nothing elided — five spawn sites, and the two footer lines are the real last two lines of a `cgx
+query` answer.
+
+Unlike `READS_FIELD`/`WRITES_FIELD`, `SPAWNS` is genuinely populated — this is the edge type this
+recipe's cross-thread questions actually stand on.
+
 To enumerate all symbols reachable from within a spawned task:
 
 ```bash
-cgx callees 'my_crate::spawn::spawned_task_fn' --depth 0 --repo /path/to/repo
+cgx callees 'my_crate::spawn::spawned_task_fn' --depth 8 --repo /path/to/repo
 ```
 
-(`--depth 0` = unlimited, work-budgeted.)
+**Do not pass `--depth 0` here.** On `callees` — and on `callers`, `reaches <from>`, `flows-to`,
+`flows-from` — `--depth 0` returns the **seed symbol only**, with an
+`approximation: under-approximate — search stopped at depth 0` line. Verified against
+`fixtures/rust-sample`:
+
+```
+$ cgx callees rust_sample::conditions::dispatch --depth 0
+rust_sample::conditions::dispatch  src/conditions.rs:42
+approximation: under-approximate — search stopped at depth 0; deeper edges were not explored | scope: call edges, confidence>=possible, depth<=0
+freshness: current | indexed tree dd3ea2b, working tree clean
+```
+
+`0` means unbounded on exactly one CLI command, `cgx paths`, where the search stays work-budgeted.
+The CLI's own `--help` text states the sentinel generally; it is wrong everywhere else. To widen a
+`callees` walk, name a real depth. Over MCP the sentinel does not survive the crossing at all: the
+`paths` tool's `max_depth: 0` returns an empty result, not an unbounded search.
 
 ---
 

@@ -13,19 +13,23 @@ fully hermetic and **always runs** in CI.
 
 ## The real-blob path (gated, skipped when absent)
 
-A real rust-analyzer index is the highest-fidelity fixture. To produce one (when
-`rust-analyzer` is installed):
+A real rust-analyzer index is the highest-fidelity fixture. `relabel.scip` is
+**not committed**, so the gated test skips everywhere until someone generates it.
+To produce one (`rust-analyzer` must be on `PATH`):
 
 ```sh
 cd fixtures/scip-relabel
-rust-analyzer scip .            # writes ./index.scip
-mv index.scip relabel.scip      # the path the gated test looks for
+rust-analyzer scip . --output relabel.scip
 ```
 
-Any test that consumes the real `relabel.scip` is gated behind the file's
-presence (`Path::exists`) and is skipped when it is absent — which is the case in
-this environment, where rust-analyzer is not installed. Commit `relabel.scip`
-alongside this README once generated so the gated test exercises a genuine
-rust-analyzer output.
+`--output` defaults to `index.scip`; naming the file directly is what the gated
+test looks for. That test is `real_scip_blob_when_present` in
+`crates/cgx-index/tests/scip_relabel_integration.rs`, which checks
+`Path::exists` on `fixtures/scip-relabel/relabel.scip` and returns early with a
+`skipping:` line when it is absent. Commit `relabel.scip` alongside this README
+once generated so the gated test exercises a genuine rust-analyzer output; it
+asserts that the real blob upgrades the cross-module `scip_relabel::caller` →
+`scip_relabel::math::add` call from `probable` to `certain`.
 
-Regenerate whenever `src/lib.rs` changes.
+Regenerate whenever anything under `src/` changes — the assertion above spans
+both `lib.rs` and `math.rs`.

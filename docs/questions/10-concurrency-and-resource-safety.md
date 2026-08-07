@@ -7,8 +7,20 @@ together on the same screen. These six questions use `cgx`'s concurrency model
 effect system (GM-12), and resource lifecycle pairs (GM-13) — to surface the
 patterns that cause data races, deadlocks, and leaked resources. All six questions
 are NOVEL: no existing tool answers them at the call-graph level for arbitrary
-user-declared constructs. Each query requires the schema-room features to be
-populated, so every entry is clearly marked.
+user-declared constructs. Two of the five underlying mechanisms are not what they
+look like below: GM-9 spawn edges (`EdgeKind::Spawns`, real and queryable today via
+`-[:SPAWNS]->`) and GM-12's function effect system (a real 7-value lattice —
+`Blocking`, `Spawns`, `IoFile`, `IoNet`, `IoProc`, `DynamicCode`, `Nondeterministic`
+— computed and stored per function, `crates/cgx-core/src/effect.rs:27-55`) both
+ship and are populated at index time. What blocks every query below that reaches
+for `own_effects`/`transitive_effects`, `suspends`, `lock_set`, or a per-access
+`spawn_context` identity is narrower than "the fact doesn't exist" — it is that
+CQL's `lower.rs` does not expose those specific node properties yet (`unknown node
+property` / `not supported in this release`), even where the underlying field is
+real and populated. GM-10 (suspension points), GM-11 (lock sets), and GM-13
+(resource lifecycle pairs) are genuine schema-room: no code anywhere constructs a
+populated instance of any of them. Each entry below states which kind of gap it
+actually has.
 
 ---
 
@@ -115,7 +127,7 @@ Note: `cgx paths` takes two positional arguments (`<FROM>` and `<TO>`) and uses 
 
 ### Q97 — Which shared fields are written from two or more spawn-distinct execution contexts under inconsistent lock sets?
 
-**Personas:** PSE · **Status:** schema-room — depends on GM-11 synchronization context and lock sets, GM-9 spawn edges (`schema-room`, Phase 3 analysis)
+**Personas:** PSE · **Status:** schema-room — depends on GM-11 lock-set and per-access spawn-context identity, neither of which any code populates yet
 
 A data race occurs when two threads write the same field while holding different
 locks — or no lock at all. Existing tools like Infer RacerD use a boolean lock
@@ -126,8 +138,15 @@ consistency family).
 
 **The query**
 
+GM-9 spawn edges are not the blocker here — `EdgeKind::Spawns` is real, shipped, and
+queryable today via `-[:SPAWNS]->` (`crates/cgx-resolve/src/link.rs:1192`,
+`crates/cgx-cql/src/lower.rs:217`). What's missing is `site_a.lock_set` (GM-11, no
+populating code anywhere) and `a.spawn_context` (not a field on any node or edge
+record at all — `grep -rn spawn_context crates/` is empty):
+
 ```cgx
--- illustrative: requires GM-9 (schema-room) spawn edges and GM-11 (schema-room) lock-set attribute
+-- illustrative: requires GM-11 (schema-room) lock-set attribute and a per-access
+-- spawn-context identity, which does not exist as a field anywhere yet
 MATCH (a)-[:CALLS*]->(site_a)-[:READS_FIELD|WRITES_FIELD]->(field)
 MATCH (b)-[:CALLS*]->(site_b)-[:READS_FIELD|WRITES_FIELD]->(field)
 WHERE a.spawn_context <> b.spawn_context
@@ -142,7 +161,7 @@ RETURN field.name, field.file,
 
 | Fragment | What it means |
 |---|---|
-| `a.spawn_context <> b.spawn_context` | The two access sites `site_a` and `site_b` are reachable from different spawn contexts — different threads or tasks. GM-9 spawn edges populate `spawn_context` identities at index time. |
+| `a.spawn_context <> b.spawn_context` | The two access sites `site_a` and `site_b` are reachable from different spawn contexts — different threads or tasks. `EdgeKind::Spawns` itself is real and populated at index time; `spawn_context` — a per-node identity naming *which* spawn site an access descends from — is not: it is not a field on any record in `cgx-core` today. |
 | `NOT ANY(lock IN site_a.lock_set WHERE lock IN site_b.lock_set)` | The inconsistent-lock-set condition: the lock sets at the two access sites share no lock in common. If they shared even one common lock, that lock would be the consistent protection. |
 | `(site_a)-[:WRITES_FIELD]->(field) OR (site_b)-[:WRITES_FIELD]->(field)` | At least one of the two accesses is a write. A read-read pair with no writer is not a race; a write from either side with an inconsistent lock set is. |
 | `site_a.lock_set AS locks_a, site_b.lock_set AS locks_b` | Return both lock sets so the reviewer can see which locks are being used and understand why they differ. |
@@ -153,7 +172,7 @@ RETURN field.name, field.file,
 
 ### Q104 — Which async functions hold a mutex guard live at an `await` point, and which blocking calls (sync I/O, `thread::sleep`) are reachable from async entrypoints?
 
-**Personas:** SSE · **Status:** schema-room — depends on GM-10 suspension points, GM-11 lock sets, GM-12 function effect system `blocking` effect (`schema-room`, Phase 3 analysis)
+**Personas:** SSE · **Status:** schema-room — depends on GM-10 suspension points and GM-11 lock sets, neither populated by any code today. GM-12's `blocking` effect is a different case: it *is* a real, populated effect label (`crates/cgx-core/src/effect.rs:27`) — what blocks this query is that CQL does not expose `own_effects`/`transitive_effects` as queryable node properties (`unknown node property`, live-verified), not that the effect itself is unbuilt
 
 Holding a mutex across an `await` point in an async function prevents the executor
 from running other tasks that need the same mutex — a potential deadlock. Calling
@@ -182,7 +201,10 @@ ORDER BY site.file, site.line
 Blocking-in-async:
 
 ```cgx
--- illustrative: requires GM-9 (schema-room), GM-10 (schema-room), and GM-12 (schema-room) blocking effect
+-- illustrative: the `blocking` effect itself ships and is populated (GM-12,
+-- effect.rs:27); what's not queryable is fn.transitive_effects (CQL rejects it,
+-- "unknown node property") and the async-entrypoint `async` property (GM-10-
+-- adjacent, also CQL-rejected)
 MATCH path = (ep {kind:"entrypoint", async:true})-[:CALLS*]->(fn)
 WHERE "blocking" IN fn.transitive_effects
   AND NONE(n IN nodes(path) WHERE n.name IN ["spawn_blocking",
@@ -195,7 +217,7 @@ ORDER BY depth, fn.file
 
 Via Layer 1:
 
-These patterns require schema-room properties (GM-10, GM-11, GM-12) and have no dedicated Layer 1 shorthand in v0.3.0. Use `cgx query` with the CQL form above once those schema properties are available. The flag `--concurrency` does not exist.
+GM-10 (`suspends`) and GM-11 (`lock_set`) are genuine schema-room — no code populates either. GM-12's effect labels are not: they ship and are populated, but `own_effects`/`transitive_effects` are not exposed as queryable CQL properties (`unknown node property`). Neither gap has a dedicated Layer 1 shorthand in v0.3.0. The flag `--concurrency` does not exist.
 
 **Breaking it down**
 
@@ -213,7 +235,7 @@ These patterns require schema-room properties (GM-10, GM-11, GM-12) and have no 
 
 ### Q105 — Which functions carry a `writes-global` effect and are callable from two or more spawn-distinct execution contexts without a lock on every path?
 
-**Personas:** SSE · **Status:** schema-room — depends on GM-12 function effect system `writes-global` effect, GM-11 lock sets, GM-9 spawn edges (`schema-room`, Phase 3 analysis)
+**Personas:** SSE · **Status:** schema-room — `writes-global` is genuinely absent from the shipped 7-value effect lattice (`Blocking, Spawns, IoFile, IoNet, IoProc, DynamicCode, Nondeterministic` — `crates/cgx-core/src/effect.rs:27-42`; no global/shared-state write label exists at all), and GM-11 lock sets are unpopulated. GM-9 spawn edges are not part of the gap — `EdgeKind::Spawns` ships and is queryable via `-[:SPAWNS]->`; what's missing alongside `writes-global` is the per-access `spawn_context` identity this query also needs, which is not a field anywhere
 
 A function that writes global or shared mutable state without consistent locking
 is a data-race hazard when called from multiple threads. The `writes-global` effect
@@ -224,7 +246,10 @@ guaranteed lock coverage. Specified in docs/05 Q-24 (cross-spawn race family).
 **The query**
 
 ```cgx
--- illustrative: requires GM-9 (schema-room), GM-11 (schema-room), and GM-12 (schema-room)
+-- illustrative: `writes-global` does not exist in the effect lattice (real gap);
+-- GM-11 lock sets and a per-access spawn_context identity are unpopulated (real gap).
+-- GM-9 itself is not a gap: EdgeKind::Spawns ships — `(spawn_a)-[:CALLS*]->(fn_a)`
+-- would need `-[:SPAWNS]->` as its first hop to actually anchor on a spawn site
 MATCH (spawn_a {edge_type:"spawns"})-[:CALLS*]->(fn_a)
 MATCH (spawn_b {edge_type:"spawns"})-[:CALLS*]->(fn_b)
 WHERE spawn_a <> spawn_b
@@ -242,7 +267,7 @@ RETURN fn_a.name, fn_a.file, fn_a.line,
 |---|---|
 | `spawn_a {edge_type:"spawns"} / spawn_b` | Two distinct spawn sites — the locations where threads or tasks are created. |
 | `fn_a = fn_b` | Both spawn contexts reach the same function — confirming shared access to the same global-writing code. |
-| `"writes-global" IN fn_a.own_effects` | The function carries the `writes-global` effect label (either syntactically inferred in Phase 1 or propagated transitively from callees in Phase 2). |
+| `"writes-global" IN fn_a.own_effects` | Two independent gaps stacked: `writes-global` is not one of the 7 shipped effect labels at all (no global/shared-state write label exists), and `own_effects` is also not a queryable CQL property today even for the 7 labels that do exist (`unknown node property`). |
 | `NOT ANY(lock IN spawn_a.lock_set WHERE lock IN spawn_b.lock_set)` | At neither spawn site does the common lock set include a shared lock — there is no consistent lock protecting the write. |
 | `spawn_a.file AS spawn_a_site, spawn_b.file AS spawn_b_site` | Return both spawn site file locations so the reviewer knows which threads are involved. |
 
@@ -252,19 +277,23 @@ RETURN fn_a.name, fn_a.file, fn_a.line,
 
 ### Q108 — Which functions annotated or inferred as pure, or reachable only from test entrypoints, transitively reach `nondeterministic` effects (time, random, env reads)?
 
-**Personas:** SSE · **Status:** schema-room — depends on GM-12 function effect system `nondeterministic` effect (`schema-room`, Phase 3 analysis)
+**Personas:** SSE · **Status:** schema-room — but not because `nondeterministic` is unbuilt. It is the 7th value of the shipped effect lattice (`crates/cgx-core/src/effect.rs:27-42`) and is computed and stored per function like the other six. Two narrower things actually block this query: `own_effects`/`transitive_effects` are not exposed as queryable CQL node properties yet, and `is_pure`/`reachable_from_test_only` are not fields on any node record at all (zero hits anywhere in `crates/`)
 
 A function that claims to be pure but transitively reaches `time.Now()`,
 `rand::random()`, or `env::var()` is not actually pure. Similarly, a function
 reachable only from test entrypoints should not depend on system clock or
 environment state if the tests must be deterministic. The GM-12 `nondeterministic`
-effect label, propagated transitively through the call graph, makes this pattern
-directly queryable. Specified in docs/05 Q-24 (effect-based queries).
+effect label is real and is propagated transitively through the call graph at
+index time; what makes this pattern not-yet-queryable is CQL's surface, not the
+underlying fact. Specified in docs/05 Q-24 (effect-based queries).
 
 **The query**
 
 ```cgx
--- illustrative: requires GM-12 (schema-room) for the `nondeterministic` transitive effect
+-- illustrative: the `nondeterministic` effect ships and is populated (effect.rs:27).
+-- Blocked by two narrower gaps instead: `own_effects`/`transitive_effects` are not
+-- queryable CQL node properties (`unknown node property`, live-verified), and
+-- `is_pure`/`reachable_from_test_only` are not fields on any node record at all
 MATCH path = (fn)-[:CALLS*]->(ndet_fn)
 WHERE (fn.is_pure = true OR fn.reachable_from_test_only = true)
   AND "nondeterministic" IN ndet_fn.transitive_effects
@@ -279,10 +308,10 @@ For a broader sweep of all functions whose transitively-computed effects include
 `nondeterministic` (regardless of pure/test annotations):
 
 ```cgx
--- illustrative: requires GM-12 (schema-room)
--- Note: MATCH (fn) with no relationship is a plan error in v0.3.0 (exit 2).
--- When GM-12 is available this will require a relationship clause, e.g.:
--- MATCH (fn)-[:CALLS]->(callee) WHERE ...
+-- illustrative: blocked by `own_effects`/`transitive_effects` not being queryable
+-- CQL node properties, not by `nondeterministic` itself (which ships).
+-- Note: MATCH (fn) with no relationship is a plan error in v0.3.0 (exit 2) — the
+-- relationship clause below is required regardless of the property gap.
 MATCH (fn)-[:CALLS]->(callee)
 WHERE "nondeterministic" IN fn.transitive_effects
   AND NOT "nondeterministic" IN fn.own_effects
@@ -295,8 +324,8 @@ ORDER BY fn.file, fn.line
 
 | Fragment | What it means |
 |---|---|
-| `fn.is_pure = true OR fn.reachable_from_test_only = true` | The function is annotated or inferred as pure, or is only reachable from test entrypoints — either property creates an expectation of determinism. |
-| `"nondeterministic" IN ndet_fn.transitive_effects` | The callee (or one of its callees) carries the `nondeterministic` effect — it reads the system clock, generates random numbers, reads environment variables, or otherwise depends on external non-deterministic state. |
+| `fn.is_pure = true OR fn.reachable_from_test_only = true` | The function is annotated or inferred as pure, or is only reachable from test entrypoints — either property creates an expectation of determinism. Neither field exists on any node record today; this half is genuine schema-room. |
+| `"nondeterministic" IN ndet_fn.transitive_effects` | The callee (or one of its callees) carries the `nondeterministic` effect — a real, populated label (system clock, random numbers, env reads). What's missing is CQL exposure of `transitive_effects`, not the label. |
 | `NOT "nondeterministic" IN fn.own_effects` | (Second query) Restrict to functions that are themselves innocent but inherit nondeterminism from a callee — the surprising cases. |
 | `depth` | Hop count from the function to the nondeterministic callee; shallow is worse (the nondeterminism is close to the surface). |
 

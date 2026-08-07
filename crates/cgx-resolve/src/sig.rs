@@ -30,16 +30,24 @@
 //!
 //! ## Compatibility definition (`sig_compatible`)
 //!
-//! **Arity match only**, against what the frontend actually stores. The call site
-//! carries a syntactic arity (the argument count, encoded in the `indirect:<arity>`
-//! rule); a candidate is compatible when its [`Signature::params`] count equals
-//! that arity. Per-parameter and return types are *not* compared: the frontend
-//! records them best-effort and a closure literal frequently elides them
-//! (`|x| ..`), so a type comparison would spuriously exclude real targets. We
-//! intentionally use only what is reliably captured (arity) rather than
-//! over-engineer a type match the data cannot support — when the call site's arity
-//! is unknown (`indirect:?`), every Lambda/free-Function is admitted (the soundest
-//! over-approximation).
+//! **Same source language, then arity match**, against what the frontend actually
+//! stores. A candidate must share the call site's [`NodeRecord::lang`] — currently
+//! `CallsClosure`/`CallsCallback` are emitted by the TS frontend exclusively (no
+//! other frontend produces these ref kinds), and a bare TS closure/callback
+//! invocation cannot, under any JS/TS calling convention, directly reach a
+//! non-TS function value without an intermediating JS-visible binding; cgx has no
+//! FFI-glue modeling that would legitimately produce such an edge via this
+//! mechanism (same reasoning as the Step-3/4 language partition in `link.rs`). The
+//! call site carries a syntactic arity (the argument count, encoded in the
+//! `indirect:<arity>` rule); among same-language candidates, one is compatible
+//! when its [`Signature::params`] count equals that arity. Per-parameter and
+//! return types are *not* compared: the frontend records them best-effort and a
+//! closure literal frequently elides them (`|x| ..`), so a type comparison would
+//! spuriously exclude real targets. We intentionally use only what is reliably
+//! captured (language, arity) rather than over-engineer a type match the data
+//! cannot support — when the call site's arity is unknown (`indirect:?`), every
+//! same-language Lambda/free-Function is admitted (the soundest over-approximation
+//! within the language partition).
 //!
 //! ## Confidence / tier (design §4.4)
 //!
@@ -109,6 +117,16 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
 
     let index = CallableIndex::build(graph);
 
+    // Every candidate must share the call site's source language (module doc,
+    // "Compatibility definition"). The call site's language is its caller's —
+    // looked up via the placeholder edge's `src`, the same `NodeRecord.lang` the
+    // frontend stamped from `file.lang` when the caller was emitted.
+    let lang_by_id: BTreeMap<NodeId, &str> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.node.id, n.node.lang.as_str()))
+        .collect();
+
     let mut next_group: u32 = graph
         .edges
         .iter()
@@ -125,7 +143,9 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
         // Always drop the placeholder edge — it is a sentinel, never stored as-is.
         drop_edge_idx.insert(site.edge_index);
 
-        let mut dsts = index.compatible(site.arity);
+        let src = graph.edges[site.edge_index].edge.src;
+        let lang = lang_by_id.get(&src).copied().unwrap_or("");
+        let mut dsts = index.compatible(lang, site.arity);
         if dsts.is_empty() {
             // No signature-compatible function value exists. Leave the call
             // honestly dangling (no edge) rather than inventing a target.
@@ -272,13 +292,17 @@ fn build_sig_edge(
 }
 
 /// The function-value candidate index: every `Lambda` and *free* `Function` node,
-/// keyed by signature arity, plus an arity-less bucket of all of them.
+/// keyed by source language and signature arity, plus a per-language arity-less
+/// bucket. Partitioned by language (module doc, "Compatibility definition") — a
+/// call site never considers a candidate from a different language.
 struct CallableIndex {
-    /// `arity → [node ids]` for Lambda + free Function nodes with that param count.
-    by_arity: BTreeMap<usize, Vec<NodeId>>,
-    /// All Lambda + free Function node ids (used when the call-site arity is
-    /// unknown — admit every function value, the soundest over-approximation).
-    all: Vec<NodeId>,
+    /// `(lang, arity) → [node ids]` for Lambda + free Function nodes of that
+    /// language with that param count.
+    by_lang_arity: BTreeMap<(String, usize), Vec<NodeId>>,
+    /// `lang → [node ids]`, every Lambda + free Function node of that language —
+    /// used when the call-site arity is unknown (admit every same-language
+    /// function value, the soundest over-approximation within the partition).
+    all_by_lang: BTreeMap<String, Vec<NodeId>>,
 }
 
 impl CallableIndex {
@@ -291,8 +315,8 @@ impl CallableIndex {
             .map(|n| n.fqn.as_str())
             .collect();
 
-        let mut by_arity: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
-        let mut all: Vec<NodeId> = Vec::new();
+        let mut by_lang_arity: BTreeMap<(String, usize), Vec<NodeId>> = BTreeMap::new();
+        let mut all_by_lang: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
         for n in graph.node_records() {
             let is_value = match n.kind {
                 SymbolKind::Lambda => true,
@@ -308,27 +332,37 @@ impl CallableIndex {
             }
             let arity = n.signature.as_ref().map(|s| s.params.len());
             if let Some(a) = arity {
-                by_arity.entry(a).or_default().push(n.id);
+                by_lang_arity.entry((n.lang.clone(), a)).or_default().push(n.id);
             }
-            all.push(n.id);
+            all_by_lang.entry(n.lang.clone()).or_default().push(n.id);
         }
-        for v in by_arity.values_mut() {
+        for v in by_lang_arity.values_mut() {
             v.sort_by_key(|id| id.0);
             v.dedup();
         }
-        all.sort_by_key(|id| id.0);
-        all.dedup();
-        CallableIndex { by_arity, all }
+        for v in all_by_lang.values_mut() {
+            v.sort_by_key(|id| id.0);
+            v.dedup();
+        }
+        CallableIndex {
+            by_lang_arity,
+            all_by_lang,
+        }
     }
 
-    /// The signature-compatible candidate dsts for a call site of the given arity.
-    /// Compatibility = arity match. An unknown call-site arity (`None`) admits
-    /// every function value (sound over-approximation). A candidate whose signature
-    /// has no recorded params count is only admitted under the unknown-arity case.
-    fn compatible(&self, arity: Option<usize>) -> Vec<NodeId> {
+    /// The signature-compatible candidate dsts for a call site of the given
+    /// language and arity. Compatibility = same language, then arity match. An
+    /// unknown call-site arity (`None`) admits every same-language function value
+    /// (sound over-approximation). A candidate whose signature has no recorded
+    /// params count is only admitted under the unknown-arity case.
+    fn compatible(&self, lang: &str, arity: Option<usize>) -> Vec<NodeId> {
         match arity {
-            Some(a) => self.by_arity.get(&a).cloned().unwrap_or_default(),
-            None => self.all.clone(),
+            Some(a) => self
+                .by_lang_arity
+                .get(&(lang.to_owned(), a))
+                .cloned()
+                .unwrap_or_default(),
+            None => self.all_by_lang.get(lang).cloned().unwrap_or_default(),
         }
     }
 }

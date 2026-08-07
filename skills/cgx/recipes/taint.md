@@ -22,8 +22,45 @@ To build a base/CALLS-only index without dataflow, use `cgx index --no-dataflow 
 or set `[index] data_flow = false` in `cgx.toml`.
 
 The full taint engine — `source_class`/`sink_class`/`sanitizer_class`/`taint_label` node
-and edge properties, `CALL cgx.pedigree(...)`, and `MUST PASS THROUGH`/`AVOIDING`
-path-set algebra — remains deferred past v0.3 and errors with exit 2 today.
+and edge properties and `MUST PASS THROUGH`/`AVOIDING` path-set algebra — remains deferred past
+v0.3 and errors with exit 2 today.
+
+**`CALL cgx.pedigree(...)` and `CALL cgx.mutation_fanout(...)` are *not* deferred — both run.**
+They are also both direction-swapped relative to their names; read the next section before using
+either.
+
+### The two CQL procedures answer the opposite of what they are called
+
+Verified live this cycle on the shipped `fixtures/rust-sample`, whose `dataflow::flow_example` is
+the chain `a#0 → b#1 → b#2` (`let b = a; let b = b + 1;`):
+
+| Procedure | YIELD column | What it actually returns | The command that matches it |
+|---|---|---|---|
+| `cgx.pedigree(v)` | `source` | the values that derive **from** `v` — its **consumers** | `cgx flows-to` |
+| `cgx.mutation_fanout(v)` | `mutator` | the values `v` derives from — its **sources** | `cgx flows-from` |
+
+```
+$ cgx query 'CALL cgx.pedigree("rust_sample::dataflow::flow_example::a#0") YIELD source RETURN source'
+source
+rust_sample::dataflow::flow_example::b#1
+rust_sample::dataflow::flow_example::b#2
+
+$ cgx query 'CALL cgx.mutation_fanout("rust_sample::dataflow::flow_example::b#2") YIELD mutator RETURN mutator'
+mutator
+rust_sample::dataflow::flow_example::a#0
+rust_sample::dataflow::flow_example::b#1
+```
+(Elided from both: the `approximation:` and `freshness:` footer lines.)
+
+`pedigree` on the *first* value in the chain returns the two values downstream of it. That is a
+forward slice, not a pedigree. The mismatch is between the **column name** and **what the returned
+nodes are**, which is why reading the procedure's own module comment does not surface it: in edge
+terms the code is self-consistent.
+
+**Use `cgx flows-to` / `cgx flows-from` (or the MCP `flows_to` / `flows_from` tools) for provenance
+work.** Their direction is what the rest of the product means by the words. If you must use the
+procedures, establish the direction on a two-value fixture first rather than trusting the name — and
+re-check it before citing this note, because the fix would most likely swap them.
 
 ### Known limitations (v0.3)
 
@@ -130,17 +167,35 @@ knowledge of which callers handle user input to identify risk.
 **Reading the result:**
 - This is a reverse-reachability query, not a taint query. Every caller is returned regardless of
   whether it carries user-controlled data.
-- The default depth is **2**. Pass `--depth N` to expand the traversal; `--depth 0` is unlimited
-  (work-budgeted, may be slow on large graphs).
-- Filter with `--confidence certain` to restrict to calls the graph resolved without ambiguity.
+- The default depth is **2**. Pass `--depth N` to expand the traversal. **`--depth 0` on `callers`
+  is not unlimited — it returns the seed symbol and nothing else**, with an
+  `under-approximate … depth<=0` contract. `paths` is the one CLI command where `0` means unbounded;
+  the CLI's own `--help` text over-generalizes that. Verified:
+
+  ```
+  $ cgx callers rust_sample::conditions::log_info --depth 0
+  rust_sample::conditions::log_info  src/conditions.rs:4
+  approximation: under-approximate — search stopped at depth 0; deeper edges were not explored | scope: call edges, confidence>=possible, depth<=0
+  freshness: current | indexed tree dd3ea2b, working tree clean
+  ```
+
+  To widen a caller search, raise `--depth` to a real number.
+- Filter with `--confidence certain` to restrict to calls the graph resolved without ambiguity —
+  remembering it is a **minimum floor**, so it drops the `possible` dynamic-dispatch candidates that
+  a taint question usually most wants to see.
 
 ### CQL reachability approximation via `cgx query`
 
 **Since: v0.1** | **Status: runnable today (CALLS graph only)**
 
 When you need a structured query over callers of a sink — for example, to find all functions calling
-`log_error` on exception paths — use the CALLS-graph CQL. Always use `.fqn` for exact symbol matches
-in `WHERE` predicates; `.name` (short name) does not match in WHERE clauses.
+`log_error` on exception paths — use the CALLS-graph CQL.
+
+**`.name` and `.fqn` both hold the full FQN, and either matches in `WHERE`.** There is no short-name
+property. Verified back-to-back on the shipped fixture: `WHERE b.name = "rust_sample::conditions::log_info"`
+and `WHERE b.fqn = "…"` return the same three rows, while `WHERE b.name = "log_info"` — the short
+name — returns none. Prefer `.fqn` for readability, but do not expect `.name` to give you short-name
+matching, and do not treat a `.name` predicate as broken.
 
 ```bash
 # Find callers of a sink by exact FQN
@@ -166,7 +221,7 @@ invisible to the CALLS graph.
 
 **Reading the result:**
 - Double-quote string values inside the query; single-quote the outer shell argument.
-- Use `.fqn` for exact-match predicates. `.name` in WHERE returns empty results.
+- `.fqn` and `.name` are the same string. Match on the **fully-qualified** name either way.
 - Always bound multi-hop patterns: `[:CALLS*1..3]`, not bare `[:CALLS*]` (unbounded can be slow).
 - Properties `source_class`, `sink_class`, `sanitizer_class`, `taint_label` are **not** available
   in v0.3 — using them produces exit 2 (plan error). See `reference/query-language.md`.
@@ -185,8 +240,29 @@ Value-node names have the synthetic FQN form `<fn>::<local>#<ver>`; use
 `--depth`, `--tree`, `--at`, `--repo`, `--format`.
 
 Taint source/sink/sanitizer classes (`source_class`, `sink_class`, `sanitizer_class`,
-`taint_label`), `MUST PASS THROUGH`/`AVOIDING` path constraints, and the `pedigree`
-procedure remain deferred past v0.3. Queries using those properties still produce plan error exit 2.
+`taint_label`) and `MUST PASS THROUGH`/`AVOIDING` path constraints remain deferred past v0.3;
+queries using those properties still produce plan error exit 2. The `cgx.pedigree` and
+`cgx.mutation_fanout` procedures **run** — see the direction warning at the top of this file.
+
+Worked structural provenance on the shipped fixture, both directions, run twice byte-identical:
+
+```
+$ cgx flows-to rust_sample::dataflow::flow_example::a#0 --depth 5
+rust_sample::dataflow::flow_example::a#0  src/dataflow.rs:5
+└─ rust_sample::dataflow::flow_example::b#1  src/dataflow.rs:6
+   └─ rust_sample::dataflow::flow_example::b#2  src/dataflow.rs:7  [probable]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree dd3ea2b, working tree clean
+
+$ cgx flows-from rust_sample::dataflow::flow_example::b#2 --depth 5
+rust_sample::dataflow::flow_example::b#2  src/dataflow.rs:7
+└─ rust_sample::dataflow::flow_example::b#1  src/dataflow.rs:6  [probable]
+   └─ rust_sample::dataflow::flow_example::a#0  src/dataflow.rs:5
+approximation: exact (within modeled graph)
+freshness: current | indexed tree dd3ea2b, working tree clean
+```
+
+The `[probable]` tag marks the `let b = b + 1;` edge. Untagged edges are `certain`.
 
 For detailed CQL syntax — `DATA_FLOW`, `MUST PASS THROUGH`, `AVOIDING`, `ANY`/`NONE` over nodes,
 pedigree procedures — see `reference/query-language.md`.
@@ -316,11 +392,26 @@ These caveats apply once DATA_FLOW edges are available:
 - **`transformation_kind`** on each edge shows how the value changed: `copy`, `formatted`, `parsed`,
   `narrow`, `parameterize(sql)`, etc. A `copy` straight to a log sink is a confirmed exposure; a
   `parameterize(sql)` clears SQL injection risk. This edge property is deferred; not yet in v0.3.
-- **Confidence** follows the standard ladder (`certain`/`probable`/`possible`). `certain` paths are
-  direct assignments; `probable` paths cross function summaries. See `reference/mental-model.md`.
+- **Confidence** follows the standard ladder (`certain`/`probable`/`possible`), and on
+  `derives-from` edges it bands the **transformation**, not the function boundary. On the shipped
+  fixture the 59 dataflow edges split 41 `certain` / 18 `probable`; every `probable` one is
+  intraprocedural — arithmetic (`let b = b + 1`), struct composition (`Point { x: a, y: b }`),
+  conditional select (`if c { a } else { b }`). A plain copy is `certain`. Do not read `probable` as
+  "crossed a function summary". See `reference/mental-model.md` for the ladder.
 - **`NONE(n IN nodes(path) WHERE n.sanitizer_class = "X")`** is the intended ∀-path "no sanitizer"
   predicate for a single path variable. It is deferred past v0.3 because `sanitizer_class` is not
   yet a supported node property (exit 2). Use `MUST PASS THROUGH`/`AVOIDING` (also deferred) for a
   must-pass assertion across all paths in aggregate.
 - Empty results mean no unsanitized paths were found in the indexed graph, not that the code is
   provably safe — dynamic dispatch and generated code may introduce paths the graph does not see.
+- **Read the `approximation` before acting on an empty answer.** Every `reaches`/`paths`/`callers`/
+  `callees`/`flows-to`/`flows-from` answer carries it, in JSON as an object and in human output as
+  the second-to-last line. On a negative answer it also carries a `scope` object naming the edge
+  kinds, confidence floor and depth actually searched. `"direction": "under"` with an
+  `unresolved-external-calls` or `depth-limit` reason means the search stopped short — that empty
+  result is not a negative finding. `exact` means exact *within* `modeled_graph`, never that the
+  answer is complete about the program.
+- **`freshness` is the last line of every answer** (human) or a top-level object (JSON), and tells
+  you which tree you actually queried. Over MCP with the default `include_dirty: true`,
+  `matches_head` is `null` on any repo that has ever been indexed — the expected value, not a fault.
+  A stale index answering a taint question is the failure mode worth checking for first.

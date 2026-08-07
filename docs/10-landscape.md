@@ -2,7 +2,6 @@
 
 **Status:** Draft  
 **Audience:** Software engineers, security engineers, engineering leadership  
-**Working name:** `cgx` (placeholder; see `README.md`)  
 **Cross-references:** `docs/01-vision-and-principles.md` (vision, non-goals), `docs/03-code-graph-model.md` (GM- features), `docs/05-queries.md` (Q- query capabilities), `docs/07-interfaces.md` (IF- interface features), `docs/09-architecture.md` (architecture decisions)
 
 ---
@@ -37,7 +36,9 @@ This document surveys the best-in-class code intelligence and call-graph tools a
 | SocratiCode | Semantic search + dep graph | MCP STDIO | Per-branch collection | Syntactic+embeddings | No | No (collection diff only) | No | VSCode+MCP |
 | CIE | Structural CG (Tree-sitter + CozoDB) | MCP STDIO (25+ tools) | None (re-index on change) | Syntactic only | No | No | No (Go/Py/JS/TS only) | STDIO MCP |
 | Axon | CG + git coupling history | MCP STDIO / CLI | Incremental (claimed) | Unclear (likely syntactic) | No | No | No | CLI+MCP |
-| **cgx** | **Call graph + data flow + provenance** | **Subcommands + Cypher-subset + MCP STDIO** | **Blob-OID content-addressed** | **Syntactic default; SCIP upgrade** | **Yes — first-class edge condition labels** | **Yes — graph-level diff queries** | **Yes** | **Rust CLI, no daemon** |
+| **cgx** | **Call graph + data flow + provenance** | **Subcommands + Cypher-subset + MCP STDIO** | **Blob-OID content-addressed** | **Syntactic default; CHA/RTA; SCIP upgrade** | **Yes — first-class edge condition labels** | **Yes — graph-level diff queries** | **Yes** | **Rust CLI, no daemon** |
+
+One column no surveyed tool would have an entry in: **per-answer error direction**. Every tool above returns results; none states, per answer, whether it may have over-reported, under-reported, or neither, nor what a *negative* answer was searched under. `cgx` attaches that to every traversal answer (docs/09 AR-13). It is the differentiator hardest to see in a feature table and the one that matters most to an automated consumer, which cannot apply the judgement a human reader supplies for free.
 
 ---
 
@@ -333,9 +334,11 @@ MCP STDIO server with 25+ tools. Tree-sitter based parsing; CozoDB (embedded gra
 
 Graph-powered impact analysis tool with a 12-phase pipeline. Incremental indexing. Combines call graph traversal with git coupling history (co-change frequency as edge weights). MCP + CLI. Exposed via `axon_impact` and related tools.
 
-**Notable.** Git coupling history as an edge weight is a distinct capability: it surfaces which functions change together historically, complementing static call edges.
+**Notable.** Git coupling history as an edge weight is a distinct capability: it surfaces which units change together historically, complementing static call edges.
 
-**Gaps.** Precision level is undocumented and likely syntactic. No exception-path classification. No worktree-native awareness. No branch-diff graph queries.
+**Gap vs cgx — narrowed.** `cgx coupling BASE HEAD` now answers the co-change question directly, on both CLI and MCP, over an explicit commit range. Two honest differences: cgx's is **file-level**, not function-level, so a reported pair may have had unrelated symbols edited in the same commit — an over-approximation that rides in the answer's own approximation contract rather than being left for the reader to infer. Function-level coupling would require indexing every historic tree, which is a materially more expensive capability. In the other direction, cgx's is a standalone deterministic query with an explicit rev range rather than an edge weight folded into a ranked impact score, so the input to any judgement stays inspectable.
+
+**Remaining gaps.** Precision level is undocumented and likely syntactic. No exception-path classification. No worktree-native awareness. No branch-diff graph queries.
 
 ---
 
@@ -421,11 +424,19 @@ These tools target specific sub-problems: framework metadata modeling, closure c
 
 The gaps below are confirmed across all surveyed tools. Each represents a question class that no existing tool answers for a Rust codebase via a fast CLI and STDIO MCP interface.
 
+**Read the status marker before the claim.** A gap analysis is a statement about the market; the "What cgx provides" paragraph under each gap is a statement about this repository, and the two have different maturities. Each carries one of:
+
+- **Shipped** — you can run it against the current binary today.
+- **Partial** — some of the described surface exists; the paragraph names which part does not.
+- **Designed** — specified in the docs, not built. The gap in the market is real and the design is committed, but nothing in the binary answers it yet.
+
+A **Designed** gap is not a weaker gap — it is the reason the roadmap has the shape it has. It is, however, not a differentiator anyone can verify by running the tool, and it must never be presented to a reader as one.
+
 ### Gap 1: Exception-path call edge classification
 
 **Evidence.** Joern has CFG exception nodes (`TRY`, `THROW`, `CATCH`), but CFG edges carry no property distinguishing exceptional from normal control flow, and `CALL`→`METHOD` edges in the CPG are unannotated. No other tool annotates call graph edges as exception-conditioned. OWASP Top 10 2025 includes A10: Mishandling of Exceptional Conditions, validating the security relevance of this gap.
 
-**What cgx provides.** Every call edge carries an `edge condition` label (`always`, `conditional`, `exception`, `loop`, `panic`) as a first-class property. The labels `exception` and `panic` form the exceptional class; queries can filter on this to find non-exceptional paths, exception-only paths, or paths where a function is exception-transient relative to a given route. See `docs/03-code-graph-model.md` (GM-3) and `docs/05-queries.md` (Q-3, Q-11, Q-12).
+**What cgx provides.** **Shipped.** Every call edge carries an `edge condition` label (`always`, `conditional`, `exception`, `loop`, `panic`) as a first-class property. The labels `exception` and `panic` form the exceptional class; queries can filter on this to find non-exceptional paths, exception-only paths, or paths where a function is exception-transient relative to a given route. See `docs/03-code-graph-model.md` (GM-3) and `docs/05-queries.md` (Q-3, Q-11, Q-12).
 
 ---
 
@@ -433,7 +444,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No tool supports queries of the form "what call edges exist in branch A but not branch B" or "which symbols became newly reachable after this PR." Tools do diff-aware scanning (Semgrep, CodeQL in CI), but not graph-level diff queries over the semantic graph. SocratiCode separates branches into collections but cannot diff them as graphs.
 
-**What cgx provides.** The `cgx diff` subcommand and the `--at <ref>` flag on all query commands enable: "show new edges between main and feature/foo," "which paths to `vulnerable::bar` appeared in the exception path since last release," and "which functions became unreachable after merging." See `docs/05-queries.md` (Q-7, Q-16) and `docs/06-indexing-and-vcs.md`.
+**What cgx provides.** **Shipped.** The `cgx diff` subcommand and the `--at <ref>` flag on all query commands enable: "show new edges between main and feature/foo," "which paths to `vulnerable::bar` appeared in the exception path since last release," and "which functions became unreachable after merging." See `docs/05-queries.md` (Q-7, Q-16) and `docs/06-indexing-and-vcs.md`.
 
 ---
 
@@ -441,7 +452,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No tool is aware of git worktrees as distinct indexing contexts sharing a git object store. All tools treat each checkout as an independent codebase. SocratiCode's docs acknowledge worktrees map to the same project configuration as a workaround.
 
-**What cgx provides.** Index shards are keyed by blob OID (git content hash). Two worktrees on different branches share all shard data for files with identical content — indexing cost is proportional to the diff between branches, not to the total codebase size per worktree. See `docs/06-indexing-and-vcs.md`.
+**What cgx provides.** **Shipped.** Index shards are keyed by blob OID (git content hash). Two worktrees on different branches share all shard data for files with identical content — indexing cost is proportional to the diff between branches, not to the total codebase size per worktree. See `docs/06-indexing-and-vcs.md`.
 
 ---
 
@@ -449,7 +460,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** CodeQL path queries come closest to general provenance but require security-specific rule framing. No tool provides first-class general provenance queries: "where did the value at this variable site come from, transitively, through transformations including `map`/`filter`/collection operations?"
 
-**What cgx provides.** The `pedigree` subcommand (Q-5) and `DATA_FLOW` edges in the query language trace value origins through function boundaries, with transformation tags (`identity`, `mapped`, `aggregated`, `parsed`) on each step. See `docs/04-dataflow-and-provenance.md` (DF-) for the full data flow model.
+**What cgx provides.** **Partial.** Backward and forward value provenance ship, under different names than this gap originally used: `cgx flows-from` walks a value's pedigree and `cgx flows-to` its forward slice, both over `derives-from` edges built by an IFDS interprocedural summary pass, so they cross function boundaries. In CQL the same capability is `CALL cgx.pedigree(value)` and `CALL cgx.mutation_fanout(value)`, each chainable into a following `MATCH`. **There is no `pedigree` subcommand** — that name appears only in the design docs. What is not built is the transformation vocabulary this gap leans on: only the structural transformation kinds (`copy`, `projection`, `parse`, `serialize`, `concat`) are emitted; the class-argument kinds are reserved and unpopulated. Both flow commands operate on **value nodes**, not function symbols — a function FQN has no `derives-from` edges and returns empty. See `docs/04-dataflow-and-provenance.md` (DF-) for the full model.
 
 ---
 
@@ -457,7 +468,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** `rustc` reports `dead_code` lint warnings for private items with no callers, but does not scope this analysis to a specific entrypoint set or support "dead from this instance." The Knight Capital incident ($440M loss from dormant reactivated code) illustrates the security significance of dead code analysis. No tool does instance-specific dead code: "given this binary is built with these entrypoints, which functions are unreachable?"
 
-**What cgx provides.** The `unused` subcommand (Q-4) scopes dead-code analysis to a declared entrypoint set. `--entrypoint-class http` restricts to HTTP handler roots; `--entrypoint main::start` restricts to a specific root. Results include confidence tiers: `certainly-unused` requires that the item has no incoming edges from any entrypoint-reachable symbol at `certain` or `probable` confidence.
+**What cgx provides.** **Partial.** The `unused` subcommand (Q-4) ships and scopes dead-code analysis to the automatically-detected entrypoint set, with `--kind` and `--confidence` filters. **The entrypoint-selection flags do not exist**: there is no `--entrypoint-class http` and no `--entrypoint main::start` on `unused`, so scoping to a *specific* root or to a *class* of roots — the "instance-level" half of this gap — is not answerable today. Detected entrypoint kinds are `main`, `test`, and (Rust) `async-main`; no adapter emits an HTTP-handler entrypoint, which is what `--entrypoint-class http` would select over. What a negative `unused` result *does* carry is its [negative-completeness scope](13-glossary.md): the edge kinds, confidence floor, and depth bound it was computed under, so a caller can tell a real absence from a narrow search.
 
 ---
 
@@ -465,7 +476,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** CodeQL `Dominance.qll` and Joern `dominates`/`postDominates` steps both operate intra-procedurally: they compute dominance within a single function's CFG only. Neither provides a call-graph-level assertion that every path from any entrypoint to a sink passes through a given check node. `BarrierGuard` (CodeQL) and sanitizer blocks (Semgrep) both express ∃-path-negation — "if any path from source to sink has no matching guard, report it" — not the ∀-positive complement. Expressing "all paths are guarded" requires hand-rolling the complement; it is not a first-class query primitive in any of the surveyed tools.
 
-**What cgx provides.** Q-20 (Path quantifiers and must-pass-through) surfaces `--must-pass-through <symbol>` as a subcommand flag and a query-language predicate. The inter-procedural dominance check uses the call graph to assert that a given node is on every path from the specified source to the specified sink, not just within a single function's CFG. This directly answers the authorization-bypass question class (Q87, Q88): "no path from handler to protected resource avoids the auth check."
+**What cgx provides.** **Designed.** Q-20 specifies `--must-pass-through <symbol>` as a subcommand flag and `MATCH ALL … MUST PASS THROUGH / AVOIDING` as a query-language form. **Neither exists**: `paths` has no such flag, and the CQL parser intercepts the `MATCH ALL` forms and returns a plan error naming them as deferred. The inter-procedural dominance check — asserting a node is on every path from source to sink across the call graph, not within one CFG — is specified in ADR-02 (guarded-cut reachability) and unbuilt. The authorization-bypass question class (Q87, Q88) is therefore **not** answerable today; an ∃-path `paths` query answers the dual, and its negative result carries only the scope it was searched under, not a ∀-path guarantee.
 
 ---
 
@@ -473,7 +484,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** The strongest available tool for lock-set analysis is Infer RacerD, which uses a boolean lock abstraction — it tracks whether *some* lock is held, not which lock. From official docs: it "misses races where two accesses are mistakenly protected by different locks." Clippy `await_holding_lock` detects mutex guards live at an `await` point within a single async function but does not cross async call boundaries. Rust lockbud analyzes deadlock and lock-order — not inconsistent lock sets for shared fields. No tool answers Q97 (fields accessed under inconsistent lock sets across spawn contexts) as a static query.
 
-**What cgx provides.** GM-11 (Synchronization context and lock sets) attributes which lock identities are held at each call site. GM-9 (Spawn edges) identifies spawn-distinct execution contexts. Q-24 (Concurrency queries) composes these: "field F is written from context X under lock A and from context Y under lock B — are A and B the same?" Clippy `await_holding_lock` covers the intra-function case; cgx extends the same analysis across async call boundaries using GM-10 (Suspension points) and GM-11.
+**What cgx provides.** **Designed.** GM-11 (Synchronization context and lock sets) attributes which lock identities are held at each call site. GM-9 (Spawn edges) identifies spawn-distinct execution contexts. Q-24 (Concurrency queries) composes these: "field F is written from context X under lock A and from context Y under lock B — are A and B the same?" Clippy `await_holding_lock` covers the intra-function case; cgx extends the same analysis across async call boundaries using GM-10 (Suspension points) and GM-11.
 
 ---
 
@@ -481,7 +492,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** Infer Pulse handles known built-in resource pairs (OS file handles, `malloc`/`free`) interprocedurally but does not expose a user-declarable acquire/release pair specification. CodeQL resource-leak queries are fixed-pattern, intra-method, and limited to known Java resource types. Rust RAII handles scoped resources at the compiler level but misses `mem::forget`, `ManuallyDrop`, `Rc` cycles, and resources inside detached `tokio` tasks. No tool expresses "user-declared pair (acquire, release): is release reached on all exception-class paths from acquire?" as a composable query primitive.
 
-**What cgx provides.** GM-13 (Resource lifecycle pairs) stores user-declared `(acquire, release)` pairs with built-in per-language defaults and user config. Q-22 (Ordering and pairing predicates) provides the "A-then-B on all paths" primitive. Combined with `edge-condition-filter`, this answers Q90 (leak-on-error across all exception-class edges, including task-cancellation paths) and Q103 (exactly one of commit/rollback on every path).
+**What cgx provides.** **Designed.** GM-13 specifies user-declared `(acquire, release)` pairs with built-in per-language defaults and user config, and Q-22 specifies the "A-then-B on all paths" primitive. **Neither is built**: no pair declaration is read from config, no adapter emits acquire/release attributes, and Q-22 depends on the same ∀-path machinery Gap 6 shows is deferred. The edge-condition filter this would compose with *does* ship (`--edge-condition` on `diff`, `--confidence` on the query commands). As specified, this would answer Q90 (leak-on-error across all exception-class edges, including task-cancellation paths) and Q103 (exactly one of commit/rollback on every path).
 
 ---
 
@@ -489,7 +500,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** CodeQL `DataFlow::StateConfigSig` allows per-query flow state labels that functionally implement class-matched sanitizer/sink pairs, but the schema is defined per query — there is no global registry that says "sanitizer of class `sql` clears taint only at sinks of class `sql`" across the standard library. Semgrep taint labels (experimental) come closest with per-rule `label`/`requires` keys, but labels are a per-rule convention with no cross-rule enforcement. No tool provides a global sanitizer-class registry where declaring `sanitizer(class=sql)` automatically governs taint clearing for all queries/rules that use `sink(class=sql)`.
 
-**What cgx provides.** DF-11 (Typed taint labels and class-matched sanitization) is a genuine novelty: the built-in sink classes (`sql`, `shell`, `path`, `html`, `header`, `redirect-url`, `format-string`, `regex`, `deserialize`, `eval`, `log`, `net-request`) have corresponding sanitizer classes that clear taint only at matching sinks. The class lists are user-extensible via config. This directly answers Q86 (injection without class-matched sanitizer) and Q92 (SSRF/path traversal with class-specific canonicalization), and makes any cross-query taint assertion consistent by construction.
+**What cgx provides.** **Designed.** DF-11 (Typed taint labels and class-matched sanitization) is a genuine novelty: the built-in sink classes (`sql`, `shell`, `path`, `html`, `header`, `redirect-url`, `format-string`, `regex`, `deserialize`, `eval`, `log`, `net-request`) have corresponding sanitizer classes that clear taint only at matching sinks. The class lists are user-extensible via config. This directly answers Q86 (injection without class-matched sanitizer) and Q92 (SSRF/path traversal with class-specific canonicalization), and makes any cross-query taint assertion consistent by construction.
 
 ---
 
@@ -497,7 +508,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** govulncheck (Go only, VTA, function-level), Snyk Reachability, and Endor Labs all answer "is the vulnerable function reachable from an entrypoint?" (∃-path). None answer: what data reaches the vulnerable function, was the call path through a trust boundary (network-sourced input), or was an authorization check on the path. All perform ∃-path reachability only; none provide data-flow context.
 
-**What cgx provides.** Q-25 (Dependency and CVE reachability queries) extends reachability with: (a) taint source class on the path — did user-controlled data flow to the vulnerable function? (b) trust boundary crossing — did the call path cross a source of class `network`, `deserialization`, etc.? (c) cgx confidence tiers on call edges, surfacing which edges are `certain` vs `possible`. This answers Q3 (CVE'd function reachability with internal chain), Q10 (SBOM CVE structured report), and Q75 (cargo audit × path × sanitizer) in ways govulncheck and SCA tools do not.
+**What cgx provides.** **Designed.** Q-25 (Dependency and CVE reachability queries) extends reachability with: (a) taint source class on the path — did user-controlled data flow to the vulnerable function? (b) trust boundary crossing — did the call path cross a source of class `network`, `deserialization`, etc.? (c) cgx confidence tiers on call edges, surfacing which edges are `certain` vs `possible`. This answers Q3 (CVE'd function reachability with internal chain), Q10 (SBOM CVE structured report), and Q75 (cargo audit × path × sanitizer) in ways govulncheck and SCA tools do not.
 
 ---
 
@@ -505,7 +516,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No production tool exposes type reconstruction from usage as an on-demand query for an arbitrary unannotated value. TypeScript `getTypeAtLocation` performs type LOOKUP — it returns `any` for `any`-typed nodes, not a candidate type reconstructed from usage. Pytype generates whole-program stubs but does not expose a per-expression query API. Research tools (DLInfer, Type4Py) apply machine learning to infer types from code patterns; they are not graph-query APIs. The brainstorm's bidirectional constraint traversal — pedigree (up), uses (down), unification across joins/aliases/channels (sideways) — has no equivalent in any production analyzer.
 
-**What cgx provides.** DF-19 (Lineage type reconstruction) implements up/down/sideways constraint gathering as a pedigree query. Q-26 surfaces the result as a candidate type set with confidence labels and an evidence trail. Single `certain` type means the value is resolved; empty unification is a contradiction and a bug signal. This answers Q109 (type reconstruction for `interface{}`-typed values) and Q110 (type-contradiction detection) for which no existing tool provides a general query.
+**What cgx provides.** **Designed.** DF-19 (Lineage type reconstruction) implements up/down/sideways constraint gathering as a pedigree query. Q-26 surfaces the result as a candidate type set with confidence labels and an evidence trail. Single `certain` type means the value is resolved; empty unification is a contradiction and a bug signal. This answers Q109 (type reconstruction for `interface{}`-typed values) and Q110 (type-contradiction detection) for which no existing tool provides a general query.
 
 ---
 
@@ -513,7 +524,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No tool models annotation-driven guards (`@PreAuthorize`, `[Authorize]`, `@login_required`) as composable graph facts — as a semantic condition on the call path rather than syntactic annotation presence. CodeQL MaD supports `barrierGuardModel` rows that block taint flow at conditional checks matching a QL expression, but this requires custom QL per guard and does not model the annotation itself as a semantic class. Semgrep can pattern-match the absence of `@PreAuthorize` on `@RequestMapping` methods syntactically, but this is not a call-path condition. CodeQL Spring `EntryPoints.qll` hardcodes Spring request-mapping annotations as QL class hierarchies — not extensible via MaD rows or a declarative pack config.
 
-**What cgx provides.** GM-15 (Metadata and annotation facts) and docs/12 framework packs lower annotation patterns to seven semantic classes (`entrypoint`, `guard`, `negative-guard`, `interception`, `generated-member`, `keep-alive`, `contract`) via a declarative config. Q-31 (Framework-aware queries) provides `--metadata-guard` for must-pass-through checks against annotation guards (Q119) and `--negative-guard` for negative-guard enumeration (Q120). Built-in packs cover major frameworks; the same extension mechanism as taint source/sink/sanitizer config applies.
+**What cgx provides.** **Designed.** GM-15 (Metadata and annotation facts) and docs/12 framework packs lower annotation patterns to seven semantic classes (`entrypoint`, `guard`, `negative-guard`, `interception`, `generated-member`, `keep-alive`, `contract`) via a declarative config. Q-31 (Framework-aware queries) provides `--metadata-guard` for must-pass-through checks against annotation guards (Q119) and `--negative-guard` for negative-guard enumeration (Q120). Built-in packs cover major frameworks; the same extension mechanism as taint source/sink/sanitizer config applies.
 
 ---
 
@@ -521,7 +532,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** Existing loop-capture lint tools (ESLint `no-loop-func`, Go `vet loopclosure`, Python B023) detect the symptom syntactically. None models the capture as a by-ref vs by-value edge attribute on the closure node in a queryable graph. None composes capture with interprocedural mutation fan-out (DF-17) or with taint propagation. The syntactic tools are per-language, hardcoded rules; they do not generalize to arbitrary mutable-capture patterns across call boundaries.
 
-**What cgx provides.** DF-18 (Function values and closures) adds a `capture` edge from each captured variable into the closure node, attributed `by-ref | by-value` × the variable's mutability level. This makes the loop-variable capture family a derived graph query: "closures where a by-ref capture has binding-mutable or value-mutable captured variable" (Q114). Q-28 (Closure-capture queries) composes capture edges with resource lifecycle pairs (Q115) and with escape analysis (DF-16).
+**What cgx provides.** **Designed.** DF-18 (Function values and closures) adds a `capture` edge from each captured variable into the closure node, attributed `by-ref | by-value` × the variable's mutability level. This makes the loop-variable capture family a derived graph query: "closures where a by-ref capture has binding-mutable or value-mutable captured variable" (Q114). Q-28 (Closure-capture queries) composes capture edges with resource lifecycle pairs (Q115) and with escape analysis (DF-16).
 
 ---
 
@@ -529,7 +540,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No production tool computes "does function f mutate parameter i?" as a queryable, composable interprocedural graph fact. Go escape analysis records "parameter escapes to heap" for allocation optimization but not write-effect semantics. SpotBugs EI_EXPOSE_REP detects the getter exposure pattern locally. Infer Pulse tracks memory states for known resource types but frames findings as bug reports, not callable-effect summaries. Rust borrow checker prevents aliased mutation at compile time; it does not model write effects on existing code as a query.
 
-**What cgx provides.** DF-17 (Mutability model) extends the GM-12 effect lattice with `writes-param(i)` and `writes-receiver` effect summaries. These are stored as queryable graph attributes on function nodes — callers can ask "does any callee of this function carry a `writes-param` effect on the value I just validated?" (Q111). Mutation fan-out queries (Q-27) compose these summaries with pedigree to answer "who can change this value after this point?", which sanitization-invalidation detection (Q113) requires.
+**What cgx provides.** **Designed.** DF-17 (Mutability model) extends the GM-12 effect lattice with `writes-param(i)` and `writes-receiver` effect summaries. These are stored as queryable graph attributes on function nodes — callers can ask "does any callee of this function carry a `writes-param` effect on the value I just validated?" (Q111). Mutation fan-out queries (Q-27) compose these summaries with pedigree to answer "who can change this value after this point?", which sanitization-invalidation detection (Q113) requires.
 
 ---
 
@@ -537,7 +548,7 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** No production tool provides call/construct edges with `established-by` provenance and confidence tiers for container-established wiring. CodeQL Spring models `@Autowired`-injected fields and Spring controllers as entry points but does not emit `calls(X, Y)` edges representing bean wiring. Jasmine (ASE'22) adds Spring injection edges as a research prototype, Spring-only, with no confidence tiers or provenance on added edges. Dagger-generated code appears as plain method calls to analyzers that ingest generated sources — `certain` confidence — but analyzers that skip generated source miss the edges entirely.
 
-**What cgx provides.** GM-17 (Mediated call edges) models DI wiring, event dispatch, and registry callbacks as `calls`/`constructs` edges carrying `established-by: <annotation | config-file | registration-site>` and confidence (`certain` for compile-time Dagger-generated edges, `probable` for runtime Spring/Guice containers). Q-31 can filter on `established-by` provenance, answering Q124 (which DI-wired edges were established by a specific annotation). Jasmine is the closest academic prior art; `cgx` extends the pattern to be language-agnostic and user-extensible.
+**What cgx provides.** **Designed.** GM-17 (Mediated call edges) models DI wiring, event dispatch, and registry callbacks as `calls`/`constructs` edges carrying `established-by: <annotation | config-file | registration-site>` and confidence (`certain` for compile-time Dagger-generated edges, `probable` for runtime Spring/Guice containers). Q-31 can filter on `established-by` provenance, answering Q124 (which DI-wired edges were established by a specific annotation). Jasmine is the closest academic prior art; `cgx` extends the pattern to be language-agnostic and user-extensible.
 
 ---
 
@@ -545,28 +556,34 @@ The gaps below are confirmed across all surveyed tools. Each represents a questi
 
 **Evidence.** TamiFlex, DroidRA, and CodeQL Reflection.qll all resolve reflective calls where the class/method name string has a literal or near-literal pedigree. None surfaces the pedigree of the string argument as a first-class graph attribute that downstream queries consume. TamiFlex is purely dynamic (bounded by test coverage). DroidRA is Android-specific. CodeQL Reflection.qll does not report a coverage fraction; non-literal strings are opaque.
 
-**What cgx provides.** GM-18 (Reflection and string-mediated dispatch) adds a `string-pedigree` attribute on each reflection call edge: `literal` (constant string — probable target resolution via pedigree), `tainted` (user-influenced string — security query target), or `dynamic` (unresolvable). The attribute is queryable: Q122 (tainted-string reflection) and Q123 (literal-pedigree resolution) both filter on `string-pedigree`. A reflection call site where the string is tainted is surfaced as a distinct security signal independent of whether the target can be resolved.
+**What cgx provides.** **Designed.** GM-18 (Reflection and string-mediated dispatch) adds a `string-pedigree` attribute on each reflection call edge: `literal` (constant string — probable target resolution via pedigree), `tainted` (user-influenced string — security query target), or `dynamic` (unresolvable). The attribute is queryable: Q122 (tainted-string reflection) and Q123 (literal-pedigree resolution) both filter on `string-pedigree`. A reflection call site where the string is tainted is surfaced as a distinct security signal independent of whether the target can be resolved.
 
 ---
 
 ## Summary: Capability Matrix by Gap
 
-| Gap | Best existing tool | cgx approach |
-|-----|-------------------|-------------|
-| Exception-path edge classification | Joern (CFG nodes only) | First-class `condition` label on every call edge |
-| Branch-diff graph queries | None | `cgx diff` + `--at <ref>` on all queries |
-| Git worktree awareness | None | Blob-OID shard sharing across worktrees |
-| Value provenance / pedigree | CodeQL (security-specific) | `pedigree` subcommand + `DATA_FLOW` edges with transformation tags |
-| Dead code from entrypoint | rustc lint (private only) | `unused` with entrypoint scoping + confidence tiers |
-| Rust CLI + persistent graph + STDIO MCP | suatkocar/codegraph (syntactic) | Semantic call graph (SCIP upgrade path) + STDIO MCP |
-| Inter-procedural ∀-path (must-pass-through) | CodeQL/Joern (intra-procedural only) | Q-20 call-graph-level must-pass-through predicate |
-| Inconsistent lock-set / await-holding-lock | Infer RacerD (boolean lock abstraction; Java/C) | GM-11 lock-set attribution + GM-9 spawn edges + Q-24 |
-| User-declarable resource pairs as query primitives | Infer Pulse (built-in pairs only; no query language) | GM-13 declared pairs + Q-22 pairing predicates |
-| Global sanitizer-class schema | None (per-query CodeQL flow states; experimental Semgrep labels) | DF-11 typed taint labels with built-in + user-extensible class lists |
-| CVE reachability with taint and trust-boundary context | govulncheck (∃-path, function-level, Go only) | Q-25 + DF-12 source/sink classes + confidence tiers |
-| Type reconstruction as a query | TypeScript `getTypeAtLocation` (type lookup only; returns `any` for `any`) | DF-19 up/down/sideways constraint reconstruction; Q-26 candidate-set query |
-| Framework-guard / entrypoint modeling as graph facts | CodeQL MaD (hardcoded QL hierarchies; no declarative guard row) | GM-15 + framework packs: declarative annotation → semantic class |
-| Closure capture-edge attributes (by-ref × mutability) | Loop lint tools (ESLint / go-vet / B023 — syntactic only) | DF-18 capture edges with `by-ref \| by-value` × mutability; Q-28 |
-| Parameter-mutation effect summaries | None (SpotBugs local pattern; Go escape = heap escape, not write effect) | DF-17 `writes-param(i)` / `writes-receiver`; mutation fan-out; Q-27 |
-| `established-by` provenance on DI-wired edges | Jasmine ASE'22 (research prototype; Spring-only; no confidence tiers) | GM-17 mediated edges with provenance + confidence; Q-31 |
-| String-pedigree attribute on reflection edges | DroidRA / CodeQL Reflection.qll (resolve literals; no pedigree attribute) | GM-18 `string-pedigree` attribute; tainted-reflection as security signal |
+The **Status** column is the same marker used above, and it is the column to read first: `Shipped` means runnable against the current binary, `Partial` means some of the named surface exists, `Designed` means specified and unbuilt.
+
+| Gap | Best existing tool | cgx approach | Status |
+|-----|-------------------|-------------|--------|
+| Exception-path edge classification | Joern (CFG nodes only) | First-class `condition` label on every call edge | Shipped |
+| Branch-diff graph queries | None | `cgx diff BASE HEAD` (+ `--path-added` gate) + `--at <ref>` on all queries | Shipped |
+| Git worktree awareness | None | Blob-OID shard sharing across worktrees | Shipped |
+| Per-answer approximation + freshness contract | None (no surveyed tool states an answer's error direction or its own staleness) | A3/A4 contract with direction, reasons, negative scope; divergence-based freshness envelope | Shipped |
+| Co-change coupling as a standalone deterministic query | Axon (edge weight folded into an impact score) | `cgx coupling BASE HEAD`, explicit rev range, file-level, contract-carried limits | Shipped |
+| Rust CLI + persistent graph + STDIO MCP | suatkocar/codegraph (syntactic) | Semantic call graph (SCIP upgrade path) + STDIO MCP | Shipped |
+| Value provenance / pedigree | CodeQL (security-specific) | `flows-from` / `flows-to` + `CALL cgx.pedigree` / `cgx.mutation_fanout`; structural transformation tags only | Partial |
+| Dead code from entrypoint | rustc lint (private only) | `unused` + confidence tiers; **no** entrypoint-selection flags, so no instance-level scoping | Partial |
+| Inter-procedural ∀-path (must-pass-through) | CodeQL/Joern (intra-procedural only) | Q-20 call-graph-level must-pass-through predicate | Designed |
+| Inconsistent lock-set / await-holding-lock | Infer RacerD (boolean lock abstraction; Java/C) | GM-11 lock-set attribution + GM-9 spawn edges + Q-24 | Designed |
+| User-declarable resource pairs as query primitives | Infer Pulse (built-in pairs only; no query language) | GM-13 declared pairs + Q-22 pairing predicates | Designed |
+| Global sanitizer-class schema | None (per-query CodeQL flow states; experimental Semgrep labels) | DF-11 typed taint labels with built-in + user-extensible class lists | Designed |
+| CVE reachability with taint and trust-boundary context | govulncheck (∃-path, function-level, Go only) | Q-25 + DF-12 source/sink classes + confidence tiers | Designed |
+| Type reconstruction as a query | TypeScript `getTypeAtLocation` (type lookup only; returns `any` for `any`) | DF-19 up/down/sideways constraint reconstruction; Q-26 candidate-set query | Designed |
+| Framework-guard / entrypoint modeling as graph facts | CodeQL MaD (hardcoded QL hierarchies; no declarative guard row) | GM-15 + framework packs: declarative annotation → semantic class | Designed |
+| Closure capture-edge attributes (by-ref × mutability) | Loop lint tools (ESLint / go-vet / B023 — syntactic only) | DF-18 capture edges with `by-ref \| by-value` × mutability; Q-28 | Designed |
+| Parameter-mutation effect summaries | None (SpotBugs local pattern; Go escape = heap escape, not write effect) | DF-17 `writes-param(i)` / `writes-receiver`; mutation fan-out; Q-27 | Designed |
+| `established-by` provenance on DI-wired edges | Jasmine ASE'22 (research prototype; Spring-only; no confidence tiers) | GM-17 mediated edges with provenance + confidence; Q-31 | Designed |
+| String-pedigree attribute on reflection edges | DroidRA / CodeQL Reflection.qll (resolve literals; no pedigree attribute) | GM-18 `string-pedigree` attribute; tainted-reflection as security signal | Designed |
+
+Most rows in this table are `Designed`. That is the honest read of where the product stands against its own thesis: the market gaps are real and researched, and the shipped surface covers the structural and temporal ones — exception-conditioned edges, graph diff, worktree-shared indexing, co-change, and the answer contract — while the dataflow-semantics and framework-modeling gaps remain specification. Quote the status column, never the gap count.

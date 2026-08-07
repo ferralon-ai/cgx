@@ -1,8 +1,7 @@
 # 08 — Language Support
 
-**Status:** Feature specification (pre-implementation)
+**Status:** Mixed — the five Tier-1 adapters (Rust, TypeScript/JavaScript, Go, Java, Python) are implemented and registered; everything about Tier 2, Tier 3 and the framework/primitive-harvest layers is specification ahead of implementation. Each section says which it is.
 **Audience:** Engineers extending `cgx` with new language support; contributors; advanced users evaluating language coverage
-**Working name:** `cgx` (placeholder — see docs/README.md)
 **Cross-references:** docs/03-code-graph-model.md (GM-) · docs/04-dataflow-and-provenance.md (DF-) · docs/09-architecture.md (AR-)
 
 > Implementation status by language: see [14 — Implementation Status Matrix](14-implementation-status-matrix.md).
@@ -33,22 +32,30 @@ This document specifies:
 
 ### Tier 1 — Deep semantics
 
-Full parse plus language-specific semantic enrichment. Scope graph construction
-via `tree-sitter-graph` with language-specific rules. Where available, an
-optional language-specific deep parser augments the tree-sitter AST.
+Full parse plus language-specific semantic enrichment, with hand-written
+scope-graph resolution rules per language. Where available, an optional
+language-specific deep parser augments the tree-sitter AST.
 
-**Tier 1 at launch: Rust, TypeScript, JavaScript** (TypeScript and JavaScript
-share one adapter family).
-
-**Tier 1 implemented since launch: Go, Python.** Both adapters extract symbols,
-call refs, imports/exports, inheritance/overrides, entrypoint and cut hints,
-own-effects, intraprocedural SSA dataflow, and concurrency hints. See
+**Five Tier-1 adapters ship and are registered** in `crates/cgx-index/src/registry.rs`:
+**Rust, TypeScript/JavaScript** (one adapter family), **Go, Java, Python**. All
+five extract symbols, call refs, imports/exports, inheritance/overrides,
+entrypoint and cut hints, own-effects, and intraprocedural SSA dataflow;
+concurrency hints are partial (`~`) rather than complete. See
 [14 — Implementation Status Matrix](14-implementation-status-matrix.md) for the
-per-capability `✓`/`~` breakdown.
+per-capability `✓`/`~` breakdown, which is the authoritative per-cell ledger.
 
-**Tier 1 planned (in order):** Java, C#. Rows for these planned languages in LS-7
-and LS-8 are specification-ahead-of-implementation (`Status: roadmap` for those
-rows).
+**Tier 1 planned:** C#. No `cgx-lang-csharp` crate exists; C# rows in LS-7 and
+LS-8 are specification ahead of implementation.
+
+Two capabilities are `planned` for **every** Tier-1 language, including the
+shipped five: **SCIP enrichment** beyond the ingest path (LS-5) and **framework
+packs** (LS-8, and GM-15 in `docs/03-code-graph-model.md`). Neither is a
+per-language gap; both are unbuilt layers.
+
+Note on the resolution mechanism: `cgx-resolve` is hand-written and depends only
+on `cgx-core`, `cgx-frontend`, `serde` and `smallvec`. There is no
+`tree-sitter-graph` dependency and no scope-graph DSL in the workspace — the
+"scope graph" in this document names the *model*, not a third-party crate.
 
 Characteristic capabilities at Tier 1:
 - Callee resolution at `certain` or `probable` confidence for most call sites.
@@ -152,8 +159,22 @@ more callee symbols and what confidence label it assigns.
 | **Go** | Direct calls; interface satisfaction; function values; goroutine launch | Interface calls produce candidate set from types satisfying the interface; goroutine launch annotated as async edge | `probable` (interface impl set), `certain` (direct call) |
 | **C** | Direct calls; function pointers | Direct calls at `certain`; function pointer calls at `possible` (callee unknown without data-flow) | `certain` (direct), `possible` (function pointer) |
 | **C++** | vtable (virtual); templates (monomorphized); std::function; function pointers | Virtual dispatch: CHA-style candidate set; templates: monomorphized call at `certain`; std::function: `possible` | `certain` (direct/template), `probable` (virtual, single override), `possible` (std::function / function pointer) |
-| **DI frameworks** | Spring (Java), Angular (TypeScript), Guice | Constructor injection and `@Autowired` / `@Inject` annotations tracked; injected type resolves to registered implementation | `probable` (single registered impl), `possible` (multiple candidates or dynamic registration) |
+| **DI frameworks** *(Planned)* | Spring (Java), Angular (TypeScript), Guice | Constructor injection and `@Autowired` / `@Inject` annotations tracked; injected type resolves to registered implementation | `probable` (single registered impl), `possible` (multiple candidates or dynamic registration) |
 | **Closures (all languages)** | Closure captures; higher-order functions passed as callbacks | Call edge from call site to closure body; capture tracking feeds DF- pedigree; higher-order call at `possible` if callee is a parameter | `probable` (closure assigned to typed variable), `possible` (callback parameter) |
+
+**The DI row is Planned; every other row describes shipped behaviour.** No
+dependency-injection resolution exists in the workspace: the `established_by`
+edge field that would record a mediated edge, and the `via-di` cut marker, are
+both real schema, but every construction site sets `established_by: None`, and
+nothing in any adapter reads a `@Autowired`, `@Inject` or Angular provider
+annotation. The same gap is described from the other side in
+`docs/12-language-primitives-and-frameworks.md` (FW-4) and
+`docs/03-code-graph-model.md` (GM-15/GM-17).
+
+The practical consequence: an injected call is not resolved to its
+implementation, and it is not marked `via-di` either. It falls through to
+whatever the language's ordinary resolution produces, or to an unresolved
+reference.
 
 ---
 
@@ -192,6 +213,8 @@ none is provided. SCIP ingestion is an accuracy upgrade for teams whose build
 tooling already generates SCIP outputs (e.g., `scip-typescript`, `scip-rust` /
 `rust-analyzer --emit-scip`, `scip-python`).
 
+**Status: partially shipped.** The ingest path is real — `cgx index --scip <index.scip>` is a flag on the binary, `crates/cgx-scip` parses the protobuf wire format, and `crates/cgx-index/src/pipeline/scip_relabel.rs` performs the upgrade-only re-label that raises matched edges to the `scip` confidence tier. That tier shows up in `cgx explain` output as `tier=scip`. What is **not** shipped is the packaging this section describes below: `cgx-scip` is an ordinary workspace dependency of `cgx-index`, not an optional Cargo feature, so "isolated behind an optional feature flag" states an intent rather than the current build.
+
 **Stewardship note:** The SCIP protocol is maintained by Sourcegraph. As of the
 writing of this document, there is uncertainty about Sourcegraph's long-term
 stewardship of the `scip` crate following organizational changes. The SCIP
@@ -199,6 +222,11 @@ protobuf schema itself is stable and versioned; if the upstream crate becomes
 unmaintained, `cgx` can regenerate bindings from the protobuf schema. For this
 reason, SCIP ingestion is isolated behind an optional feature flag and is not
 part of the critical indexing path.
+
+*(That risk is already retired in practice: `crates/cgx-scip` is a hand-rolled,
+zero-dependency read-only protobuf decoder — the workspace never depended on the
+upstream `scip` crate. Its one Cargo feature, `test-support`, gates a synthetic
+`.scip` encoder used only by tests.)*
 
 **LSP-based extraction** (shelling out to a running language server for
 type-resolved call targets) is classified as out of scope for v1. It adds
@@ -241,13 +269,14 @@ catalogued per-language now so that GM-9, GM-10, GM-11, and GM-12 schema
 reservations are grounded in concrete language surface; the full concurrency
 query surface (Q-24) follows.
 
-**Scope note:** rows for Rust, TypeScript/JavaScript, Go, and Python are
-implemented (spawn and lock constructs land as `spawns` / `blocking`; the `.await`
-suspension edge is partial — see the Concurrency `~` cell in
-[14 — Implementation Status Matrix](14-implementation-status-matrix.md)). Rows for
-Java, C/C++, Kotlin, Swift, C# are specification-ahead-of-implementation
-(`Status: roadmap`) — they ground the schema reservation but are not implemented
-until their language's Tier-1 adapter ships.
+**Scope note:** rows for **Rust, TypeScript/JavaScript, Go, Java and Python** are
+partially implemented — spawn and lock constructs land as `spawns` / `blocking`
+(the Java adapter emits `Spawns` at thread and executor launch sites), while the
+`.await` suspension edge is partial. That is the Concurrency `~` cell in
+[14 — Implementation Status Matrix](14-implementation-status-matrix.md), which is
+the authoritative per-cell ledger. Rows for **C/C++, Kotlin, Swift, C#** are
+specification ahead of implementation — they ground the schema reservation, and
+no adapter exists for any of them.
 
 This section specifies the per-language mapping of concurrency constructs to
 the graph attributes defined in docs/03-code-graph-model.md: `spawns` edge kind
@@ -337,16 +366,31 @@ for framework-pack evaluation (see docs/12-language-primitives-and-frameworks.md
 FW-1). Per-language packs for resource-pair syntax (column 3) harvest into GM-13
 without requiring user configuration.
 
-**Scope note:** rows for Rust (LS-8.1) and TypeScript/JavaScript (LS-8.4) are
-Phase-1 implementation commitments. The Go adapter (LS-8.2) implements the
-channel / non-call-dataflow row (DF-20 `ch <-` / `<- ch` send-receive pedigree);
-its remaining LS-8.2 rows and **all** Python (LS-8.3), Java (LS-8.5), and C#
-(LS-8.6) rows are specification-ahead-of-implementation (`Status: roadmap`) —
-they ground the schema reservation but are not implemented until that adapter
-harvests the primitive. The Python adapter ships the LS-1 capability set
-(symbols, refs, imports, inheritance, effects, intraprocedural dataflow,
-concurrency hints) but does **not** yet harvest the LS-8.3 implicit-call,
-resource-pair, metadata-carrier, or channel-dataflow primitives.
+**Scope note — read this before any LS-8 table.** The `implicit:<kind>` tables
+below are **almost entirely unharvested, including for Rust**, and that is not
+obvious from their formatting. `ImplicitKind` is a real twelve-variant enum in
+`crates/cgx-core/src/edge.rs`, but only two variants are ever constructed
+anywhere in the workspace: Go's `Defer`, and one `Iterator` site. `cgx-lang-rust`
+constructs almost none of the LS-8.1 table it is credited with — no `Drop`, no
+`Deref`, no `Coercion`, no `Operator`, no `ContextEnter`/`ContextExit`, no
+`Property`, no `StaticInit`, no `Conversion` — and `cgx-lang-java` and
+`cgx-lang-python` never construct any variant at all
+(`grep -rl "ImplicitKind" crates/cgx-lang-*/src/` returns only the Go and Rust
+adapters).
+
+Concretely: LS-8.1 (Rust) and LS-8.4 (TypeScript/JavaScript) are Phase-1
+implementation *commitments*, not shipped harvests. LS-8.2 (Go) ships the
+channel / non-call-dataflow row (DF-20 `ch <-` / `<- ch` send-receive pedigree)
+and the `defer` implicit-call row; its remaining rows, and **all** of LS-8.3
+(Python), LS-8.5 (Java) and LS-8.6 (C#), are specification ahead of
+implementation. Java and Python ship the full LS-1 capability set — symbols,
+refs, imports, inheritance, effects, intraprocedural dataflow, concurrency hints
+— but neither harvests the LS-8 implicit-call, resource-pair, metadata-carrier
+or channel-dataflow primitives.
+
+A query written against an `implicit:*` edge kind therefore returns a clean
+empty result today, in every language but Go. An empty result is not evidence
+that the construct is absent from the code.
 
 This table maps the concrete surface syntax of each Tier 1 language (plus C#,
 which is covered in LS-2 and LS-3) to the `cgx` primitive types defined in

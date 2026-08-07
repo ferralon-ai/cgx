@@ -98,9 +98,9 @@ ORDER BY hops, callee.file
 |---|---|
 | `(src {name:"processOrder"})-[:CALLS*]->` | Traverse all call edges transitively from `processOrder`. |
 | `ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | Restrict to callees that are only reachable via at least one exception-class edge — these are the error-path callees. |
-| `edge_kinds` | Shows `implicit:defer`, `implicit:drop`, `implicit:context-exit`, etc. (GM-16) to identify language-native cleanup constructs. |
+| `edge_kinds` | Resolves only to the real call-family `EdgeKind` tokens (`calls`, `calls-virtual`, `calls-closure`, …) — a `defer` or `Drop::drop` callee shows the same `calls` kind as any other call. The `ImplicitKind` tag (GM-16) that distinguishes language-native cleanup constructs (`Defer`, `ContextExit`, …) is stored on the edge record but is not exposed to CQL at all, so it cannot appear in this column. |
 
-**Reading the result** — Each returned callee executes on the error return path. Cross-reference against Q41 (which happy-path callees are missing) to identify audit-logging or state-persistence calls that are absent on the error path. The `edge_kinds` column distinguishes explicit cleanup calls from implicit ones like `Drop::drop` or `defer`.
+**Reading the result** — Each returned callee executes on the error return path. Cross-reference against Q41 (which happy-path callees are missing) to identify audit-logging or state-persistence calls that are absent on the error path. `edge_kinds` cannot tell you whether a given callee was reached via an explicit call or an implicit `defer`/`Drop`/context-exit — use `callee.name` and the source to distinguish those by inspection.
 
 ---
 

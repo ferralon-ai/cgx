@@ -182,6 +182,10 @@ struct FrontierFacts {
     dangling_refs: u64,
     cut_counts: BTreeMap<CutMarker, usize>,
     below_floor: usize,
+    /// Edges the walk's `--max-candidates` fan-out cap excluded. Counted only for
+    /// edges that would otherwise have passed the confidence floor, so this and
+    /// `below_floor` partition the excluded edges rather than double-counting.
+    dropped_max_candidates: usize,
     depth_truncated: bool,
 }
 
@@ -212,6 +216,10 @@ fn scan_frontier(view: &GraphView, walker: &PathWalker, reached: &[bool]) -> Fro
         min_confidence: Confidence::Possible,
         condition: ConditionFilter::Any,
         kinds: walker.filter.kinds.clone(),
+        // Deliberately uncapped, not merely defaulted: this scan exists to see what
+        // the *walk* excluded, so applying the walk's `--max-candidates` fan-out cap
+        // here would hide exactly the edges `dropped-max-candidates` must report.
+        max_candidates: None,
     };
     let floor = walker.filter.min_confidence;
     let bounded = walker.max_depth.is_some();
@@ -232,6 +240,12 @@ fn scan_frontier(view: &GraphView, walker: &PathWalker, reached: &[bool]) -> Fro
             }
             if er.edge.confidence < floor {
                 facts.below_floor += 1;
+            } else if let (Some(max), Some(group)) =
+                (walker.filter.max_candidates, er.edge.candidate_group)
+            {
+                if view.candidate_group_size(group) > max {
+                    facts.dropped_max_candidates += 1;
+                }
             }
         }
         if bounded && !facts.depth_truncated {
@@ -298,6 +312,18 @@ pub fn contract_for(
                 confidence_token(walker.filter.min_confidence)
             ),
         ));
+    }
+    if frontier.dropped_max_candidates > 0 {
+        if let Some(max) = walker.filter.max_candidates {
+            reasons.push(under(
+                "dropped-max-candidates",
+                format!(
+                    "{} edge(s) in a candidate set larger than {max} were excluded from the \
+                     search (--max-candidates fan-out cap)",
+                    frontier.dropped_max_candidates
+                ),
+            ));
+        }
     }
     if frontier.depth_truncated {
         if let Some(d) = walker.max_depth {

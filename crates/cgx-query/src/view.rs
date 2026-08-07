@@ -17,6 +17,8 @@
 //! these primitives today; Layer 2, when scheduled, becomes a frontend that lowers
 //! to the same surface rather than a second execution path.
 
+use std::collections::BTreeMap;
+
 use cgx_core::{
     Candidate, EdgeId, EdgeRecord, NodeId, NodeRecord, PatternKind, SymbolKind, SymbolPattern,
 };
@@ -37,6 +39,12 @@ pub struct GraphView {
     out_edges: Vec<Vec<u32>>,
     /// `in_edges[n]` = edge indices whose `dst == n`, in canonical edge order.
     in_edges: Vec<Vec<u32>>,
+    /// Size of each over-approximated candidate group (`candidate_group id → member
+    /// count`), precomputed once from the candidate table. A group appears only
+    /// when it has ≥ 2 members (a singleton sheds its group at resolve time), so an
+    /// edge with no group id is fan-out 1. Read by [`candidate_group_size`] to
+    /// enforce the `--max-candidates` fan-out cap without re-resolving.
+    group_sizes: BTreeMap<u32, u32>,
 }
 
 /// A borrowed reference to one edge plus the convenience of its already-resolved
@@ -77,12 +85,17 @@ impl GraphView {
                 in_edges[d].push(idx);
             }
         }
+        let mut group_sizes: BTreeMap<u32, u32> = BTreeMap::new();
+        for c in &candidates {
+            *group_sizes.entry(c.candidate_group).or_default() += 1;
+        }
         GraphView {
             nodes,
             edges,
             candidates,
             out_edges,
             in_edges,
+            group_sizes,
         }
     }
 
@@ -104,6 +117,14 @@ impl GraphView {
     /// All candidate-set members.
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
+    }
+
+    /// The fan-out of an over-approximated candidate group — the number of parallel
+    /// target edges that share `group`. Read from the persisted candidate table (no
+    /// re-resolve). A group that is not present has no recorded members; callers
+    /// treat a groupless edge as fan-out 1.
+    pub fn candidate_group_size(&self, group: u32) -> u32 {
+        self.group_sizes.get(&group).copied().unwrap_or(0)
     }
 
     /// The record for a node id.
@@ -198,6 +219,15 @@ impl GraphView {
             let edge = &self.edges[ei as usize];
             if !filter.admits(edge) {
                 return None;
+            }
+            // The `--max-candidates` fan-out cap: a candidate-group property that
+            // `EdgeFilter::admits` cannot decide from the edge alone, applied here
+            // because this view owns the candidate table. An edge with no group is
+            // a single resolved target (fan-out 1) and is never dropped.
+            if let (Some(max), Some(group)) = (filter.max_candidates, edge.candidate_group) {
+                if self.candidate_group_size(group) > max {
+                    return None;
+                }
             }
             let peer = match dir {
                 Direction::Forward => edge.dst,

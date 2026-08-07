@@ -279,6 +279,52 @@ fn supernode_cap_keeps_the_full_set_with_a_cut_marker() {
 }
 
 #[test]
+fn candidates_are_partitioned_by_source_language() {
+    // A TS CallClosure at a call site of arity 1: candidates are restricted to
+    // TS Lambda/free-Function values (the call site's language). A same-arity
+    // function in a *different* language (rust) must never be a candidate — a
+    // bare TS closure invocation cannot reach a non-TS function value without an
+    // intermediating JS-visible binding (F1c verdict). A same-language,
+    // same-arity function is a legitimate candidate and must be preserved.
+    let mut ts = FileBuilder::new();
+    ts.def("m::run", SymbolKind::Function, ROOT, 1, PUB, false, Some(0));
+    ts.def("m::double", SymbolKind::Function, ROOT, 2, PUB, false, Some(1));
+    let run_scope = ts.scope(ROOT, Some("m::run"));
+    ts.raw_ref(
+        &["cb"],
+        run_scope,
+        3,
+        RefKind::CallClosure,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let ts_facts = ts.build();
+
+    let mut rs = FileBuilder::new();
+    rs.def("x::add_one", SymbolKind::Function, ROOT, 1, PUB, false, Some(1));
+    let rs_facts = rs.build();
+
+    let inputs = vec![
+        FileInput::new("blob-ts".to_string(), "src/m.ts", "typescript", &ts_facts),
+        FileInput::new("blob-rs".to_string(), "src/x.rs", "rust", &rs_facts),
+    ];
+    let mut g = link(&inputs, &LinkOpts::default());
+
+    let stats = run_sig(&mut g);
+    assert_eq!(stats.sites_resolved, 1);
+
+    let dsts = sig_candidate_dsts(&g);
+    assert!(
+        dsts.contains(&node_id(&g, "m::double")),
+        "same-language same-arity candidate is preserved"
+    );
+    assert!(
+        !dsts.contains(&node_id(&g, "x::add_one")),
+        "cross-language same-arity candidate is excluded"
+    );
+}
+
+#[test]
 fn re_running_the_signature_pass_is_byte_identical() {
     // Determinism (§7): link + run_sig twice → identical graphs.
     let facts = callback_with_arity_one_and_two();

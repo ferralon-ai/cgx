@@ -1,6 +1,6 @@
 # cgx CLI — Command Reference
 
-cgx provides the subcommands below, organised into seven groups. Most read from a `.cgx/` index built by `cgx index`; `diff` and `impacted-tests` index the refs they compare themselves.
+cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
 
 ## Commands
 
@@ -34,7 +34,9 @@ cgx provides the subcommands below, organised into seven groups. Most read from 
 |---------|---------|-----------|
 | `cgx explain` | Full provenance for one symbol: definition, caller/callee counts, all incident edges | [explain.md](explain.md) |
 | `cgx search` | Search the symbol table by FQN substring or regex | [search.md](search.md) |
+| `cgx symbols` | Rank symbols by degree, with a per-symbol edge breakdown | [symbols.md](symbols.md) |
 | `cgx unused` | Symbols not reachable from any indexed entrypoint | [unused.md](unused.md) |
+| `cgx coupling` | Which files historically change together across a commit range | [coupling.md](coupling.md) |
 
 ### Change impact
 
@@ -56,24 +58,57 @@ cgx provides the subcommands below, organised into seven groups. Most read from 
 
 ---
 
+## Reading an answer
+
+A graph traversal answers two questions besides the one you asked: *how approximate is this answer* and *how stale is the index it came from*. Where a command can answer them, the answer travels with the result rather than in a separate report, in whichever format you asked for.
+
+```
+cgx callers rust_sample::conditions::dispatch --repo /path/to/worktree
+```
+
+```
+rust_sample::conditions::dispatch  fixtures/rust-sample/src/conditions.rs:42
+├─ ts_sample::closures::closureVariable  fixtures/ts-sample/src/closures.ts:6  [possible]
+...
+approximation: over- and under-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur; external/unindexed callees not modeled (no SCIP) (6 site(s) on the searched frontier)
+freshness: current | indexed tree 5ea331d, working tree clean
+```
+
+*(tree body elided — the full output is in [callers.md](callers.md).)*
+
+- **`approximation:`** — the approximation contract: `exact (within modeled graph)`, `under-approximate`, `over-approximate`, or both, plus the reasons. On an absence answer (empty result, `--assert-empty`) it also carries a `| scope: …` tail naming the edge family, confidence floor, and depth the search actually covered, so a "nothing found" answer states what it looked at.
+- **`freshness:`** — `current`, `stale`, or `unknown`, the indexed tree, and how far the working tree has drifted from it. The verdict reads `current` only when both halves were established clean; anything uninspected reads `unknown`, never `current`.
+
+In `--format json` the same two objects appear as top-level `approximation` and `freshness` keys; in `--format sarif` they appear as `cgx/approximation-contract` and `cgx/index-freshness` `note` results.
+
+Not every command carries both, and which it carries follows from what it computes rather than from when it was written:
+
+| Command | `approximation` | `freshness` |
+|---------|-----------------|-------------|
+| `callers`, `callees`, `flows-to`, `flows-from`, `reaches`, `paths`, `unused`, `query` | yes | yes |
+| `search`, `symbols`, `explain` | no — a table scan or a single symbol's incident edges, with no traversal to approximate | yes |
+| `doctor` | no — the report *is* an index-quality verdict | no |
+| `diff` | no — a graph-to-graph delta, not a query answer | no |
+| `coupling` | yes — but scoped to a *history* model, not the call graph: co-change is file-level and the rev range is bounded | no — it reads committed git history and never opens the index, so there is no index freshness to report |
+
+`dot`, `mermaid`, and `d2` output carries neither: those formats render a graph, and computing freshness would mean walking the working tree for a renderer that has nowhere to print it.
+
 ## Reproducing the examples
 
-Command reference examples query the same corpus, with one exception: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so that page builds throwaway repositories from the fixture trees and documents the setup itself.
+All command reference examples query the same corpus: **the cgx worktree itself**, indexed at its root. That covers the crate sources under `crates/` and both language fixtures under `fixtures/` in one graph, which is what the shown output was captured from — file paths in every example are worktree-relative (`fixtures/rust-sample/src/conditions.rs:42`, `crates/cgx-cli/src/forest.rs:345`).
 
-**Corpus:** `fixtures/rust-sample` — a multi-file Rust crate included in the repository.
+One page is an exception: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so that page builds throwaway repositories from the fixture trees and documents the setup itself.
 
-**Index the corpus** (run once from the worktree root):
-
-```bash
-cgx index fixtures/rust-sample
-```
-
-Or with an explicit path from any directory:
+**Index the corpus** (run once, from the worktree root):
 
 ```bash
-cgx index /path/to/worktree/fixtures/rust-sample
+cgx index .
 ```
 
-Every example then passes `--repo /path/to/worktree/fixtures/rust-sample` to point at the indexed directory.
+Every example then passes `--repo /path/to/worktree` to point at it.
 
-The corpus package name is `rust-sample`; all fixture FQNs carry the `rust_sample::` prefix. Use `cgx search rust_sample` to list all indexed symbols.
+Indexing `fixtures/rust-sample` alone is not enough. Several examples — the `callers` and `explain` trees in particular — show TypeScript callers of Rust symbols, which only exist when `fixtures/ts-sample` is in the same graph. A rust-sample-only index reproduces those invocations with zero callers and no error.
+
+The fixture package names are `rust-sample` and `ts-sample`; their FQNs carry the `rust_sample::` and `ts_sample::` prefixes. Use `cgx search rust_sample` to list the Rust fixture's symbols, or [`cgx symbols`](symbols.md) to rank the whole corpus by degree.
+
+**Counts move.** Examples that report graph-wide totals — `doctor`'s node and edge counts, `unused`'s result count — were captured against one commit of this worktree and scale with it. Your numbers will differ; the shape, field names, and verdicts are what the examples are documenting.

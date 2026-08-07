@@ -2,7 +2,6 @@
 
 **Status:** Draft  
 **Audience:** Software engineers, security engineers, AI coding agents  
-**Working name:** `cgx` (placeholder; see `README.md`)  
 **Cross-references:** `docs/03-code-graph-model.md` (node/edge taxonomy, edge condition labels), `docs/04-dataflow-and-provenance.md` (DF- features), `docs/07-interfaces.md` (CLI UX, output formats)
 
 ---
@@ -16,35 +15,47 @@
 
 Both layers produce identical result objects: every result node and edge carries file:line provenance and an edge condition label (`always`, `conditional`, `exception`, `loop`, `panic`) from the taxonomy in `docs/03-code-graph-model.md`. The labels `exception` and `panic` together form the exceptional class; query predicates that filter "non-exception paths" exclude both.
 
+### What an answer is
+
+A cgx answer is never a bare result set. Two envelopes travel with it, and reading them is part of reading the answer:
+
+- **The approximation contract** — which direction this specific answer errs in (`exact`, `under-approximate`, `over-approximate`, `over- and under-approximate`), why, and what graph it was computed over. It is computed **per answer**, not per binary: the same subcommand is `exact` on one invocation and `under-approximate` on the next because a bound fired. Negative answers ("no path exists") additionally carry a `scope:` tail naming exactly what was searched, because an absence is only as strong as its search.
+- **The freshness envelope** — whether the index the answer came from still matches the working tree (`current`, `stale`, `unknown`), which tree was indexed, and how many files are dirty.
+
+In `human` format these are the last one or two lines; in `json` they are the `approximation` and `freshness` keys; in `sarif` they are the `cgx/approximation-contract` and `cgx/index-freshness` notes. **Which of the two a command emits is a per-command fact** — see "Answer envelopes by command" below. Confidence (`certain`/`probable`/`possible`) is a third, orthogonal axis: it labels individual *edges*, and a path carries the weakest confidence along it.
+
 ---
 
 ## Feature List
 
-Shipped status reflects v0.3.0. Features without a "Planned" note are available in the current binary.
+Shipped status reflects v0.3.0. Features without a "Planned" note are available in the current binary. "Shipped" here means the command or clause runs; it does not mean every flag the section below sketches for it exists — where a section describes a flag that is not in the binary, the section says so inline.
 
 | ID | Feature | Layer | v0.3.0 status |
 |----|---------|-------|---------------|
 | Q-1 | `callers` subcommand | 1 | Shipped |
 | Q-2 | `callees` subcommand | 1 | Shipped |
-| Q-3 | `paths` subcommand with edge-condition filter | 1 | Shipped |
+| Q-2b | `reaches` subcommand (forward enumeration, or a witness path to a target) | 1 | Shipped |
+| Q-3 | `paths` subcommand | 1 | Shipped — but **no edge-condition filter on `paths`**; that filter exists only on `diff` |
 | Q-4 | `unused` subcommand | 1 | Shipped |
+| Q-4b | `search` / `symbols` subcommands (symbol-table lookup and degree ranking) | 1 | Shipped |
 | Q-5a | `flows-from` subcommand (backward data-flow pedigree from a value node) | 1 | Shipped (`Since: v0.3`) |
 | Q-5b | `flows-to` subcommand (forward data-flow walk from a value node) | 1 | Shipped (`Since: v0.3`) |
 | Q-5 | `pedigree` subcommand (value provenance with `--at-function`) | 1 | **Planned** — use `flows-from` today |
 | Q-6 | `explain` subcommand | 1 | Shipped |
-| Q-7 | `diff` subcommand (`<BASE> <HEAD>` positional, `--newer-than` only) | 1 | Shipped (full flags at v0.4) |
-| Q-8 | Full query language: `cgx query '<q>' ./` | 2 | Shipped (CALLS + DATA_FLOW) |
-| Q-9 | Query from file: `cgx query @file.cql ./` | 2 | Shipped |
-| Q-10 | SQL alternative: `cgx query --sql 'WITH RECURSIVE ...' ./` | 2 | **Planned (not yet shipped in v0.3.0)** |
-| Q-11 | Edge-condition filters on any query | 1 + 2 | Shipped |
+| Q-7 | `diff` subcommand (`<BASE> <HEAD>` positional) | 1 | Shipped, including `--added/--removed/--changed`, `--kind`, `--edge-condition`, `--from/--to`, `--path-added`, `--require-anchor-match` |
+| Q-7b | `coupling` subcommand (file-level co-change frequency over git history) | 1 | Shipped |
+| Q-8 | Full query language: `cgx query '<q>' --repo <path>` | 2 | Shipped (CALLS + DATA_FLOW) |
+| Q-9 | Query from file: `cgx query @file.cql --repo <path>` | 2 | Shipped |
+| Q-10 | SQL alternative: `cgx query --sql 'WITH RECURSIVE ...'` | 2 | **Planned** — the flag is parsed and **rejected with exit 2** on `query` |
+| Q-11 | Edge-condition filters | 1 + 2 | Shipped in CQL (`r.condition`) and on `cgx diff --edge-condition`. **Not** on `callers`/`callees`/`paths` |
 | Q-12 | Path-relative transience predicates | 2 | Shipped |
-| Q-13 | Depth limits | 1 + 2 | Shipped |
+| Q-13 | Depth limits (`--depth`) | 1 + 2 | Shipped. Fan-out limits (`--max-fanout`, `--through-sentinels`) are **Planned** |
 | Q-14 | Negative path constraints (`reaches X WITHOUT passing through Y`) | 2 | Shipped |
 | Q-15 | Reachability matrix queries | 2 | Shipped |
-| Q-16 | Graph diff queries across commit or branch ranges | 1 + 2 | Shipped (`--newer-than`); full diff filters at v0.4 |
-| Q-17 | Determinism guarantee: stable ordering, query against a specific commit (`--at`) | 1 + 2 | Shipped |
-| Q-18 | Confidence-tier filtering (`--confidence certain|probable|possible`) | 1 + 2 | Shipped |
-| Q-19 | Entrypoint-scoped reachability | 1 + 2 | Shipped |
+| Q-16 | Graph diff queries across commit or branch ranges | 1 + 2 | Shipped; see Q-7 for the real flag set |
+| Q-17 | Determinism guarantee: stable ordering, query against a specific commit (`--at`) | 1 + 2 | Shipped. `--order` is **Planned** (no such flag) |
+| Q-18 | Confidence-tier filtering (`--confidence certain\|probable\|possible`) | 1 + 2 | Shipped |
+| Q-19 | Entrypoint-scoped reachability | 1 + 2 | **Planned** — `cgx unused` uses the *auto-detected* entrypoint set; there is no flag to declare or scope one |
 | Q-20 | Path quantifiers and must-pass-through (∀-path / must-analysis) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-21 | Path-set algebra (complement, intersection, difference) | 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-22 | Ordering and pairing predicates (A-then-B on all paths; acquire/release) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
@@ -52,146 +63,319 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | Q-24 | Concurrency queries (lock sets, await-holding-lock, blocking-in-async, cross-spawn races) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-25 | Dependency and CVE reachability queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-26 | Lineage type reconstruction queries (type discovery; type-contradiction bug query) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
-| Q-27 | Mutation fan-out and exposed-state queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-27 | Mutation fan-out and exposed-state queries | 1 + 2 | **Partly shipped** — `CALL cgx.mutation_fanout(v) YIELD mutator, confidence` runs; the `effect`/`transform`/`evidence` columns, the `mutation-fanout` subcommand and the `writes-param(i)` lattice are Planned |
 | Q-28 | Closure-capture queries (loop-variable capture; captured-resource lifetime) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
-| Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
+| Q-29 | Higher-order / function-value call-resolution queries | 1 + 2 | **Partly shipped** — `calls:callback`/`calls:indirect` edges are queryable; function-value nodes and indirect-call *resolution* are Planned |
 | Q-30 | Coercion and type-confidence queries (type-juggling-in-auth; `any`-frontier) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-31 | Framework-aware queries (metadata-guard-aware must-pass-through; entrypoint reachability; tainted-reflection dispatch) | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 | Q-32 | Override-contract drift queries (exception-widening, dropped-base-guard, field-footprint drift) | 2 | **Planned (not yet shipped in v0.3.0)** |
-| Q-33 | Recursion / SCC / architecture-cycle queries | 1 + 2 | Shipped |
+| Q-33 | Recursion / SCC / architecture-cycle queries | 1 + 2 | **Planned (not yet shipped in v0.3.0)** |
 
 ---
 
 ## Layer 1: Focused Subcommands
 
-All subcommands accept a **path** argument (the repository root or subdirectory) as their final positional argument. The graph index is automatically located from that path (see `docs/06-indexing-and-vcs.md`).
+### How a subcommand is addressed to a repository
+
+**`--repo <path>`, not a trailing positional path.** Every query subcommand — `callers`, `callees`, `reaches`, `paths`, `unused`, `explain`, `query`, `search`, `symbols`, `flows-to`, `flows-from`, `diff`, `coupling`, `doctor` — takes the repository root as the **`--repo` option**, defaulting to the current directory. A trailing positional path is a usage error:
+
+```console
+$ cgx callers helper ./
+error: unexpected argument './' found
+
+Usage: cgx callers [OPTIONS] <SYMBOL>
+
+For more information, try '--help'.
+$ echo $?
+2
+```
+
+**`cgx index` is the exception, in both directions.** It takes a **positional** `[PATH]` and has no `--repo` at all:
+
+```console
+$ cgx index --repo /path/to/repo
+error: unexpected argument '--repo' found
+
+  tip: to pass '--repo' as a value, use '-- --repo'
+
+Usage: cgx index [OPTIONS] [PATH]
+$ echo $?
+2
+```
+
+The graph index is located from the resolved repository root (see `docs/06-indexing-and-vcs.md`). Every command in this section except `index`, `coupling` and `mcp` auto-indexes when no index is present; `--no-auto-index` turns that off, and `cgx doctor` never auto-indexes at all (it exits 3 on an unindexed repo).
+
+### The example repository
+
+Every run shown in this document is against this repository, which you can recreate exactly:
+
+```rust
+// src/main.rs
+fn main() {
+    let cfg = load_config();
+    let raw = read_input(cfg);
+    let out = middle(raw);
+    danger(out);
+}
+
+fn load_config() -> u32 { 7 }
+
+fn read_input(c: u32) -> u32 {
+    let x = c + 1;
+    x
+}
+
+fn middle(v: u32) -> u32 {
+    let y = helper(v);
+    y
+}
+
+fn helper(x: u32) -> u32 { x * 2 }
+
+fn danger(v: u32) {
+    if v > 3 {
+        risky(v);
+    }
+}
+
+fn risky(v: u32) -> u32 { v }
+
+fn orphan() -> u32 { 42 }
+```
+
+```console
+$ git init -q . && git add -A && git commit -qm initial
+$ cgx index .
+Indexed /tmp/fixture (7380e245ab98db2dfed12ed3ee3b005f0fbf7036)
+  blobs: 1 indexed, 1 extracted, 0 cached, 0 unsupported
+  graph: 22 nodes, 14 edges, 0 unresolved
+  dataflow: 5 fns recomputed, 0 fns reused; ifds: 4 summaries, 3 interproc edges, 0 budget-exceeded SCCs
+```
+
+(The absolute path in the first line is the repository root; `/tmp/fixture` stands in for whatever yours is. Everything else is verbatim.)
+
+Twenty-two nodes for eight functions: the extra fourteen are **SSA value nodes** (`rust_sample::middle::y#1` and friends), which the dataflow pass creates and which `flows-to`/`flows-from` operate on. They are ordinary graph nodes, so they show up in `search`, `symbols` and `unused` output too.
 
 ### Q-1: callers
 
 Find all symbols that call a given symbol, up to a specified depth.
 
 ```
-cgx callers <symbol> <path> [--depth N] [--confidence certain|probable|possible]
-                             [--edge-condition always|conditional|exception|loop|panic]
-                             [--max-fanout N] [--through-sentinels]
-                             [--at <ref>] [--format <fmt>]
+cgx callers <SYMBOL> [--repo <path>] [--depth N]
+                     [--confidence certain|probable|possible]
+                     [--tree full|spanning] [--at <ref>] [--format <fmt>]
+                     [--assert-empty] [--allow-vacuous] [--no-auto-index]
 ```
 
-`--max-fanout N` caps the per-node breadth of the traversal and
-`--through-sentinels` expands through high-degree hub nodes that are otherwise
-reported as leaves; both are specified in Q-13.
+`callers`, `callees`, `reaches`, `paths`, `flows-to`, `flows-from`, `query` and `unused` share this flag block. Note what is **not** in it: there is no `--edge-condition` filter on any traversal subcommand (that flag exists only on `cgx diff`), and no `--max-fanout` / `--through-sentinels` — fan-out bounding is Planned, specified in Q-13.
 
-**Examples:**
+**Worked run:**
 
-```bash
-# Direct callers of crypto::hash
-cgx callers crypto::hash ./
-
-# All callers within 3 hops, only certain edges
-cgx callers crypto::hash ./ --depth 3 --confidence certain
-
-# Callers that reach the function through an exception path
-cgx callers crypto::hash ./ --edge-condition exception
-
-# Callers as of a specific commit
-cgx callers crypto::hash ./ --at abc1234
+```console
+$ cgx callers helper --repo .
+rust_sample::helper  src/main.rs:20
+└─ rust_sample::middle  src/main.rs:15
+   └─ rust_sample::main  src/main.rs:1
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
 ```
+
+Human output is an **indented forest**, not a flat list: depth is carried by indentation, and there is no `depth=` field. A node annotated `[if]` was reached over a `conditional` edge and `[exc]` over an `exception` edge; `always` is left unmarked. Confidence is annotated only when it is not `certain` (`[probable]`, `[possible]`). JSON and SARIF do carry a numeric `depth` per result.
+
+**`--depth` on `callers` and `callees` defaults to 2, and `--depth 0` is not "unlimited":**
+
+```console
+$ cgx callers helper --repo . --depth 0
+rust_sample::helper  src/main.rs:20
+approximation: under-approximate — search stopped at depth 0; deeper edges were not explored | scope: call edges, confidence>=possible, depth<=0
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+`--depth 0` returns the seed node and nothing else, and the contract says so. `--depth 0` lifts the depth limit on **`cgx paths` only** (Q-3) — and even there "unlimited" needs the qualification in Q-3, because lifting the depth limit hands the bound to the work budget instead. The CLI's own `--help` text for `--depth` states the unlimited reading unconditionally and is wrong for every command except `paths`; the contract line is the reliable signal.
 
 ### Q-2: callees
 
-Find all symbols a given symbol calls, transitively to a depth limit.
+Find all symbols a given symbol calls, transitively to a depth limit. Same flag block as Q-1.
 
 ```
-cgx callees <symbol> <path> [--depth N] [--confidence certain|probable|possible]
-                             [--edge-condition always|conditional|exception|loop|panic]
-                             [--max-fanout N] [--through-sentinels]
-                             [--at <ref>] [--format <fmt>]
+cgx callees <SYMBOL> [--repo <path>] [--depth N] [--confidence …] [--at <ref>] [--format <fmt>]
 ```
 
-**Examples:**
+**Worked run:**
 
-```bash
-# All direct callees of main::process_request
-cgx callees main::process_request ./
-
-# Transitive callees up to depth 5
-cgx callees main::process_request ./ --depth 5
-
-# Only callees reachable via exception-conditioned edges
-cgx callees main::process_request ./ --edge-condition exception
+```console
+$ cgx callees main --repo . --depth 3
+rust_sample::main  src/main.rs:1
+├─ rust_sample::danger  src/main.rs:22
+│  └─ rust_sample::risky  src/main.rs:28  [if]
+├─ rust_sample::load_config  src/main.rs:8
+├─ rust_sample::middle  src/main.rs:15
+│  └─ rust_sample::helper  src/main.rs:20
+└─ rust_sample::read_input  src/main.rs:10
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
 ```
+
+`risky` carries `[if]` because `danger` only calls it inside an `if`. That is the edge-condition label doing its job: the path exists, but it is not unconditional.
+
+`--tree full` (the default) repeats a node under each of its callers; `--tree spanning` renders each node once under its shortest-path parent with a `(+N call sites)` annotation.
+
+### Q-2b: reaches
+
+Answer "does `FROM` reach `TO`?" with a witness path, or enumerate everything `FROM` reaches when `TO` is omitted. The two forms have **different result shapes and different depth defaults**, which matters more than the shared name suggests:
+
+```
+cgx reaches <FROM> [TO] [--repo <path>] [--depth N] [--confidence …] [--at <ref>] [--format <fmt>]
+```
+
+| Form | Result | Default depth | `dot`/`mermaid`/`d2` |
+|---|---|---|---|
+| `cgx reaches <FROM>` | forest enumeration | 2 | rejected, exit 2 |
+| `cgx reaches <FROM> <TO>` | witness path | unlimited | accepted |
+
+```console
+$ cgx reaches main risky --repo .
+path 1 (2 hops, min-confidence=certain):
+     rust_sample::main  (src/main.rs:1)
+  -> rust_sample::danger  (src/main.rs:22) [always]
+  -> rust_sample::risky  (src/main.rs:28) [conditional]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+**Direction matters and is easy to get backwards.** `cgx reaches <FROM>` with no `TO` walks *forward* — what `FROM` calls. To ask "is this vulnerable function reachable from anything," that is the wrong direction; use `cgx callers <SYMBOL>` or give `reaches` both anchors.
 
 ### Q-3: paths
 
-Find all call paths between a source and a sink, with optional edge-condition filtering.
+Enumerate the call paths between a source and a sink. **Both anchors are positional**; there are no `--from`/`--to` flags on `paths` (those exist on `cgx diff`, where they are glob anchors for `--path-added`).
 
 ```
-cgx paths --from <symbol> --to <symbol> <path>
-          [--exclude-edge-condition exception|conditional|loop]
-          [--only-edge-condition exception]
-          [--depth N] [--max-paths N]
-          [--max-fanout N] [--through-sentinels]
-          [--at <ref>] [--format <fmt>]
+cgx paths <FROM> <TO> [--repo <path>] [--depth N] [--confidence …]
+                      [--at <ref>] [--format <fmt>] [--assert-empty] [--allow-vacuous]
 ```
 
-`--max-fanout` and `--through-sentinels` bound per-node breadth (orthogonally to
-the `--depth` / `--max-paths` bounds, which limit path length and path
-count); see Q-13.
+```console
+$ cgx paths --from main --to risky --repo .
+error: unexpected argument '--from' found
 
-**Examples:**
+  tip: a similar argument exists: '--format'
 
-```bash
-# Non-exception paths from main::foo to vulnerable::bar
-cgx paths --from main::foo --to vulnerable::bar ./ --exclude-edge-condition exception
-
-# Only exception paths to vulnerable::bar
-cgx paths --from main::foo --to vulnerable::bar ./ --only-edge-condition exception
-
-# Paths with depth limit to keep output manageable
-cgx paths --from '**' --to crypto::decrypt ./ --depth 8
+Usage: cgx paths --format <FORMAT> <FROM> <TO>
 ```
+
+**Worked run:**
+
+```console
+$ cgx paths main risky --repo .
+path 1 (2 hops, min-confidence=certain):
+     rust_sample::main  (src/main.rs:1)
+  -> rust_sample::danger  (src/main.rs:22) [always]
+  -> rust_sample::risky  (src/main.rs:28) [conditional]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+`min-confidence=certain` on the header line is the **weakest** confidence anywhere along the path — a path is only as trustworthy as its least trustworthy hop.
+
+`paths` defaults to depth **6**, and is the one command where `--depth 0` lifts the depth limit.
+
+**`--depth 0` is not "get everything", and it can return *less* than a bounded search.** Lifting
+the depth limit does not remove the bound — it moves it to the shared work budget, which then
+truncates. On a graph with a deep subtree, the same query goes from a provably complete answer
+to a truncated one purely by passing `--depth 0`:
+
+```console
+$ cgx paths main sink --repo . --depth 6 --format json   # count=1, truncated=false, approximation.direction="exact"
+$ cgx paths main sink --repo . --depth 0 --format json   # count=1, truncated=true,  truncation_reason="step-budget", direction="under"
+$ cgx paths main sink --repo . --depth 0
+…
+[truncated: search budget exhausted; narrow with --depth]
+approximation: under-approximate — path enumeration hit the work budget; more paths may exist
+freshness: current | indexed tree 0b6795c, working tree clean
+```
+
+(Run against a deliberately deep fixture, not the example repository above; `…` elides the path
+listing.) The budget is spent depth-first, so the deep subtree can consume it before shallow
+paths are enumerated — **a smaller result than the bounded query, including zero results, is a
+realistic outcome.** A reader who takes an empty `--depth 0` result as "no path exists" has it
+backwards.
+
+This is why the truncation signals are load-bearing rather than cosmetic: the `[truncated: …]`
+marker line, the `truncated` / `truncation_reason` JSON keys, and the contract flipping from
+`exact` to `under-approximate` are how a complete answer is distinguished from an exhausted one.
+Check the contract, not the row count.
+
+`paths` is also one of the two path-shaped result sets (with `reaches <FROM> <TO>`), so it is the place `--format dot|mermaid|d2` is accepted. On a non-path-shaped result those three formats are a **hard usage error, exit 2** — not a degraded rendering.
 
 ### Q-4: unused
 
-Find symbols with no incoming call edges from the reachable graph rooted at a declared set of entrypoints.
+Find symbols not reachable from any auto-detected entrypoint.
 
 ```
-cgx unused <path> [--kind fn|method|field|all]
-                  [--type <TypeName>]
-                  [--entrypoint <symbol>]
-                  [--confidence certain|probable]
-                  [--format <fmt>]
+cgx unused [--repo <path>] [--kind <KIND>] [--depth N] [--confidence …]
+           [--at <ref>] [--format <fmt>] [--assert-empty] [--allow-vacuous]
 ```
 
-**Examples:**
+`--kind` takes one of the ten symbol kinds — `function method type field variable module constant macro lambda entrypoint` — and is the same enum `search` and `symbols` use. There is no `--type <TypeName>` flag and no `--entrypoint <symbol>` flag; entrypoint scoping is Q-19, which is Planned.
 
-```bash
-# All unreachable functions from declared entrypoints
-cgx unused ./
+**Worked run:**
 
-# Unreachable methods on UserService
-cgx unused ./ --kind method --type UserService
-
-# Unreachable fields on a specific struct
-cgx unused ./ --kind field --type OrderState
-
-# Only certainly-unreachable (no probable/possible callers anywhere)
-cgx unused ./ --confidence certain
+```console
+$ cgx unused --repo . --kind function
+rust_sample::orphan  (src/main.rs:30)
+approximation: exact (within modeled graph) | scope: call edges, confidence>=possible, depth=unbounded
+freshness: current | indexed tree 7380e24, working tree clean
 ```
+
+The `| scope:` tail is the important half here. `unused` is a **negative** answer — "nothing calls this" — and the scope names precisely what was searched, so a reader can see that a caller reaching `orphan` through a mechanism outside the modeled call graph (reflection, a dynamic registry, an FFI boundary) is *not* excluded by this result.
+
+**`--kind function` is not decoration.** Without it, SSA value nodes dominate the output on a dataflow index, because a local that is written and never read is genuinely a node with no incoming call edge:
+
+```console
+$ cgx unused --repo .
+rust_sample::main::cfg#1  (src/main.rs:2)
+rust_sample::main::raw#1  (src/main.rs:3)
+rust_sample::main::out#1  (src/main.rs:4)
+rust_sample::read_input::c#0  (src/main.rs:10)
+…
+rust_sample::risky::v#0  (src/main.rs:28)
+rust_sample::orphan  (src/main.rs:30)
+approximation: exact (within modeled graph) | scope: call edges, confidence>=possible, depth=unbounded
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+(Rows 5–13, all value nodes, elided at the `…`; the sole function is the last row.) Any `unused` example that shows only functions was produced either with `--kind function` or against an index built `--no-dataflow`.
 
 ### Q-5: pedigree — **Planned (not yet shipped in v0.3.0)**
 
-> **v0.3.0 shipped subcommands:** `flows-from` (backward/pedigree) and `flows-to` (forward). These operate on **value nodes** (e.g., `fn::local#1`), not function symbols. Use `cgx search <name>` to discover value-node FQNs.
->
-> ```bash
-> # Backward pedigree (where does this value derive from?)
-> cgx flows-from fn::local#1 ./
->
-> # Forward walk (what does this value flow into?)
-> cgx flows-to fn::local#1 ./
-> ```
->
-> The `pedigree` subcommand with `--at-function` is a planned future surface that will operate on named variables within a function scope.
+**What ships today: `flows-from` and `flows-to`.** Both operate on **value nodes** (`rust_sample::middle::y#1`), not on function symbols — a function FQN has no `derives-from` edges and resolves to an empty walk. Discover value-node FQNs with `cgx search`:
+
+```console
+$ cgx search y --repo .
+rust_sample::middle::y#1      src/main.rs:16  [variable]
+rust_sample::risky            src/main.rs:28  [function]
+rust_sample::risky::return#1  src/main.rs:28  [variable]
+rust_sample::risky::v#0       src/main.rs:28  [variable]
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+Four hits for one letter: `search` matches a **case-insensitive substring of the whole FQN** by default, so `y` also matches `risky`. Use `--regex` to anchor (`--regex '.*::y#\d+$'`), or `--kind variable` to drop the function row.
+
+```console
+$ cgx flows-from 'rust_sample::middle::y#1' --repo .
+rust_sample::middle::y#1  src/main.rs:16
+└─ rust_sample::middle::v#0  src/main.rs:15  [probable]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+`y` derives from `v`, `middle`'s parameter — and the edge is `[probable]`, not `certain`. That band is the honest one: the dataflow pass reconstructed the link without a precise type resolution, and the doc-level rule is that a `probable` edge is never described as an established fact.
+
+**The two directions are named against intuition, and the CLI's own definition is the one to trust.** `flows-from` is the *pedigree* (backward: where did this value come from). `flows-to` is the *forward slice* (what does this value flow into). Internally `flows-from` walks `derives-from` forward and `flows-to` walks it backward, because a `derives-from` edge points from the derived value to its source.
+
+On an index built with `cgx index --no-dataflow` the value nodes do not exist and both commands exit 2 on symbol resolution.
+
+**Planned:** a `pedigree` subcommand addressing values by their source-level name within a function scope, rather than by SSA FQN. Nothing below this line is runnable.
 
 Trace all inbound provenance for a value at a named program point: which callers, fields, return values, and transformations populate it. This is the fan-in slice of `docs/04-dataflow-and-provenance.md` DF-* features.
 
@@ -212,67 +396,187 @@ them and `--max-fanout N` caps per-node breadth. See Q-13.
 
 ```bash
 # Where does the value of `user_input` come from in AuthHandler::handle?
-cgx pedigree user_input ./ --at-function AuthHandler::handle
+cgx pedigree user_input --repo . --at-function AuthHandler::handle
 
 # Full provenance tree for config object in init_database
-cgx pedigree config ./ --at-function init_database --depth 5
+cgx pedigree config --repo . --at-function init_database --depth 5
 ```
 
 ### Q-6: explain
 
-Show the full provenance record for a single symbol: its definition location, incoming caller count, outgoing callee count, all edges with their condition labels and confidence tiers, and the index version that produced the answer.
+Show the full provenance record for a single symbol: its definition location, caller and callee counts, and every direct incident edge with its condition label, confidence, resolution tier and resolution rule.
 
 ```
-cgx explain <symbol> <path> [--at <ref>] [--format <fmt>]
+cgx explain <SYMBOL> [--repo <path>] [--format <fmt>] [--no-auto-index]
 ```
 
-**Examples:**
+`explain` does **not** take the shared flag block: no `--at`, no `--depth`, no `--confidence`, no `--assert-empty`. It is a one-symbol, one-hop provenance dump, not a traversal.
 
-```bash
-# Explain what cgx knows about crypto::hash
-cgx explain crypto::hash ./
+**Worked run:**
 
-# Explain at a prior commit
-cgx explain crypto::hash ./ --at HEAD~5
+```console
+$ cgx explain helper --repo .
+rust_sample::helper  (src/main.rs:20)
+  kind: function
+  callers: 1, callees: 0
+  edges:
+    <- rust_sample::middle  (src/main.rs:15)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/main.rs:15
+freshness: current | indexed tree 7380e24, working tree clean
 ```
+
+`<-` is an incoming edge, `->` outgoing. `tier=` is the resolution tier that produced the edge (`name_syntactic`, `scope_graph`, `scip`, `cha_rta`, `points_to`) and `rule=` is the specific rule that fired. This is the command to reach for when you want to know *why* cgx believes an edge exists — and it is the only place the resolution tier is surfaced on the CLI.
+
+`explain` carries the **freshness envelope but no approximation contract**: it reports what the index holds about one symbol rather than answering a search, so there is no search whose direction of error needs stating.
 
 ### Q-7: diff
 
-Compute the graph diff between two commits or branches: which edges were added, which were removed, and which symbols changed reachability status.
-
-**Shipped syntax (v0.3.0):** `<BASE>` and `<HEAD>` are positional arguments. Only `--newer-than` is available today. The named `--base`/`--head` flags and `--calls-to`/`--edge-condition`/`--taint-class` security-gate filters are **Planned (v0.4)**.
+Compute the graph diff between two git refs: which edges and nodes were added, removed, or changed.
 
 ```
-cgx diff <BASE> <HEAD> [--newer-than] [--format <fmt>] [--repo <path>]
+cgx diff <BASE> <HEAD> [--repo <path>] [--format human|json]
+                       [--added] [--removed] [--changed] [--newer-than]
+                       [--kind <KIND>]… [--edge-condition always|conditional|loop|exception|panic]
+                       [--from <glob>] [--to <glob>]
+                       [--path-added] [--require-anchor-match]
 ```
 
-**Planned full syntax (v0.4):**
-```
-cgx diff --base <ref> [--head <ref>] <path>
-         [--calls-to <symbol>]
-         [--edge-condition exception|always]
-         [--format <fmt>]
+`<BASE>` and `<HEAD>` are **positional**; there are no `--base`/`--head` flags. With none of `--added`/`--removed`/`--changed`, all buckets print; `--newer-than` is sugar for `--added`. `--kind` is repeatable and accepts nineteen edge-kind tokens (`calls`, `calls-virtual`, … , `data-flow`, `reads-field`, `writes-field`). `--edge-condition` is real and shipped **here** — `diff` is the only command that has it.
+
+Two commits were added to the example repository for this section: one adding `fn sneaky() { risky(1); }` and a `tests/t.rs`, then three commits touching both files.
+
+**Full mode:**
+
+```console
+$ cgx diff HEAD~1 HEAD --repo .
++ edge  rust_sample::sneaky  ->  rust_sample::risky  (src/main.rs)
++ node  rust_sample::sneaky
 ```
 
-**Examples (shipped):**
+`+` added, `-` removed, `~` changed; a clean diff prints `(no diff)`.
+
+**`--path-added` — the CI gate.** This mode asks a narrower and much more useful question: *did this change introduce a new reachability path between these two anchors?* Both `--from` and `--to` are **required** here (a missing anchor is exit 2), and they are globs over FQNs.
+
+```console
+$ cgx diff HEAD~1 HEAD --repo . --path-added --from 'rust_sample::sneaky' --to 'rust_sample::risky'
+1 new call/dataflow reachability path(s) [reachability, not a security guarantee]:
++ path  rust_sample::sneaky  ->  rust_sample::risky  [introduced by 125264854eef (t)]
+cgx: path-added gate: 1 new call/dataflow reachability path(s) found
+$ echo $?
+1
+```
+
+**Exit 1 when a new path is found, exit 0 when clean** — that inversion is what makes it usable as a gate step without parsing output. The bracketed disclaimer in the output is not boilerplate: a new path is a *reachability* fact, not evidence of exploitability.
+
+`--path-added` is also where git attribution surfaces. `introduced by <12-hex> (<author>)` comes from a blame walk; `--format json` adds `introducing_commit`, `introducing_author`, `introducing_email` and `author_time` per path. An unattributable path reads `introducing commit unattributed`.
+
+**Format support differs between the two modes**, and neither accepts `sarif`:
+
+| Mode | Accepted `--format` | Rejected (exit 2) |
+|---|---|---|
+| full `cgx diff BASE HEAD` | `human`, `json` | `sarif`, `dot`, `mermaid`, `d2` |
+| `--path-added` | `human`, `json`, `dot`, `mermaid`, `d2` | `sarif` |
+
+The check runs before any indexing, so a bad `--format` fails fast.
+
+**`diff` carries neither the approximation contract nor the freshness envelope.** It computes both sides from committed trees and never consults the working-tree index, so there is no index-freshness question to answer — see "Answer envelopes by command" below.
+
+**Planned (v0.4):** `--calls-to <symbol>` and `--taint-class <class>` security-gate filters. Neither exists today.
+
+### Q-7b: coupling
+
+Ask which files historically change together. `coupling` walks committed git history over an explicit rev range and reports, for every pair of files touched by the same commit, the co-change count and each file's own change count.
+
+```
+cgx coupling <BASE> <HEAD> [--repo <path>] [--format human|json]
+                           [--limit N] [--min-cochanges N] [--max-files-per-commit N]
+```
+
+`<BASE>` is **exclusive** and `<HEAD>` inclusive. `--format` accepts `human` and `json`; the other four are exit 2 (`Sarif format is not available for 'coupling' (a co-change table is neither a locatable finding nor a path graph)`).
+
+**`coupling` needs no index.** It reads git history only — no extraction, no graph, no `.cgx/`. That is why it is the one query command that emits an approximation contract but **no freshness envelope**: there is no index whose staleness could be reported.
+
+```console
+$ cgx coupling HEAD~4 HEAD --repo .
+HEAD~4 (7ef5392)..HEAD (d3429b0)
+4 commits considered · 0 merge excluded · 0 root excluded · 0 oversized excluded
+cochanges  a-changes  b-changes  files
+        4          4          4  src/main.rs  tests/t.rs
+approximation: over- and under-approximate — co-change is attributed at file granularity; two files reported as co-changing may have had unrelated symbols edited in the same commit; only the 4 single-parent commit(s) in HEAD~4 (7ef5392421f668900a3f6f4a886ea840a39ed817)..HEAD (d3429b0e205f8b3336d19b450c221b7356580f03) were walked; co-change outside this range is not visible; rename detection is disabled so the walk cannot depend on ambient git config; a renamed file appears as an unrelated delete and add, reporting a co-change pair between its old and new path, and the new path does not inherit the old path's history; pairs with fewer than 2 co-changes are not reported
+```
+
+The contract is long because the answer really is approximate, and each reason changes how you
+should read a row. **These four are the ones this example emits**; three of them
+(`file-level-granularity`, `bounded-rev-range`, `renames-not-tracked`) are unconditional and
+`cochange-threshold` fires whenever `--min-cochanges` is above zero:
+
+| Reason code | Direction | What it means for the result |
+|---|---|---|
+| `file-level-granularity` | over | A pair may co-change because unrelated symbols in those files were edited together. This is a file-level signal, not a symbol-level one. |
+| `bounded-rev-range` | under | Only single-parent commits inside `BASE..HEAD` were walked. Coupling outside the range is invisible. |
+| `renames-not-tracked` | over | Rename detection is deliberately off so the walk cannot depend on ambient `diff.*` config. A rename reads as a delete plus an add. |
+| `cochange-threshold` | under | Pairs below `--min-cochanges` (default 2) are not reported at all. |
+
+**The full set of reason codes is larger and conditional.** Seven more appear only when their
+condition holds: `merge-commits-excluded`, `root-commits-excluded`, `large-commit-excluded`,
+`result-limit`, `shallow-repository`, `history-boundary` and `empty-rev-range`. Read the
+`reasons` array in `--format json`, keyed on `code`, rather than assuming a fixed set — a new
+code can appear without any existing one changing.
+
+### The shallow-clone trap, and how to detect it
+
+The second-line census — `4 commits considered · 0 merge excluded · 0 root excluded · 0 oversized excluded` — is how you check that the range you asked for is the range that was walked. **On a shallow clone it will not be.** `coupling` paints the base commit's full ancestry eagerly and stops at the graft, so a range that appears to sit well inside `--depth N` can return an empty answer **at exit 0**. Since `fetch-depth: 1` is the default for `actions/checkout`, a CI job that gates on exit code alone will read "no coupling here" from a checkout that simply had no history to walk.
+
+**This is detectable rather than something to catch by eye.** Human output carries a
+`degraded:` line whenever the walk truncated or the clone is shallow — on a `--depth 2` clone
+the whole answer is that line:
+
+```console
+$ cgx coupling HEAD~1 HEAD --repo .
+HEAD~1 (ae36d86)..HEAD (d3429b0)
+0 commits considered · 0 merge excluded · 0 root excluded · 0 oversized excluded
+degraded: walk truncated at a history boundary (missing or unreadable object) · shallow clone — deepen the clone to see more history
+(no co-changed pairs)
+approximation: over- and under-approximate — …
+$ echo $?
+0
+```
+
+Zero commits, zero pairs, exit 0. For scripts, the same condition is a named
+under-approximation reason:
+
+```json
+{ "direction": "under",
+  "code": "shallow-repository",
+  "detail": "the repository is a shallow clone; history before the graft boundary is absent and its co-changes are not counted" }
+```
+
+So the correct CI gate is a check on the reason codes, not on the exit status:
 
 ```bash
-# All edge changes between main and a feature branch
-cgx diff main feature/new-auth
-
-# Edge changes between two specific commits
-cgx diff abc1234 def5678
-
-# Only edges added at HEAD that were absent at main
-cgx diff main HEAD --newer-than
+cgx coupling "$BASE" HEAD --repo . --format json > coupling.json
+jq -e '.approximation.reasons | any(.code == "shallow-repository")' coupling.json \
+  && { echo "refusing to trust coupling on a shallow clone"; exit 1; }
 ```
 
-**Examples (planned — not yet runnable):**
+`history-boundary` (the walk stopped at a missing or unreadable object) and `empty-rev-range`
+deserve the same treatment. `git fetch --unshallow` before running is the other fix. The
+report's `shallow_repository` and `truncated_at_history_boundary` booleans carry the same
+signal if you prefer a top-level field to a reason lookup.
 
-```bash
-# New edges that reach vulnerable::bar on an exception path (planned v0.4)
-# cgx diff --base main --head feature/new-auth ./ --calls-to vulnerable::bar --edge-condition exception
-```
+### Answer envelopes by command
+
+"Every cgx answer carries both envelopes" is a convenient sentence and it is not true. Which envelope a command emits follows from what the command actually does, and a script that unconditionally reads `.approximation` will `null`-deref on a third of the surface. Verified by running each command in `human` format and counting the trailing lines:
+
+| Command | approximation | freshness | Why |
+|---|---|---|---|
+| `callers`, `callees`, `reaches`, `paths`, `unused`, `flows-to`, `flows-from`, `query` | yes | yes | A bounded search over an index: both the search's error direction and the index's currency are in question |
+| `explain` | no | yes | Reports what the index holds about one symbol; no search to characterise |
+| `search`, `symbols` | no | yes | Symbol-table lookups, not graph traversals |
+| `coupling` | yes | **no** | Approximate in several named ways, but never opens the index |
+| `diff` (both modes) | no | no | Both sides come from committed trees; the working-tree index is not consulted |
+| `doctor` | no | no | Reports *on* the index rather than answering from it |
+
+The same split holds in `json` (`approximation` / `freshness` keys) and in `sarif` (`cgx/approximation-contract` / `cgx/index-freshness` notes). One more asymmetry worth knowing: under `--format dot|mermaid|d2` the freshness envelope is deliberately **omitted** rather than computed — emitting a graph does not justify the working-tree walk, so an uninspected envelope is substituted.
 
 ---
 
@@ -281,22 +585,50 @@ cgx diff main HEAD --newer-than
 The `cgx query` command accepts a Cypher-subset expression (ISO GQL-compatible) or a file reference. The query language is parsed and evaluated in-process against the indexed graph — no external graph engine is required.
 
 ```
-cgx query '<expression>' <path> [--at <ref>] [--format <fmt>]
-cgx query @file.cql <path> [--at <ref>] [--format <fmt>]
-cgx query --sql '<recursive-cte>' <path> [--at <ref>] [--format <fmt>]
+cgx query '<expression>' [--repo <path>] [--at <ref>] [--format <fmt>] [--depth N] [--confidence …]
+cgx query @file.cql      [--repo <path>] [--at <ref>] [--format <fmt>]
 ```
+
+`query` takes the same shared flag block as `callers` (Q-1). `--sql` is Planned; passing it is **exit 2**, not a silent fallback.
+
+**A `RETURN path` query routes through the same path renderer as `cgx paths`**, so its `human`/`json`/`sarif`/`dot`/`mermaid`/`d2` output is identical in shape to Layer 1's. A tabular `RETURN a.fqn, b.fqn` query renders aligned columns, with the header printed even for zero rows.
 
 ### Query language syntax
 
 Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projection>`
 
+**A `MATCH` pattern must contain at least one relationship.** A bare single-node `MATCH (n)` is a plan error, not an empty result — several query classes that read naturally as "find all nodes where …" have to be phrased through an edge instead.
+
 **Node properties available:**
-- `name` — qualified name (e.g. `"crypto::hash"`)
+- `name` — **the fully qualified name**, and `fqn` is an accepted synonym for the same field. This is the single most common source of a silently empty result: `WHERE a.name = "main"` matches nothing, because the stored value is `rust_sample::main`. Use the full FQN, or a glob in the inline property map:
+
+```console
+$ cgx query 'MATCH (a)-[:CALLS]->(b) WHERE a.name = "main" RETURN a.name, b.name' --repo .
+a.name  b.name
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+```console
+$ cgx query 'MATCH (a {name:"*::main"})-[:CALLS]->(b) RETURN a.fqn, b.fqn' --repo .
+a.fqn              b.fqn
+rust_sample::main  rust_sample::danger
+rust_sample::main  rust_sample::load_config
+rust_sample::main  rust_sample::middle
+rust_sample::main  rust_sample::read_input
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+The first query is a clean exit 0 with a header and no rows. That is the failure mode to watch for: **an empty CQL result is not evidence of absence** until you have confirmed the anchor binds. Multi-key inline predicates (`{kind:"function", name:"*::main"}`) are supported and are usually the clearer form.
+
 - `file` — file path relative to root
-- `line`, `col` — source location
-- `kind` — `"function"`, `"method"`, `"field"`, `"type"`, `"module"`
-- `confidence` — `"certain"`, `"probable"`, `"possible"`
-- `in_degree`, `out_degree` — per-edge-kind inbound/outbound edge counts (GM-1.3 in `docs/03-code-graph-model.md`), keyed by edge kind: `n.in_degree.calls`, `n.out_degree.derives_from`, `n.in_degree.coerce`. Filterable and sortable — `WHERE n.in_degree.calls > 5000`, `ORDER BY n.in_degree.calls DESC` — for detecting and ranking hub nodes. Structural only; not coupled to `confidence`.
+- `line` — source location (start line). **`col` is not a node property** and is a plan error.
+- `kind` — one of the ten symbol kinds (`function`, `method`, `type`, `field`, `variable`, `module`, `constant`, `macro`, `lambda`, `entrypoint`)
+
+**Not node properties, and each returns a specific plan error rather than an empty result:** `confidence` (it is an *edge* attribute — use `r.confidence`), `in_degree` / `out_degree` (computed on demand by `cgx symbols`, never materialised on the node record, so they cannot be filtered or sorted in CQL), and `scope`, `col`, `type`, `is_exit`, `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `introduced_in_branch`, `suspends`, `lock_set`, `async`. To rank hub nodes today, use `cgx symbols --rank inbound|outbound|total` (Q-4b), which computes the degrees in one pass.
+
+`own_effects` and `transitive_effects` are rejected too, but for a different reason worth keeping straight: **the data is there.** Both are populated `NodeRecord` fields — the GM-12 transitive closure runs on every index — and what is missing is only the way to ask. `transitive_effects` happens to be rejected with the shared "no backing field on a symbol node" message, which is misleading for these two.
 
 **Edge types:**
 - `CALLS` — direct or transitive call edge
@@ -307,14 +639,24 @@ Pattern: `MATCH (a)-[r:EDGE_TYPE*min..max]->(b) WHERE <filter> RETURN <projectio
 
 **`CALLS*` transitive-closure semantics under cycles (finding 2.3):**
 
-`CALLS*` (and `CALLS*min..max`) uses simple-path semantics: each node is visited at most once per traversal. When the call graph contains a recursive cycle — directly recursive functions, or mutually recursive groups — the traversal terminates after visiting each node in the cycle exactly once and does not loop. This guarantees finite termination regardless of cycle structure. The default upper bound when no `max` is specified is the `--depth` flag value (default: unlimited but bounded by the simple-path constraint — the longest simple path in the graph). Users may supply an explicit bound `[:CALLS*1..10]` to cap traversal depth independently of the simple-path guarantee.
+`CALLS*` (and `CALLS*min..max`) uses simple-path semantics: each node is visited at most once per traversal. When the call graph contains a recursive cycle — directly recursive functions, or mutually recursive groups — the traversal terminates after visiting each node in the cycle exactly once and does not loop. This guarantees finite termination regardless of cycle structure. The default upper bound when no `max` is specified is the longest simple path in the graph — **not** the `--depth` flag, which `cgx query` ignores entirely (see "Two traps in the query surface"). An unbounded `CALLS*` on a large graph is the expensive case; bound it explicitly. Users may supply an explicit bound `[:CALLS*1..10]` to cap traversal depth independently of the simple-path guarantee.
 
 Implications for Q-15 reachability-matrix queries: `count(*) over CALLS*` counts distinct reachable nodes (each counted once under simple-path semantics), not path lengths or traversal steps. A pair of mutually recursive functions `f ↔ g` appears as two reachable nodes, not an infinite count.
 
-**Edge properties:**
+**Edge properties — exactly three:**
 - `condition` — `"always"`, `"conditional"`, `"exception"`, `"loop"`, `"panic"`
 - `confidence` — `"certain"`, `"probable"`, `"possible"`
-- `via` — specific condition kind for filtering
+- `kind` — the edge-kind token (`"calls"`, `"derives-from"`, `"throws"`, …)
+
+`r.transformation` is rejected with a specific message (the tags exist in the schema but no frontend populates them); `r.via`, `r.taint_label` and `r.site` are rejected as having no backing field. Note that the edge-condition property is `r.condition`, **not** `r.edge_condition` — the latter is an unknown-property plan error:
+
+```console
+$ cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE r.condition = "conditional" RETURN a.fqn, b.fqn, r.confidence' --repo .
+a.fqn                b.fqn               r.confidence
+rust_sample::danger  rust_sample::risky  certain
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
 
 **Path functions:**
 - `nodes(path)` — list of nodes on a path
@@ -329,8 +671,59 @@ Implications for Q-15 reachability-matrix queries: `count(*) over CALLS*` counts
 **Predicates:**
 - `NONE(n IN nodes(path) WHERE <condition>)` — negative path constraint
 - `ANY(r IN relationships(path) WHERE <condition>)` — path-relative transience check
-- `<type> COMPATIBLE_WITH <type>` — structural type-compatibility test; returns `false` when the two types share no common subtype (used by the type-reconstruction queries in Q-26)
-- `<expr> IS EMPTY` — true when a reconstructed candidate set is empty, i.e. the constraint intersection has no solution (a type contradiction; see Q-26)
+
+**Planned predicates, and the two different ways they fail.** `<expr> IS EMPTY` (empty reconstructed candidate set, for Q-26) reaches the planner and is rejected with the deferred-feature message: ``plan error: `IS EMPTY` / `IS NULL` predicates are not supported in this release``. `<type> COMPATIBLE_WITH <type>` (Q-26) and `STARTS WITH` / `ENDS WITH` / `CONTAINS` do not parse at all, so they surface as a bare ``parse error: expected WITH or RETURN, found identifier `COMPATIBLE_WITH` `` — informative about the syntax, silent about the roadmap. Both are exit 2; only the first tells you the feature is planned.
+
+### Two traps in the query surface
+
+Both produce a well-formed answer rather than an error, which is what makes them worth a section of their own. Everything in `cgx` that *cannot* work tells you so with a plan error and exit 2; these two do not.
+
+**1. A variable shared across two `MATCH` clauses is not joined — it cross-products, and the second clause re-binds it.**
+
+```console
+$ cgx query 'MATCH (a {name:"*::main"})-[:CALLS]->(b) RETURN a.fqn, b.fqn' --repo .
+a.fqn              b.fqn
+rust_sample::main  rust_sample::danger
+rust_sample::main  rust_sample::load_config
+rust_sample::main  rust_sample::middle
+rust_sample::main  rust_sample::read_input
+```
+
+Four rows, `b` ranging over `main`'s four callees. Now add a second clause that reads as "…and then what does `b` call?":
+
+```console
+$ cgx query 'MATCH (a {name:"*::main"})-[:CALLS]->(b) MATCH (b)-[:CALLS]->(c) RETURN a.fqn, b.fqn, c.fqn' --repo .
+a.fqn              b.fqn                c.fqn
+rust_sample::main  rust_sample::danger  rust_sample::risky
+rust_sample::main  rust_sample::danger  rust_sample::risky
+rust_sample::main  rust_sample::danger  rust_sample::risky
+rust_sample::main  rust_sample::danger  rust_sample::risky
+rust_sample::main  rust_sample::main    rust_sample::danger
+…
+```
+
+Two things went wrong, and neither raised an error. `b` is bound **from scratch** by the second clause — row 5 has `b = rust_sample::main`, which was never in the first clause's binding set for `b`. And every combination appears with multiplicity four, the cardinality of the first clause: this is a cross-product of the two clauses, not a join. Twenty rows where the intended query has one.
+
+**Express a multi-hop relationship as one pattern**, which is what the language is built for:
+
+```console
+$ cgx query 'MATCH (a {name:"*::main"})-[:CALLS]->(b)-[:CALLS]->(c) RETURN a.fqn, b.fqn, c.fqn' --repo .
+a.fqn              b.fqn                c.fqn
+rust_sample::main  rust_sample::danger  rust_sample::risky
+rust_sample::main  rust_sample::middle  rust_sample::helper
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+Two rows, which is the correct answer. Interior nodes in a chained pattern *are* joined. Where you genuinely need two separate clauses, put a `WITH` between them — `WITH` is a real scope barrier and is the only construct that carries a binding from one clause to the next.
+
+**Note for the Planned sections below.** Several of them (Q-24, Q-25, Q-28, Q-29, Q-32, Q-33) sketch queries that share a variable across two bare `MATCH` clauses. None of them can run today — each plan-errors on an unbacked property (`spawn_context`, `source_class`, `scc_id`, `lock_set`) or a parse error before the binding semantics matter, so no example in this document is currently returning a silent cross-product. They will need rewriting into single chained patterns, or around a `WITH`, when the properties they depend on land.
+
+**2. `cgx query` silently ignores `--depth`, `--confidence` and `--tree`.**
+
+They are part of the shared flag block, so clap accepts them, but `run_query` never reads them: the output is byte-identical with and without each. Verified on all four of `--depth 1`, `--depth 0`, `--confidence certain`, `--tree spanning`. Bound a CQL traversal inside the pattern instead — `[:CALLS*1..3]` — and filter confidence in the `WHERE` with `r.confidence`. (`--repo`, `--at`, `--format`, `--assert-empty` and `--allow-vacuous` *are* honoured.)
+
+**A related cost note:** a var-length CQL expansion (`[:CALLS*n..m]`) is not bounded the way the Layer-1 `paths` walk is. `cgx paths` carries a work budget and reports `[truncated]` when it fires; an unbounded or wide `*n..m` expansion in CQL can run for a very long time on a large graph where `cgx paths` answers immediately. Bound the range explicitly, and prefer the Layer-1 subcommand when it can express the question.
 
 ### Procedure calls
 
@@ -340,27 +733,49 @@ Most traversals express directly as `MATCH` patterns. A small number of analyses
 CALL cgx.<procedure>(<args>) YIELD <columns>
 ```
 
-The yielded columns bind like node properties and may be filtered in a following `WHERE` and returned in `RETURN`. Available procedures:
+The yielded columns bind like node properties and may be filtered in a following `WHERE` and returned in `RETURN`.
 
-- `cgx.type_reconstruct(value, direction: "up"|"down"|"sideways"|"all")` — reconstructs a value's type from its lineage (see Q-26); yields `candidate_type`, `confidence`, `evidence`. The constraint intersection across the three directions is why this is a procedure rather than a pattern.
-- `cgx.mutation_fanout(value)` — the outbound dual of pedigree (see Q-27); yields `mutator`, `effect`, `confidence`.
+**Exactly two procedures are registered.** The engine's own error names them:
 
-Procedures compose with the rest of Layer 2: their yielded values can drive a subsequent `MATCH`, and `COMPATIBLE_WITH` / `IS EMPTY` operate on the reconstructed types they return.
+```console
+$ cgx query 'CALL cgx.type_reconstruct("x") YIELD candidate_type RETURN candidate_type' --repo .
+…
+cgx: plan error: unknown procedure `cgx.type_reconstruct` (known: `cgx.mutation_fanout`, `cgx.pedigree`)
+```
+
+| Procedure | Yields | Walk |
+|---|---|---|
+| `cgx.pedigree(value)` | `source`, `confidence` | one direction along `derives-from` |
+| `cgx.mutation_fanout(value)` | `mutator`, `confidence` | the other direction along `derives-from` |
+
+Both are real `derives-from` BFS walks — neither is a stub. `effect`, `transform` and `evidence` are *not* yieldable columns and are rejected at plan time with a message that says so; drop them from the `YIELD` list and the base procedure runs today.
+
+> **Known defect — the two procedures' directions are swapped relative to their column names.** Verified against the example repository, whose value chain is `middle::v#0` → `middle::y#1` → `middle::return#1`:
+>
+> ```console
+> $ cgx query 'CALL cgx.pedigree("rust_sample::middle::y#1") YIELD source, confidence RETURN source, confidence' --repo .
+> source                         confidence
+> rust_sample::middle::return#1  certain
+> ```
+>
+> `return#1` is what `y#1` flows *into*, not what it derives *from* — `cgx flows-from` on the same node returns `v#0`. `cgx.mutation_fanout` is wrong in the mirror direction: called on `return#1` it yields `v#0` and `y#1`, which are its sources, not values it mutates. The two are consistent with each other and inverted relative to `flows-from`/`flows-to`, which are correct. **Until this is fixed, read `cgx.pedigree` as a forward slice and `cgx.mutation_fanout` as a pedigree**, or use the `flows-*` subcommands, whose direction is correct.
+
+Procedures compose with the rest of Layer 2: their yielded values can drive a subsequent `MATCH`.
 
 ### Shell quoting convention
 
 Wrap the query in single quotes; use double quotes for string values inside the query:
 
 ```bash
-cgx query 'MATCH (c)-[:CALLS*1..5]->(fn {name:"foo"}) RETURN c.name, c.file, c.line' ./
+cgx query 'MATCH (c)-[:CALLS*1..5]->(fn {name:"*::helper"}) RETURN c.fqn, c.file, c.line' --repo .
 ```
 
 ### Q-9: Query files
 
-For queries longer than one line, use `@file.cql`:
+For queries longer than one line, use `@file.cql`. A read failure on the file is exit 2.
 
 ```bash
-cgx query @queries/exception-sinks.cql ./
+cgx query @queries/exception-sinks.cql --repo .
 ```
 
 Contents of `exception-sinks.cql`:
@@ -377,7 +792,7 @@ ORDER BY src.file, src.line
 
 ### Q-10: SQL alternative (unstable, view-based) — **Planned (not yet shipped in v0.3.0)**
 
-**Status: core-extension** (the views ship with the SQLite backend).
+**Status: planned.** `--sql` is a hidden flag on the shared flag block. On `cgx query` it is read and **rejected with exit 2**. On the other seven commands that inherit the flag block nothing reads it, so it is accepted and silently ignored (exit 0) — a known defect; do not write scripts that rely on either behaviour.
 
 For v1 implementations that use SQLite storage, a recursive-CTE interface is available. Queries execute against a small set of documented, versioned SQL views; physical tables are not API and carry no stability guarantee.
 
@@ -395,7 +810,7 @@ cgx query --sql '
     WHERE r.depth < 5
   )
   SELECT DISTINCT caller, depth FROM callers ORDER BY depth, caller
-' ./
+' --repo .
 ```
 
 ---
@@ -468,15 +883,21 @@ The `cgx query` command is implemented in the `cgx-cql` crate (crates/cgx-cql). 
 
 ### Deferred in v1
 
-The items below are specified in the sections above but are not yet built. Each produces a clear `plan error: … (deferred)` message rather than a silent wrong answer or a generic syntax error.
+Most items below produce a clear `plan error: … (deferred)` message rather than a silent wrong answer. **Three do not, and knowing which is the difference between a five-second fix and a confused half hour:**
+
+- **`STARTS WITH` / `ENDS WITH` / `CONTAINS`** are not in the grammar at all, so they fail as ``parse error: expected WITH or RETURN, found identifier `STARTS` `` — no mention that anything is deferred. Use a glob in the inline property map instead (`{name:"*::handler"}`).
+- **`COMPATIBLE_WITH`** fails the same way, for the same reason.
+- **A bare single-node `MATCH (n)`** is ``plan error: a MATCH pattern must contain at least one relationship``. This is a structural rule of the language, not a deferred feature, and it is worth internalising early: every CQL query is anchored on an edge. "Find all nodes where …" has to be phrased through a relationship, or answered with `cgx search` / `cgx symbols` instead.
 
 | Feature | Reason deferred |
 |---|---|
+| Bare single-node `MATCH (n)` with no relationship | Structural: the planner lowers `MATCH` onto an edge walk. Not planned to change |
+| `STARTS WITH` / `ENDS WITH` / `CONTAINS` string predicates | Not in the grammar; use a glob in the inline property map |
 | Theme-13 edge types: `CALLS:super`, `RESOLVES_TO`, `PROVIDES_BODY`, `SHADOWS_FIELD`, `FULFILLS` | Object-model edge schema not yet produced by the frontend (object-model ADR in progress) |
 | `COMPATIBLE_WITH` predicate | Requires type reconstruction (`cgx.type_reconstruct`) which is deferred |
 | `IS EMPTY` predicate | Requires type reconstruction; deferred with type-reconstruct |
 | `cgx.type_reconstruct` procedure | Type-lineage extraction from the frontend is a follow-up cycle |
-| `--sql` (Q-10) | Follow-up cycle; SQLite backend not yet integrated |
+| `--sql` (Q-10) | The SQLite backend *is* integrated (`rusqlite`, the store's only backend); what is missing is the documented view set and its version contract. Rejected with exit 2 on `query`; silently ignored on the other seven commands that inherit the flag |
 | `MATCH ALL … MUST PASS THROUGH / AVOIDING` (Q-20 guarded cut) | Requires call-site dominator facts at index time (Phase 3); planned follow-up |
 | `UNWIND` | Deferred clause |
 | `OPTIONAL MATCH` | Deferred clause |
@@ -484,7 +905,8 @@ The items below are specified in the sections above but are not yet built. Each 
 | `CREATE`, `SET`, `DELETE` | cgx query is a read-only language; write clauses will never be supported |
 | Query parameters `$name` | Deferred |
 | Arithmetic expressions (`+`, `-`, `*`, `/`) | Deferred |
-| Node properties: `col`, `scope`, `type`, `in_degree`, `out_degree`, `is_exit`, `introduced_in_branch`, `confidence` (on nodes), `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `transitive_effects`, `lock_set`, `suspends`, `async` | No backing field on a symbol node record in the current frontend |
+| Node properties: `col`, `scope`, `type`, `in_degree`, `out_degree`, `is_exit`, `introduced_in_branch`, `confidence` (on nodes), `entrypoint_class`, `source_class`, `sink_class`, `sanitizer_class`, `lock_set`, `suspends`, `async` | No backing field on a symbol node record in the current frontend |
+| Node properties: `own_effects`, `transitive_effects` | **Different reason — the data exists.** Both are real, populated `NodeRecord` fields (the GM-12 closure pass runs on every index); what is deferred is the *query surface*. `transitive_effects` is rejected with the shared "no backing field" message, which is inaccurate for these two; `own_effects` falls through to `unknown node property` |
 | Edge properties: `transformation`, `via`, `taint_label`, `site.*` | No backing field on an edge record in the current frontend |
 
 ### Canonical-example substitutions
@@ -502,24 +924,25 @@ Two of the three canonical examples reference properties that are not yet backed
 
 The prompt's first canonical question: find call paths between two points that do not traverse any exception-conditioned edge.
 
-**Subcommand:**
+**Subcommand — partially.** `cgx paths` takes both anchors positionally and enumerates *all* paths; it has no edge-condition filter, so the exceptional-class exclusion has to happen in Layer 2:
 
 ```bash
-cgx paths --from main::foo --to vulnerable::bar ./ \
-  --exclude-edge-condition exception --exclude-edge-condition panic
+cgx paths main::foo vulnerable::bar --repo .
 ```
 
-**Full query:**
+**Full query — this is the form that actually answers the question:**
 
 ```bash
 cgx query '
   MATCH path = (src {name:"main::foo"})-[:CALLS*]->(dst {name:"vulnerable::bar"})
   WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
   RETURN path
-' ./
+' --repo .
 ```
 
 The `NONE` predicate implements a negative path constraint (Q-14): the path is only returned when no edge on it carries a label in the exceptional class (`exception` or `panic`). This is a condition on the complete path, not on any individual edge in isolation.
+
+`{name:"main::foo"}` is an inline property map against the **full FQN**; in a real repository it is `{name:"*::main::foo"}` or the crate-qualified form. A `RETURN path` query renders through the same path renderer as `cgx paths`, contract line and all.
 
 ---
 
@@ -527,23 +950,25 @@ The `NONE` predicate implements a negative path constraint (Q-14): the path is o
 
 Find all inbound data sources for a named variable at a specific program point.
 
-**Subcommand:**
+**Subcommand — today:**
 
 ```bash
-cgx pedigree amount ./ --at-function PaymentProcessor::charge
+cgx flows-from 'PaymentProcessor::charge::amount#1' --repo .
 ```
 
-**Full query:**
+`flows-from` addresses the value by its SSA FQN, not by source-level name plus `--at-function`; discover the FQN with `cgx search amount`. The `pedigree` subcommand with `--at-function` is Planned (Q-5).
+
+**Full query — the pattern runs; two of its projections do not:**
 
 ```bash
 cgx query '
-  MATCH flow = (src)-[:DATA_FLOW*1..8]->(sink {name:"amount", scope:"PaymentProcessor::charge"})
-  RETURN src.name, src.file, src.line,
-         [r IN relationships(flow) | r.transformation] AS transformations
-' ./
+  MATCH flow = (src)-[r:DATA_FLOW*1..8]->(sink {name:"*::charge::amount#1"})
+  RETURN src.fqn, src.file, src.line,
+         [e IN relationships(flow) | e.condition] AS conditions
+' --repo .
 ```
 
-Each edge in the `DATA_FLOW` chain carries a `transformation` tag: `identity`, `mapped`, `aggregated`, or `parsed`. The sequence of tags describes how the value was transformed along each hop of its pedigree.
+The var-length `DATA_FLOW` pedigree pattern is real and returns real rows. What is **not** available is the original example's two projections: `scope` is not a node property (plan error), and `r.transformation` is rejected with ``edge property `transformation` is not populated by the current frontend; DATA_FLOW transformation tags are deferred``. The `Transform` enum exists in the schema — `Copy`, `Projection`, `Arith`, `Concat`, `Composed`, `Branched`, `Aggregation`, `Parse`, `Serialize`, `Other` — but no frontend populates it and CQL does not expose it. Project `e.condition` instead, as the integration test for this example does.
 
 ---
 
@@ -554,8 +979,10 @@ Find methods or fields on a specific type that have no callers reachable from a 
 **Subcommand:**
 
 ```bash
-cgx unused ./ --kind method --type MyStruct --entrypoint main
+cgx unused --repo . --kind method
 ```
+
+`--kind` is the only filter `unused` has. `--type <TypeName>` and `--entrypoint <symbol>` do not exist (Q-19 is Planned), so narrowing to one type has to happen in Layer 2 — or by post-filtering the JSON on `fqn`.
 
 **Full query:**
 
@@ -565,7 +992,7 @@ cgx query '
   WHERE NOT (m)<-[:CALLS]-()
   RETURN m.name, m.file, m.line
   ORDER BY m.name
-' ./
+' --repo .
 ```
 
 To restrict to "never referenced downstream from a specific instance allocation site":
@@ -577,7 +1004,7 @@ cgx query '
   MATCH (all_m:method)-[:MEMBER_OF]->(t {name:"MyStruct"})
   WHERE NOT all_m.name IN reached
   RETURN all_m.name, all_m.file, all_m.line
-' ./
+' --repo .
 ```
 
 ---
@@ -586,21 +1013,19 @@ cgx query '
 
 This question combines graph diff (Q-16) with edge-condition filtering (Q-11).
 
-**Subcommand (shipped v0.3.0 — positional refs, `--newer-than` only):**
+**Subcommand — shipped, including the edge-condition filter:**
 
 ```bash
-# Show edges added at feature/risky-change that were absent at main
-cgx diff main feature/risky-change --newer-than
+# Edges added at feature/risky-change that were absent at main
+cgx diff main feature/risky-change --newer-than --repo .
+
+# Narrowed to exception-conditioned call edges only
+cgx diff main feature/risky-change --added --kind calls --edge-condition exception --repo .
 ```
 
-**Planned subcommand flags (v0.4 — not yet runnable):**
+`--edge-condition` is real on `diff` (and only on `diff`). `--kind` is repeatable across nineteen edge-kind tokens.
 
-```bash
-# Compare each feature branch against main; show only exception-path edges to the target
-# cgx diff --base main --head feature/risky-change ./ \
-#     --calls-to vulnerable::bar \
-#     --edge-condition exception
-```
+**Planned (v0.4 — not yet runnable):** `--calls-to <symbol>`, which would restrict the diff to edges that reach a named sink. Today the way to express that is `--path-added --from '**' --to 'vulnerable::bar'`, which answers the closely related question "did a new *path* to this sink appear," with an exit-1 gate.
 
 **Full query (per-branch comparison):**
 
@@ -609,13 +1034,13 @@ cgx query '
   MATCH path = (src)-[:CALLS* {condition: "exception"}]->(dst {name:"vulnerable::bar"})
   WHERE src.introduced_in_branch = "feature/risky-change"
   RETURN src.name, src.file, src.line, length(path) AS hops
-' ./
+' --repo .
 ```
 
 To check all branches at once against main (planned v0.4):
 
 ```bash
-# cgx diff --base main --head "refs/heads/*" ./ --calls-to vulnerable::bar --edge-condition exception
+# cgx diff --base main --head "refs/heads/*" --repo . --calls-to vulnerable::bar --edge-condition exception
 ```
 
 ---
@@ -628,7 +1053,7 @@ cgx query '
   MATCH (ep {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(target {name:"crypto::decrypt"})
   RETURN ep.name, ep.file, ep.line
   LIMIT 10
-' ./
+' --repo .
 ```
 
 ---
@@ -640,7 +1065,7 @@ cgx query '
   MATCH path = (src {entrypoint_class:"http"})-[:CALLS*]->(sink {name:"sql_query"})
   WHERE NONE(n IN nodes(path) WHERE n.name IN ["validate_input", "sanitize", "escape_sql"])
   RETURN src.name, sink.name, length(path) AS hops
-' ./
+' --repo .
 ```
 
 ---
@@ -654,7 +1079,7 @@ cgx query '
   MATCH path = (root {name:"main"})-[:CALLS*]->(target {name:"vulnerable::bar"})
   WHERE ANY(r IN relationships(path) WHERE r.condition = "exception")
   RETURN path
-' ./
+' --repo .
 ```
 
 This returns paths where `vulnerable::bar` is exception-transient relative to the path, meaning the call to it is only reached via at least one exception-conditioned edge. Compare with the canonical example 1 which returns paths where it is NOT exception-transient.
@@ -665,8 +1090,8 @@ This returns paths where `vulnerable::bar` is exception-transient relative to th
 
 ```bash
 # Callers up to depth 2, callees up to depth 3 — minimal subgraph for editing a function
-cgx callers OrderService::submit ./ --depth 2 --format json > callers.json
-cgx callees OrderService::submit ./ --depth 3 --format json > callees.json
+cgx callers OrderService::submit --repo . --depth 2 --format json > callers.json
+cgx callees OrderService::submit --repo . --depth 3 --format json > callees.json
 ```
 
 Or as a single subgraph query:
@@ -675,7 +1100,7 @@ Or as a single subgraph query:
 cgx query '
   MATCH (c)-[:CALLS*1..2]->(fn {name:"OrderService::submit"})-[:CALLS*1..3]->(d)
   RETURN c, fn, d
-' ./
+' --repo .
 ```
 
 ---
@@ -691,7 +1116,7 @@ cgx query '
     AND sink.sink_class IN ["sql", "shell", "file_write", "network_send", "crypto"]
   RETURN ep.entrypoint_class, sink.sink_class, count(*) AS path_count
   ORDER BY ep.entrypoint_class, sink.sink_class
-' ./
+' --repo .
 ```
 
 With `--format csv`, this output is directly usable in a spreadsheet.
@@ -702,12 +1127,17 @@ With `--format csv`, this output is directly usable in a spreadsheet.
 
 Find all paths from any symbol to a known-dangerous function; assert none exist for CI:
 
-```bash
-cgx paths --from '**' --to dangerous::sink ./ \
-    --assert-empty \
-    --format sarif > security.sarif
-echo $?   # 0 = clean; 1 = paths found (CI fail); 4 = vacuously satisfied (gate tested nothing)
+```console
+$ cgx paths '**' dangerous_sink --repo . --assert-empty --format sarif > security.sarif
+cgx: assertion failed: results found when none expected
+$ echo $?   # 0 = clean; 1 = paths found (CI fail); 4 = vacuously satisfied (gate tested nothing)
+1
 ```
+
+Both anchors are positional. The SARIF document written to `security.sarif` carries the path as
+a `codeFlows`/`threadFlows` sequence under rule `cgx/paths`, plus the two envelope notes
+(`cgx/approximation-contract`, `cgx/index-freshness`) — so the gate's verdict and the basis for
+it upload together.
 
 > **Vacuity guard applies.** When combined with `--confidence certain`, this gate passes vacuously before a SCIP index is present (pre-SCIP, no edges are `certain`). The vacuity guard (exit code 4) fires in that case. See `docs/07-interfaces.md` IF-5 for the full vacuity guard definition and `--allow-vacuous` opt-out.
 
@@ -725,18 +1155,18 @@ cgx diff HEAD~10 HEAD
 cgx diff HEAD~1 HEAD --newer-than
 
 # New exception-path edges introduced in the last commit (PLANNED v0.4 — not yet runnable)
-# cgx diff --base HEAD~1 --head HEAD ./ --edge-condition exception
+# cgx diff --base HEAD~1 --head HEAD --repo . --edge-condition exception
 
 # Diff expressed as a query (compare graph at two commits)
 cgx query --at HEAD '
   MATCH (a)-[:CALLS {condition:"exception"}]->(b {name:"vulnerable::bar"})
   RETURN a.name, a.file, a.line
-' ./ > head.json
+' --repo . > head.json
 
 cgx query --at HEAD~1 '
   MATCH (a)-[:CALLS {condition:"exception"}]->(b {name:"vulnerable::bar"})
   RETURN a.name, a.file, a.line
-' ./ > prior.json
+' --repo . > prior.json
 ```
 
 ---
@@ -744,12 +1174,34 @@ cgx query --at HEAD~1 '
 ## Q-13: Depth and Fan-Out Limits
 
 Transitive traversals are bounded in two orthogonal dimensions. **Depth** is
-bounded by the simple-path guarantee and the explicit `--depth` / `--depth`
-flags (and `[:CALLS*min..max]` in the query language — see the `CALLS*`
-semantics above). **Fan-out** — the per-node breadth of the traversal — is
-bounded by `--max-fanout` and the sentinel mechanism. The two are independent: a
-shallow traversal can still enumerate an unbounded frontier if it hops into a
-high-degree hub, which depth limits alone do not prevent.
+bounded by the simple-path guarantee and the explicit `--depth` flag (and
+`[:CALLS*min..max]` in the query language — see the `CALLS*` semantics above).
+**Fan-out** — the per-node breadth of the traversal — is the second dimension.
+The two are independent: a shallow traversal can still enumerate an unbounded
+frontier if it hops into a high-degree hub, which depth limits alone do not
+prevent.
+
+**Depth ships; fan-out does not.** `--depth` is real on every traversal
+subcommand. `--max-fanout` and `--through-sentinels` are **Planned** — neither
+flag exists in the binary, and passing either is a clap parse error (exit 2).
+What ships in their place is a **work budget**: the walk stops after 10,000
+emitted rows and renders `… (truncated: N more)`, with the approximation
+contract turning `under-approximate`. The rest of this section specifies the
+intended fan-out design; nothing in it is runnable today.
+
+**`--depth` has three different behaviours, and they are worth knowing before
+you script against one:**
+
+| Command | `--depth` omitted | `--depth 0` |
+|---|---|---|
+| `callers`, `callees`, `reaches <FROM>`, `flows-to`, `flows-from` | 2 | seed node only |
+| `paths` | 6 | depth limit lifted — **but the work budget then binds**, and the answer can be truncated (`under-approximate`) where the bounded query was `exact` |
+| `reaches <FROM> <TO>`, `unused` | unlimited | seed node only |
+
+The CLI's own `--help` text for `--depth` says `0` means unlimited without
+qualification. That is wrong twice over: it is true only for `paths`, and even on `paths`
+an unbounded search remains work-budgeted and frequently truncates. The reliable signal is
+never the flag — it is the approximation contract on the answer you actually got.
 
 ### Per-node fan-out cap
 
@@ -825,24 +1277,20 @@ by symbol id**:
 
 - **Stable ordering.** All result sets are sorted by `(file_path, line, col)` by default. No hash-map ordering, no pointer-order traversal.
 - **Reproducibility via `--at`.** Queries accept `--at <ref>` (commit SHA or branch name) to pin the query to a specific graph snapshot. `--at HEAD` is the default; `--at abc1234` re-queries a prior state.
-- **No randomness.** No random tie-breaking. No timestamp in default output. The JSON output includes a `graph_version` hash (commit SHA + index schema version) for audit trails.
+- **No randomness.** No random tie-breaking. No timestamp in default output.
+- **Audit identity comes from the freshness envelope.** Every answer that consults the index reports `indexed_tree` and `head_tree` (git tree OIDs) plus `matches_head`, `dirty_files` and `stale` — enough to reproduce the exact graph the answer came from. **No CLI output format carries a `graph_version` key**; the MCP surface does carry one (`"7380e24+dirty.0a12fb8d97d6"` — indexed tree plus an overlay digest when a working-tree overlay is in play), so a script written against MCP JSON does not port field-for-field to CLI JSON.
 - **Same index, same answer.** The graph DB is append-write during indexing and read-only during query. Concurrent reads are safe; writes lock only during index updates.
-- **Deterministic truncation.** When a frontier is cut by `--max-fanout` (Q-13), the emitted neighbors are selected by confidence, then relevance, with ties broken by symbol id — so a truncated result is identical on every run of the same query against the same index.
+- **Deterministic truncation.** When the work budget cuts a frontier, the emitted rows are selected in the traversal's own stable order, so a truncated result is identical on every run of the same query against the same index — and the contract says the answer is `under-approximate` rather than leaving the reader to notice the marker line.
 
-**Order control flags:**
+Byte-identical repeat output is an identity property, not a best effort: every example in this document was run twice and byte-compared.
 
-```
---order file        Sort by (file, line, col) — default, stable
---order alpha       Sort by qualified name
---order discovery   BFS/DFS discovery order (useful for path rendering)
---order relevance   Closest-to-query-root first (depth ascending)
-```
+**Planned:** `--order file|alpha|discovery|relevance`. No such flag exists today; ordering is the stable `(file, line, col)` sort described above and is not user-selectable.
 
 ---
 
 ## Edge-Condition Filter Reference (Q-11)
 
-All subcommands and the query language support filtering on edge condition labels from `docs/03-code-graph-model.md`:
+Edge condition labels come from `docs/03-code-graph-model.md`. **Where they can be filtered is narrower than the label taxonomy suggests:** `cgx diff --edge-condition <label>` and the CQL `r.condition` predicate. There is no edge-condition filter on `callers`, `callees`, `paths`, `reaches`, `flows-*` or `unused`.
 
 | Label | Meaning | Use case |
 |-------|---------|----------|
@@ -852,11 +1300,11 @@ All subcommands and the query language support filtering on edge condition label
 | `loop` | Call site lexically inside a loop body (taken zero or more times) — see GM-3 | Loop body analysis |
 | `panic` | Edge on an unwinding/aborting path (exceptional class) | Panic-surface analysis |
 
-Subcommand flags:
+Subcommand flag (`cgx diff` only):
 
-- `--exclude-edge-condition exception` — skip any edge with this condition (finds non-exception paths)
-- `--only-edge-condition exception` — require at least one such edge on the path
-- `--edge-condition always` — restrict to edges with exactly this label
+- `--edge-condition always|conditional|loop|exception|panic` — restrict the diff to edges carrying exactly this label
+
+**Planned:** `--exclude-edge-condition` and `--only-edge-condition` on the traversal subcommands. Neither exists; both are a clap parse error. Until they land, express the constraint in CQL — which is strictly more expressive anyway, because a path-level predicate is not the same thing as an edge-level filter:
 
 Query language predicates:
 
@@ -879,13 +1327,13 @@ Every edge carries a confidence tier from `docs/03-code-graph-model.md`: `certai
 
 ```bash
 # Only certain edges (statically resolved, no ambiguity)
-cgx callers foo::bar ./ --confidence certain
+cgx callers foo::bar --repo . --confidence certain
 
 # Certain and probable (excludes over-approximated edges)
-cgx callers foo::bar ./ --confidence probable
+cgx callers foo::bar --repo . --confidence probable
 
 # All edges including possible (maximum coverage, may include false positives)
-cgx callers foo::bar ./ --confidence possible
+cgx callers foo::bar --repo . --confidence possible
 ```
 
 Query language:
@@ -899,26 +1347,18 @@ RETURN c.name
 
 ---
 
-## Entrypoint-Scoped Reachability (Q-19)
+## Entrypoint-Scoped Reachability (Q-19) — **Planned (not yet shipped in v0.3.0)**
 
-Reachability queries can be scoped to a declared entrypoint set rather than the entire graph.
-
-```bash
-# Unreachable from any declared entrypoint
-cgx unused ./
-
-# Unreachable from HTTP handler entrypoints specifically
-cgx unused ./ --entrypoint-class http
-
-# Custom entrypoint root
-cgx unused ./ --entrypoint main::start
-```
-
-In the query language, entrypoints are nodes with `kind="entrypoint"` and an `entrypoint_class` property set during indexing. Users can declare additional entrypoints:
+**What ships:** `cgx unused` walks from the entrypoint set the indexer *auto-detected* — `main`, `#[tokio::main]`, and recognised test functions. That set is not inspectable and not overridable.
 
 ```bash
-cgx index --entrypoint 'my_module::start_server' ./
+# Unreachable from the auto-detected entrypoint set
+cgx unused --repo . --kind function
 ```
+
+**What does not ship:** every mechanism for controlling that set. `cgx unused --entrypoint-class http`, `cgx unused --entrypoint main::start` and `cgx index --entrypoint '<fqn>'` are all clap parse errors (exit 2). In CQL, `entrypoint_class` is a rejected node property. Framework entrypoint detection — the `HttpHandler` entrypoint kind that would populate an `http` class — is defined in the schema but constructed nowhere, so no symbol in any indexed repository carries it today.
+
+The consequence for reading a `cgx unused` result: "unreachable" means unreachable from *whatever the indexer happened to recognise as a root*. A handler invoked only by a web framework's dispatcher is not currently recognised as a root, so its whole call tree can be reported as unused. This is the practical reason the `unused` contract carries its `| scope:` tail.
 
 ---
 
@@ -965,13 +1405,13 @@ cgx paths --from <symbol> --to <symbol> <path>
 
 ```bash
 # Find paths that avoid require_admin (authorization bypass candidates)
-cgx paths --from '**::handle' --to db::write ./ \
+cgx paths --from '**::handle' --to db::write --repo . \
     --avoiding require_admin \
     --confidence certain \
     --format sarif > authz-bypass.sarif
 
 # Assert there are none (CI gate — exit 1 if any bypass path found)
-cgx paths --from '**::handle' --to db::write ./ \
+cgx paths --from '**::handle' --to db::write --repo . \
     --avoiding require_admin \
     --assert-empty
 ```
@@ -1258,9 +1698,15 @@ RETURN src.name, sink.name, sink.sink_class
 
 ---
 
-## Q-24: Concurrency Queries
+## Q-24: Concurrency Queries — **Planned (not yet shipped in v0.3.0)**
 
-**Status: schema-room** — lock-set (GM-11), suspension points (GM-10), spawn edges (GM-9), and the `blocking` effect (GM-12) must all be populated before these queries execute. The query surface is specified here so that schema decisions in those features can be validated against real query patterns.
+**Status: schema-room for the queries; two of their four inputs already ship.** The `spawns`
+edge kind (GM-9) is real and queryable — `MATCH (a)-[:SPAWNS]->(b)` plans and runs — and the
+`blocking` effect (GM-12) is a real `Effect` variant stamped by the adapters. What is missing is
+the pair the query families actually pivot on: **lock sets (GM-11) do not exist**, and
+**`suspends` (GM-10), though a real `CallSite` field, is a rejected CQL node property**. Every
+query below needs one or the other, so none is expressible; but "no concurrency support" would
+overstate the gap.
 
 ### Query families
 
@@ -1364,7 +1810,7 @@ RETURN fn_a.name, fn_a.file, fn_a.line,
 
 ---
 
-## Q-25: Dependency and CVE Reachability Queries
+## Q-25: Dependency and CVE Reachability Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: schema-room** — dependency edges (GM-14.3) must be populated (package, version, ecosystem attributes) before these queries execute. The confidence labels and edge-condition context described here depend on the GM-14 schema.
 
@@ -1460,16 +1906,33 @@ This is the ∀-path authorization bypass pattern: find the complement of "all p
 
 **Subcommand:**
 
-```bash
-cgx paths --from '**::handle' --to db::write ./ \
-    --avoiding require_admin \
-    --confidence certain \
-    --format sarif > authz-bypass.sarif
+**`--avoiding` is Planned (Q-20); `paths` takes positional anchors.** What runs today is the
+unfiltered enumeration plus the CI gate:
 
-# Fail CI if any bypass path exists
-cgx paths --from '**::handle' --to db::write ./ \
-    --avoiding require_admin \
-    --assert-empty
+```console
+$ cgx paths '**::handle' db_write --repo . --confidence certain
+path 1 (1 hops, min-confidence=certain):
+     rust_sample::handle  (src/main.rs:2)
+  -> rust_sample::db_write  (src/main.rs:4) [always]
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 57616e8, working tree clean
+
+$ cgx paths '**::handle' db_write --repo . --assert-empty
+…
+cgx: assertion failed: results found when none expected
+$ echo $?
+1
+```
+
+The `--avoiding require_admin` half — "only the paths that bypass the guard" — has no
+subcommand form. Express it in Layer 2, where it is a path-level predicate:
+
+```bash
+cgx query '
+  MATCH path = (h {name:"*::handle"})-[:CALLS*]->(sink {name:"*::db_write"})
+  WHERE NONE(n IN nodes(path) WHERE n.name = "*::require_admin")
+  RETURN path
+' --repo .
 ```
 
 **Full query:**
@@ -1483,7 +1946,7 @@ cgx query '
          sink.name, sink.file, sink.line,
          length(path) AS hops
   ORDER BY h.file, h.line
-' ./
+' --repo .
 ```
 
 The `NONE` on `require_admin` finds bypass paths (Q-20 / Q-14). The second `NONE` restricts to non-exception paths (Q-21) — exception-path-only bypasses are reported separately to distinguish structural bypasses from error-path bypasses.
@@ -1498,13 +1961,16 @@ This directly uses Q-22 acquire/release pairing. The critical paths are those in
 
 **Subcommand:**
 
+**Planned — not runnable.** Four separate unshipped things: `--quantifier`,
+`--including-exception-paths` and `--assert-all-reach-sink` are Q-20 must-analysis flags that do
+not exist, `paths` takes exactly two positional anchors (not a list of sinks), and there is no
+`--from`/`--to`. The ∀-path question this asks ("do *all* paths from acquire reach a release?")
+is precisely what Q-20 is for, and it is a plan error today.
+
 ```bash
-cgx paths --from db::Connection::begin \
-          --to db::Connection::commit db::Connection::rollback \
-          --quantifier all \
-          --including-exception-paths \
-          --assert-all-reach-sink \
-          ./
+# Planned (Q-20) — none of these flags exist
+# cgx paths db::Connection::begin db::Connection::commit \
+#           --quantifier all --including-exception-paths --assert-all-reach-sink --repo .
 ```
 
 **Full query:**
@@ -1521,7 +1987,7 @@ cgx query '
          ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
            AS on_exception_path
   ORDER BY on_exception_path DESC, acquire.file
-' ./
+' --repo .
 ```
 
 Non-empty results indicate a resource leak. The `on_exception_path` field distinguishes leaks that only occur on error paths (the most common category) from leaks on the happy path.
@@ -1546,8 +2012,10 @@ cgx query '
             AND position_in(n, path) > position_in(validate, path)
             AND position_in(n, path) < position_in(use, path))
   RETURN path
-' ./ --param validate_fn=fs::metadata --param use_fn=fs::read
+' --repo . --param validate_fn=fs::metadata --param use_fn=fs::read
 ```
+
+> **`--param` / `$name` are Planned.** `cgx query` has no `--param` flag (clap parse error, exit 2) and query parameters are in the Deferred list below. Inline the literal value into the query text until they ship.
 
 **Variation — any value validated by a check function and then used after an await:**
 
@@ -1556,7 +2024,7 @@ cgx query '
   MATCH path = (check {name:"validate_path"})-[:CALLS*]->(use {name:"fs::open"})
   WHERE ANY(n IN nodes(path) WHERE n.suspends = true)
   RETURN check.file, check.line, use.file, use.line
-' ./
+' --repo .
 ```
 
 ---
@@ -1569,11 +2037,17 @@ Uses DF-13 (secret pedigree), DF-11/12 (typed taint), Q-23 (typed taint queries)
 
 **Subcommand:**
 
+**Planned — not runnable.** `--from-class` / `--to-class` are Q-23 typed-taint flags; they do
+not exist, and neither does the `source_class` / `sink_class` node property they would filter on
+(both are explicit CQL plan errors). There is no taint-class machinery to anchor this query.
+
 ```bash
-cgx paths --from-class secret --to-class log \
-          --confidence probable \
-          --format sarif > secret-exposure.sarif
+# Planned (Q-23) — no class-based anchors exist
+# cgx paths --from-class secret --to-class log --confidence probable --repo .
 ```
+
+What ships in this space is the untyped pedigree walk: `cgx flows-from`/`cgx flows-to` over
+`derives-from`, which answers "where did this value come from" with no notion of trust class.
 
 **Full query:**
 
@@ -1587,7 +2061,7 @@ cgx query '
          [e IN relationships(path) | e.transformation_kind] AS transforms,
          length(path) AS hops
   ORDER BY src.file, src.line
-' ./
+' --repo .
 ```
 
 The `transformation_kind` sequence on each path shows whether the secret passed through `encode`, `format-string`, or `copy` transformations — useful for triage. A secret that reaches a `log` sink via `concat` is a direct exposure; one via `encode(log)` may be intentionally redacted (if a redact sanitizer class is declared).
@@ -1602,19 +2076,28 @@ Uses Q-25 (dependency and CVE reachability), GM-14.3 (dependency edges).
 
 **Subcommand:**
 
-```bash
-# Quick reachability check — any entrypoint reaching the vulnerable symbol?
-cgx paths --from '**' \
-          --to 'libfoo::parse_header' \
-          --confidence probable \
-          ./
+```console
+$ cgx paths '**' 'libfoo::parse_header' --confidence probable --repo .
+cgx: no symbol matched pattern `libfoo::parse_header`
+$ echo $?
+2
+```
 
-# With edge-condition context — is it reachable only in exception paths?
-cgx paths --from '**' \
-          --to 'libfoo::parse_header' \
-          --only-edge-condition exception \
-          --confidence probable \
-          ./
+That is the shipped form — positional anchors — shown against a repository that does not vendor
+`libfoo`. **Exit 2, not exit 0**: an unresolvable anchor is a usage error, not "no path found."
+The distinction matters for CVE triage, because a typo'd symbol name and a genuinely unreachable
+CVE must not look the same. Only an exit 0 with `(no results)` and an `exact` contract is a real
+negative.
+
+The second half — restricting to exception paths — has **no subcommand form**;
+`--only-edge-condition` does not exist on `paths`. Express it in Layer 2:
+
+```bash
+cgx query '
+  MATCH path = (ep)-[:CALLS*]->(v {name:"*::parse_header"})
+  WHERE ANY(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+  RETURN path
+' --repo .
 ```
 
 **Full query:**
@@ -1628,7 +2111,7 @@ cgx query '
          MIN([e IN relationships(path) | e.confidence]) AS weakest_confidence
   ORDER BY hops, ep.name
   LIMIT 20
-' ./
+' --repo .
 ```
 
 The `MIN` over edge confidences gives the weakest-link confidence for the entire path. A path where all edges are `certain` is a confirmed reachable path; one where the weakest edge is `possible` may be a false positive from dynamic dispatch over-approximation.
@@ -1642,7 +2125,7 @@ cgx query '
   RETURN src.name, src.file, arg.name,
          vuln.name, vuln.file,
          length(taint_path) + length(call_path) AS total_hops
-' ./
+' --repo .
 ```
 
 ---
@@ -1655,20 +2138,47 @@ Uses Q-16 (graph diff), IX-9 (edge age and author attribution, `docs/06-indexing
 
 **Subcommand (CI gate):**
 
-```bash
-# Step 1: Find any new paths from network sources to sql sinks introduced on this branch
-cgx diff --base main --head HEAD ./ \
-    --new-paths-only \
-    --from-class network \
-    --to-class sql \
-    --assert-empty
+**`cgx diff` takes positional refs, and the shipped gate is `--path-added`.** The class-based
+anchors (`--from-class`/`--to-class`) and `--new-paths-only` / `--calls-to-sink-class` are Q-23
+typed-taint surface and do not exist; `--from`/`--to` on `diff` are **glob anchors over FQNs**,
+which is what makes the shipped gate usable without taint classes:
 
-# Step 2: Find any new edges into sensitive sinks, annotated with introducing commit
-cgx diff --base main --head HEAD ./ \
-    --calls-to-sink-class sql \
-    --calls-to-sink-class shell \
-    --calls-to-sink-class eval \
-    --format sarif > new-sink-edges.sarif
+```console
+$ cgx diff HEAD~1 HEAD --repo . --path-added --from '**::bypass' --to '**::db_write'
+1 new call/dataflow reachability path(s) [reachability, not a security guarantee]:
++ path  rust_sample::bypass  ->  rust_sample::db_write  [introduced by f1fa44406965 (t)]
+cgx: path-added gate: 1 new call/dataflow reachability path(s) found
+$ echo $?
+1
+```
+
+Exit 1 when a new path appears, exit 0 when clean — no output parsing needed in CI. Attribution
+(`introduced by <12-hex> (<author>)`) comes free; `--format json` adds `introducing_commit`,
+`introducing_author`, `introducing_email` and `author_time` per path. For the coarser "what
+edges changed" view:
+
+```console
+$ cgx diff HEAD~1 HEAD --repo . --added --kind calls
++ edge  rust_sample::bypass  ->  rust_sample::db_write  (src/main.rs)
+```
+
+The class-typed version below is Planned:
+
+```bash
+# Planned (Q-23) — none of these flags exist
+# cgx diff main HEAD --repo . \
+#     --new-paths-only \
+#     --from-class network \
+#     --to-class sql \
+#     --assert-empty
+
+# Step 2 (Planned): new edges into sensitive sinks by taint class
+# cgx diff main HEAD --repo . \
+#     --calls-to-sink-class sql \
+#     --calls-to-sink-class shell \
+#     --calls-to-sink-class eval \
+#     --format sarif > new-sink-edges.sarif
+#   (`--calls-to-sink-class` does not exist, and `diff` accepts only human|json — sarif is exit 2)
 
 # Step 3: General new-edge security gate using IX-9 edge age
 cgx query --at HEAD '
@@ -1679,8 +2189,10 @@ cgx query --at HEAD '
          sink.name, sink.sink_class,
          r.introducing_commit, r.introducing_author
   ORDER BY sink.sink_class, a.file
-' ./ --param branch_commits=$(git log main..HEAD --format='%H' | jq -Rs 'split("\n")')
+' --repo . --param branch_commits=$(git log main..HEAD --format='%H' | jq -Rs 'split("\n")')
 ```
+
+> **`--param` / `$name` are Planned.** `cgx query` has no `--param` flag (clap parse error, exit 2) and query parameters are in the Deferred list below. Inline the literal value into the query text until they ship.
 
 **Full query (comparing edge sets between base and head):**
 
@@ -1690,14 +2202,14 @@ cgx query --at HEAD '
   MATCH path = (src {source_class:"network"})-[:DATA_FLOW*]->(sink {sink_class:"sql"})
   WHERE NONE(n IN nodes(path) WHERE n.sanitizer_class = "sql")
   RETURN src.name, sink.name, length(path) AS hops
-' ./ > head-findings.json
+' --repo . > head-findings.json
 
 # At merge-base: baseline findings
 cgx query --at $(git merge-base main HEAD) '
   MATCH path = (src {source_class:"network"})-[:DATA_FLOW*]->(sink {sink_class:"sql"})
   WHERE NONE(n IN nodes(path) WHERE n.sanitizer_class = "sql")
   RETURN src.name, sink.name, length(path) AS hops
-' ./ > base-findings.json
+' --repo . > base-findings.json
 
 # Diff the findings sets to identify regressions introduced by this branch
 # (new findings in head that were not in base)
@@ -1707,7 +2219,7 @@ The `introducing_commit` and `introducing_author` fields on edges (IX-9) let CI 
 
 ---
 
-## Q-26: Lineage Type Reconstruction Queries
+## Q-26: Lineage Type Reconstruction Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — the query-layer surface mirrors the graph-level reconstruction defined in `docs/04-dataflow-and-provenance.md` DF-19, which is itself `core-extension`. The constraint-gathering traversal (up/down/sideways over existing pedigree, forward-flow, and unification edges) requires no new schema primitives beyond those already present in DF-1, DF-6, DF-9, DF-16, and DF-20.
 
@@ -1737,7 +2249,7 @@ A contradiction indicates the value is used in two incompatible ways — for exa
 ### Layer 1 — Subcommand
 
 ```
-cgx type-of <symbol-or-var> <path>
+cgx type-of <symbol-or-var> [--repo <path>]
              [--at-function <fn>]
              [--direction up|down|sideways|all]  # default: all
              [--confidence certain|probable|possible]
@@ -1750,14 +2262,14 @@ The `--direction` flag restricts which constraint directions are gathered. `all`
 
 ```bash
 # Discover the candidate type of 'v' at entry to process()
-cgx type-of v ./ --at-function process
+cgx type-of v --repo . --at-function process
 
 # Type discovery using only pedigree (up-direction only — fastest)
-cgx type-of v ./ --at-function process --direction up --confidence probable
+cgx type-of v --repo . --at-function process --direction up --confidence probable
 
 # All values in the codebase whose declared type is any/interface{} but
 # whose reconstructed type is certain — they have a known type despite erasure
-cgx type-of '*' ./ --declared-type any --reconstructed-confidence certain
+cgx type-of '*' --repo . --declared-type any --reconstructed-confidence certain
 ```
 
 ### Layer 2 — Query language
@@ -1770,7 +2282,7 @@ cgx query '
   CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
   RETURN candidate_type, confidence, evidence
   ORDER BY confidence DESC
-' ./
+' --repo .
 ```
 
 **Type-contradiction bug query — values whose reconstructed type contradicts their declared type:**
@@ -1788,16 +2300,47 @@ cgx query '
          candidate_type,
          evidence
   ORDER BY v.file, v.line
-' ./
+' --repo .
 ```
 
 `candidate_type IS EMPTY` returns values where the constraint intersection is empty — a contradiction. The `COMPATIBLE_WITH` predicate tests structural compatibility; it returns `false` when the reconstructed type and the declared type share no common subtype.
 
 ---
 
-## Q-27: Mutation Fan-Out and Exposed-State Queries
+## Q-27: Mutation Fan-Out and Exposed-State Queries — **Partly shipped**
 
-**Status: schema-room** — depends on the `writes-param(i)` / `writes-receiver` effect-lattice extensions (DF-17.2, GM-12) and alias edges (DF-16), both `schema-room`. The query patterns described here are expressed once that schema is populated.
+**The base procedure runs today.** `CALL cgx.mutation_fanout(<value>) YIELD mutator, confidence`
+plans and executes as a real `derives-from` BFS walk, returning rows with an `exact` contract:
+
+```console
+$ cgx query 'CALL cgx.mutation_fanout("rust_sample::middle::return#1") YIELD mutator, confidence RETURN mutator, confidence' --repo .
+mutator                   confidence
+rust_sample::middle::v#0  probable
+rust_sample::middle::y#1  certain
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 7380e24, working tree clean
+```
+
+**What is deferred is narrower than "the feature":**
+
+- The **`effect` / `transform` / `evidence` YIELD columns.** Ask for one and the plan error says
+  exactly this — drop them and the procedure runs:
+  ```
+  plan error: procedure `cgx.mutation_fanout` does not yield column `effect`; it yields
+  `mutator` and `confidence` (the `effect`/`transform`/`evidence` columns are not populated
+  by the current frontend and are deferred)
+  ```
+- The **`cgx mutation-fanout` subcommand** — not in the `Command` enum; the CQL procedure is the
+  only surface.
+- The **`writes-param(i)` / `writes-receiver` effect-lattice extensions** (DF-17.2, GM-12) and
+  alias edges (DF-16), both genuinely `schema-room`. The richer query families below rest on
+  those and are not expressible yet.
+
+**Read the direction caveat before using it.** `cgx.mutation_fanout` and `cgx.pedigree` are
+currently **inverted relative to their column names** — `mutation_fanout` returns a value's
+*sources* under a column called `mutator`. See DF-1.1a in
+`docs/04-dataflow-and-provenance.md` for the reproduction. The rows above are `return#1`'s
+sources, not values it mutates.
 
 ### Motivation and prior art position
 
@@ -1818,7 +2361,7 @@ cgx query '
          effect,        -- writes-param(0), writes-receiver, mutation-out
          confidence
   ORDER BY confidence DESC, mutator.file
-' ./
+' --repo .
 ```
 
 #### Does f(x) mutate x?
@@ -1830,7 +2373,7 @@ cgx query '
      OR "writes-param(0)" IN fn.transitive_effects
   RETURN fn.name, fn.file, fn.line,
          fn.transitive_effects
-' ./
+' --repo .
 ```
 
 #### Getters returning references to mutable internal state (EI_EXPOSE_REP-style)
@@ -1844,7 +2387,7 @@ cgx query '
   RETURN getter.name, getter.file, getter.line,
          t.name AS containing_type
   ORDER BY t.name, getter.name
-' ./
+' --repo .
 ```
 
 The `return_is_internal_field` attribute is set when the return value's pedigree traces to a field of `self`/`this` without a defensive copy. This is the composable graph-query equivalent of SpotBugs `EI_EXPOSE_REP`; unlike SpotBugs, it composes with pedigree and taint queries to answer "which code mutates the exposed field through the returned reference?"
@@ -1860,23 +2403,23 @@ cgx query '
               AND edge.taint_label.reason = "mutation-after-sanitization")
   RETURN sanitizer.name, sanitizer.file, sanitizer.line,
          use.name, use.file, use.line
-' ./
+' --repo .
 ```
 
 ### Layer 1 — Subcommand
 
 ```bash
 # Mutation fan-out from a named value at a given function
-cgx mutation-fanout <symbol-or-var> <path> [--at-function <fn>] [--depth N] \
+cgx mutation-fanout <symbol-or-var> [--repo <path>] [--at-function <fn>] [--depth N] \
                     [--max-fanout N] [--through-sentinels] [--format <fmt>]
 
 # Functions that mutate their first argument
-cgx query --effect writes-param(0) <path>
+cgx query --effect writes-param(0)   # Planned: no --effect flag exists
 ```
 
 ---
 
-## Q-28: Closure-Capture Queries
+## Q-28: Closure-Capture Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: schema-room** — depends on capture edges (DF-18.3) with `by-value`/`by-ref` attribution and the captured variable's mutability level (DF-17.1). Both are `schema-room`. The query patterns are expressed once these edge attributes are populated.
 
@@ -1899,7 +2442,7 @@ cgx query '
          closure.name,  closure.file, closure.line,
          cap.capture AS capture_mode
   ORDER BY loop_var.file, loop_var.line
-' ./
+' --repo .
 ```
 
 This query is language-agnostic: it finds Go pre-1.22 goroutine closures capturing loop variables, JavaScript `var`-in-loop closures, and Python late-binding lambdas from a single pattern.
@@ -1914,7 +2457,7 @@ cgx query '
          closure.name, closure.file, closure.line,
          cap.capture AS capture_mode
   ORDER BY resource.file, resource.line
-' ./
+' --repo .
 ```
 
 A closure capturing a lock guard extends the resource lifecycle pair (GM-13): the lock is held until the closure executes, not until the enclosing scope exits. This is analogous to the `await-holding-lock` concurrency query (Q-24) but for captured (rather than actively held) locks.
@@ -1930,7 +2473,7 @@ cgx query '
   RETURN v.name, v.file, v.line,
          closure.name, sink.name,
          sink.file, sink.line
-' ./
+' --repo .
 ```
 
 ### Layer 1 — Subcommand
@@ -1945,9 +2488,24 @@ cgx query --capture-bug resource-lifetime <path> [--format <fmt>]
 
 ---
 
-## Q-29: Higher-Order / Function-Value Call-Resolution Queries
+## Q-29: Higher-Order / Function-Value Call-Resolution Queries — **Partly shipped**
 
-**Status: schema-room** — depends on function-value nodes (DF-18.1) and pedigree-based indirect-call resolution (DF-18.2). Both are `schema-room`, as is the `calls:indirect` candidate-set population from the pedigree query.
+**The edge kinds ship and are queryable.** `calls:callback` and `calls:indirect` are real
+`EdgeKind` variants, and the CQL `CALLS` token expands to the whole call family — `Calls`,
+`CallsVirtual`, `CallsClosure`, `CallsCallback`, `CallsAsync`, `CallsIndirect` — so a
+higher-order call is already traversable, and `r.kind` projects which flavour it was:
+
+```bash
+cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE r.kind = "calls-indirect" RETURN a.fqn, b.fqn' --repo .
+```
+
+`lambda` is likewise a real symbol kind and matches in an inline predicate.
+
+**What is Planned** is everything that would make those edges *resolve*: function-value nodes
+(DF-18.1 — `SymbolKind` has no `FunctionValue` variant, so `:function-value` is a parse error),
+pedigree-based indirect-call resolution (DF-18.2), and population of the `calls:indirect`
+candidate set from a pedigree query. Today an indirect call is an edge you can find but whose
+target set is not reconstructed.
 
 ### Overview
 
@@ -1966,10 +2524,10 @@ Each candidate in the set carries the confidence label from how it was tracked t
 
 ```bash
 # What functions can the callback argument to process() actually call?
-cgx pedigree callback ./ --at-function process --kind function-value
+cgx pedigree callback --repo . --at-function process --kind function-value
 
 # Resolve indirect call sites in the auth module up to probable confidence
-cgx callees '**' ./ --indirect --confidence probable --path-filter 'auth/**'
+cgx callees '**' --repo . --indirect --confidence probable --path-filter 'auth/**'
 ```
 
 ### Layer 2 — Query language
@@ -1984,7 +2542,7 @@ cgx query '
   RETURN target.name, target.file, target.line,
          callsite.confidence AS resolution_confidence
   ORDER BY callsite.confidence DESC, target.name
-' ./
+' --repo .
 ```
 
 **Unresolved indirect call sites (no candidate beyond possible):**
@@ -1997,7 +2555,7 @@ cgx query '
   RETURN callsite.name, callsite.file, callsite.line,
          r.cut_marker
   ORDER BY callsite.file, callsite.line
-' ./
+' --repo .
 ```
 
 **Function values that flow to multiple call sites (shared callbacks):**
@@ -2011,12 +2569,12 @@ cgx query '
          collect(distinct site1.name + "@" + site1.file + ":" + site1.line)
            AS call_sites
   ORDER BY fn_val.file, fn_val.line
-' ./
+' --repo .
 ```
 
 ---
 
-## Q-30: Coercion and Type-Confidence Queries
+## Q-30: Coercion and Type-Confidence Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: schema-room** — depends on `coerce(from,to)` transformation kind on DF-10 edges (`schema-room` as part of DF-10 vocabulary) and type-confidence boundaries (GM-14.6, `schema-room`). The query patterns are expressed once these attributes are populated.
 
@@ -2039,7 +2597,7 @@ cgx query '
          [e IN relationships(path) | e.transformation_kind] AS transformations,
          sink.name, sink.file, sink.line
   ORDER BY src.file, src.line
-' ./
+' --repo .
 ```
 
 The `transformation_kind:"coerce"` filter selects only the edges where a type change occurs; the `sink_class:"auth-check"` targets comparisons or decisions that determine authentication or authorization outcomes.
@@ -2068,7 +2626,7 @@ cgx query '
          typed_receiver.name, typed_receiver.declared_type,
          r.transformation_kind
   ORDER BY boundary.file, boundary.line
-' ./
+' --repo .
 ```
 
 When `type_confidence_boundary = true`, the node carries a GM-14.6 attribute indicating that downstream resolution confidence is at most `possible` without further assertion or reconstruction (DF-19).
@@ -2084,12 +2642,12 @@ cgx query '
          sink.name, sink.file, sink.line
   ORDER BY length(path) DESC
   LIMIT 20
-' ./
+' --repo .
 ```
 
 ---
 
-## Q-31: Framework-Aware Queries
+## Q-31: Framework-Aware Queries — **Planned (not yet shipped in v0.3.0)**
 
 **Status: core-extension** — the query patterns here consume GM-15 `guard` and `entrypoint` facts and GM-18 `reflective` cut-marker edges, all of which are `core-extension`. The must-pass-through predicate (Q-20) and the pedigree query (DF-1) are already specified as core capabilities; Q-31 extends them by consuming the framework-pack-supplied metadata facts at query time.
 
@@ -2112,7 +2670,7 @@ cgx query '
          sink.name, sink.file, sink.line,
          length(path) AS hops
   ORDER BY h.file, h.line
-' ./
+' --repo .
 ```
 
 The `n.guard_class IS NOT NULL` predicate matches any node that carries a GM-15 `guard` semantic class, regardless of whether the guard is a function call or a metadata annotation. Without this clause, annotated endpoints produce false bypass findings.
@@ -2123,13 +2681,13 @@ The `n.guard_class IS NOT NULL` predicate matches any node that carries a GM-15 
 # Authorization bypass: any handler reaches db::write without a guard
 # (metadata guards satisfied by GM-15 guard facts — no false positives on
 # annotated endpoints)
-cgx paths --from 'kind:entrypoint' --to db::write ./ \
+cgx paths --from 'kind:entrypoint' --to db::write --repo . \
     --avoiding 'name:require_admin OR guard_class:*' \
     --confidence probable \
     --format sarif > authz-bypass.sarif
 
 # Assert no bypass exists (CI gate)
-cgx paths --from 'kind:entrypoint' --to db::write ./ \
+cgx paths --from 'kind:entrypoint' --to db::write --repo . \
     --avoiding 'name:require_admin OR guard_class:*' \
     --assert-empty
 ```
@@ -2146,7 +2704,7 @@ cgx query '
          sink.name, sink.sink_class,
          ep.framework_pack AS established_by
   ORDER BY ep.framework_pack, ep.name
-' ./
+' --repo .
 ```
 
 The `framework_pack` attribute records which pack promoted the symbol to `entrypoint`, enabling queries that audit coverage ("which frameworks have entrypoints in scope?").
@@ -2161,7 +2719,7 @@ cgx query '
          ep.negative_guard_class AS disabled_protection,
          ep.framework_pack
   ORDER BY ep.negative_guard_class, ep.name
-' ./
+' --repo .
 ```
 
 Negative guards (GM-15.1) are annotations that disable a protection — `@csrf_exempt` (Django), `[AllowAnonymous]` (ASP.NET), `#[allow(...)]` (Rust). This query enumerates all endpoints that carry such a fact, making the "which endpoints opt out of protection P?" question a single graph lookup.
@@ -2182,7 +2740,7 @@ cgx query '
          [e IN relationships(path) | e.transformation_kind] AS transforms,
          dispatch.string_pedigree
   ORDER BY src.file, src.line
-' ./
+' --repo .
 ```
 
 The `string_pedigree` attribute on the dispatch node records whether the method-name string has a `literal`, `constant`, `joined`, or `tainted` provenance (GM-18.1). Queries can filter for `tainted` specifically to surface the highest-severity cases.
@@ -2201,13 +2759,17 @@ The following three worked examples show both query layers for the headline quer
 
 This demonstrates Q-26 (lineage type reconstruction, DF-19).
 
-**Part A — Type discovery for a single value:**
+**Part A — Type discovery for a single value. Planned — `cgx type-of` is not a subcommand**
+(it is absent from the 16-command `Command` enum), and `cgx.type_reconstruct` is not a
+registered CQL procedure — the engine's own error names the only two that are:
+`unknown procedure 'cgx.type_reconstruct' (known: 'cgx.mutation_fanout', 'cgx.pedigree')`.
 
 ```bash
-cgx type-of payload ./ --at-function RpcHandler::dispatch
+# Planned (Q-26) — no `type-of` subcommand exists
+# cgx type-of payload --repo . --at-function RpcHandler::dispatch
 ```
 
-Example output (JSON):
+Illustrative output shape (not produced by any shipped command):
 
 ```json
 {
@@ -2249,7 +2811,7 @@ cgx query '
          v.declared_type AS declared,
          evidence AS contradiction_evidence
   ORDER BY v.file, v.line
-' ./
+' --repo .
 ```
 
 An empty candidate set means no type satisfies all three directions of constraints simultaneously — the value is used in two incompatible ways. This is a class of bug that no production static analysis tool exposes as an on-demand graph query.
@@ -2261,7 +2823,7 @@ cgx query '
   MATCH (v {name:"result", scope:"Processor::run"})
   CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
   RETURN v.name, v.file, v.line, candidate_type, confidence
-' ./
+' --repo .
 ```
 
 ---
@@ -2274,11 +2836,17 @@ This demonstrates Q-30 (coercion and type-confidence queries, DF-10 `coerce(from
 
 **Subcommand:**
 
+**Planned — not runnable.** `--from-class` / `--to-class` are Q-23 typed-taint flags and
+`--require-transformation` is Q-30; none exists. Nor does the data underneath: `source_class`
+and `sink_class` are rejected node properties, and `r.transformation` is rejected with
+``edge property `transformation` is not populated by the current frontend``. There is no
+`coerce` transformation kind in the schema at all — the shipped `Transform` enum is
+`Copy, Projection, Arith, Concat, Composed, Branched, Aggregation, Parse, Serialize, Other`.
+
 ```bash
-cgx paths --from-class user-input --to-class auth-check \
-          --require-transformation coerce \
-          --confidence probable \
-          --format sarif > type-juggling-auth.sarif
+# Planned (Q-23 + Q-30) — none of these flags or classes exist
+# cgx paths --from-class user-input --to-class auth-check \
+#           --require-transformation coerce --confidence probable --repo .
 ```
 
 **Full query:**
@@ -2300,7 +2868,7 @@ cgx query '
          sink.name, sink.file, sink.line,
          length(path) AS hops
   ORDER BY src.file, src.line
-' ./
+' --repo .
 ```
 
 The `ANY ... WHERE transformation_kind STARTS WITH "coerce"` selects paths that include at least one DF-10 `coerce(from,to)` edge. The `NONE` clause excludes paths where a sanitizer appears after the coercion. Non-empty results indicate that a user-controlled value reaches an auth decision through a type change — the value may satisfy the check through coercion rather than legitimate data.
@@ -2315,22 +2883,24 @@ This demonstrates Q-31 consuming GM-15 `guard` facts so that `@PreAuthorize`-sty
 
 **Subcommand:**
 
-```bash
-# Step 1: find bypass paths (metadata guards satisfy the check — no false positives)
-cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
-          --to db::write \
-          --avoiding 'name:require_admin OR guard_class:*' \
-          --confidence probable \
-          --exclude-edge-condition exception \
-          --format sarif > authz-bypass.sarif
+**Planned — not runnable, and unbuilt several layers deep.** `paths` takes two positional
+anchors and has no `--from`/`--to`/`--avoiding`/`--exclude-edge-condition`;
+`kind:entrypoint,entrypoint_class:http` is not an anchor syntax cgx parses; `entrypoint_class`
+is a rejected node property, and the `HttpHandler` entrypoint kind that would populate it is
+constructed **nowhere**, so no symbol in any indexed repository carries an http entrypoint
+class; and `guard_class` / GM-15 metadata facts have zero occurrences in the codebase. Each is
+independently blocking.
 
-# Step 2: CI gate — assert no bypass exists
-cgx paths --from 'kind:entrypoint,entrypoint_class:http' \
-          --to db::write \
-          --avoiding 'name:require_admin OR guard_class:*' \
-          --exclude-edge-condition exception \
-          --assert-empty
+```bash
+# Planned (Q-20 + Q-31) — anchors, guard classes and http entrypoint detection are all unbuilt
+# cgx paths 'kind:entrypoint,entrypoint_class:http' db::write \
+#           --avoiding 'name:require_admin OR guard_class:*' \
+#           --exclude-edge-condition exception --assert-empty
 ```
+
+The `--assert-empty` half *is* shipped and is the reusable part of this pattern: a gate that
+exits 1 when results appear. What is missing is every anchor and filter that would make the
+result mean "authorization bypass" rather than "reaches `db_write`".
 
 **Full query:**
 
@@ -2346,7 +2916,7 @@ cgx query '
          h.framework_pack AS handler_established_by,
          length(path) AS hops
   ORDER BY hops, h.file, h.line
-' ./
+' --repo .
 ```
 
 **Without** the `n.guard_class IS NOT NULL` clause, every handler annotated with `@PreAuthorize` (or equivalent) would appear as a bypass because the annotation's authz check has no call in the source path. With GM-15 `guard` facts present, `guard_class` is non-null on those methods and the `NONE` predicate correctly excludes them. This is the direct answer to the false-positive problem on Spring, Django, and ASP.NET codebases.
@@ -2361,7 +2931,7 @@ cgx query '
   RETURN ep.name, ep.file, ep.line,
          ep.framework_pack
   ORDER BY ep.framework_pack, ep.name
-' ./
+' --repo .
 ```
 
 Zero results means every HTTP endpoint has at least one authz annotation or call-based guard — the ∀ coverage assertion for the authz layer.
@@ -2390,9 +2960,11 @@ RETURN sub.name, sub.file, sub.line
 
 ---
 
-## Q-33: Recursion / SCC / Architecture-Cycle Queries
+## Q-33: Recursion / SCC / Architecture-Cycle Queries — **Planned (not yet shipped in v0.3.0)**
 
-**Status: core-extension** — the petgraph SCC (Strongly Connected Component) algorithm is part of the selected dependency stack (docs/09), shared with the `unused` query's reachability analysis. Exposing SCC membership as a queryable property requires no new schema primitives beyond function-node attributes derived at index time.
+**Status: roadmap.** Nothing in this section runs today, and the Feature List previously marked it Shipped — that was wrong. Specifically: `scc_id` and `scc_size` are not node properties (unknown-property plan error, and they are not even in the deferred list); `cgx unused --filter`, `cgx explain --show-scc` and `cgx query --scc-of` are not flags; and several of the CQL examples below additionally use `STARTS WITH`, which does not parse. Read the section as the design for SCC exposure, not as a usage guide.
+
+Two things a reader can rely on today in place of it: `CALLS*` uses **simple-path semantics**, so a recursive cycle terminates the traversal after visiting each member once rather than looping; and a var-length traversal that hits a cycle renders `↺ name (cycle)` in the human forest.
 
 ### Motivation
 
@@ -2413,13 +2985,13 @@ These attributes are derived from the call graph at index time using Tarjan's or
 
 ```bash
 # List all functions in recursive cycles (scc_size > 1)
-cgx unused ./ --kind fn --filter scc_size_gt 1
+cgx unused --repo . --kind fn --filter scc_size_gt 1
 
 # Show which SCC a given function belongs to
-cgx explain crypto::hash ./ --show-scc
+cgx explain crypto::hash --repo . --show-scc
 
 # List all members of the SCC containing a named function
-cgx query --scc-of crypto::hash ./
+cgx query --scc-of crypto::hash --repo .
 ```
 
 ### Layer 2 — Query language

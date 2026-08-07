@@ -132,6 +132,13 @@ impl G {
     fn view(self) -> GraphView {
         GraphView::new(self.nodes, self.edges, Vec::<Candidate>::new())
     }
+
+    /// A view whose candidate table is populated, so `--max-candidates` has group
+    /// sizes to compare against. `GraphView::new` with an empty table reports every
+    /// group as size 0, which no cap can ever exceed.
+    fn view_with_candidates(self, candidates: Vec<Candidate>) -> GraphView {
+        GraphView::new(self.nodes, self.edges, candidates)
+    }
 }
 
 fn unbounded() -> PathWalker {
@@ -989,5 +996,50 @@ fn a_counted_unindexed_file_wins_over_the_dropped_path_disclosure() {
             .any(|r| r.code == "impacted-changed-file-unindexed" && r.detail.contains("2 changed")),
         "the counted variant is the one that survives: {:?}",
         c.reasons
+    );
+}
+
+/// The `--max-candidates` fan-out cap drops edges from the *backward* walk, so it
+/// can cost a real impacted test — and an answer that loses a test without saying
+/// why is the exact failure this contract exists to prevent.
+///
+/// Regression for the merge that brought #45 in: `run_impacted_tests` builds its
+/// walker with `build_walker`, which applies the cap, while this crate's frontier
+/// scan is caller-side and predates the flag. Verified against the release binary
+/// too: uncapped reports the test, `--max-candidates 1` reports none.
+#[test]
+fn a_test_lost_to_the_fanout_cap_is_named_by_the_contract() {
+    let mut g = G::new();
+    let t = g.test("t");
+    let mid = g.func("mid");
+    let other = g.func("other");
+    let target = g.func("target");
+    g.calls(t, mid);
+    // `mid -> target` is one member of an over-approximated candidate set of size 2.
+    g.edge(mid, target, Confidence::Probable, &[], Some(7));
+    g.edge(mid, other, Confidence::Probable, &[], Some(7));
+    let v = g.view_with_candidates(vec![
+        Candidate { candidate_group: 7, dst: target, rank: 0 },
+        Candidate { candidate_group: 7, dst: other, rank: 1 },
+    ]);
+
+    // Uncapped: the test is reachable and reported, and the cap reason is absent.
+    let (open_a, open_c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    assert_eq!(open_a.tests.len(), 1, "uncapped, the test is reachable");
+    assert!(
+        !codes(&open_c).contains(&"dropped-max-candidates"),
+        "no cap in force must not claim one dropped anything: {:?}",
+        codes(&open_c)
+    );
+
+    // Capped below the group size: the only route to the test is dropped.
+    let mut capped = unbounded();
+    capped.filter = capped.filter.with_max_candidates(1);
+    let (shut_a, shut_c) = contract_of(&v, &[target], &capped, DiffFacts::default());
+    assert_eq!(shut_a.tests.len(), 0, "the cap severs the only route");
+    assert!(
+        codes(&shut_c).contains(&"dropped-max-candidates"),
+        "a test lost to the cap must be disclosed, not silently dropped: {:?}",
+        codes(&shut_c)
     );
 }

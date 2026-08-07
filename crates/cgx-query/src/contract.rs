@@ -966,10 +966,9 @@ mod tests {
         // is attributed to the confidence exclusion only (the two counts partition
         // the excluded edges).
         let view = fanout_view();
-        let mut filter = EdgeFilter::calls()
+        let filter = EdgeFilter::calls()
             .with_min_confidence(Confidence::Certain)
             .with_max_candidates(2);
-        filter.max_candidates = Some(2);
         let w = PathWalker {
             filter,
             max_depth: None,

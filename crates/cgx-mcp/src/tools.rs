@@ -930,6 +930,10 @@ fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
     if let Some(c) = opt_str(args, "confidence") {
         filter = filter.with_min_confidence(parse_confidence(c)?);
     }
+    // `max_candidates` is deliberately not wired here: the fan-out cap is a
+    // property of call candidate groups, and this walk is scoped to `DerivesFrom`
+    // edges (no candidate groups), so the cap could never fire. The neighbor /
+    // reaches / paths tools expose it because they traverse the call family.
     let walker = PathWalker {
         filter,
         max_depth: Some(opt_u32(args, "depth")?.unwrap_or(DEFAULT_FOREST_DEPTH)),

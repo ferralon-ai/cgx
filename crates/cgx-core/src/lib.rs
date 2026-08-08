@@ -41,6 +41,7 @@ pub mod cut;
 pub mod edge;
 pub mod effect;
 pub mod id;
+pub mod locality;
 pub mod node;
 pub mod pattern;
 pub mod provenance;
@@ -56,6 +57,7 @@ pub use cut::{CutMarker, CutMarkers};
 pub use edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance, EstablishedBy, ImplicitKind};
 pub use effect::{Effect, EffectSet};
 pub use id::{EdgeId, NodeId, NodeSortKey, SiteId, ValueId};
+pub use locality::{locality_tier, LocalityTier};
 pub use node::{
     CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, ValueNode,
     Visibility,

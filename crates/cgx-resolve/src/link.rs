@@ -5,6 +5,7 @@ use cgx_core::confidence::{Confidence, Tier};
 use cgx_core::cut::{CutMarker, CutMarkers};
 use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
+use cgx_core::locality::{locality_tier, LocalityTier};
 use cgx_core::node::{EntrypointKind, NodeRecord, NodeWithProvenance, SymbolKind, Visibility};
 use cgx_core::provenance::{Provenance, Span};
 use cgx_core::transform::Transform;
@@ -1300,6 +1301,40 @@ fn emit_candidate_set(
     // match the CHA post-pass exactly.
     let mut dsts: Vec<NodeId> = hits.iter().map(|d| d.node_id).collect();
     let confidence = canonicalize_candidate_dsts(&mut dsts);
+
+    // F3 locality ranking (Step-4 `name-arity` bare-name fallback only). The
+    // Tier-0 fallback over-approximates to every same-name(+arity) def; keep
+    // *every* candidate — no cut (the revindex lesson: never trade a false-over for
+    // a false-under silently, and a facade method delegating to a same-named free
+    // function elsewhere in the crate is a real edge a cut would drop) — but order
+    // them nearest-first by locality so the candidate `rank` and the denormalized
+    // `rule` carry that structure and F2's `--max-candidates` can cut from the far
+    // end. The canonical node-id order (from `canonicalize_candidate_dsts`) is the
+    // deterministic tiebreak within a tier, so AR-10 byte-identity holds. Virtual
+    // dispatch (Step 3 `name-method`) is deliberately *not* ranked here:
+    // polymorphism legitimately targets overrides in other modules/crates, so a
+    // locality order there would mis-rank real targets.
+    let locality: std::collections::BTreeMap<NodeId, LocalityTier> = if rule == "name-arity" {
+        hits.iter()
+            .map(|d| {
+                (
+                    d.node_id,
+                    locality_tier(&span.file, caller_fqn, &d.file, &d.fqn),
+                )
+            })
+            .collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    if rule == "name-arity" {
+        dsts.sort_by_key(|dst| {
+            (
+                locality.get(dst).copied().unwrap_or(LocalityTier::Global),
+                dst.0,
+            )
+        });
+    }
+
     let group = if dsts.len() > 1 {
         let g = *next_group;
         *next_group += 1;
@@ -1348,6 +1383,23 @@ fn emit_candidate_set(
                 candidate_group: group,
             },
         );
+        // Stamp the locality tier onto the denormalized rule of the edge just
+        // pushed (`name-arity:loc:<tier>`), following the `indirect:<arity>`
+        // precedent below, so every surface that renders `rule` (e.g.
+        // `cgx explain`) exposes it. The `rule == "name-arity"` band gate above
+        // reads the `&'static` `rule` param, not this suffix, so it is unaffected.
+        if rule == "name-arity" {
+            let tag = locality
+                .get(dst)
+                .copied()
+                .unwrap_or(LocalityTier::Global)
+                .as_str();
+            if let Some(e) = edges.last_mut() {
+                let annotated = format!("name-arity:loc:{tag}");
+                e.provenance.rule = annotated.clone();
+                e.edge.rule = annotated;
+            }
+        }
     }
 }
 

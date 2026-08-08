@@ -340,7 +340,7 @@ fn name_arity_fallback_emits_possible_candidate_set() {
 
     let fallback: Vec<_> = g
         .edge_records()
-        .filter(|e| e.rule == "name-arity")
+        .filter(|e| e.rule.starts_with("name-arity"))
         .collect();
     assert_eq!(fallback.len(), 2, "one edge per same-named candidate");
     for e in &fallback {
@@ -401,7 +401,7 @@ fn name_arity_fallback_single_hit_is_possible_not_probable() {
 
     let fallback: Vec<_> = g
         .edge_records()
-        .filter(|e| e.rule == "name-arity")
+        .filter(|e| e.rule.starts_with("name-arity"))
         .collect();
     assert_eq!(fallback.len(), 1, "single surviving candidate");
     let e = fallback[0];
@@ -414,6 +414,139 @@ fn name_arity_fallback_single_hit_is_possible_not_probable() {
     assert!(
         e.candidate_group.is_none(),
         "single-target edge carries no candidate group"
+    );
+}
+
+#[test]
+fn name_arity_candidates_ranked_by_locality_none_dropped() {
+    // F3: the Step-4 fallback RANKS its candidate set by locality (nearest first)
+    // but drops NOTHING — the revindex lesson. This guards the `map_symbol` class:
+    // a real same-crate target (the analogue of
+    // `ScipResolver::map_symbol -> symbol::map_symbol`) must survive ranking, never
+    // be evicted by a nearer candidate. Three same-named defs at three localities
+    // relative to the caller `crate::b::run` (file `src/b.rs`), none in the caller's
+    // file or scope, so all reach the fallback as one candidate group:
+    //   crate::b::helper  (shares crate::b) -> same-module (nearest)
+    //   crate::x::helper  (shares crate)    -> same-crate
+    //   other::helper     (shares nothing)  -> global (farthest)
+    let mut m = FileBuilder::new();
+    m.def(
+        "crate::b::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let m = m.build();
+
+    let mut x = FileBuilder::new();
+    x.def(
+        "crate::x::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let x = x.build();
+
+    let mut o = FileBuilder::new();
+    o.def(
+        "other::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let o = o.build();
+
+    let mut caller_file = FileBuilder::new();
+    let run = caller_file.scope(ScopeId::ROOT, Some("crate::b::run"));
+    caller_file.def(
+        "crate::b::run",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    // run() calls helper(x) — unknown locally, unimported → global fallback with
+    // three same-named candidates across the other files.
+    caller_file.raw_ref(
+        &["helper"],
+        run,
+        2,
+        RefKind::Call,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let b = caller_file.build();
+
+    let inputs = vec![
+        input("src/m.rs", "rust", &m),
+        input("src/x.rs", "rust", &x),
+        input("src/o.rs", "rust", &o),
+        input("src/b.rs", "rust", &b),
+    ];
+    let g = link(&inputs, &LinkOpts::default());
+
+    // node id -> fqn, to name the candidate targets.
+    let fqn_of: std::collections::BTreeMap<_, _> =
+        g.node_records().map(|n| (n.id, n.fqn.clone())).collect();
+
+    let fallback: Vec<_> = g
+        .edge_records()
+        .filter(|e| e.rule.starts_with("name-arity"))
+        .collect();
+    assert_eq!(fallback.len(), 3, "one edge per same-named candidate, none dropped");
+
+    // Every candidate — including the far ones — survives, each tagged with its tier.
+    let tag_for = |fqn: &str| -> Option<String> {
+        fallback
+            .iter()
+            .find(|e| fqn_of.get(&e.dst).map(String::as_str) == Some(fqn))
+            .map(|e| e.rule.clone())
+    };
+    assert_eq!(
+        tag_for("crate::b::helper").as_deref(),
+        Some("name-arity:loc:same-module")
+    );
+    assert_eq!(
+        tag_for("crate::x::helper").as_deref(),
+        Some("name-arity:loc:same-crate"),
+        "the same-crate target must survive ranking (the map_symbol invariant)"
+    );
+    assert_eq!(
+        tag_for("other::helper").as_deref(),
+        Some("name-arity:loc:global")
+    );
+
+    // rank orders nearest-first: same-module < same-crate < global.
+    let rank_of = |fqn: &str| -> u32 {
+        let dst = fqn_of
+            .iter()
+            .find(|(_, f)| f.as_str() == fqn)
+            .map(|(id, _)| *id)
+            .expect("def node exists");
+        g.candidates
+            .iter()
+            .find(|c| c.dst == dst)
+            .map(|c| c.rank)
+            .expect("candidate row exists")
+    };
+    assert!(
+        rank_of("crate::b::helper") < rank_of("crate::x::helper"),
+        "same-module ranks before same-crate"
+    );
+    assert!(
+        rank_of("crate::x::helper") < rank_of("other::helper"),
+        "same-crate ranks before global"
     );
 }
 

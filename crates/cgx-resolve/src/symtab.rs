@@ -24,6 +24,10 @@ pub struct DefEntry {
     /// same-language defs: a name collision across languages is never a real call
     /// (genuine cross-language calls are FFI and carry their own `ViaFfi` marker).
     pub lang: String,
+    /// Source file, copied from the def's [`NodeRecord::file`]. Lets the Step-4
+    /// fallback rank its candidate set by locality (same-file first) without a
+    /// store round-trip — a link-time parallel to [`DefEntry::lang`].
+    pub file: String,
 }
 
 /// One import binding visible somewhere in a file: a local name (possibly an
@@ -80,6 +84,7 @@ impl SymbolTable {
                 kind: n.kind,
                 arity: n.signature.as_ref().map(|s| s.params.len().min(255) as u8),
                 lang: n.lang.clone(),
+                file: n.file.clone(),
             };
             t.by_fqn.insert(n.fqn.clone(), entry.clone());
             t.by_short

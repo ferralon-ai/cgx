@@ -85,6 +85,13 @@ struct Finding<'a> {
     depth: Option<u32>,
     condition: Option<EdgeCondition>,
     confidence: Option<Confidence>,
+    /// The **weakest** confidence on the whole discovery path, where
+    /// `confidence` above is only the discovery edge's own. `None` for every
+    /// subcommand that does not report a per-row weakest-link tier, so the
+    /// shipped output shapes are unchanged; `Some` for `impacted-tests`, where
+    /// a test is only as trustworthy as the least-certain hop between it and
+    /// the change.
+    min_confidence: Option<Confidence>,
     transient: bool,
 }
 
@@ -95,7 +102,17 @@ impl<'a> Finding<'a> {
             depth: Some(n.depth),
             condition: Some(n.condition),
             confidence: Some(n.confidence),
+            min_confidence: None,
             transient: n.exception_transient,
+        }
+    }
+
+    /// A neighbor row from `impacted-tests`, which additionally reports the
+    /// weakest confidence on the path from the test to the changed symbol.
+    fn from_impacted(n: &'a NeighborResult) -> Self {
+        Finding {
+            min_confidence: Some(n.min_confidence_on_path),
+            ..Finding::from_neighbor(n)
         }
     }
 
@@ -105,6 +122,7 @@ impl<'a> Finding<'a> {
             depth: None,
             condition: None,
             confidence: None,
+            min_confidence: None,
             transient: false,
         }
     }
@@ -122,6 +140,9 @@ impl<'a> Finding<'a> {
         }
         if let Some(c) = self.confidence {
             s.push_str(&format!("  [{}]", confidence_str(c)));
+        }
+        if let Some(c) = self.min_confidence {
+            s.push_str(&format!("  [min-on-path={}]", confidence_str(c)));
         }
         if self.transient {
             s.push_str("  [exception-transient]");
@@ -146,6 +167,9 @@ impl<'a> Finding<'a> {
         if let Some(c) = self.confidence {
             map.insert("confidence".into(), json!(confidence_str(c)));
         }
+        if let Some(c) = self.min_confidence {
+            map.insert("min_confidence_on_path".into(), json!(confidence_str(c)));
+        }
         if self.transient {
             map.insert("exception_transient".into(), json!(true));
         }
@@ -162,6 +186,9 @@ impl<'a> Finding<'a> {
         }
         if let Some(c) = self.condition {
             props.insert("edgeCondition".into(), json!(condition_str(c)));
+        }
+        if let Some(c) = self.min_confidence {
+            props.insert("minConfidenceOnPath".into(), json!(confidence_str(c)));
         }
         if let Some(d) = self.depth {
             props.insert("depth".into(), json!(d));
@@ -409,6 +436,23 @@ pub fn rule_id(subcommand: &str) -> String {
     format!("cgx/{subcommand}")
 }
 
+/// The `subcommand` token `impacted-tests` renders under. It is the discriminator
+/// for the one row shape that carries a weakest-link tier per result
+/// ([`Finding::from_impacted`]), so the constant lives here rather than as a
+/// literal at the call site in `main`.
+pub const IMPACTED_SUBCOMMAND: &str = "impacted-tests";
+
+/// Build the row for one neighbor result under `subcommand`. Every shipped
+/// neighbor command keeps [`Finding::from_neighbor`] — and therefore its exact
+/// shipped JSON and SARIF shape; only `impacted-tests` adds the weakest-link tier.
+fn neighbor_finding<'a>(subcommand: &str, n: &'a NeighborResult) -> Finding<'a> {
+    if subcommand == IMPACTED_SUBCOMMAND {
+        Finding::from_impacted(n)
+    } else {
+        Finding::from_neighbor(n)
+    }
+}
+
 /// Render a result set, plus optional assertion metadata, to a single string.
 ///
 /// `vacuous` is threaded into JSON (`"vacuous": <bool>`) and adds a `note`-level
@@ -436,7 +480,7 @@ pub fn render(
             body.push('\n');
             body
         }
-        Format::Json => render_json(results, vacuous, contract, freshness),
+        Format::Json => render_json(subcommand, results, vacuous, contract, freshness),
         Format::Sarif => {
             sarif_document(subcommand, results, vacuous, contract, freshness).to_string()
         }
@@ -1048,7 +1092,11 @@ fn render_table_human(t: &TableData) -> String {
     out
 }
 
+/// `subcommand` selects the neighbor row shape: `impacted-tests` additionally
+/// reports `min_confidence_on_path` per row (the weakest hop between the test and
+/// the change), every other neighbor command keeps its shipped shape verbatim.
 fn render_json(
+    subcommand: &str,
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
@@ -1058,9 +1106,10 @@ fn render_json(
         return render_table_json(t, vacuous, contract, freshness);
     }
     let items: Vec<Value> = match results {
-        ResultSet::Neighbors { results, .. } => {
-            results.iter().map(|n| Finding::from_neighbor(n).json()).collect()
-        }
+        ResultSet::Neighbors { results, .. } => results
+            .iter()
+            .map(|n| neighbor_finding(subcommand, n).json())
+            .collect(),
         ResultSet::Nodes(v) => v.iter().map(|n| Finding::from_node(n).json()).collect(),
         ResultSet::Paths(v) => v.paths.iter().map(path_json).collect(),
         ResultSet::Table(_) => unreachable!("handled above"),
@@ -1182,7 +1231,7 @@ pub fn sarif_document(
     let mut sarif_results: Vec<Value> = match results {
         ResultSet::Neighbors { results, .. } => results
             .iter()
-            .map(|n| Finding::from_neighbor(n).sarif(&rid))
+            .map(|n| neighbor_finding(subcommand, n).sarif(&rid))
             .collect(),
         ResultSet::Nodes(v) => v
             .iter()

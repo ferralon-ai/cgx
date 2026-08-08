@@ -14,13 +14,13 @@ use std::process::ExitCode as ProcExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use cgx_core::{EdgeKind, NodeId, SymbolKind, SymbolPattern};
-use cgx_diff::BlameRepo;
+use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeKind, NodeId, SymbolKind, SymbolPattern};
+use cgx_diff::{impacted::Sides, BlameRepo};
 use cgx_index::{default_registry, index_path, IndexOpts};
 use cgx_mcp::ServerConfig;
 use cgx_query::{
     callees, callers, contract, entrypoint_roots, neighborhood, paths as query_paths, rank_symbols,
-    reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter,
+    reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
 use cgx_store::{FactStore, GraphId, SqliteStore};
@@ -31,7 +31,7 @@ use cgx_cli::forest::{ForestData, TreeMode, DEFAULT_TREE_DEPTH};
 use cgx_cli::freshness;
 use cgx_cli::output::{
     render, render_coupling, render_explanation, render_path_walks, render_search, render_symbols,
-    Format, ResultSet, TableData,
+    Format, ResultSet, TableData, IMPACTED_SUBCOMMAND,
 };
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
@@ -329,6 +329,43 @@ enum Command {
         /// Default repository root injected into tool calls that omit it.
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Test entrypoints whose call graph reaches a symbol changed between two git
+    /// refs, or in the uncommitted working tree.
+    ///
+    /// The changed set is the union of the symbols the graph diff names and every
+    /// symbol defined in a file whose content changed. The file-granular half is
+    /// what makes a body-only edit (`>` to `>=`) land at all — the graph diff for
+    /// such an edit is empty — and it is disclosed as an over-approximation on the
+    /// answer's contract, never assumed away.
+    ///
+    /// **Rust, Go, Java and Python only.** A diff touching only unsupported
+    /// languages (TypeScript/JavaScript) produces a *visibly degenerate* answer:
+    /// an `impacted-language-unsupported` reason on the contract, a stderr line,
+    /// and exit 4 — never a silent empty list that reads as "no tests to run".
+    ImpactedTests {
+        /// The base ref (e.g. `main`, `HEAD~1`, a tag, or a commit SHA). Omit it
+        /// and pass `--uncommitted` to compare the working tree instead.
+        base: Option<String>,
+        /// The head ref (default: `HEAD`).
+        head: Option<String>,
+        /// Inner loop: compare the committed `HEAD` tree against the working
+        /// directory, uncommitted edits included. Mutually exclusive with the
+        /// positional refs.
+        #[arg(long)]
+        uncommitted: bool,
+        /// Compare against the base ref's *tip* rather than `merge-base(base,
+        /// head)`. The default (merge-base) makes `cgx impacted-tests main HEAD`
+        /// mean "tests impacted by what this branch adds", which is the PR-gate
+        /// question; note that `cgx diff` compares tips, so the two disagree on
+        /// the same pair of refs. Setting this flag fires the
+        /// `impacted-tip-to-tip-base` over-reason. No effect with
+        /// `--uncommitted`: the committed `HEAD` tree is the branch point by
+        /// construction.
+        #[arg(long)]
+        no_merge_base: bool,
+        #[command(flatten)]
+        query: QueryArgs,
     },
 }
 
@@ -634,6 +671,13 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Mcp { root } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
         }
+        Command::ImpactedTests {
+            base,
+            head,
+            uncommitted,
+            no_merge_base,
+            query,
+        } => run_impacted_tests(base, head, uncommitted, no_merge_base, query),
     }
 }
 
@@ -1137,6 +1181,280 @@ fn run_unused(kind: Option<KindArg>, args: QueryArgs) -> Result<(), CliError> {
         len,
         approximation,
     )
+}
+
+/// `cgx impacted-tests [<base> [<head>]] [--uncommitted]`: the test entrypoints
+/// whose call graph reaches a symbol changed between the two sides.
+///
+/// The whole answer — both graphs, the changed set, the reverse walk and the
+/// contract — is produced by [`cgx_diff::impacted::run`], the single entry point
+/// the MCP tool also calls, so the two surfaces cannot drift. This function is the
+/// argument validation, the witness forest, and the exit-code contract.
+///
+/// ## Exit codes
+///
+/// The answer is emitted through [`emit`] on **every** format first, so the
+/// contract and its reasons are always printed; only then does a degenerate
+/// answer (nothing changed in a language whose tests cgx can identify) become
+/// [`ExitCode::Vacuous`]. A caller therefore gets three independent signals that
+/// an empty list is not a clean bill of health: exit 4, a `cgx: …` line on
+/// stderr, and an `impacted-language-unsupported` reason with an `under`
+/// direction on the contract.
+///
+/// Routing through `emit` also inherits the path-graph format guard for free
+/// (`--format dot|mermaid|d2` against this neighbor-shaped result is a usage
+/// error, exit 2), which is why this function contains no `match format` of its
+/// own — see the `print_diff_full` defect it must not reproduce.
+fn run_impacted_tests(
+    base: Option<String>,
+    head: Option<String>,
+    uncommitted: bool,
+    no_merge_base: bool,
+    args: QueryArgs,
+) -> Result<(), CliError> {
+    // `--at` pins a query to one ref's graph. This command *is* a two-sided
+    // comparison, so the two cannot both be honoured.
+    if args.at.is_some() {
+        return Err(CliError::usage(
+            "--at pins a query to a single ref's graph and conflicts with impacted-tests' \
+             two-sided comparison; pass the refs positionally instead \
+             (`cgx impacted-tests <base> [<head>]`)"
+                .to_string(),
+        ));
+    }
+
+    if uncommitted && (base.is_some() || head.is_some()) {
+        return Err(CliError::usage(
+            "--uncommitted compares the working directory against the committed HEAD tree \
+             and cannot be combined with positional refs"
+                .to_string(),
+        ));
+    }
+    let sides = match (uncommitted, base) {
+        (true, _) => Sides::Workdir,
+        (false, Some(base)) => Sides::Refs {
+            base,
+            head: head.unwrap_or_else(|| "HEAD".to_string()),
+            merge_base: !no_merge_base,
+        },
+        (false, None) => {
+            return Err(CliError::usage(
+                "nothing to compare: give a base ref (`cgx impacted-tests <base> [<head>]`) \
+                 or pass --uncommitted to compare the working tree against HEAD"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let repo_root = resolve_repo(args.repo.clone())?;
+    // The on-disk `.cgx/` store, as `run_diff` uses: both sides land in one store
+    // (`diff_trees` reads them together) and the warm Layer-1 blob cache means an
+    // unchanged file re-extracts nothing. `index_repo` is deliberately not used —
+    // it prunes the store to a single graph and would delete the other side.
+    ensure_cgx_dir(&repo_root)?;
+    let db_file = db_path(&repo_root);
+    let mut store =
+        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+
+    // Unbounded by default: a test three hops from the change is still impacted,
+    // and the forest's depth-2 rendering bound must not leak into the walk. An
+    // explicit `--depth N` narrows it and the contract then reports `depth-limit`.
+    let walker = build_walker(&args);
+    let answer = cgx_diff::impacted::run(
+        &mut store,
+        cgx_diff::impacted::Request {
+            repo_root: &repo_root,
+            sides,
+            walker: walker.clone(),
+        },
+    )
+    .map_err(|e| CliError::graph(format!("impacted-tests: {e}")))?;
+
+    let subgraph = witness_subgraph(&answer, &walker.filter);
+    // `None`, not the default depth of 2: the subgraph is already pruned to the
+    // witness chains, and truncating a chain would be a rendering-level
+    // under-approximation the contract does not report.
+    let forest = ForestData::resolve(&answer.view, &subgraph, args.tree, None);
+
+    // ADR-08. Clause (a) is "did anything change at all", the analogue of an
+    // anchor resolving. Clause (b) is a *filter-attribution* test — it fires when
+    // the confidence/edge-condition filters removed every candidate — so
+    // `unfiltered_count` must be the number of tests this same query reports with
+    // those filters removed, and nothing else. The test-node predicate is not
+    // such a filter: "which of the reached nodes are tests" is the question, so a
+    // reached non-test node is a correct negative, not an excluded candidate.
+    // Feeding the reached-node count in here made clause (b) fire on every
+    // honestly-empty answer, because the seeds are always reached.
+    //
+    // With no confidence floor in force the counterfactual run *is* this run, so
+    // the two counts are equal and clause (b) cannot fire at all. When there is
+    // one, the counterfactual is a second walk over the same in-memory head view
+    // — no re-index, and `evaluate` reads the count only for a *passing*
+    // `--assert-empty` gate, so nothing else pays for it.
+    let any_symbol_matched = !answer.changed.is_empty();
+    let filtered_count = answer.tests.tests.len();
+    let unfiltered_count = if args.assert_empty && filtered_count == 0 && args.confidence.is_some()
+    {
+        cgx_query::impacted_tests(&answer.view, &answer.changed, &unfiltered_walker(&args))
+            .tests
+            .len()
+    } else {
+        filtered_count
+    };
+    // A depth bound is not a confidence filter, so ADR-08 clause (b) does not and
+    // must not cover it — but it produces the same damage on the same surface. A
+    // `--depth N` added for speed can truncate the only route from the change to
+    // a test, and the gate then exits 0 with an empty stderr, which is exactly
+    // what `docs/commands/impacted-tests.md` defines as "a change that genuinely
+    // reaches no test". The contract does carry `depth-limit`, but a CI author
+    // reads the exit code.
+    //
+    // So a *passing* depth-bounded gate is re-asked with the bound lifted and
+    // everything else — including any confidence floor — identical. Only when
+    // that finds tests is the pass a truncation artifact; a bound that changed
+    // nothing leaves the honest exit 0 alone. Same shape and cost as the
+    // clause-(b) counterfactual above, and gated the same way, so only a passing
+    // depth-bounded gate pays for it.
+    let depth_truncated = if args.assert_empty && filtered_count == 0 && args.max_depth.is_some() {
+        cgx_query::impacted_tests(&answer.view, &answer.changed, &depth_lifted_walker(&args))
+            .tests
+            .len()
+    } else {
+        0
+    };
+
+    let degenerate = answer.degenerate;
+    let degenerate_reason = answer.degenerate_reason;
+    let degenerate_error = || {
+        CliError::new(
+            ExitCode::Vacuous,
+            format!(
+                "{}; the empty result is vacuous, not a clean bill of health",
+                degenerate_reason
+                    .clone()
+                    .unwrap_or_else(|| "no supported language in the changed set".to_string())
+            ),
+        )
+    };
+
+    match emit(
+        IMPACTED_SUBCOMMAND,
+        &args,
+        ResultSet::Neighbors {
+            results: answer.tests.tests,
+            forest: Some(forest),
+        },
+        any_symbol_matched,
+        unfiltered_count,
+        answer.contract,
+    ) {
+        Ok(()) => {}
+        // A usage error (exit 2) or a fired assertion (exit 1) is about the
+        // invocation, not about how much of the answer is trustworthy: it wins.
+        Err(e) if e.code != ExitCode::Vacuous => return Err(e),
+        // Both are exit 4. `emit`'s generic "assertion passed vacuously" says
+        // nothing a reader can act on, while the degenerate reason names the
+        // cause — the unanalysed language, or the file that yielded no symbols.
+        // Adding `--assert-empty` must not cost the user that sentence.
+        Err(e) => return Err(if degenerate { degenerate_error() } else { e }),
+    }
+
+    if degenerate {
+        return Err(degenerate_error());
+    }
+    if depth_truncated > 0 {
+        let bound = args.max_depth.unwrap_or_default();
+        let plural = if depth_truncated == 1 { "" } else { "s" };
+        let reason = format!(
+            "--depth {bound} truncated the only route to {depth_truncated} impacted test{plural}"
+        );
+        if args.allow_vacuous {
+            eprintln!(
+                "warning: --assert-empty passed vacuously ({reason}); allowed by --allow-vacuous"
+            );
+        } else {
+            return Err(CliError::new(
+                ExitCode::Vacuous,
+                format!(
+                    "{reason}; the empty result is an artifact of the bound, not a clean bill \
+                     of health (drop --depth, or pass --allow-vacuous to accept a bounded answer)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The pruned witness sub-graph the human forest renders: only the nodes that lie
+/// on some reported test's witness chain, rooted at the changed symbols that
+/// actually reached a test. The forest therefore reads change → … → test.
+///
+/// Edges are in the [`Subgraph`] traversal orientation: `src` is the node the
+/// backward walk expanded *from* (one hop nearer the change) and `dst` the caller
+/// it reached, so a node's forest children are its callers.
+///
+/// A test that is **itself** in the changed set is reported at depth 0 with the
+/// self-identifying `changed_symbol_marker` `via` and a single-element chain. It
+/// contributes a root and no edge — skipping it here is what stops the forest
+/// drawing a self-loop for a row whose justification is "the change is inside
+/// you", not "you call the change".
+fn witness_subgraph(answer: &cgx_diff::impacted::Answer, filter: &EdgeFilter) -> Subgraph {
+    let mut roots: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+    let mut nodes: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+    // Keyed by the node pair so a segment shared by two tests yields one edge;
+    // `BTreeMap` order is the `(src, dst)` order the subgraph contract wants.
+    let mut edges: std::collections::BTreeMap<(NodeId, NodeId), EdgeRec> =
+        std::collections::BTreeMap::new();
+
+    for (test, witness) in answer.tests.tests.iter().zip(&answer.tests.witnesses) {
+        roots.insert(witness.root);
+        nodes.extend(witness.chain.iter().copied());
+        if cgx_query::impacted::is_changed_symbol_marker(&test.via) {
+            continue;
+        }
+        // `chain` runs test → … → root, so within a window the *second* element
+        // is the one nearer the root — the node the walk expanded from.
+        for hop in witness.chain.windows(2) {
+            let (dst, src) = (hop[0], hop[1]);
+            edges
+                .entry((src, dst))
+                .or_insert_with(|| induced_edge(&answer.view, filter, src, dst));
+        }
+    }
+
+    Subgraph {
+        roots: roots.into_iter().collect(),
+        nodes: nodes.into_iter().collect(),
+        edges: edges.into_values().collect(),
+    }
+}
+
+/// The graph edge behind one witness hop, chosen by lowest edge id so parallel
+/// edges never let neighbor iteration order reach the output (AR-10).
+///
+/// A containment-lift hop has no edge at all: the walk crossed from a closure
+/// body to its lexically enclosing function, which is exactly the step
+/// `impacted-closure-containment-lift` discloses as an over-approximation. It
+/// renders as a synthetic `possible` link — the tier the lift clamps the row to —
+/// rather than being dropped, which would orphan the test from its root.
+fn induced_edge(view: &GraphView, filter: &EdgeFilter, src: NodeId, dst: NodeId) -> EdgeRec {
+    view.neighbors(src, Direction::Backward, filter)
+        .filter(|er| er.peer == dst)
+        .min_by_key(|er| er.edge.id)
+        .map(|er| EdgeRec {
+            src,
+            dst,
+            edge_id: er.edge.id,
+            condition: er.edge.condition,
+            confidence: er.edge.confidence,
+        })
+        .unwrap_or(EdgeRec {
+            src,
+            dst,
+            edge_id: EdgeId(u32::MAX),
+            condition: EdgeCondition::Always,
+            confidence: Confidence::Possible,
+        })
 }
 
 /// `cgx query '<cql>'` (P8): run a Layer-2 CQL query and render its result table.
@@ -2013,6 +2331,32 @@ fn build_walker(args: &QueryArgs) -> PathWalker {
         max_depth: args.max_depth,
         max_paths: None,
         max_steps: None,
+    }
+}
+
+/// [`build_walker`] with the confidence floor lifted: the ADR-08 clause-(b)
+/// counterfactual, "what this query returns with the confidence/edge-condition
+/// filters removed".
+///
+/// `--depth` is deliberately preserved. A depth bound is not a confidence or
+/// edge-condition filter — it narrows the question rather than discarding
+/// candidates the question admits, and the contract reports it separately as
+/// `depth-limit`.
+fn unfiltered_walker(args: &QueryArgs) -> PathWalker {
+    PathWalker {
+        filter: EdgeFilter::calls(),
+        ..build_walker(args)
+    }
+}
+
+/// [`build_walker`] with the depth bound lifted and every other filter left in
+/// place: "what would this same query return if `--depth` were not narrowing
+/// it". Used by `impacted-tests` to tell a genuinely empty `--assert-empty` pass
+/// from one the depth bound manufactured.
+fn depth_lifted_walker(args: &QueryArgs) -> PathWalker {
+    PathWalker {
+        max_depth: None,
+        ..build_walker(args)
     }
 }
 

@@ -1,6 +1,6 @@
 # cgx CLI — Command Reference
 
-cgx provides 16 subcommands organised into six groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index.
+cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
 
 ## Commands
 
@@ -37,6 +37,12 @@ cgx provides 16 subcommands organised into six groups. Most read from a `.cgx/` 
 | `cgx symbols` | Rank symbols by degree, with a per-symbol edge breakdown | [symbols.md](symbols.md) |
 | `cgx unused` | Symbols not reachable from any indexed entrypoint | [unused.md](unused.md) |
 | `cgx coupling` | Which files historically change together across a commit range | [coupling.md](coupling.md) |
+
+### Change impact
+
+| Command | Purpose | Reference |
+|---------|---------|-----------|
+| `cgx impacted-tests` | Test entrypoints whose call graph reaches a symbol changed between two refs, or in the working tree | [impacted-tests.md](impacted-tests.md) |
 
 ### Query
 
@@ -90,6 +96,8 @@ Not every command carries both, and which it carries follows from what it comput
 ## Reproducing the examples
 
 All command reference examples query the same corpus: **the cgx worktree itself**, indexed at its root. That covers the crate sources under `crates/` and both language fixtures under `fixtures/` in one graph, which is what the shown output was captured from — file paths in every example are worktree-relative (`fixtures/rust-sample/src/conditions.rs:42`, `crates/cgx-cli/src/forest.rs:345`).
+
+One page is an exception: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so that page builds throwaway repositories from the fixture trees and documents the setup itself.
 
 **Index the corpus** (run once, from the worktree root):
 

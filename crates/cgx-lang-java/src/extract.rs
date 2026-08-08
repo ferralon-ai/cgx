@@ -1040,7 +1040,12 @@ impl<'a> Builder<'a> {
     fn record_entrypoints(&mut self, node: Node<'_>, name: &str, fqn: &str) {
         let kind = if name == "main" && has_modifier(node, "static") {
             Some(EntrypointKind::Main)
-        } else if self.annotation_names(node).iter().any(|a| a == "Test") || is_junit3_test(name) {
+        } else if self
+            .annotation_names(node)
+            .iter()
+            .any(|a| is_test_annotation(a))
+            || is_junit3_test(name)
+        {
             Some(EntrypointKind::Test)
         } else {
             None
@@ -1661,6 +1666,32 @@ fn vis_from_modifiers(node: Node<'_>) -> Visibility {
 /// JUnit3 name-based test convention: an instance method whose name starts with
 /// `test` followed by an uppercase letter (`testFoo`). The analogue of Go's
 /// name-based `TestXxx` detection.
+/// Whether a method-level annotation declares a test.
+///
+/// JUnit 5 spreads test declaration across five annotations and cgx recognised
+/// one, so a `@ParameterizedTest` — standard in any JUnit 5 suite — produced no
+/// `EntrypointKind::Test` at all.
+///
+/// A literal set rather than the Rust adapter's shape rule, and TestNG is the
+/// reason: `@BeforeTest` and `@AfterTest` are *lifecycle* annotations that end
+/// in `Test` and declare no test. An `ends_with("Test")` rule would stamp them
+/// as entrypoints, and `unused` (`cgx-query/src/engine.rs:291`) roots at every
+/// entrypoint, so each false positive suppresses a real dead-code finding.
+///
+/// [`Ex::annotation_names`] has already reduced
+/// `org.junit.jupiter.api.ParameterizedTest` to its last `.` segment, so the
+/// imported and fully-qualified forms arrive here identically.
+///
+/// Still not recognised, and still named on the contract: TestNG's class-level
+/// `@Test` (a structural change — the annotation sits on the type and every
+/// public method inherits it), and JUnit 4's experimental `@Theory`.
+fn is_test_annotation(name: &str) -> bool {
+    matches!(
+        name,
+        "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory" | "TestTemplate"
+    )
+}
+
 fn is_junit3_test(name: &str) -> bool {
     name.strip_prefix("test")
         .and_then(|rest| rest.chars().next())

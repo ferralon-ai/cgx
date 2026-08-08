@@ -9,14 +9,17 @@
 //! Every result surfaces confidence (GM-5) and edge-condition context (GM-3);
 //! path-relative transience (GM-4) is computed per walk by the [`PathWalker`].
 
-use cgx_core::{Confidence, NodeId, SymbolKind, SymbolPattern};
+use std::collections::{BTreeMap, BTreeSet};
+
+use cgx_core::{Confidence, EntrypointKind, NodeId, SymbolKind, SymbolPattern};
 
 use crate::filter::{Direction, EdgeFilter};
+use crate::impacted::{ImpactedTests, ImpactedWitness};
 use crate::result::{
     ExplainEdge, Explanation, NeighborResult, PathResult, PathSet, PathStep, ReachResult,
 };
 use crate::view::{GraphView, ResolveError};
-use crate::walk::{PathWalker, WalkStep};
+use crate::walk::{Discovered, PathWalker, WalkStep};
 
 /// Q-1 `callers`: symbols that (transitively, to the walker's depth) call `target`.
 ///
@@ -389,4 +392,216 @@ fn result_key(node: &cgx_core::NodeRecord) -> (&str, u32, &str) {
 /// sequence (stable and independent of discovery order).
 fn path_key(p: &PathResult) -> (usize, Vec<u32>) {
     (p.hops(), p.node_ids().into_iter().map(|i| i.0).collect())
+}
+
+/// `impacted-tests`: the test entrypoints whose call graph reaches any changed
+/// symbol. One multi-root reverse (`Backward`) frontier walk with a
+/// closure-containment lift, filtered to
+/// `entrypoint_kind == Some(EntrypointKind::Test)`. Ordered by
+/// `(file, line_start, fqn)` — the same IF-8 key every other answer uses.
+///
+/// It lives here rather than in [`crate::impacted`] because [`result_key`] is
+/// module-private and is the crate's determinism contract.
+///
+/// # Root order cannot reach the answer
+///
+/// The root order is load-bearing beyond row order: with the
+/// already-walked-root skip below, *which root expands first* decides each
+/// node's discovery edge, hence its reported `depth`, `confidence` and witness
+/// chain — and the `(file, line_start, fqn)` sort would hide the difference. So
+/// `changed` is sorted and deduped **here** rather than trusted to arrive that
+/// way: a caller that built its set from a `HashSet` would otherwise be
+/// non-deterministic in the row *contents*, silently.
+///
+/// # Cost
+///
+/// `k' × O(V+E)` traversal, where `k'` ≤ `|changed|` is the number of roots
+/// actually expanded, plus `O(V log V)` for the FQN index and `O(Σ depth)` for
+/// the witness chains. No `shortest_path`, no path enumeration, no
+/// `DerivesFrom`-widened filter — the three ways `path_diff`'s cost cliff comes
+/// back.
+pub fn impacted_tests(view: &GraphView, changed: &[NodeId], walker: &PathWalker) -> ImpactedTests {
+    let n = view.node_count();
+    let mut reached = vec![false; n];
+    // Reached by another root's backward BFS — the only condition under which a
+    // root's own expansion is redundant. A node pulled in by the containment
+    // lift does NOT qualify: nothing has enumerated its backward closure.
+    let mut walk_reached = vec![false; n];
+    let mut expanded = vec![false; n];
+    let mut via_of: Vec<Option<Discovered>> = vec![None; n];
+    let mut lift_from: Vec<Option<NodeId>> = vec![None; n];
+
+    // FQN → node id, lowest id winning a duplicate FQN. `BTreeMap` fed in
+    // canonical node order, so the lift target never depends on hash order.
+    let mut fqn_index: BTreeMap<&str, NodeId> = BTreeMap::new();
+    for node in view.nodes() {
+        fqn_index.entry(node.fqn.as_str()).or_insert(node.id);
+    }
+
+    let mut langs_in_play: BTreeSet<String> = BTreeSet::new();
+    let mut seeds: Vec<NodeId> = changed.iter().copied().filter(|r| r.index() < n).collect();
+    seeds.sort_unstable_by_key(|r| r.0);
+    seeds.dedup();
+    for &r in &seeds {
+        reached[r.index()] = true;
+        langs_in_play.insert(view.node(r).lang.clone());
+    }
+
+    // Skipping a root another root's walk already reached is sound only when the
+    // walk is unbounded: under `--depth N`, being reached at depth `d` leaves
+    // the root's own remaining `N - d` hops unexplored.
+    let skip_walked_roots = walker.max_depth.is_none();
+
+    let mut worklist = seeds.clone();
+    let mut round_new = seeds.clone();
+    loop {
+        for &r in &worklist {
+            let ri = r.index();
+            if ri >= n || expanded[ri] || (skip_walked_roots && walk_reached[ri]) {
+                continue;
+            }
+            expanded[ri] = true;
+            for d in walker.bfs(view, r, Direction::Backward) {
+                let node = d.node;
+                let di = node.index();
+                if di >= n || reached[di] {
+                    continue;
+                }
+                reached[di] = true;
+                walk_reached[di] = true;
+                via_of[di] = Some(d);
+                round_new.push(node);
+            }
+        }
+
+        // The containment lift: every reached `Lambda` pulls in its lexically
+        // enclosing named callable. A fixpoint, not one pass — a lambda's owner
+        // may itself only be called from inside another lambda.
+        round_new.sort_unstable_by_key(|id| id.0);
+        let mut next: BTreeSet<NodeId> = BTreeSet::new();
+        for &x in &round_new {
+            let node = view.node(x);
+            if node.kind != SymbolKind::Lambda {
+                continue;
+            }
+            let Some(owner) = crate::impacted::lambda_owner_fqn(&node.fqn)
+                .and_then(|fqn| fqn_index.get(fqn).copied())
+            else {
+                continue;
+            };
+            let oi = owner.index();
+            if oi >= n || reached[oi] {
+                continue;
+            }
+            reached[oi] = true;
+            lift_from[oi] = Some(x);
+            next.insert(owner);
+        }
+        if next.is_empty() {
+            break;
+        }
+        worklist = next.into_iter().collect();
+        round_new = worklist.clone();
+    }
+
+    let mut rows: Vec<(NeighborResult, ImpactedWitness)> = Vec::new();
+    for node in view.nodes() {
+        let i = node.id.index();
+        if i >= n || !reached[i] || node.entrypoint_kind != Some(EntrypointKind::Test) {
+            continue;
+        }
+
+        // Witness chain, reconstructed from the one BFS. On a `Backward` walk
+        // `neighbors` sets `peer = edge.src`, so the discovered node IS the edge
+        // source and its predecessor toward the root is `via.dst`.
+        let mut chain = vec![node.id];
+        let mut min_confidence_on_path = Confidence::Certain;
+        let mut via_containment_lift = false;
+        let mut cur = node.id;
+        while chain.len() <= n {
+            let ci = cur.index();
+            if let Some(lambda) = lift_from[ci] {
+                via_containment_lift = true;
+                chain.push(lambda);
+                cur = lambda;
+                continue;
+            }
+            let Some(d) = &via_of[ci] else { break };
+            min_confidence_on_path = min_confidence_on_path.weakest(d.via.confidence);
+            chain.push(d.via.dst);
+            cur = d.via.dst;
+        }
+        if via_containment_lift {
+            // Containment is not invocation (§2): clamp, never claim better.
+            min_confidence_on_path = min_confidence_on_path.weakest(Confidence::Possible);
+        }
+
+        // A lifted row has no discovery edge of its own; it inherits the one
+        // that reached the lambda. A row for a test that is *itself* in the
+        // changed set has none at all — see `changed_symbol_marker`.
+        let (via, exception_transient) = {
+            let mut c = node.id;
+            loop {
+                let ci = c.index();
+                if let Some(d) = &via_of[ci] {
+                    break (d.via.clone(), d.exception_transient);
+                }
+                match lift_from[ci] {
+                    Some(lambda) => c = lambda,
+                    None => break (crate::impacted::changed_symbol_marker(node.id), false),
+                }
+            }
+        };
+
+        // The witness root is READ OFF THE CHAIN, never stamped forward from the
+        // root whose `walker.bfs` happened to discover this node. The seeds are
+        // all marked `reached` before any expansion, so when a second seed `S`
+        // lies on the path from the expanding root `R` to this test, the
+        // bookkeeping loop skips `S` (already reached) while `bfs` walks straight
+        // past it. A forward stamp then says `R` while the backward
+        // reconstruction above terminates at `S` — `root ∉ chain`, and every
+        // consumer that treats the pair as one structure breaks (the human
+        // forest silently dropped rows, or panicked indexing a root that is in
+        // `Subgraph.roots` but not in `Subgraph.nodes`).
+        //
+        // `chain` is seeded with `node.id` and only ever grown, and the walk
+        // above stops exactly at a node with neither a `via_of` nor a
+        // `lift_from` entry — which, since every non-seed reached node gets one
+        // or the other, is a seed. So `chain.last()` is a changed symbol, is in
+        // `chain` by construction, and the old `debug_assert_eq!` here is now a
+        // tautology rather than a check that a release build compiles out.
+        let root = *chain
+            .last()
+            .expect("witness chain is seeded with the test node and never emptied");
+        rows.push((
+            NeighborResult {
+                node: node.clone(),
+                depth: (chain.len() - 1) as u32,
+                condition: via.condition,
+                confidence: via.confidence,
+                via,
+                min_confidence_on_path,
+                exception_transient,
+            },
+            ImpactedWitness {
+                root,
+                chain,
+                via_containment_lift,
+            },
+        ));
+    }
+
+    rows.sort_by(|a, b| result_key(&a.0.node).cmp(&result_key(&b.0.node)));
+    let lifted = rows.iter().filter(|(_, w)| w.via_containment_lift).count();
+    let (tests, witnesses): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+
+    ImpactedTests {
+        tests,
+        witnesses,
+        changed_symbols: seeds.len(),
+        file_granular_only: 0,
+        lifted,
+        langs_in_play,
+        reached,
+    }
 }

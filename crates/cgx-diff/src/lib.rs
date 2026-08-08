@@ -45,6 +45,7 @@ mod coupling;
 mod diff;
 mod error;
 mod filter;
+pub mod impacted;
 mod path_diff;
 
 pub use age::{BlameRepo, EdgeAge, Warning};
@@ -52,6 +53,7 @@ pub use coupling::{coupling, CouplingOptions, CouplingPair, CouplingReport, MODE
 pub use diff::{diff_graphs, ChangedEdge, DiffEdge, DiffNode, EdgeChanges, GraphDiff};
 pub use error::{DiffError, Result};
 pub use filter::{BucketSelect, DiffFilter};
+pub use impacted::{run as impacted_tests, Answer, Request, Sides};
 pub use path_diff::{path_diff_graphs, path_diff_graphs_bounded, AddedPath, PathDiff};
 
 use cgx_store::{FactStore, GraphId, LinkedGraph, TreeOid};

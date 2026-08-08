@@ -218,3 +218,55 @@ fn record_components_are_field_defs() {
     assert_eq!(x.kind, SymbolKind::Field);
     assert!(facts.defs.iter().any(|d| d.fqn == "app::Point::y"));
 }
+
+// --- the widened test-annotation set -----------------------------------------
+
+/// JUnit 5 declares tests through five annotations, not one. Recognising only
+/// `@Test` dropped every `@ParameterizedTest` in a suite — the standard way to
+/// write a table-driven test in Java — from `impacted-tests` and from the
+/// `unused` entrypoint roots alike.
+#[test]
+fn every_junit5_test_declaring_annotation_is_a_test_entrypoint() {
+    for annotation in [
+        "@Test",
+        "@ParameterizedTest",
+        "@RepeatedTest(3)",
+        "@TestFactory",
+        "@TestTemplate",
+        "@org.junit.jupiter.api.ParameterizedTest",
+    ] {
+        let facts = extract(
+            "CTest.java",
+            &format!("{PKG}class CTest {{ {annotation} public void checksSomething() {{}} }}"),
+        );
+        assert!(
+            facts
+                .entrypoint_hints
+                .iter()
+                .any(|h| h.kind == EntrypointKind::Test
+                    && h.fqn.ends_with("::checksSomething")),
+            "{annotation} must declare a test"
+        );
+    }
+}
+
+/// Why Java gets an explicit set and not Rust's shape rule. TestNG's lifecycle
+/// annotations end in `Test` and declare no test; an `ends_with("Test")` rule
+/// would stamp them as entrypoints, and `unused` roots at every entrypoint, so
+/// each one would suppress a real dead-code finding.
+#[test]
+fn testng_lifecycle_annotations_ending_in_test_are_not_tests() {
+    for annotation in ["@BeforeTest", "@AfterTest", "@BeforeSuite", "@TestInstance"] {
+        let facts = extract(
+            "CTest.java",
+            &format!("{PKG}class CTest {{ {annotation} public void prepares() {{}} }}"),
+        );
+        assert!(
+            !facts
+                .entrypoint_hints
+                .iter()
+                .any(|h| h.kind == EntrypointKind::Test && h.fqn.ends_with("::prepares")),
+            "{annotation} declares no test"
+        );
+    }
+}

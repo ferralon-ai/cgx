@@ -1,6 +1,6 @@
 # cgx MCP Tools — Reference
 
-cgx exposes twelve MCP tools over a STDIO server. Start the server with:
+cgx exposes thirteen MCP tools over a STDIO server. Start the server with:
 
 ```bash
 cgx mcp
@@ -26,6 +26,7 @@ The registry is `tool_list()` in `crates/cgx-mcp/src/tools.rs`; the order below 
 | `flows_from` | Data-flow pedigree: the symbols a value derives from (its `DerivesFrom` sources) | [flows_from.md](flows_from.md) |
 | `graph_query` | Execute a CQL (Cypher-subset) query and return a result table; a `RETURN path` query yields a paths channel | [graph_query.md](graph_query.md) |
 | `coupling` | Which files historically change together over a commit range — committed git history only, no index | [coupling.md](coupling.md) |
+| `impacted_tests` | Test functions whose call graph reaches a symbol changed between two git refs, or in the working tree | [impacted_tests.md](impacted_tests.md) |
 
 Note the **underscore** spelling of `flows_to`, `flows_from` and `graph_query`. The equivalent CLI subcommands are `cgx flows-to`, `cgx flows-from` and `cgx query`.
 

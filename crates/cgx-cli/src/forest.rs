@@ -66,15 +66,26 @@ impl ForestData {
         mode: TreeMode,
         max_depth: Option<u32>,
     ) -> ForestData {
-        let nodes = subgraph
+        let nodes: HashMap<NodeId, NodeRecord> = subgraph
             .nodes
             .iter()
             .filter_map(|&id| view.try_node(id).map(|rec| (id, rec.clone())))
             .collect();
+        // A root that did not resolve into `nodes` — either absent from
+        // `subgraph.nodes` or absent from the view — would panic the renderer at
+        // `Forest::node`'s `&self.nodes[&id]`. Rendering a forest one root short
+        // is a degradation; crashing the process is not. Every caller is
+        // expected to hand over a `roots ⊆ nodes` subgraph, so this filter is a
+        // backstop, not a policy.
         ForestData {
             mode,
             max_depth,
-            roots: subgraph.roots.clone(),
+            roots: subgraph
+                .roots
+                .iter()
+                .copied()
+                .filter(|id| nodes.contains_key(id))
+                .collect(),
             nodes,
             edges: subgraph.edges.clone(),
         }

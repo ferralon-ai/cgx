@@ -29,19 +29,21 @@
 //! ## This module's stages
 //!
 //! This file landed in three surgical commits: the namespace + manifest
-//! foundation, then `interface-map` (#8, this commit), then
-//! `dependency-footprint` (#4).
+//! foundation, then `interface-map` (#8), then `dependency-footprint` (#4,
+//! this commit).
 
 use serde_json::{json, Value};
 
 use cgx_core::{Confidence, EdgeKind, NodeId, SymbolPattern};
 use cgx_doctor::DoctorReport;
-use cgx_query::{over_only, Direction, EdgeFilter, GraphView};
+use cgx_query::{callees, for_neighbors, over_only, Direction, EdgeFilter, GraphView, PathWalker};
+
+use crate::output::{condition_str, confidence_str, kind_str};
 
 /// Card tokens implemented so far. The single source of truth the CLI
 /// dispatch validates requests against — keeps the accepted-token list and
 /// the dispatch `match` from drifting apart.
-pub const IMPLEMENTED_CARDS: &[&str] = &["interface-map"];
+pub const IMPLEMENTED_CARDS: &[&str] = &["interface-map", "dependency-footprint"];
 
 /// Implemented cards addressable with **no** required symbol/selector — the
 /// set `cgx pack` (bare, no card token) assembles into the "full pack".
@@ -104,7 +106,7 @@ pub const CARD_REGISTRY: &[CardMeta] = &[
         tier: "light at low --depth, scales toward heavy",
         token_cost_estimate: "~150 tokens fixed + ~50 tokens/callee row; grows with --depth",
         reach_for: "what X transitively touches, before editing X",
-        status: "not yet implemented natively (planned this cycle)",
+        status: "implemented",
     },
     CardMeta {
         token: "reachability",
@@ -209,6 +211,125 @@ pub fn pack_document(doctor: &DoctorReport, card_docs: &[(&str, Value)]) -> Valu
     json!({
         "manifest": manifest(doctor),
         "cards": Value::Object(cards),
+    })
+}
+
+// --- #4 dependency-footprint -------------------------------------------------
+
+/// `cgx pack dependency-footprint <FQN> [--depth N] [--confidence <floor>]`:
+/// the forward-direction call-graph closure from `symbol` — the same
+/// primitive family as `callees` — wrapped with per-row confidence labels,
+/// the `approximation` envelope carried verbatim, and the `external_callees`
+/// path-filter judgment disclosed as such (spec §3).
+pub fn dependency_footprint(
+    view: &GraphView,
+    symbol: &str,
+    depth: u32,
+    confidence_floor: Option<Confidence>,
+) -> Value {
+    let anchor = match view.resolve_one(&SymbolPattern::fqn(symbol)) {
+        Ok(id) => id,
+        Err(_) => return unresolved_dependency_footprint(symbol, depth),
+    };
+
+    let mut filter = EdgeFilter::calls();
+    if let Some(c) = confidence_floor {
+        filter = filter.with_min_confidence(c);
+    }
+    let walker = PathWalker {
+        filter,
+        max_depth: Some(depth),
+        max_paths: None,
+        max_steps: None,
+    };
+    let results = callees(view, anchor, &walker);
+    let approximation = for_neighbors(view, &walker, anchor, Direction::Forward, &results);
+
+    let direct_callees = results.iter().filter(|r| r.depth == 1).count();
+    let external_callees = results
+        .iter()
+        .filter(|r| !is_first_party(&r.node.file))
+        .count();
+    let rows: Vec<Value> = results.iter().map(callee_row).collect();
+
+    json!({
+        "card": "dependency-footprint",
+        "symbol": symbol,
+        "resolved": true,
+        "depth": depth,
+        "approximation": serde_json::to_value(&approximation)
+            .expect("approximation contract serializes"),
+        "total_callees": results.len(),
+        "direct_callees": direct_callees,
+        "external_callees": external_callees,
+        "callees": rows,
+        "honesty": dependency_footprint_honesty(results.is_empty(), depth, confidence_floor),
+    })
+}
+
+fn callee_row(r: &cgx_query::NeighborResult) -> Value {
+    json!({
+        "fqn": r.node.fqn,
+        "file": r.node.file,
+        "line": r.node.line_start,
+        "kind": kind_str(r.node.kind),
+        "depth": r.depth,
+        "condition": condition_str(r.condition),
+        "confidence": confidence_str(r.confidence),
+    })
+}
+
+/// The default first-party ("internal") determination for `external_callees`
+/// — card #4's open design item (spec §7). `cgx pack` never resolves an
+/// out-of-repo callee to a node (Phase-1 resolution leaves genuinely external
+/// calls as an unresolved dangling ref, not a graph node — see
+/// `cgx_query::contract`'s `unresolved-external-calls` reason), so this rule
+/// exists mainly to stay correct as cross-crate/SCIP dependency edges are
+/// added: a row is internal iff its `file` (cgx's repo-relative path
+/// convention) stays inside the indexed workspace root — it is neither an
+/// absolute path (`/…`) nor does it escape via a `..` segment. This is a
+/// path-filter judgment, not a cgx semantic property (spec §3); the card
+/// states that explicitly via `honesty`, never lets a reader treat
+/// `external_callees` as a first-class classification.
+fn is_first_party(file: &str) -> bool {
+    !file.starts_with('/') && !file.split('/').any(|seg| seg == "..")
+}
+
+fn dependency_footprint_honesty(empty: bool, depth: u32, floor: Option<Confidence>) -> String {
+    let floor_txt = floor.map(confidence_str).unwrap_or("possible");
+    let mut s = format!(
+        "external_callees is a path-filter judgment (file falls outside the indexed \
+         workspace root), not a cgx semantic property; condition is the raw per-edge label \
+         (always/conditional/loop/exception/panic) — \"side-effecting\" is inferred by the \
+         reader, cgx does not classify it. depth={depth} is the traversal bound actually \
+         applied, even when an internal limit silently capped it."
+    );
+    if empty {
+        s.push_str(&format!(
+            " This symbol resolved, but the query returned zero rows at depth={depth}, \
+             confidence>={floor_txt} — that states what was checked, not the symbol's true \
+             dependency count or effect profile; it is not a claim of a dependency-free or \
+             side-effect-free body."
+        ));
+    }
+    s
+}
+
+fn unresolved_dependency_footprint(symbol: &str, depth: u32) -> Value {
+    json!({
+        "card": "dependency-footprint",
+        "symbol": symbol,
+        "resolved": false,
+        "error": format!("no symbol matched exact FQN `{symbol}` in the current index"),
+        "depth": depth,
+        "approximation": Value::Null,
+        "total_callees": 0,
+        "direct_callees": 0,
+        "external_callees": 0,
+        "callees": [],
+        "honesty": "the symbol did not resolve at all — this is NOT the same as a resolved \
+                     symbol with zero callees; re-check the FQN with `cgx search` and confirm \
+                     the index is current (`cgx doctor`)",
     })
 }
 
@@ -514,5 +635,109 @@ mod tests {
         let view = interface_map_view();
         let doc = interface_map(&view, InterfaceMapSelector::All);
         assert!(doc["row_limit_applied"].is_null());
+    }
+
+    fn call_edge(id: u32, src: u32, dst: u32, confidence: Confidence) -> EdgeRecord {
+        EdgeRecord {
+            id: EdgeId(id),
+            src: NodeId(src),
+            dst: NodeId(dst),
+            kind: EdgeKind::Calls,
+            condition: EdgeCondition::Always,
+            confidence,
+            tier: Tier::ScopeGraph,
+            rule: "test".to_string(),
+            site_id: None,
+            stmt_index: None,
+            cut_markers: cgx_core::CutMarkers::new(),
+            implicit: None,
+            candidate_group: None,
+            established_by: None,
+            cfg_condition: None,
+            macro_origin: None,
+            transform: None,
+        }
+    }
+
+    // a -> b -> c: a fully-certain forward closure.
+    fn dep_footprint_view() -> GraphView {
+        let nodes = vec![
+            node(0, "crate_a::a", SymbolKind::Function),
+            node(1, "crate_a::b", SymbolKind::Function),
+            node(2, "crate_a::c", SymbolKind::Function),
+        ];
+        let edges = vec![
+            call_edge(0, 0, 1, Confidence::Certain),
+            call_edge(1, 1, 2, Confidence::Certain),
+        ];
+        GraphView::new(nodes, edges, Vec::<Candidate>::new())
+    }
+
+    #[test]
+    fn dependency_footprint_schema_and_counts() {
+        let view = dep_footprint_view();
+        let doc = dependency_footprint(&view, "crate_a::a", 2, None);
+        assert_eq!(doc["card"], "dependency-footprint");
+        assert_eq!(doc["resolved"], true);
+        assert_eq!(doc["depth"], 2);
+        assert_eq!(doc["total_callees"], 2);
+        assert_eq!(doc["direct_callees"], 1);
+        assert_eq!(doc["external_callees"], 0);
+        assert_eq!(doc["callees"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dependency_footprint_every_row_carries_confidence() {
+        let view = dep_footprint_view();
+        let doc = dependency_footprint(&view, "crate_a::a", 2, None);
+        for row in doc["callees"].as_array().unwrap() {
+            assert!(row.get("confidence").is_some(), "row missing confidence: {row}");
+            assert!(row.get("condition").is_some(), "row missing condition: {row}");
+        }
+    }
+
+    #[test]
+    fn dependency_footprint_envelope_round_trips() {
+        let view = dep_footprint_view();
+        let doc = dependency_footprint(&view, "crate_a::a", 2, None);
+        assert_eq!(doc["approximation"]["direction"], "exact");
+    }
+
+    #[test]
+    fn dependency_footprint_depth_cap_is_disclosed() {
+        let view = dep_footprint_view();
+        let doc = dependency_footprint(&view, "crate_a::a", 1, None);
+        assert_eq!(doc["depth"], 1);
+        // Depth 1 stops at `b`; `c` is not reached.
+        assert_eq!(doc["total_callees"], 1);
+    }
+
+    #[test]
+    fn dependency_footprint_empty_result_is_not_worded_as_no_dependencies() {
+        let nodes = vec![node(0, "crate_a::leaf", SymbolKind::Function)];
+        let view = GraphView::new(nodes, Vec::new(), Vec::<Candidate>::new());
+        let doc = dependency_footprint(&view, "crate_a::leaf", 2, None);
+        assert_eq!(doc["resolved"], true);
+        assert_eq!(doc["total_callees"], 0);
+        let honesty = doc["honesty"].as_str().unwrap();
+        assert!(
+            honesty.contains("zero rows") && honesty.contains("checked"),
+            "empty-result text must state what was checked: {honesty}"
+        );
+        assert!(
+            !honesty.to_lowercase().contains("has no dependencies")
+                && !honesty.to_lowercase().contains("is side-effect-free"),
+            "must never assert absence as fact: {honesty}"
+        );
+    }
+
+    #[test]
+    fn dependency_footprint_unresolvable_fqn_is_labeled_not_crashed() {
+        let view = dep_footprint_view();
+        let doc = dependency_footprint(&view, "crate_a::does_not_exist", 2, None);
+        assert_eq!(doc["resolved"], false);
+        assert!(doc["error"].as_str().unwrap().contains("does_not_exist"));
+        assert_eq!(doc["total_callees"], 0);
+        assert_eq!(doc["callees"].as_array().unwrap().len(), 0);
     }
 }

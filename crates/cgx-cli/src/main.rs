@@ -1994,13 +1994,18 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
                 };
                 pack::interface_map(&view, selector)
             }
+            "dependency-footprint" => {
+                let symbol = args.symbol.as_deref().ok_or_else(|| {
+                    CliError::usage(
+                        "cgx pack dependency-footprint requires an FQN positional".to_string(),
+                    )
+                })?;
+                pack::dependency_footprint(&view, symbol, depth, args.confidence.map(Into::into))
+            }
             other => unreachable!("card token validated above: {other}"),
         };
         card_docs.push((token.as_str(), doc));
     }
-    // `dependency-footprint` (#4) lands in the next commit; `depth` is unused
-    // until then.
-    let _ = depth;
 
     let output_doc = if multi || bare_full_pack || args.onedoc {
         pack::pack_document(&doctor, &card_docs)

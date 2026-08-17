@@ -33,6 +33,7 @@ use cgx_cli::output::{
     render, render_coupling, render_explanation, render_path_walks, render_search, render_symbols,
     Format, ResultSet, TableData, IMPACTED_SUBCOMMAND,
 };
+use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
@@ -367,6 +368,55 @@ enum Command {
         #[command(flatten)]
         query: QueryArgs,
     },
+    /// Generate an agent-context pack: addressable JSON "cards" over the graph,
+    /// each wrapping an existing cgx primitive in-process, plus a
+    /// `manifest.json`-equivalent graph-honesty header. Implemented cards this
+    /// release: `interface-map` (#8), `dependency-footprint` (#4).
+    Pack {
+        /// Card token, or a comma-separated list of tokens (a list requires
+        /// `--onedoc`). Implemented: `interface-map`, `dependency-footprint`.
+        /// Omitted → the full pack: every implemented card that needs no
+        /// address (this release: `interface-map`), plus the manifest header.
+        cards: Option<String>,
+        /// The exact FQN — copied verbatim from `cgx search`/`cgx symbols`
+        /// output, no glob/short-name matching — that the `dependency-footprint`
+        /// card resolves against. Required (and meaningful) only when `cards`
+        /// names exactly `dependency-footprint`.
+        symbol: Option<String>,
+        /// `dependency-footprint`: forward-traversal depth (default: cgx's own
+        /// forest default — `DEFAULT_TREE_DEPTH`, currently 2).
+        #[arg(long = "depth", value_name = "N")]
+        pack_depth: Option<u32>,
+        /// `dependency-footprint`: minimum confidence floor for traversed edges.
+        #[arg(long, value_enum)]
+        confidence: Option<ConfidenceArg>,
+        /// `interface-map`: implementers of one interface. Mutually exclusive
+        /// with `--type`.
+        #[arg(long, value_name = "FQN")]
+        interface: Option<String>,
+        /// `interface-map`: interfaces satisfied by one type. Mutually
+        /// exclusive with `--interface`.
+        #[arg(long = "type", value_name = "FQN")]
+        type_: Option<String>,
+        /// Merge a multi-card request into one document that still carries the
+        /// manifest header. Required whenever `cards` names more than one
+        /// token; a no-op (still wraps) on a single-card request.
+        #[arg(long)]
+        onedoc: bool,
+        /// Machine-readable JSON output — the only format this release;
+        /// accepted for symmetry with the contract's per-card flag surface.
+        #[arg(long)]
+        json: bool,
+        /// Write the pack document to a file instead of stdout.
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Do not auto-index when the `.cgx/` store is missing or stale.
+        #[arg(long)]
+        no_auto_index: bool,
+    },
 }
 
 /// The subset of [`SymbolKind`] a user can filter `unused` by from the CLI.
@@ -678,6 +728,31 @@ fn run(command: Command) -> Result<(), CliError> {
             no_merge_base,
             query,
         } => run_impacted_tests(base, head, uncommitted, no_merge_base, query),
+        Command::Pack {
+            cards,
+            symbol,
+            pack_depth,
+            confidence,
+            interface,
+            type_,
+            onedoc,
+            json,
+            output,
+            repo,
+            no_auto_index,
+        } => run_pack(PackArgs {
+            cards,
+            symbol,
+            pack_depth,
+            confidence,
+            interface,
+            type_,
+            onedoc,
+            json,
+            output,
+            repo,
+            no_auto_index,
+        }),
     }
 }
 
@@ -1817,6 +1892,118 @@ fn run_doctor(repo: Option<PathBuf>, format: Format) -> Result<(), CliError> {
                 .map_err(|e| CliError::graph(format!("rendering doctor json: {e}")))?
         ),
         _ => println!("{}", cgx_doctor::render_text(&rep)),
+    }
+    Ok(())
+}
+
+/// Parsed `cgx pack` invocation.
+struct PackArgs {
+    cards: Option<String>,
+    symbol: Option<String>,
+    pack_depth: Option<u32>,
+    confidence: Option<ConfidenceArg>,
+    interface: Option<String>,
+    type_: Option<String>,
+    onedoc: bool,
+    json: bool,
+    output: Option<PathBuf>,
+    repo: Option<PathBuf>,
+    no_auto_index: bool,
+}
+
+/// `cgx pack`: the CLI wiring around `cgx_cli::pack`'s pure card-construction
+/// functions — request validation, repo/index resolution, and the
+/// stdout/`-o` write. The card logic itself lives in the library so it is
+/// testable without spinning up the binary (see `cgx_cli::pack`'s own tests).
+fn run_pack(args: PackArgs) -> Result<(), CliError> {
+    // `--json` is accepted for symmetry with the contract's per-card flag
+    // surface (spec: "`--json` is the default output"); JSON is the only
+    // format this release emits, so the flag is a no-op either way.
+    let _ = args.json;
+
+    if args.interface.is_some() && args.type_.is_some() {
+        return Err(CliError::usage(
+            "cgx pack interface-map: pass --interface or --type, not both".to_string(),
+        ));
+    }
+
+    let bare_full_pack = args.cards.is_none();
+    let requested: Vec<String> = match &args.cards {
+        None => pack::ADDRESSLESS_IMPLEMENTED_CARDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+    };
+    // A bare pack over zero addressless implemented cards is a legitimate
+    // (if minimal) manifest-only answer, not a usage error; only an
+    // explicitly-supplied empty/whitespace-only list (`cgx pack ""`) is one.
+    if requested.is_empty() && !bare_full_pack {
+        return Err(CliError::usage("cgx pack: empty card list".to_string()));
+    }
+    for token in &requested {
+        if !pack::IMPLEMENTED_CARDS.contains(&token.as_str()) {
+            return Err(CliError::usage(format!(
+                "cgx pack: unknown or not-yet-implemented card `{token}` — implemented this \
+                 release: {}",
+                pack::IMPLEMENTED_CARDS.join(", ")
+            )));
+        }
+    }
+    let multi = requested.len() > 1;
+    if multi && !args.onedoc {
+        return Err(CliError::usage(
+            "cgx pack: requesting more than one card requires --onedoc".to_string(),
+        ));
+    }
+    let wants_dependency_footprint = requested.iter().any(|t| t == "dependency-footprint");
+    if wants_dependency_footprint && (multi || bare_full_pack) {
+        return Err(CliError::usage(
+            "cgx pack: `dependency-footprint` requires its own single-card invocation with an \
+             FQN positional (`cgx pack dependency-footprint <FQN>`) — it needs an address, so \
+             it cannot join a multi-card list or the addressless full pack"
+                .to_string(),
+        ));
+    }
+
+    let repo_root = resolve_repo(args.repo.clone())?;
+    if !args.no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    let view = load_view(&repo_root)?;
+    let ptr = read_pointer(&repo_root)?;
+    let store = open_store(&repo_root)?;
+    let doctor = cgx_doctor::report(&store, GraphId(ptr.graph_id))
+        .map_err(|e| CliError::graph(format!("computing doctor report: {e}")))?;
+
+    let depth = args.pack_depth.unwrap_or(DEFAULT_TREE_DEPTH);
+
+    // No card token is implemented yet in this foundation stage: every
+    // request was already rejected above by the `IMPLEMENTED_CARDS` gate
+    // (currently empty), or resolved to the empty addressless bundle, so
+    // `requested` is always empty here. Card dispatch arms land with each
+    // card.
+    let card_docs: Vec<(&str, serde_json::Value)> = Vec::new();
+    debug_assert!(requested.is_empty());
+    let _ = depth;
+
+    let output_doc = if multi || bare_full_pack || args.onedoc {
+        pack::pack_document(&doctor, &card_docs)
+    } else {
+        card_docs.into_iter().next().expect("exactly one card requested").1
+    };
+
+    let mut text =
+        serde_json::to_string_pretty(&output_doc).expect("pack document serializes");
+    text.push('\n');
+    match &args.output {
+        Some(path) => std::fs::write(path, &text)
+            .map_err(|e| CliError::graph(format!("writing {path:?}: {e}")))?,
+        None => print!("{text}"),
     }
     Ok(())
 }

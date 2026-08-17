@@ -1982,13 +1982,24 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
 
     let depth = args.pack_depth.unwrap_or(DEFAULT_TREE_DEPTH);
 
-    // No card token is implemented yet in this foundation stage: every
-    // request was already rejected above by the `IMPLEMENTED_CARDS` gate
-    // (currently empty), or resolved to the empty addressless bundle, so
-    // `requested` is always empty here. Card dispatch arms land with each
-    // card.
-    let card_docs: Vec<(&str, serde_json::Value)> = Vec::new();
-    debug_assert!(requested.is_empty());
+    let mut card_docs: Vec<(&str, serde_json::Value)> = Vec::with_capacity(requested.len());
+    for token in &requested {
+        let doc = match token.as_str() {
+            "interface-map" => {
+                let selector = match (&args.interface, &args.type_) {
+                    (Some(f), None) => pack::InterfaceMapSelector::Interface(f),
+                    (None, Some(f)) => pack::InterfaceMapSelector::Type(f),
+                    (None, None) => pack::InterfaceMapSelector::All,
+                    (Some(_), Some(_)) => unreachable!("rejected above"),
+                };
+                pack::interface_map(&view, selector)
+            }
+            other => unreachable!("card token validated above: {other}"),
+        };
+        card_docs.push((token.as_str(), doc));
+    }
+    // `dependency-footprint` (#4) lands in the next commit; `depth` is unused
+    // until then.
     let _ = depth;
 
     let output_doc = if multi || bare_full_pack || args.onedoc {

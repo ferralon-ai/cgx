@@ -75,7 +75,7 @@ pub use result::{
     ExplainEdge, Explanation, NeighborResult, PathResult, PathSet, PathStep, ReachResult,
     TruncationReason,
 };
-pub use view::{EdgeRef, GraphView, ResolveError};
+pub use view::{EdgeRef, GraphView, ResolveError, SelectResolution};
 pub use walk::{
     Discovered, EdgeRec, PathEnumeration, PathWalker, Subgraph, WalkStep, DEFAULT_MAX_PATHS,
     DEFAULT_MAX_STEPS,

@@ -9,6 +9,7 @@ description = "cgx Layer-1 query engine: a GraphView over a linked graph plus th
 
 [dependencies]
 cgx-core.workspace = true
+cgx-select = { path = "../cgx-select" }
 regex = { workspace = true }
 serde = { workspace = true }
 

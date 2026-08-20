@@ -193,6 +193,7 @@ dependencies = [
  "cgx-index",
  "cgx-mcp",
  "cgx-query",
+ "cgx-select",
  "cgx-store",
  "clap",
  "predicates",
@@ -217,6 +218,7 @@ version = "0.3.0"
 dependencies = [
  "cgx-core",
  "cgx-query",
+ "cgx-select",
  "proptest",
 ]
 
@@ -362,6 +364,7 @@ name = "cgx-query"
 version = "0.3.0"
 dependencies = [
  "cgx-core",
+ "cgx-select",
  "cgx-store",
  "regex",
  "serde",

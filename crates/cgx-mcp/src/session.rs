@@ -44,7 +44,7 @@ use cgx_index::{
     default_registry, index_path, index_workdir, manifest_digest, IndexOpts, Repo, SourceFile,
 };
 use cgx_query::{FreshnessEnvelope, GraphView};
-use cgx_store::{FactStore, SqliteStore};
+use cgx_store::{FactStore, SqliteStore, TreeOid};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -116,7 +116,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     if !include_dirty {
         let outcome = index_path(root, &registry, &mut store, &opts)
             .map_err(|e| ToolError::index(format!("indexing committed tree: {e}")))?;
-        let view = load_view(&store, outcome.graph_id)?;
+        let view = load_view(&store, &TreeOid::new(outcome.graph_key.clone()))?;
         // `HEAD` is resolved independently rather than reusing the graph key, so
         // `matches_head` is derived from two separately established facts instead
         // of being true by construction. The working tree was never inspected under
@@ -158,7 +158,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
 
     let outcome = index_workdir(root, &workdir, &registry, &mut store, &opts)
         .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
-    let view = load_view(&store, outcome.graph_id)?;
+    let view = load_view(&store, &TreeOid::new(outcome.graph_key.clone()))?;
 
     // The envelope's divergence count comes from the *same* function the CLI uses,
     // so `freshness.dirty_files` answers the same question on both surfaces. It is
@@ -274,9 +274,9 @@ fn dataflow_default(root: &Path) -> bool {
 }
 
 /// Read a stored graph back into a queryable [`GraphView`].
-fn load_view(store: &SqliteStore, graph_id: cgx_store::GraphId) -> Result<GraphView, ToolError> {
+fn load_view(store: &impl FactStore, tree: &TreeOid) -> Result<GraphView, ToolError> {
     let graph = store
-        .read_graph(graph_id)
+        .read_graph(tree)
         .map_err(|e| ToolError::index(format!("reading graph: {e}")))?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }

@@ -39,9 +39,8 @@ const GITIGNORE_BODY: &str = "*\n";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexPointer {
     /// The Layer-2 key the graph was stored under (tree OID or `workdir:<digest>`).
+    /// This is the read key: `FactStore::read_graph` is keyed by it directly.
     pub graph_key: String,
-    /// The stored graph's id; passed to `FactStore::read_graph`.
-    pub graph_id: i64,
     /// Total files seen by the pipeline (supported + unsupported), from
     /// `IndexStats`. `#[serde(default)]` so a pointer written by a pre-existing
     /// `.cgx/HEAD.json` (before this field existed) still parses; `cgx doctor`
@@ -162,7 +161,6 @@ mod tests {
             root,
             &IndexPointer {
                 graph_key: "deadbeef".into(),
-                graph_id: 1,
                 total_files: None,
                 unsupported_files: None,
             },

@@ -46,7 +46,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let index_elapsed = t_index.elapsed();
 
     let graph = store
-        .read_graph(outcome.graph_id)
+        .read_graph(&cgx_store::TreeOid::new(outcome.graph_key.clone()))
         .context("reading indexed graph back")?;
     let (node_count, edge_count) = (graph.nodes.len(), graph.edges.len());
     let view = GraphView::new(graph.nodes, graph.edges, graph.candidates);

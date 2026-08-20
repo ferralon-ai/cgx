@@ -25,7 +25,7 @@ fn workdir_index_includes_uncommitted_file() {
     );
 
     let out = index_workdir(&repo, &repo, &registry, &mut store, &Default::default()).unwrap();
-    let g = read_graph(&store, out.graph_id);
+    let g = read_graph(&store, &out.graph_key);
     let idx = GraphIndex::new(&g);
     assert!(
         idx.has_node("rust_sample::uncommitted::brand_new_entrypoint"),

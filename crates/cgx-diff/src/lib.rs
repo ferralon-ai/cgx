@@ -56,31 +56,32 @@ pub use filter::{BucketSelect, DiffFilter};
 pub use impacted::{run as impacted_tests, Answer, Request, Sides};
 pub use path_diff::{path_diff_graphs, path_diff_graphs_bounded, AddedPath, PathDiff};
 
-use cgx_store::{FactStore, GraphId, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, LinkedGraph, TreeOid};
 
-/// Diff two graphs identified by [`GraphId`] in `store` (`base` → `head`).
+/// Diff two graphs identified by tree OID in `store` (`base` → `head`).
 ///
 /// Reads both Layer-2 graphs and classifies their edges/nodes. This is the entry
 /// point the `cgx diff` subcommand calls once it has indexed both comparison
-/// points into the store.
-pub fn diff_trees(store: &impl FactStore, base: GraphId, head: GraphId) -> Result<GraphDiff> {
+/// points into the store. A tree with no linked graph reads as empty.
+pub fn diff_trees(store: &impl FactStore, base: &TreeOid, head: &TreeOid) -> Result<GraphDiff> {
     let base_graph = store.read_graph(base)?;
     let head_graph = store.read_graph(head)?;
     Ok(diff_graphs(&base_graph, &head_graph))
 }
 
-/// Diff two graphs identified by tree OID in `store` (`base` → `head`).
+/// Diff two graphs identified by tree OID in `store` (`base` → `head`), erroring
+/// if either tree has no linked graph.
 ///
-/// Convenience over [`diff_trees`] for callers that hold tree OIDs (e.g. resolved
-/// from `--base`/`--head` refs) rather than dense graph ids.
+/// Stricter variant of [`diff_trees`] for callers that must fail loudly on an
+/// unindexed side rather than diff against an empty graph.
 pub fn diff_tree_oids(store: &impl FactStore, base: &TreeOid, head: &TreeOid) -> Result<GraphDiff> {
-    let base_id = store
-        .graph_for(base)?
-        .ok_or_else(|| DiffError::MissingGraph(base.0.clone()))?;
-    let head_id = store
-        .graph_for(head)?
-        .ok_or_else(|| DiffError::MissingGraph(head.0.clone()))?;
-    diff_trees(store, base_id, head_id)
+    if !store.graph_for(base)? {
+        return Err(DiffError::MissingGraph(base.0.clone()));
+    }
+    if !store.graph_for(head)? {
+        return Err(DiffError::MissingGraph(head.0.clone()));
+    }
+    diff_trees(store, base, head)
 }
 
 /// The set of edges present at `head` but **not** at `base` — the differentiator
@@ -93,8 +94,8 @@ pub fn diff_tree_oids(store: &impl FactStore, base: &TreeOid, head: &TreeOid) ->
 /// with [`BlameRepo::edge_age`].
 pub fn edges_newer_than(
     store: &impl FactStore,
-    base: GraphId,
-    head: GraphId,
+    base: &TreeOid,
+    head: &TreeOid,
 ) -> Result<Vec<DiffEdge>> {
     Ok(diff_trees(store, base, head)?.added_edges)
 }

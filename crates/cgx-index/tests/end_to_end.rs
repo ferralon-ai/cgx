@@ -18,7 +18,7 @@ fn index_fixture(fixture: &str) -> (tempfile::TempDir, cgx_store::SqliteStore, G
     let registry = default_registry();
     let mut store = mem_store();
     let outcome = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
-    let g = read_graph(&store, outcome.graph_id);
+    let g = read_graph(&store, &outcome.graph_key);
     (tmp, store, GraphIndexHolder { graph: g })
 }
 

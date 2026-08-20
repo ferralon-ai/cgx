@@ -14,7 +14,7 @@ use cgx_diff::impacted::{run, Request, Sides};
 use cgx_diff::{Answer, GraphDiff};
 use cgx_index::{default_registry, index_path, index_workdir, IndexOpts, Repo};
 use cgx_query::PathWalker;
-use cgx_store::{FactStore, SqliteStore};
+use cgx_store::{FactStore, SqliteStore, TreeOid};
 
 // --- the proof gate ----------------------------------------------------------
 
@@ -53,10 +53,13 @@ fn two_graphs_one_store_head_and_workdir() {
 
     assert_ne!(base.graph_key, head.graph_key, "keys must not collide");
     assert!(head.graph_key.starts_with("workdir:"));
-    assert_ne!(base.graph_id, head.graph_id, "two distinct graph ids");
 
-    let base_graph = store.read_graph(base.graph_id).expect("read base");
-    let head_graph = store.read_graph(head.graph_id).expect("read head");
+    let base_graph = store
+        .read_graph(&TreeOid::new(base.graph_key.clone()))
+        .expect("read base");
+    let head_graph = store
+        .read_graph(&TreeOid::new(head.graph_key.clone()))
+        .expect("read head");
 
     assert!(
         base_graph.nodes.iter().all(|n| !n.fqn.ends_with("::extra")),
@@ -146,7 +149,12 @@ fn a_body_only_edit_yields_an_empty_graph_diff_but_a_non_empty_answer() {
     let (store, a) = run_workdir(&repo);
 
     let diff: GraphDiff =
-        cgx_diff::diff_trees(&store, a.base_graph_id, a.head_graph_id).expect("diff");
+        cgx_diff::diff_trees(
+            &store,
+            &TreeOid::new(a.base_graph_key.clone()),
+            &TreeOid::new(a.head_graph_key.clone()),
+        )
+        .expect("diff");
     assert!(
         diff.is_empty(),
         "the hazard must be real for this test to mean anything: {diff:?}"

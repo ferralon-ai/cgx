@@ -70,15 +70,15 @@ fn two_writes_of_same_graph_are_byte_identical() {
     let data_a = {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let tree = cgx_store::TreeOid::new("sha1:abcdef0000000000000000000000000000000001");
-        let gid = store.put_graph(&tree, None, &graph).unwrap();
-        store.dump_node_edge_data(gid).unwrap()
+        store.put_graph(&tree, None, &graph).unwrap();
+        store.dump_node_edge_data(&tree).unwrap()
     };
 
     let data_b = {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let tree = cgx_store::TreeOid::new("sha1:abcdef0000000000000000000000000000000001");
-        let gid = store.put_graph(&tree, None, &graph).unwrap();
-        store.dump_node_edge_data(gid).unwrap()
+        store.put_graph(&tree, None, &graph).unwrap();
+        store.dump_node_edge_data(&tree).unwrap()
     };
 
     assert_eq!(data_a.len(), data_b.len(), "row count must match");
@@ -97,9 +97,9 @@ fn read_graph_round_trips_identically() {
 
     let mut store = SqliteStore::open_in_memory().unwrap();
     let tree = cgx_store::TreeOid::new("sha1:abcdef0000000000000000000000000000000002");
-    let gid = store.put_graph(&tree, None, &graph).unwrap();
+    store.put_graph(&tree, None, &graph).unwrap();
 
-    let readback = store.read_graph(gid).unwrap();
+    let readback = store.read_graph(&tree).unwrap();
     assert_eq!(
         graph, readback,
         "read_graph must reproduce identical LinkedGraph"
@@ -118,16 +118,16 @@ fn doctor_report_is_identical_across_two_runs() {
     let rep_a = {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let tree = cgx_store::TreeOid::new("sha1:abcdef0000000000000000000000000000000003");
-        let gid = store.put_graph(&tree, None, &graph).unwrap();
-        report(&store, gid).unwrap()
+        store.put_graph(&tree, None, &graph).unwrap();
+        report(&store, &tree).unwrap()
     };
 
     // Run B
     let rep_b = {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let tree = cgx_store::TreeOid::new("sha1:abcdef0000000000000000000000000000000003");
-        let gid = store.put_graph(&tree, None, &graph).unwrap();
-        report(&store, gid).unwrap()
+        store.put_graph(&tree, None, &graph).unwrap();
+        report(&store, &tree).unwrap()
     };
 
     assert_eq!(
@@ -181,9 +181,9 @@ fn full_pipeline_two_run_byte_identity() {
         let mut store = SqliteStore::open(&db_a).unwrap();
         let registry = cgx_index::default_registry();
         let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default()).unwrap();
-        let data = store.dump_node_edge_data(outcome.graph_id).unwrap();
-        let rep = cgx_doctor::report(&store, outcome.graph_id).unwrap();
-        (data, outcome.graph_id, rep)
+        let data = store.dump_node_edge_data(&cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap();
+        let rep = cgx_doctor::report(&store, &cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap();
+        (data, outcome.graph_key.clone(), rep)
     };
 
     // Run B: index into a fresh store_b.db
@@ -192,16 +192,16 @@ fn full_pipeline_two_run_byte_identity() {
         let mut store = SqliteStore::open(&db_b).unwrap();
         let registry = cgx_index::default_registry();
         let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default()).unwrap();
-        let data = store.dump_node_edge_data(outcome.graph_id).unwrap();
-        let rep = cgx_doctor::report(&store, outcome.graph_id).unwrap();
-        (data, outcome.graph_id, rep)
+        let data = store.dump_node_edge_data(&cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap();
+        let rep = cgx_doctor::report(&store, &cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap();
+        (data, outcome.graph_key.clone(), rep)
     };
 
     // Assert byte identity of stored graph data.
     assert_eq!(
         data_a.len(),
         data_b.len(),
-        "node+edge row count must match across runs (run_a graph_id={gid_a:?})"
+        "node+edge row count must match across runs (run_a graph_key={gid_a:?})"
     );
     for (i, (a, b)) in data_a.iter().zip(data_b.iter()).enumerate() {
         assert_eq!(

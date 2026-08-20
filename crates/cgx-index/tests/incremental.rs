@@ -129,11 +129,11 @@ fn two_index_runs_produce_byte_identical_graph() {
     // Two fully independent stores; same committed tree.
     let mut store_a = mem_store();
     let out_a = index_path(&repo, &registry, &mut store_a, &Default::default()).unwrap();
-    let graph_a = read_graph(&store_a, out_a.graph_id);
+    let graph_a = read_graph(&store_a, &out_a.graph_key);
 
     let mut store_b = mem_store();
     let out_b = index_path(&repo, &registry, &mut store_b, &Default::default()).unwrap();
-    let graph_b = read_graph(&store_b, out_b.graph_id);
+    let graph_b = read_graph(&store_b, &out_b.graph_key);
 
     assert_eq!(out_a.graph_key, out_b.graph_key, "same tree OID key");
     assert_eq!(graph_a, graph_b, "stored graph must be deterministic");
@@ -146,10 +146,10 @@ fn determinism_holds_for_typescript_too() {
     let registry = default_registry();
 
     let mut store_a = mem_store();
-    let id_a = index_path(&repo, &registry, &mut store_a, &Default::default()).unwrap().graph_id;
-    let a = read_graph(&store_a, id_a);
+    let id_a = index_path(&repo, &registry, &mut store_a, &Default::default()).unwrap().graph_key;
+    let a = read_graph(&store_a, &id_a);
     let mut store_b = mem_store();
-    let id_b = index_path(&repo, &registry, &mut store_b, &Default::default()).unwrap().graph_id;
-    let b = read_graph(&store_b, id_b);
+    let id_b = index_path(&repo, &registry, &mut store_b, &Default::default()).unwrap().graph_key;
+    let b = read_graph(&store_b, &id_b);
     assert_eq!(a, b);
 }

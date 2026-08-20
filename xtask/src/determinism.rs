@@ -70,10 +70,11 @@ fn index_once(repo_root: &Path, db_path: &Path) -> Result<(Vec<Vec<u8>>, DoctorR
     let registry = cgx_index::default_registry();
     let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
         .context("indexing repo")?;
+    let tree = cgx_store::TreeOid::new(outcome.graph_key.clone());
     let data = store
-        .dump_node_edge_data(outcome.graph_id)
+        .dump_node_edge_data(&tree)
         .context("dumping node/edge data")?;
-    let rep = cgx_doctor::report(&store, outcome.graph_id).context("computing doctor report")?;
+    let rep = cgx_doctor::report(&store, &tree).context("computing doctor report")?;
     Ok((data, rep))
 }
 

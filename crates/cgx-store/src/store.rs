@@ -6,7 +6,7 @@ use crate::lock::WriteLock;
 use crate::schema::{
     META_SCHEMA_VERSION, META_VIEW_SCHEMA_VERSION, SCHEMA_DDL, SCHEMA_VERSION, VIEW_SCHEMA_VERSION,
 };
-use crate::types::{BlobOid, BlobSet, CachedFragment, GraphId, LinkedGraph, PruneStats, TreeOid};
+use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
 use cgx_core::codec::{decode, encode};
 use cgx_core::{EdgeRecord, NodeRecord};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -30,23 +30,25 @@ pub trait FactStore {
     /// verbatim.
     fn put_fragments(&mut self, batch: &[FragmentInput<'_>]) -> Result<()>;
 
-    /// Look up the Layer-2 graph id for a tree OID, or `None` if not linked yet.
-    fn graph_for(&self, tree: &TreeOid) -> Result<Option<GraphId>>;
+    /// Whether a Layer-2 graph is linked for `tree`. An existence predicate: the
+    /// tree OID is itself the read key, so callers gate a [`Self::read_graph`] on
+    /// this rather than threading a storage id.
+    fn graph_for(&self, tree: &TreeOid) -> Result<bool>;
 
-    /// Materialize a linked graph for a tree OID, returning its graph id. If the
-    /// tree is already linked, its rows are replaced atomically and the existing
-    /// id is reused.
+    /// Materialize a linked graph for a tree OID. If the tree is already linked,
+    /// its rows are replaced atomically (the store's own id, if any, is reused
+    /// internally).
     fn put_graph(
         &mut self,
         tree: &TreeOid,
         created_rev: Option<&str>,
         g: &LinkedGraph,
-    ) -> Result<GraphId>;
+    ) -> Result<()>;
 
-    /// Read back the linked graph for a graph id. The returned value is byte-for-
-    /// byte identical to what was written (records reconstructed from canonical
-    /// postcard `data`).
-    fn read_graph(&self, graph: GraphId) -> Result<LinkedGraph>;
+    /// Read back the linked graph stored under `tree`. The returned value is byte-
+    /// for-byte identical to what was written (records reconstructed from canonical
+    /// postcard `data`). A tree with no linked graph yields an empty [`LinkedGraph`].
+    fn read_graph(&self, tree: &TreeOid) -> Result<LinkedGraph>;
 
     /// Remove Layer-1 fragments whose blob OID is not in `live`, and Layer-2
     /// graphs whose tree is no longer referenced (IX-5). With `aggressive`, also
@@ -275,21 +277,39 @@ impl SqliteStore {
         Ok(v)
     }
 
-    /// Dump the canonical `data` bytes of every node and edge row of a graph, in
-    /// row order. Used by the determinism harness to assert two writes of the same
-    /// graph hold byte-identical row data.
-    pub fn dump_node_edge_data(&self, graph: GraphId) -> Result<Vec<Vec<u8>>> {
+    /// Resolve a tree OID to its internal `graphs.graph_id` rowid, or `None` if the
+    /// tree has no linked graph. The rowid is a private SQLite detail — every
+    /// public method keys off the tree OID and resolves here.
+    fn graph_rowid(&self, tree: &TreeOid) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT graph_id FROM graphs WHERE tree_oid = ?1",
+                params![tree.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Dump the canonical `data` bytes of every node and edge row of the graph
+    /// stored under `tree`, in row order. Used by the determinism harness to assert
+    /// two writes of the same graph hold byte-identical row data. A tree with no
+    /// linked graph yields an empty dump.
+    pub fn dump_node_edge_data(&self, tree: &TreeOid) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
+        let Some(graph_id) = self.graph_rowid(tree)? else {
+            return Ok(out);
+        };
         let mut nstmt = self
             .conn
             .prepare("SELECT data FROM nodes WHERE graph_id = ?1 ORDER BY node_id")?;
-        for row in nstmt.query_map(params![graph.0], |r| r.get::<_, Vec<u8>>(0))? {
+        for row in nstmt.query_map(params![graph_id], |r| r.get::<_, Vec<u8>>(0))? {
             out.push(row?);
         }
         let mut estmt = self
             .conn
             .prepare("SELECT data FROM edges WHERE graph_id = ?1 ORDER BY edge_id")?;
-        for row in estmt.query_map(params![graph.0], |r| r.get::<_, Vec<u8>>(0))? {
+        for row in estmt.query_map(params![graph_id], |r| r.get::<_, Vec<u8>>(0))? {
             out.push(row?);
         }
         Ok(out)
@@ -351,16 +371,8 @@ impl FactStore for SqliteStore {
         Ok(())
     }
 
-    fn graph_for(&self, tree: &TreeOid) -> Result<Option<GraphId>> {
-        let id = self
-            .conn
-            .query_row(
-                "SELECT graph_id FROM graphs WHERE tree_oid = ?1",
-                params![tree.as_str()],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?;
-        Ok(id.map(GraphId))
+    fn graph_for(&self, tree: &TreeOid) -> Result<bool> {
+        Ok(self.graph_rowid(tree)?.is_some())
     }
 
     fn put_graph(
@@ -368,7 +380,7 @@ impl FactStore for SqliteStore {
         tree: &TreeOid,
         created_rev: Option<&str>,
         g: &LinkedGraph,
-    ) -> Result<GraphId> {
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         let graph_id: i64 = {
             // Reuse the row for an already-linked tree (idempotent put).
@@ -463,16 +475,19 @@ impl FactStore for SqliteStore {
         }
 
         tx.commit()?;
-        Ok(GraphId(graph_id))
+        Ok(())
     }
 
-    fn read_graph(&self, graph: GraphId) -> Result<LinkedGraph> {
+    fn read_graph(&self, tree: &TreeOid) -> Result<LinkedGraph> {
+        let Some(graph_id) = self.graph_rowid(tree)? else {
+            return Ok(LinkedGraph::default());
+        };
         let mut nodes = Vec::new();
         {
             let mut stmt = self
                 .conn
                 .prepare("SELECT data FROM nodes WHERE graph_id = ?1 ORDER BY node_id")?;
-            let rows = stmt.query_map(params![graph.0], |r| r.get::<_, Vec<u8>>(0))?;
+            let rows = stmt.query_map(params![graph_id], |r| r.get::<_, Vec<u8>>(0))?;
             for row in rows {
                 let bytes = row?;
                 nodes.push(decode::<NodeRecord>(&bytes)?);
@@ -484,7 +499,7 @@ impl FactStore for SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare("SELECT data FROM edges WHERE graph_id = ?1 ORDER BY edge_id")?;
-            let rows = stmt.query_map(params![graph.0], |r| r.get::<_, Vec<u8>>(0))?;
+            let rows = stmt.query_map(params![graph_id], |r| r.get::<_, Vec<u8>>(0))?;
             for row in rows {
                 let bytes = row?;
                 edges.push(decode::<EdgeRecord>(&bytes)?);
@@ -497,7 +512,7 @@ impl FactStore for SqliteStore {
                 "SELECT candidate_group, dst, rank FROM candidates
                  WHERE graph_id = ?1 ORDER BY candidate_group, rank, dst",
             )?;
-            let rows = stmt.query_map(params![graph.0], |r| {
+            let rows = stmt.query_map(params![graph_id], |r| {
                 Ok(cgx_core::Candidate {
                     candidate_group: r.get::<_, i64>(0)? as u32,
                     dst: cgx_core::NodeId(r.get::<_, i64>(1)? as u32),

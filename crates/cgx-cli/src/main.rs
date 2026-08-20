@@ -23,7 +23,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, GraphId, SqliteStore};
+use cgx_store::{FactStore, SqliteStore, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -844,7 +844,6 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
         repo_root,
         &IndexPointer {
             graph_key: outcome.graph_key.clone(),
-            graph_id: outcome.graph_id.0,
             total_files: Some(outcome.stats.blobs_indexed + outcome.stats.blobs_unsupported),
             unsupported_files: Some(outcome.stats.blobs_unsupported),
         },
@@ -1879,7 +1878,7 @@ fn run_doctor(repo: Option<PathBuf>, format: Format) -> Result<(), CliError> {
     let repo_root = resolve_repo(repo)?;
     let ptr = read_pointer(&repo_root)?;
     let store = open_store(&repo_root)?;
-    let mut rep = cgx_doctor::report(&store, GraphId(ptr.graph_id))
+    let mut rep = cgx_doctor::report(&store, &TreeOid::new(ptr.graph_key.clone()))
         .map_err(|e| CliError::graph(format!("reading graph: {e}")))?;
     if let (Some(total_files), Some(unsupported_files)) = (ptr.total_files, ptr.unsupported_files)
     {
@@ -1977,7 +1976,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
     let view = load_view(&repo_root)?;
     let ptr = read_pointer(&repo_root)?;
     let store = open_store(&repo_root)?;
-    let doctor = cgx_doctor::report(&store, GraphId(ptr.graph_id))
+    let doctor = cgx_doctor::report(&store, &TreeOid::new(ptr.graph_key.clone()))
         .map_err(|e| CliError::graph(format!("computing doctor report: {e}")))?;
 
     let depth = args.pack_depth.unwrap_or(DEFAULT_TREE_DEPTH);
@@ -2024,7 +2023,8 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Index a single git ref into the store, returning its graph id.
+/// Index a single git ref into the store, returning the tree OID it was stored
+/// under (the Layer-2 read key).
 ///
 /// Uses `git worktree add --detach` to materialize the commit tree, calls
 /// `index_path` against it (blob-OID cache hits are free), then removes the
@@ -2034,7 +2034,7 @@ fn index_ref(
     repo_root: &Path,
     commit_hex: &str,
     store: &mut SqliteStore,
-) -> Result<GraphId, CliError> {
+) -> Result<TreeOid, CliError> {
     let tmp = tempfile::Builder::new()
         .prefix("cgx-diff-")
         .tempdir()
@@ -2077,7 +2077,7 @@ fn index_ref(
         ])
         .status();
 
-    Ok(outcome.graph_id)
+    Ok(TreeOid::new(outcome.graph_key))
 }
 
 /// Parsed `cgx diff` invocation (S0 post-filters + the S1 path gate).
@@ -2177,16 +2177,16 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
         .resolve_commit(&args.head)
         .map_err(|e| CliError::usage(format!("resolving head ref {:?}: {e}", args.head)))?;
 
-    let base_id = index_ref(&repo_root, &base_commit, &mut store)?;
-    let head_id = index_ref(&repo_root, &head_commit, &mut store)?;
+    let base_tree = index_ref(&repo_root, &base_commit, &mut store)?;
+    let head_tree = index_ref(&repo_root, &head_commit, &mut store)?;
 
     // The S1 path gate is a distinct mode: it runs reachability over the two
     // graphs rather than printing the edge/node buckets.
     if args.path_added {
-        return run_path_added(&args, &store, base_id, head_id, &blame, &head_commit);
+        return run_path_added(&args, &store, &base_tree, &head_tree, &blame, &head_commit);
     }
 
-    let diff = cgx_diff::diff_trees(&store, base_id, head_id)
+    let diff = cgx_diff::diff_trees(&store, &base_tree, &head_tree)
         .map_err(|e| CliError::graph(format!("diffing trees: {e}")))?;
 
     // `--newer-than` is sugar for `--added` (show only the added bucket).
@@ -2272,8 +2272,8 @@ fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
 fn run_path_added(
     args: &DiffArgs,
     store: &SqliteStore,
-    base_id: GraphId,
-    head_id: GraphId,
+    base_tree: &TreeOid,
+    head_tree: &TreeOid,
     blame: &BlameRepo,
     head_commit: &str,
 ) -> Result<(), CliError> {
@@ -2289,10 +2289,10 @@ fn run_path_added(
     };
 
     let base_graph = store
-        .read_graph(base_id)
+        .read_graph(base_tree)
         .map_err(|e| CliError::graph(format!("reading base graph: {e}")))?;
     let head_graph = store
-        .read_graph(head_id)
+        .read_graph(head_tree)
         .map_err(|e| CliError::graph(format!("reading head graph: {e}")))?;
 
     let path_diff = cgx_diff::path_diff_graphs(&base_graph, &head_graph, &from, &to);
@@ -2669,9 +2669,9 @@ fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
         .resolve_commit(at)
         .map_err(|e| CliError::usage(format!("resolving ref {at:?}: {e}")))?;
 
-    let graph_id = index_ref(repo_root, &commit, &mut store)?;
+    let tree = index_ref(repo_root, &commit, &mut store)?;
     let graph = store
-        .read_graph(graph_id)
+        .read_graph(&tree)
         .map_err(|e| CliError::graph(format!("reading graph at {at}: {e}")))?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
@@ -2681,8 +2681,8 @@ fn load_view(repo_root: &Path) -> Result<GraphView, CliError> {
     let ptr = read_pointer(repo_root)?;
     let store = open_store(repo_root)?;
     let graph = store
-        .read_graph(cgx_store::GraphId(ptr.graph_id))
-        .map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_id)))?;
+        .read_graph(&TreeOid::new(ptr.graph_key.clone()))
+        .map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 

@@ -61,19 +61,19 @@ fn program_repo() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// Index a one-file effectful program in a fresh committed repo, returning the
-/// store, the stored graph, and its id.
+/// store, the stored graph, and its Layer-2 key.
 fn index_program() -> (
     tempfile::TempDir,
     cgx_store::SqliteStore,
     cgx_store::LinkedGraph,
-    cgx_store::GraphId,
+    String,
 ) {
     let (tmp, repo) = program_repo();
     let registry = default_registry();
     let mut store = mem_store();
     let outcome = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
-    let g = read_graph(&store, outcome.graph_id);
-    (tmp, store, g, outcome.graph_id)
+    let g = read_graph(&store, &outcome.graph_key);
+    (tmp, store, g, outcome.graph_key)
 }
 
 fn node<'g>(g: &'g cgx_store::LinkedGraph, name: &str) -> &'g cgx_core::NodeRecord {
@@ -158,7 +158,7 @@ fn transitive_effects_survive_store_round_trip() {
     let out2 = index_path(&repo2, &registry, &mut store2, &Default::default()).unwrap();
 
     // Compare the canonical row bytes of both stores.
-    let dump1 = store.dump_node_edge_data(id1).unwrap();
-    let dump2 = store2.dump_node_edge_data(out2.graph_id).unwrap();
+    let dump1 = store.dump_node_edge_data(&cgx_store::TreeOid::new(id1.clone())).unwrap();
+    let dump2 = store2.dump_node_edge_data(&cgx_store::TreeOid::new(out2.graph_key.clone())).unwrap();
     assert_eq!(dump1, dump2, "stored node/edge bytes must be byte-identical");
 }

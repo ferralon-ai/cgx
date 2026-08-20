@@ -43,4 +43,4 @@ pub use error::{Result, StoreError};
 pub use lock::WriteLock;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};
 pub use store::{FactStore, FragmentInput, SqliteStore};
-pub use types::{BlobOid, BlobSet, CachedFragment, GraphId, LinkedGraph, PruneStats, TreeOid};
+pub use types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};

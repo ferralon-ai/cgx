@@ -21,12 +21,12 @@ fn query_over_store_loaded_graph() {
     let mut store = SqliteStore::open_in_memory().expect("open store");
     let graph = LinkedGraph::new(nodes.clone(), edges.clone(), candidates.clone());
     let tree = TreeOid::new("deadbeef");
-    let gid = store
+    store
         .put_graph(&tree, Some("rev1"), &graph)
         .expect("put graph");
 
     // Read it back and build the view over the round-tripped records.
-    let loaded = store.read_graph(gid).expect("read graph");
+    let loaded = store.read_graph(&tree).expect("read graph");
     assert_eq!(loaded.nodes, nodes);
     assert_eq!(loaded.edges, edges);
 

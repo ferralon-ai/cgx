@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use cgx_core::{EdgeRecord, NodeRecord};
-use cgx_store::{FactStore, GraphId, LinkedGraph, SqliteStore};
+use cgx_store::{FactStore, LinkedGraph, SqliteStore, TreeOid};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -154,9 +154,12 @@ pub fn mem_store() -> SqliteStore {
     SqliteStore::open_in_memory().expect("open store")
 }
 
-/// Read back the stored graph for assertions.
-pub fn read_graph(store: &SqliteStore, id: GraphId) -> LinkedGraph {
-    store.read_graph(id).expect("read graph")
+/// Read back the stored graph for assertions, keyed by the Layer-2 graph key
+/// (tree OID or `workdir:<digest>`) that [`cgx_index::IndexOutcome`] reports.
+pub fn read_graph(store: &SqliteStore, key: &str) -> LinkedGraph {
+    store
+        .read_graph(&TreeOid::new(key.to_string()))
+        .expect("read graph")
 }
 
 /// Index a graph by FQN for edge-existence assertions.

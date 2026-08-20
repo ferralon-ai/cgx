@@ -179,8 +179,8 @@ fn full_rebuild_equals_incremental_byte_identical() {
         inc.graph_key, cold.graph_key,
         "same final tree content keys the same Layer-2 graph"
     );
-    let dump_inc = store_inc.dump_node_edge_data(inc.graph_id).unwrap();
-    let dump_cold = store_cold.dump_node_edge_data(cold.graph_id).unwrap();
+    let dump_inc = store_inc.dump_node_edge_data(&cgx_store::TreeOid::new(inc.graph_key.clone())).unwrap();
+    let dump_cold = store_cold.dump_node_edge_data(&cgx_store::TreeOid::new(cold.graph_key.clone())).unwrap();
     assert_eq!(
         dump_inc, dump_cold,
         "incremental graph must be byte-identical to the cold rebuild"
@@ -233,7 +233,7 @@ fn interproc_summary_edge_materialized_end_to_end() {
     );
     assert_eq!(out.stats.ifds.budget_exceeded_sccs, 0, "no budget trip on the small chain");
 
-    let g = read_graph(&store, out.graph_id);
+    let g = read_graph(&store, &out.graph_key);
     let interproc: Vec<_> = g
         .edges
         .iter()
@@ -266,7 +266,7 @@ fn summary_edges_consumed_by_existing_walk_no_second_path() {
 
     // The store's read path reconstructs the interproc edges from the same `edges`
     // table as every other edge — proving they live on the one execution path.
-    let g = read_graph(&store, out.graph_id);
+    let g = read_graph(&store, &out.graph_key);
     let interproc = g
         .edges
         .iter()

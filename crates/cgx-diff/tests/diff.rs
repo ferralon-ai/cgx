@@ -42,7 +42,7 @@ fn added_and_removed_edges_are_classified_by_identity() {
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, head) = repo.index_head();
 
-    let diff = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let diff = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
 
     let added = added_pairs(&diff);
     let removed = removed_pairs(&diff);
@@ -74,7 +74,7 @@ fn added_and_removed_nodes_are_classified_by_fqn() {
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, _) = repo.index_head();
 
-    let diff = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let diff = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
 
     let added: Vec<&str> = diff.added_nodes.iter().map(|n| n.fqn.as_str()).collect();
     let removed: Vec<&str> = diff.removed_nodes.iter().map(|n| n.fqn.as_str()).collect();
@@ -100,7 +100,7 @@ fn identical_trees_produce_empty_diff() {
     repo.commit("a", "2020-01-01T00:00:00Z");
     let (id, _) = repo.index_head();
 
-    let diff = diff_trees(&repo.store, id, id).expect("diff");
+    let diff = diff_trees(&repo.store, &id, &id).expect("diff");
     assert!(
         diff.is_empty(),
         "diffing a tree against itself is empty: {diff:?}"
@@ -128,7 +128,7 @@ pub fn caller(flag: bool) -> i32 { if flag { target() } else { 0 } }
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, _) = repo.index_head();
 
-    let diff = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let diff = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
 
     let changed = diff.changed_edges.iter().find(|c| {
         c.identity.src_fqn.ends_with("::caller") && c.identity.dst_fqn.ends_with("::target")
@@ -157,8 +157,8 @@ fn edges_newer_than_equals_added_edges() {
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, _) = repo.index_head();
 
-    let newer = edges_newer_than(&repo.store, base_id, head_id).expect("gate");
-    let diff = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let newer = edges_newer_than(&repo.store, &base_id, &head_id).expect("gate");
+    let diff = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
     assert_eq!(
         newer, diff.added_edges,
         "the gate is exactly the added-edge set"
@@ -182,7 +182,7 @@ fn diff_is_deterministic_across_repeated_runs() {
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, head) = repo.index_head();
 
-    let d1 = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let d1 = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
     let d2 = diff_graphs(&base, &head);
     let d3 = diff_graphs(&base, &head);
     assert_eq!(d1, d2);

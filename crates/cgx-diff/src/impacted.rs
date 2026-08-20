@@ -30,7 +30,7 @@ use cgx_core::NodeId;
 use cgx_index::{default_registry, index_path, index_workdir, IndexOpts, Repo};
 use cgx_query::impacted::{contract_for, DiffFacts, ImpactedTests, SUPPORTED_LANGS};
 use cgx_query::{impacted_tests, ApproximationContract, GraphView, PathWalker};
-use cgx_store::{FactStore, GraphId, SqliteStore};
+use cgx_store::{FactStore, TreeOid};
 
 use crate::age::BlameRepo;
 use crate::error::{DiffError, Result};
@@ -86,11 +86,10 @@ pub struct Answer {
     pub head_ref: String,
     /// The Layer-2 keys the two graphs were stored under — a real tree OID or a
     /// `workdir:<digest>`.
+    /// Both sides remain readable from the caller's store after the call, keyed by
+    /// these Layer-2 keys.
     pub base_graph_key: String,
     pub head_graph_key: String,
-    /// Both sides remain readable from the caller's store after the call.
-    pub base_graph_id: GraphId,
-    pub head_graph_id: GraphId,
     /// Files whose content differs between the two sides.
     pub dirty_files: usize,
     /// The changed-symbol set the walk was seeded with, ascending.
@@ -108,7 +107,7 @@ pub struct Answer {
 ///
 /// It must **not** be routed through `index_repo`: that prunes the store to a
 /// single graph and would delete the other side of the diff.
-pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
+pub fn run(store: &mut impl FactStore, req: Request<'_>) -> Result<Answer> {
     let root = req.repo_root;
     let (base, head) = acquire(store, root, &req.sides)?;
 
@@ -122,9 +121,11 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
         .map(|(path, _)| path.clone())
         .collect();
 
-    let head_graph = store.read_graph(head.graph_id)?;
+    let base_tree = TreeOid::new(base.graph_key.clone());
+    let head_tree = TreeOid::new(head.graph_key.clone());
+    let head_graph = store.read_graph(&head_tree)?;
     let view = GraphView::new(head_graph.nodes, head_graph.edges, head_graph.candidates);
-    let diff = crate::diff_trees(store, base.graph_id, head.graph_id)?;
+    let diff = crate::diff_trees(store, &base_tree, &head_tree)?;
 
     // FQN → node id, lowest id winning a duplicate FQN. `BTreeMap` over the
     // canonical node order, so the resolution never depends on hash order.
@@ -253,8 +254,6 @@ pub fn run(store: &mut SqliteStore, req: Request<'_>) -> Result<Answer> {
         head_ref: head.reference,
         base_graph_key: base.graph_key,
         head_graph_key: head.graph_key,
-        base_graph_id: base.graph_id,
-        head_graph_id: head.graph_id,
         dirty_files: changed_paths.len(),
         changed,
         view,
@@ -349,13 +348,12 @@ fn git_ignored(repo_root: &Path, paths: &[&str]) -> BTreeSet<String> {
 /// One indexed side: its graph, its Layer-2 key, and its `path → blob OID`
 /// manifest.
 struct Side {
-    graph_id: GraphId,
     graph_key: String,
     reference: String,
     manifest: BTreeMap<String, String>,
 }
 
-fn acquire(store: &mut SqliteStore, root: &Path, sides: &Sides) -> Result<(Side, Side)> {
+fn acquire(store: &mut impl FactStore, root: &Path, sides: &Sides) -> Result<(Side, Side)> {
     match sides {
         Sides::Refs {
             base,
@@ -389,7 +387,6 @@ fn acquire(store: &mut SqliteStore, root: &Path, sides: &Sides) -> Result<(Side,
             let committed = repo.enumerate_tree()?;
             let outcome = index_path(root, &default_registry(), store, &IndexOpts::default())?;
             let base_side = Side {
-                graph_id: outcome.graph_id,
                 graph_key: outcome.graph_key,
                 reference: "HEAD".to_string(),
                 manifest: manifest_of(committed),
@@ -401,7 +398,7 @@ fn acquire(store: &mut SqliteStore, root: &Path, sides: &Sides) -> Result<(Side,
 }
 
 /// Index the working directory (uncommitted edits included) as the head side.
-fn index_working_dir(store: &mut SqliteStore, root: &Path) -> Result<Side> {
+fn index_working_dir(store: &mut impl FactStore, root: &Path) -> Result<Side> {
     let repo = Repo::discover(root)?;
     let workdir = repo
         .workdir()
@@ -417,7 +414,6 @@ fn index_working_dir(store: &mut SqliteStore, root: &Path) -> Result<Side> {
         &IndexOpts::default(),
     )?;
     Ok(Side {
-        graph_id: outcome.graph_id,
         graph_key: outcome.graph_key,
         reference: "workdir".to_string(),
         manifest,
@@ -430,7 +426,7 @@ fn index_working_dir(store: &mut SqliteStore, root: &Path) -> Result<Side> {
 /// `HEAD` *is* the commit, so `enumerate_tree` yields exactly that commit's
 /// `rel_path → blob_oid`. The manifest is built before the worktree is removed.
 /// Blob-OID cache hits make the second index of a shared file free.
-fn index_ref(store: &mut SqliteStore, repo_root: &Path, commit_hex: &str) -> Result<Side> {
+fn index_ref(store: &mut impl FactStore, repo_root: &Path, commit_hex: &str) -> Result<Side> {
     let tmp = tempfile::Builder::new()
         .prefix("cgx-impacted-")
         .tempdir()
@@ -481,7 +477,6 @@ fn index_ref(store: &mut SqliteStore, repo_root: &Path, commit_hex: &str) -> Res
 
     let (outcome, sources) = acquired?;
     Ok(Side {
-        graph_id: outcome.graph_id,
         graph_key: outcome.graph_key,
         reference: commit_hex.to_string(),
         manifest: manifest_of(sources),

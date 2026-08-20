@@ -2203,3 +2203,70 @@ fn coupling_cli_and_mcp_emit_identical_contract_bytes() {
         "CLI and MCP coupling answers are not the same document"
     );
 }
+
+/// Like [`run_cgx`] but also captures stderr, for asserting the selector engine's
+/// honesty disclosures (which go to stderr to keep stdout parseable).
+fn run_cgx_err(repo: &Path, args: &[&str]) -> (String, String, i32) {
+    let out = Command::new(cargo_bin("cgx"))
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("run cgx");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    (stdout, stderr, out.status.code().unwrap_or(-1))
+}
+
+/// A selector-grammar pattern (`**` globstar + `!` affix negation) routes through
+/// the node-selector engine, not the substring scan: `fixture::**::!*gamma` selects
+/// every symbol whose leaf does *not* end in `gamma`, so the `search_target_gamma`
+/// function is the one result excluded.
+#[test]
+fn search_selector_grammar_routes_to_engine() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, code) = run_cgx(&repo, &["search", "fixture::**::!*gamma"]);
+    assert_eq!(code, 0, "a selector search still exits 0: {out}");
+    assert!(out.contains("fixture::search_target_alpha"), "alpha kept: {out}");
+    assert!(
+        out.contains("fixture::helper::search_target_beta"),
+        "beta kept: {out}"
+    );
+    assert!(
+        out.contains("fixture::helper::SearchWidget"),
+        "type kept: {out}"
+    );
+    assert!(
+        !out.contains("search_target_gamma"),
+        "gamma excluded by the `!*gamma` negation: {out}"
+    );
+}
+
+/// A selector that no tokenizer can parse is a hard, labeled usage error (exit 2)
+/// — never a silent empty result. The leading `(` routes it to the engine; the
+/// unbalanced group makes every family reject it.
+#[test]
+fn search_selector_zero_parse_is_labeled_error() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (_out, stderr, code) = run_cgx_err(&repo, &["search", "(unclosed"]);
+    assert_eq!(code, 2, "zero clean parses is a usage error, not empty");
+    assert!(
+        stderr.contains("no valid parse") || stderr.contains("selector"),
+        "the engine's labeled error reaches the user: {stderr}"
+    );
+}
+
+/// The degenerate `!*` (a negation cannot bind a wildcard) is rewritten to `*!` and
+/// the rewrite is disclosed on stderr — while stdout stays a clean symbol table.
+#[test]
+fn search_selector_negation_rewrite_warns_on_stderr() {
+    let (_tmp, repo) = search_fixture_repo();
+    index(&repo);
+    let (out, stderr, code) = run_cgx_err(&repo, &["search", "fixture::**::!*Widget"]);
+    assert_eq!(code, 0, "still a successful search: {out}{stderr}");
+    assert!(
+        stderr.contains("rewritten"),
+        "the `!*`→`*!` rewrite is disclosed on stderr: {stderr}"
+    );
+}

@@ -19,6 +19,7 @@ cgx-doctor = { path = "../cgx-doctor" }
 cgx-index = { path = "../cgx-index" }
 cgx-mcp = { path = "../cgx-mcp" }
 cgx-query = { path = "../cgx-query" }
+cgx-select = { path = "../cgx-select" }
 cgx-store = { path = "../cgx-store" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }

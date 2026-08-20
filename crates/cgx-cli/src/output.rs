@@ -49,7 +49,7 @@ impl Format {
 const CGX_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CGX_INFO_URI: &str = "https://github.com/ferralon-ai/cgx";
 
-fn confidence_str(c: Confidence) -> &'static str {
+pub(crate) fn confidence_str(c: Confidence) -> &'static str {
     match c {
         Confidence::Possible => "possible",
         Confidence::Probable => "probable",
@@ -57,7 +57,7 @@ fn confidence_str(c: Confidence) -> &'static str {
     }
 }
 
-fn condition_str(c: EdgeCondition) -> &'static str {
+pub(crate) fn condition_str(c: EdgeCondition) -> &'static str {
     match c {
         EdgeCondition::Always => "always",
         EdgeCondition::Conditional => "conditional",
@@ -1460,7 +1460,7 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
 /// The canonical lowercase string for a [`SymbolKind`] (`function`, `type`, …),
 /// reusing the serde `snake_case` representation so it matches the `kind` field
 /// every other JSON renderer emits.
-fn kind_str(kind: cgx_core::SymbolKind) -> String {
+pub(crate) fn kind_str(kind: cgx_core::SymbolKind) -> String {
     serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))

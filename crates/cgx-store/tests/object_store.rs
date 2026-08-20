@@ -11,7 +11,7 @@ use cgx_core::{
     NodeRecord, SymbolKind, Tier, Visibility,
 };
 use cgx_store::manifest::Manifest;
-use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, TreeOid};
+use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, SqliteStore, TreeOid};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -139,6 +139,32 @@ fn absent_tree_reads_as_empty_graph() {
     assert_eq!(
         s.read_graph(&TreeOid::new("missing")).unwrap(),
         LinkedGraph::default()
+    );
+}
+
+// --- shadow parity: object-store read == SQLite read (criterion 8) ------------
+
+/// The shadow read path must lose nothing versus the incumbent: the same tree,
+/// put into a fresh [`SqliteStore`] and a fresh [`ObjectStore`], reads back as a
+/// byte-identical [`LinkedGraph`] — nodes/edges by dense id, candidates in
+/// canonical `(group, rank, dst)` order. `sample_graph()` is the rich corpus
+/// fixture (virtual calls, a candidate set, effects, cut markers) the existing
+/// store tests exercise.
+#[test]
+fn object_store_read_matches_sqlite_read_for_the_same_tree() {
+    let root = TempDir::new().unwrap();
+    let mut objects = store(&root);
+    let mut sqlite = SqliteStore::open_in_memory().unwrap();
+    let tree = TreeOid::new("t-parity");
+    let g = common::sample_graph();
+
+    sqlite.put_graph(&tree, Some("rev1"), &g).unwrap();
+    objects.put_graph(&tree, Some("rev1"), &g).unwrap();
+
+    assert_eq!(
+        objects.read_graph(&tree).unwrap(),
+        sqlite.read_graph(&tree).unwrap(),
+        "object-store read must equal SQLite read for the same tree"
     );
 }
 

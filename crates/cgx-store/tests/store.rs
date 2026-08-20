@@ -563,4 +563,20 @@ proptest! {
             b.dump_node_edge_data(&tree).unwrap()
         );
     }
+
+    /// Shadow parity across the generated corpus: the object-store read of a tree
+    /// is byte-identical to the SQLite read of the same tree (criterion 8).
+    #[test]
+    fn prop_object_store_read_matches_sqlite_read(g in arb_graph()) {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut objects = cgx_store::ObjectStore::open(root.path().join(".cgx")).unwrap();
+        let mut sqlite = SqliteStore::open_in_memory().unwrap();
+        let tree = TreeOid::new("t");
+        objects.put_graph(&tree, None, &g).unwrap();
+        sqlite.put_graph(&tree, None, &g).unwrap();
+        prop_assert_eq!(
+            objects.read_graph(&tree).unwrap(),
+            sqlite.read_graph(&tree).unwrap()
+        );
+    }
 }

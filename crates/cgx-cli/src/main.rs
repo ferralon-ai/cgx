@@ -23,7 +23,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, SqliteStore, TreeOid};
+use cgx_store::{FactStore, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -35,7 +35,8 @@ use cgx_cli::output::{
 };
 use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{db_path, ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::shadow_store::ShadowStore;
+use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -1326,9 +1327,8 @@ fn run_impacted_tests(
     // unchanged file re-extracts nothing. `index_repo` is deliberately not used —
     // it prunes the store to a single graph and would delete the other side.
     ensure_cgx_dir(&repo_root)?;
-    let db_file = db_path(&repo_root);
-    let mut store =
-        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+    let mut store = ShadowStore::open(&repo_root)
+        .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     // Unbounded by default: a test three hops from the change is still impacted,
     // and the forest's depth-2 rendering bound must not leak into the walk. An
@@ -2033,7 +2033,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
 fn index_ref(
     repo_root: &Path,
     commit_hex: &str,
-    store: &mut SqliteStore,
+    store: &mut ShadowStore,
 ) -> Result<TreeOid, CliError> {
     let tmp = tempfile::Builder::new()
         .prefix("cgx-diff-")
@@ -2163,10 +2163,9 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
     let repo_root = resolve_repo(args.repo.clone())?;
 
     // Open (or create) the shared on-disk store for this diff session.
-    let db_file = db_path(&repo_root);
     ensure_cgx_dir(&repo_root)?;
-    let mut store =
-        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+    let mut store = ShadowStore::open(&repo_root)
+        .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(&repo_root)
         .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;
@@ -2271,7 +2270,7 @@ fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
 /// usage error (exit 2), never an unanchored walk (the dense-graph blowup risk).
 fn run_path_added(
     args: &DiffArgs,
-    store: &SqliteStore,
+    store: &ShadowStore,
     base_tree: &TreeOid,
     head_tree: &TreeOid,
     blame: &BlameRepo,
@@ -2629,9 +2628,9 @@ fn resolve_repo(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .map_err(|e| CliError::usage(format!("path {raw:?} is not accessible: {e}")))
 }
 
-fn open_store(repo_root: &Path) -> Result<SqliteStore, CliError> {
-    let path = db_path(repo_root);
-    SqliteStore::open(&path).map_err(|e| CliError::graph(format!("opening store {path:?}: {e}")))
+fn open_store(repo_root: &Path) -> Result<ShadowStore, CliError> {
+    ShadowStore::open(repo_root)
+        .map_err(|e| CliError::graph(format!("opening store at {repo_root:?}: {e}")))
 }
 
 /// Resolve the query's repo root, auto-index it unless opted out, and load the
@@ -2659,9 +2658,8 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
 /// the store by id (no pointer involved).
 fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
     ensure_cgx_dir(repo_root)?;
-    let db_file = db_path(repo_root);
-    let mut store =
-        SqliteStore::open(&db_file).map_err(|e| CliError::graph(format!("opening store: {e}")))?;
+    let mut store = ShadowStore::open(repo_root)
+        .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(repo_root)
         .map_err(|e| CliError::graph(format!("discovering repo: {e}")))?;

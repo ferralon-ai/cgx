@@ -83,12 +83,123 @@ pub fn run(args: DeterminismArgs) -> Result<()> {
         }
     }
 
+    // Push determinism (criterion 7 / cgx-transport): the two independently
+    // indexed object stores above (`objects_a`, `objects_b`) are already laid
+    // out exactly like a `.cgx/` directory (`ObjectStore::open` creates
+    // `<root>/objects` + `<root>/refs`), so reuse them rather than indexing a
+    // third time. Copy each into its own throwaway git repo as `.cgx/`, push
+    // each to its own fresh local bare remote, and assert:
+    //   (a) the two independent index runs push to the SAME deterministic
+    //       commit OID (byte-identical promotion, not just byte-identical
+    //       objects), and
+    //   (b) a second push of one unchanged tree is a CAS no-op
+    //       (`ref_advanced == false`) at the same OID.
+    let commit_a = push_once(&dir.path().join("objects_a"), &dir.path().join("push_repo_a"))
+        .context("push run-1 (from objects_a)")?;
+    let commit_b = push_once(&dir.path().join("objects_b"), &dir.path().join("push_repo_b"))
+        .context("push run-2 (from objects_b)")?;
+    if commit_a != commit_b {
+        bail!(
+            "cgx push of two independently-indexed but byte-identical trees produced different \
+             commit OIDs: run-1={commit_a}, run-2={commit_b}"
+        );
+    }
+
+    let repo_a = dir.path().join("push_repo_a");
+    let second = cgx_transport::push(&repo_a, "origin")
+        .context("second push of an unchanged tree (idempotence check)")?;
+    if second.ref_advanced {
+        bail!("a second push of one unchanged tree must be a CAS no-op (ref_advanced=false), was true");
+    }
+    if second.commit_oid != commit_a {
+        bail!(
+            "second push of an unchanged tree advanced to a different commit OID: first={commit_a}, \
+             second={}",
+            second.commit_oid
+        );
+    }
+
     println!(
         "xtask determinism: OK — {} store rows + {} content-addressed objects, byte-identical \
-         across 2 independent index runs",
+         across 2 independent index runs; cgx push of both runs converges on commit {commit_a} \
+         (idempotent re-push confirmed)",
         data_a.len(),
         objs_a.len()
     );
+    Ok(())
+}
+
+/// Copy `objects_root` (an already-populated `<root>/{objects,refs}` tree from
+/// [`index_once_objects`]) into `<repo_dir>/.cgx`, `git init` a fresh throwaway
+/// repo at `repo_dir`, wire a fresh local bare remote as `origin`, and push once.
+/// Returns the resulting `refs/cgx/index` commit OID.
+fn push_once(objects_root: &Path, repo_dir: &Path) -> Result<String> {
+    std::fs::create_dir_all(repo_dir).context("creating throwaway push repo dir")?;
+    copy_dir_all(objects_root, &repo_dir.join(".cgx")).context("copying object store into .cgx")?;
+    run_git(repo_dir, &["init", "-q", "-b", "main"])?;
+    run_git(repo_dir, &["config", "user.name", "cgx-xtask"])?;
+    run_git(repo_dir, &["config", "user.email", "cgx-xtask@localhost"])?;
+    run_git(repo_dir, &["config", "commit.gpgsign", "false"])?;
+    // A trivial commit so the repo has a valid HEAD; push's ref (refs/cgx/index)
+    // is independent of the branch HEAD (invisibility, criterion 3) but `git`
+    // itself is happier with a non-unborn repo for `push`/`fetch`.
+    std::fs::write(repo_dir.join(".gitkeep"), b"")?;
+    run_git(repo_dir, &["add", "-A"])?;
+    run_git(
+        repo_dir,
+        &["-c", "author.name=cgx-xtask", "-c", "author.email=cgx-xtask@localhost", "commit", "-q", "-m", "throwaway"],
+    )?;
+
+    let remote_dir = repo_dir
+        .parent()
+        .expect("repo_dir has a parent")
+        .join(format!(
+            "{}_remote.git",
+            repo_dir.file_name().unwrap().to_string_lossy()
+        ));
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&remote_dir)
+        .status()
+        .context("spawning git init --bare for throwaway push remote")?;
+    if !status.success() {
+        bail!("git init --bare failed for {remote_dir:?}");
+    }
+    run_git(repo_dir, &["remote", "add", "origin", remote_dir.to_str().unwrap()])?;
+
+    let outcome = cgx_transport::push(repo_dir, "origin")
+        .with_context(|| format!("cgx-transport push from {repo_dir:?}"))?;
+    if !outcome.ref_advanced {
+        bail!("first push into a fresh remote must advance the ref, but ref_advanced=false");
+    }
+    Ok(outcome.commit_oid)
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("spawning git {args:?}"))?;
+    if !status.success() {
+        bail!("git {args:?} in {repo:?} failed");
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
     Ok(())
 }
 

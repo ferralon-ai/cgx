@@ -15,6 +15,7 @@ cgx-doctor = { path = "../crates/cgx-doctor" }
 cgx-index = { path = "../crates/cgx-index" }
 cgx-query = { path = "../crates/cgx-query" }
 cgx-store = { path = "../crates/cgx-store" }
+cgx-transport = { path = "../crates/cgx-transport" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

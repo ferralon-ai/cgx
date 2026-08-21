@@ -195,6 +195,7 @@ dependencies = [
  "cgx-query",
  "cgx-select",
  "cgx-store",
+ "cgx-transport",
  "clap",
  "predicates",
  "serde",
@@ -411,6 +412,18 @@ dependencies = [
  "serde",
  "sha1",
  "tempfile",
+]
+
+[[package]]
+name = "cgx-transport"
+version = "0.3.0"
+dependencies = [
+ "assert_cmd",
+ "cgx-core",
+ "cgx-store",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -2806,6 +2819,7 @@ dependencies = [
  "cgx-index",
  "cgx-query",
  "cgx-store",
+ "cgx-transport",
  "clap",
  "predicates",
  "serde",

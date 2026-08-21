@@ -5,13 +5,13 @@
 
 mod common;
 
-use cgx_core::codec::decode;
+use cgx_core::codec::{decode, encode};
 use cgx_core::{
     Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId,
     NodeRecord, SymbolKind, Tier, Visibility,
 };
-use cgx_store::manifest::Manifest;
-use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, SqliteStore, TreeOid};
+use cgx_store::manifest::{Manifest, CURRENT_STORE_FORMAT};
+use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, SqliteStore, StoreError, TreeOid};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -210,6 +210,51 @@ fn re_put_of_same_graph_is_a_noop_at_the_object_level() {
 
     assert_eq!(first, second);
     assert_eq!(manifest_first, manifest_second);
+}
+
+// --- store_format compat gate (D-3) -------------------------------------------
+
+#[test]
+fn manifest_is_stamped_with_current_store_format() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    s.put_graph(&TreeOid::new("t1"), Some("rev"), &common::sample_graph())
+        .unwrap();
+
+    assert_eq!(read_manifest(&root, "t1").store_format, CURRENT_STORE_FORMAT);
+}
+
+#[test]
+fn read_rejects_manifest_with_newer_store_format() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph())
+        .unwrap();
+
+    // Forge a manifest claiming a future format, write it as a new object, and
+    // repoint the ref at it — simulating a graph committed by a newer cgx.
+    let mut forged = read_manifest(&root, "t1");
+    forged.store_format = CURRENT_STORE_FORMAT + 1;
+    let bytes = encode(&forged).unwrap();
+    let moid = ObjectOid::of_bytes(&bytes);
+    let opath = moid.object_path(&objects_dir(&root));
+    fs::create_dir_all(opath.parent().unwrap()).unwrap();
+    fs::write(&opath, &bytes).unwrap();
+    let ref_path = root
+        .path()
+        .join(".cgx")
+        .join("refs")
+        .join(ObjectOid::of_bytes("t1".as_bytes()).0);
+    fs::write(&ref_path, format!("{}\nt1\n", moid.0)).unwrap();
+
+    match s.read_graph(&tree) {
+        Err(StoreError::StoreFormat { found, expected }) => {
+            assert_eq!(found, CURRENT_STORE_FORMAT + 1);
+            assert_eq!(expected, CURRENT_STORE_FORMAT);
+        }
+        other => panic!("expected StoreFormat rejection, got {other:?}"),
+    }
 }
 
 // --- 3. manifest + candidate canonical ordering -------------------------------

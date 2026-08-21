@@ -138,6 +138,46 @@ fn ignored_paths_do_not_count_as_dirty() {
 }
 
 #[test]
+fn the_cgx_store_dir_is_never_counted_as_divergence() {
+    // Once `.cgx/` is committable (Slice 2) its objects are no longer git-ignored,
+    // and a user may commit them into the tree. The store is cgx's own artifact,
+    // never source, so it must count as divergence on neither side: not as a
+    // working-tree addition (disk-side prune) nor as a phantom removal when it is
+    // present in the indexed tree (tree-side exclusion).
+    let (_tmp, repo) = init_fixture_repo("rust-sample");
+
+    // On disk but never committed: must not count as additions.
+    write_file(&repo, ".cgx/HEAD.json", "{\"graph_key\":\"deadbeef\"}\n");
+    write_file(&repo, ".cgx/objects/ab/cdef0123", "postcard-ish\n");
+    write_file(&repo, ".cgx/refs/deadbeef", "oid\ndeadbeef\n");
+    let (r, map) = head_map(&repo);
+    assert!(!map.keys().any(|k| k.starts_with(".cgx/")));
+    assert_eq!(
+        r.dirty_file_count(&map).unwrap(),
+        0,
+        "an uncommitted .cgx/ store is not a working-tree addition"
+    );
+
+    // Now commit the store into the tree: it appears in the indexed map, but must
+    // still not count as removals or divergence.
+    commit_all(&repo, "commit the cgx store");
+    let (r, map) = head_map(&repo);
+    assert!(
+        map.keys().any(|k| k.starts_with(".cgx/")),
+        "the committed store must be in the indexed tree"
+    );
+    assert_eq!(
+        r.dirty_file_count(&map).unwrap(),
+        0,
+        "a committed .cgx/ store, unchanged on disk, is not divergence"
+    );
+
+    // A real source edit still counts — the exclusion is scoped to the store.
+    write_file(&repo, "src/counted.rs", "pub fn counted() {}\n");
+    assert_eq!(r.dirty_file_count(&map).unwrap(), 1);
+}
+
+#[test]
 fn a_tracked_but_ignored_file_is_still_compared() {
     // Git applies ignore rules only to untracked paths. A file that is both
     // committed and matched by .gitignore must still be diffed, not reported as

@@ -1,6 +1,6 @@
 # 06 — Indexing and VCS Integration
 
-**Status:** Mixed — IX-1, IX-2, IX-3 and IX-9 are substantially shipped (see the IX-0 envelope section below and the per-section status notes); IX-4 through IX-8 are design ahead of implementation, and IX-8's shipped location is *not* the one it decides on.
+**Status:** Mixed — IX-1, IX-2, IX-3 and IX-9 are substantially shipped (see the IX-0 envelope section below and the per-section status notes); IX-4 through IX-8 are design ahead of implementation, and IX-8's shipped location is *not* the one it decides on. IX-8's transport overlay (`cgx push`/`cgx pull`, sharing the index via `refs/cgx/index`) is shipped independently of the location decision — see below.
 **Audience:** Engineers building or operating `cgx`; contributors; CI/CD integrators
 **Cross-references:** docs/03-code-graph-model.md (GM-) · docs/09-architecture.md (AR-) · docs/05-queries.md
 
@@ -489,6 +489,75 @@ it records are still the ones that matter if the location is ever revisited. It 
 description of shipped behaviour. In particular there is no `<repo-id>` hash, no
 `.git/cgx/config` pointer file, and worktrees of the same repository each get their own
 `.cgx/` rather than sharing one cache.
+
+### Shipped: sharing the index — the `refs/cgx/index` overlay (`cgx push`/`cgx pull`)
+
+The location above (`.cgx/` in the repo root, self-ignored) is local-only: nothing under
+`.cgx/` is committed, so a fresh clone or a CI runner starts with no index. `cgx push` and
+`cgx pull` share a locally-built index over git's own transport, without writing anything to
+a branch.
+
+`cgx push [remote] [--repo <path>]` promotes the local `.cgx` committable set —
+`objects/` + `refs/` + `HEAD.json`, the same content-addressed object model described in IX-1,
+unchanged — into the repository's git object database using `git` plumbing (`hash-object`,
+`mktree`, `commit-tree`, `update-ref`; no `libgit2` dependency). The objects are wrapped in a
+**deterministic, parentless commit** (fixed author/committer identity and timestamp, fixed
+message, no parent — two pushes of an unchanged tree produce a byte-identical commit OID) and
+that commit is advanced, via compare-and-swap, at a dedicated non-branch ref:
+**`refs/cgx/index`**. `cgx push` never writes `refs/heads/*` and creates no commit on any
+branch; the objects it writes do not appear in `git log`, `git blame`, or a `refs/heads/*`
+diff. The one honest caveat: a ref *is* a ref, and `git log --all` (which walks every ref,
+not just branch history) does list the commit — invisibility holds for the ordinary
+branch-history walk, not for a full-ref enumeration.
+
+`cgx pull [remote] [--repo <path>]` fetches `refs/cgx/index` and materializes `.cgx/objects`,
+`.cgx/refs`, and `.cgx/HEAD.json` locally, re-hashing each object's bytes against its OID as
+it writes them (a mismatch is a hard integrity error, never served). `cgx push`/`cgx pull` are
+transport only — they do not change the object model, the OID scheme, or the manifest format
+described elsewhere in this document.
+
+**Refspec ergonomics.** A plain `git clone` or a default `git fetch` does not bring
+`refs/cgx/*` down — git only fetches refs a refspec names. One step configures it for a given
+clone:
+
+```
+cgx configure-remote [remote]
+```
+
+which writes `remote.<remote>.fetch`/`remote.<remote>.push = +refs/cgx/*:refs/cgx/*` into
+that repository's git config (idempotent; defaults `remote` to `origin`). The same effect is
+had by hand-editing `.git/config`:
+
+```
+[remote "origin"]
+    fetch = +refs/cgx/*:refs/cgx/*
+```
+
+`cgx pull` itself always passes an explicit `+refs/cgx/index:refs/cgx/index` refspec on the
+`git fetch` it runs, so **pulling works without `configure-remote` having been run** — the
+refspec matters for anything that does a *bare* `git fetch`/`git pull` outside of `cgx pull`
+(a CI job's checkout step, an editor's background fetch, a teammate's manual `git fetch`).
+Every clone or CI runner that wants `refs/cgx/*` visible to plain git needs this configured
+independently — `cgx configure-remote` edits only the repository it is run in and **cannot**
+reach into a CI runner's own git config on your behalf. If the ref is genuinely absent from
+the remote (no one has pushed yet, or the wrong remote was named), `cgx pull` fails **loudly**
+with an error naming the `+refs/cgx/*:refs/cgx/*` refspec as the fix — never a silent,
+empty-but-successful pull.
+
+**Portability posture.** `refs/cgx/index` is the primary, shipped rung: it works on
+GitHub-class hosts that accept pushes to arbitrary custom refs. Custom refs are not accepted
+everywhere — Azure DevOps rejects pushes outside `refs/heads/*` and `refs/tags/*` (verified
+2026-06-29; see the host-compatibility table in the sparse-storage RFC, §4.7). For hosts in
+that class, the documented next rung is an **orphan branch, `refs/heads/cgx-index`**: the same
+object model and the same deterministic commit, retargeted to a normal branch ref instead of
+`refs/cgx/index` — a one-line ref-name change, since the commit-wrapping the objects already
+require (above) is exactly what an orphan branch under `refs/heads/*` needs. This rung is
+**documented, not implemented, in this cycle.** Its tradeoff: a branch under `refs/heads/*` is
+visible in ordinary branch listings and PR UIs (unlike `refs/cgx/index`), and an
+organization's branch-protection or required-review policy applied to all branches may block
+cgx's automated updates to it. A third, in-tree rung (committing the index directly into a
+source branch) was considered and **dropped**; it is not offered as an option here or
+elsewhere in `cgx`.
 
 ### Decision (design, not shipped): XDG cache directory
 

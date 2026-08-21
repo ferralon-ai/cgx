@@ -36,7 +36,7 @@ use cgx_cli::output::{
 use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
 use cgx_cli::shadow_store::ShadowStore;
-use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, FlipOutcome, IndexPointer};
+use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
 use cgx_cli::CliError;
 
 /// cgx — a deterministic, language-agnostic call-graph tool.
@@ -265,17 +265,6 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = DumpFormat::Text)]
         format: DumpFormat,
-    },
-    /// Make the current `.cgx/` graph artifacts trackable by git (the "flip").
-    ///
-    /// Upgrades `.cgx/.gitignore` to the committable allowlist so `objects/`,
-    /// `refs/`, and `HEAD.json` become git-visible; then leaves `git add` /
-    /// `git commit` to you (it never commits on your behalf). Refuses when the
-    /// current index is an ephemeral working-tree (`workdir:`) graph. Idempotent.
-    StoreCommit {
-        /// Path to the indexed repository (defaults to the current directory).
-        #[arg(long)]
-        repo: Option<PathBuf>,
     },
     /// Report on the quality of the current on-disk index.
     Doctor {
@@ -730,7 +719,6 @@ fn run(command: Command) -> Result<(), CliError> {
         } => run_symbols(rank, kind, limit, top, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Dump { symbol, repo, format } => run_dump(symbol, repo, format),
-        Command::StoreCommit { repo } => run_store_commit(repo),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
             base,
@@ -2068,23 +2056,6 @@ fn run_dump(
         matches!(format, DumpFormat::Json),
     )?;
     println!("{rendered}");
-    Ok(())
-}
-
-/// `cgx store-commit`: the explicit "flip" that makes the current `.cgx/` graph
-/// trackable by git. Delegates the guard + gitignore upgrade to
-/// `cgx_cli::store_loc::flip_to_committable`; it never runs `git add`/`commit`.
-fn run_store_commit(repo: Option<PathBuf>) -> Result<(), CliError> {
-    let repo_root = resolve_repo(repo)?;
-    match cgx_cli::store_loc::flip_to_committable(&repo_root)? {
-        FlipOutcome::Flipped => println!(
-            ".cgx/ is now committable — objects/, refs/, and HEAD.json are git-trackable. \
-             Review and `git add .cgx` to commit the graph."
-        ),
-        FlipOutcome::AlreadyCommittable => {
-            println!(".cgx/ is already committable — nothing to do.")
-        }
-    }
     Ok(())
 }
 

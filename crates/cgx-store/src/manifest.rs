@@ -10,6 +10,13 @@
 use crate::oid::ObjectOid;
 use serde::{Deserialize, Serialize};
 
+/// The Layer-2 object/postcard schema version stamped on every manifest. Bump on
+/// any change to the on-disk shape of `Manifest`/`Shard`/`Node`/`Edge`/candidates.
+/// Unlike `created_rev` (git provenance), this is the compatibility gate: a reader
+/// rejects a manifest whose `store_format` exceeds this value rather than
+/// mis-decoding non-self-describing postcard bytes (recon §4 / D-3).
+pub const CURRENT_STORE_FORMAT: u32 = 1;
+
 /// One shard entry: the owning-function key and the OID of the object holding that
 /// function's nodes + edges. The list is sorted by `fn_key` so the manifest bytes
 /// are deterministic (no hash-order iteration).
@@ -25,6 +32,10 @@ pub struct ShardEntry {
 /// order; `shards` sorted by `fn_key`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// The object/postcard schema version this manifest was written under (see
+    /// [`CURRENT_STORE_FORMAT`]). Placed first so it reads as a format header; a
+    /// reader gates on it before trusting the remaining fields.
+    pub store_format: u32,
     /// The Layer-2 key: a tree OID **or** a `workdir:<digest>` synthetic key
     /// (recon §B — not always a tree OID).
     pub graph_key: String,

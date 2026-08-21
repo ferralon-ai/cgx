@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assertions;
+pub mod dump;
 pub mod exit;
 pub mod forest;
 pub mod freshness;

@@ -27,9 +27,9 @@
 //! therefore never observes a manifest that references an object not yet fully
 //! written.
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::lock::WriteLock;
-use crate::manifest::{Manifest, ShardEntry};
+use crate::manifest::{Manifest, ShardEntry, CURRENT_STORE_FORMAT};
 use crate::oid::ObjectOid;
 use crate::store::{FactStore, FnSummaryRow, FragmentInput, SqliteStore};
 use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
@@ -116,7 +116,17 @@ impl ObjectStore {
             .to_owned();
         let path = ObjectOid(manifest_oid).object_path(&self.objects_dir);
         let bytes = fs::read(&path)?;
-        Ok(Some(decode::<Manifest>(&bytes)?))
+        let manifest = decode::<Manifest>(&bytes)?;
+        // Compat gate: a committed manifest from a newer cgx may carry a schema this
+        // binary cannot decode faithfully (postcard is not self-describing). Reject
+        // loudly — naming both versions — rather than silently mis-decode (D-3).
+        if manifest.store_format > CURRENT_STORE_FORMAT {
+            return Err(StoreError::StoreFormat {
+                found: manifest.store_format,
+                expected: CURRENT_STORE_FORMAT,
+            });
+        }
+        Ok(Some(manifest))
     }
 
     /// Write `bytes` as a content-addressed object under `dir`, returning its OID.
@@ -271,6 +281,7 @@ impl FactStore for ObjectStore {
         };
 
         let manifest = Manifest {
+            store_format: CURRENT_STORE_FORMAT,
             graph_key: tree.as_str().to_owned(),
             created_rev: created_rev.map(|s| s.to_owned()),
             shards: shard_entries,

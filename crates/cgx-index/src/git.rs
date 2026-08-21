@@ -212,19 +212,30 @@ impl Repo {
             matched: 0,
         };
         walk.visit(&workdir, "")?;
-        // Every indexed path we never saw on disk is a removal. `matched` counts
-        // distinct indexed paths found on disk, so it can never exceed the map —
-        // except through a lossy path conversion collapsing two indexed paths onto
-        // one string, which would count one of them twice. Saturating rather than
-        // wrapping: a count is a report, and the honest failure of an over-count is
-        // "zero removals", not a panic in debug and ~1.8e19 in release.
+        // Symmetry with the disk-side prune: a committable store commits its
+        // `.cgx/objects/**` etc. into the tree, so `indexed` can carry `.cgx/`
+        // paths that the walk deliberately never visits. Excluding them from the
+        // indexed denominator keeps them from counting as phantom removals — the
+        // store is cgx's own artifact, not source divergence.
+        let store_prefix = format!("{CGX_STORE_DIRNAME}/");
+        let store_paths = indexed
+            .range(store_prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&store_prefix))
+            .count();
+        let source_indexed = indexed.len() - store_paths;
+        // Every source indexed path we never saw on disk is a removal. `matched`
+        // counts distinct (non-store) indexed paths found on disk, so it can never
+        // exceed `source_indexed` — except through a lossy path conversion
+        // collapsing two indexed paths onto one string, which would count one
+        // twice. Saturating rather than wrapping: a count is a report, and the
+        // honest failure of an over-count is "zero removals", not a panic in debug
+        // and ~1.8e19 in release.
         debug_assert!(
-            walk.matched <= indexed.len(),
-            "matched {} exceeds the {} indexed paths",
+            walk.matched <= source_indexed,
+            "matched {} exceeds the {source_indexed} source indexed paths",
             walk.matched,
-            indexed.len()
         );
-        Ok(walk.dirty + indexed.len().saturating_sub(walk.matched))
+        Ok(walk.dirty + source_indexed.saturating_sub(walk.matched))
     }
 
     /// The absolute base directories of all linked worktrees (IX-6). The main
@@ -258,6 +269,11 @@ struct DirtyWalk<'a> {
     matched: usize,
 }
 
+/// The repo-local cgx store directory name (mirrors `cgx_cli::store_loc::CGX_DIR`,
+/// duplicated here to avoid a CLI dependency in the index layer). Pruned from the
+/// freshness dirty-walk because the store is cgx's own artifact, not source.
+const CGX_STORE_DIRNAME: &str = ".cgx";
+
 impl DirtyWalk<'_> {
     /// Visit `dir` (absolute), whose repo-relative form is `rel` (`""` for the
     /// root, otherwise `/`-separated with no trailing slash).
@@ -273,6 +289,15 @@ impl DirtyWalk<'_> {
             })?;
             let name = entry.file_name();
             if name == ".git" {
+                continue;
+            }
+            // cgx's own content-addressed store (`.cgx/` at the repo root) is
+            // never part of the indexed source tree. Since Slice 2 its committable
+            // subset (objects/, refs/, HEAD.json) is no longer git-ignored, so
+            // without this prune the store's own objects would be miscounted as
+            // working-tree additions, inflating the freshness divergence. It holds
+            // no indexed path by construction; skip it (root level only).
+            if rel.is_empty() && name == CGX_STORE_DIRNAME {
                 continue;
             }
             let file_type = entry.file_type().map_err(|source| IndexError::Io {

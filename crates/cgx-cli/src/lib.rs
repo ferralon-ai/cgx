@@ -15,6 +15,7 @@ pub mod freshness;
 pub mod output;
 pub mod pack;
 pub mod pattern;
+pub mod shadow_store;
 pub mod store_loc;
 
 use exit::ExitCode;

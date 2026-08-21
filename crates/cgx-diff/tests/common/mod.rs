@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use cgx_index::{default_registry, index_path};
-use cgx_store::{FactStore, GraphId, LinkedGraph, SqliteStore};
+use cgx_store::{FactStore, LinkedGraph, SqliteStore, TreeOid};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -115,12 +115,14 @@ impl TestRepo {
         git(&self.path, &["config", key, value]);
     }
 
-    /// Index the current committed HEAD tree into the store, returning its graph.
-    pub fn index_head(&mut self) -> (GraphId, LinkedGraph) {
+    /// Index the current committed HEAD tree into the store, returning its Layer-2
+    /// key (tree OID) and graph.
+    pub fn index_head(&mut self) -> (TreeOid, LinkedGraph) {
         let registry = default_registry();
         let outcome = index_path(&self.path, &registry, &mut self.store, &Default::default()).expect("index");
-        let graph = self.store.read_graph(outcome.graph_id).expect("read");
-        (outcome.graph_id, graph)
+        let tree = TreeOid::new(outcome.graph_key);
+        let graph = self.store.read_graph(&tree).expect("read");
+        (tree, graph)
     }
 }
 

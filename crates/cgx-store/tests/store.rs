@@ -31,8 +31,8 @@ fn linked_graph_round_trips_identically() {
     let g = sample_graph();
     let tree = TreeOid::new("tree-aaa");
 
-    let id = store.put_graph(&tree, Some("rev-1"), &g).unwrap();
-    let back = store.read_graph(id).unwrap();
+    store.put_graph(&tree, Some("rev-1"), &g).unwrap();
+    let back = store.read_graph(&tree).unwrap();
 
     assert_eq!(g, back, "graph read back must equal the graph written");
 }
@@ -42,8 +42,9 @@ fn own_effects_survive_the_round_trip() {
     use cgx_core::Effect;
     let mut store = open();
     let g = sample_graph();
-    let id = store.put_graph(&TreeOid::new("tree-fx"), None, &g).unwrap();
-    let back = store.read_graph(id).unwrap();
+    let tree = TreeOid::new("tree-fx");
+    store.put_graph(&tree, None, &g).unwrap();
+    let back = store.read_graph(&tree).unwrap();
 
     // node1 in the sample graph carries io.file + nondeterministic.
     let n1 = back.nodes.iter().find(|n| n.id.0 == 1).expect("node 1");
@@ -76,29 +77,39 @@ fn own_effects_column_is_denormalized_for_sql() {
 fn empty_graph_round_trips() {
     let mut store = open();
     let g = LinkedGraph::default();
-    let id = store
-        .put_graph(&TreeOid::new("tree-empty"), None, &g)
-        .unwrap();
-    assert_eq!(store.read_graph(id).unwrap(), g);
+    let tree = TreeOid::new("tree-empty");
+    store.put_graph(&tree, None, &g).unwrap();
+    assert_eq!(store.read_graph(&tree).unwrap(), g);
 }
 
 #[test]
-fn graph_for_returns_id_after_put() {
+fn graph_for_reports_existence_after_put() {
     let mut store = open();
     let tree = TreeOid::new("tree-lookup");
-    assert!(store.graph_for(&tree).unwrap().is_none());
-    let id = store.put_graph(&tree, None, &sample_graph()).unwrap();
-    assert_eq!(store.graph_for(&tree).unwrap(), Some(id));
+    assert!(!store.graph_for(&tree).unwrap());
+    store.put_graph(&tree, None, &sample_graph()).unwrap();
+    assert!(store.graph_for(&tree).unwrap());
 }
 
 #[test]
-fn re_putting_same_tree_reuses_graph_id_and_replaces_rows() {
+fn re_putting_same_tree_replaces_rows_without_appending() {
     let mut store = open();
     let tree = TreeOid::new("tree-reput");
-    let id1 = store.put_graph(&tree, None, &sample_graph()).unwrap();
-    let id2 = store.put_graph(&tree, None, &sample_graph()).unwrap();
-    assert_eq!(id1, id2, "same tree OID must reuse its graph row");
-    assert_eq!(store.read_graph(id2).unwrap(), sample_graph());
+    store.put_graph(&tree, None, &sample_graph()).unwrap();
+    // A second put of the same tree replaces (not appends): the symbol row count
+    // stays at one graph's worth, and the read-back is the single sample graph.
+    let symbols_after_first = store
+        .query_count("SELECT COUNT(*) FROM nodes")
+        .unwrap();
+    store.put_graph(&tree, None, &sample_graph()).unwrap();
+    let symbols_after_second = store
+        .query_count("SELECT COUNT(*) FROM nodes")
+        .unwrap();
+    assert_eq!(
+        symbols_after_first, symbols_after_second,
+        "re-putting the same tree OID must replace its rows, not append a second graph"
+    );
+    assert_eq!(store.read_graph(&tree).unwrap(), sample_graph());
 }
 
 // ---- Blob-OID fragment CRUD + no-op re-put ----------------------------------
@@ -210,11 +221,12 @@ fn two_writes_of_same_graph_produce_identical_row_bytes() {
     let mut b = open();
     let g = sample_graph();
 
-    let ida = a.put_graph(&TreeOid::new("t"), None, &g).unwrap();
-    let idb = b.put_graph(&TreeOid::new("t"), None, &g).unwrap();
+    let tree = TreeOid::new("t");
+    a.put_graph(&tree, None, &g).unwrap();
+    b.put_graph(&tree, None, &g).unwrap();
 
-    let dump_a = a.dump_node_edge_data(ida).unwrap();
-    let dump_b = b.dump_node_edge_data(idb).unwrap();
+    let dump_a = a.dump_node_edge_data(&tree).unwrap();
+    let dump_b = b.dump_node_edge_data(&tree).unwrap();
     assert_eq!(
         dump_a, dump_b,
         "two stores writing the same graph must hold byte-identical row data"
@@ -225,8 +237,9 @@ fn two_writes_of_same_graph_produce_identical_row_bytes() {
 fn round_trip_then_re_encode_is_byte_identical() {
     let mut store = open();
     let g = sample_graph();
-    let id = store.put_graph(&TreeOid::new("t"), None, &g).unwrap();
-    let back = store.read_graph(id).unwrap();
+    let tree = TreeOid::new("t");
+    store.put_graph(&tree, None, &g).unwrap();
+    let back = store.read_graph(&tree).unwrap();
 
     // Re-encoding original and round-tripped records yields identical bytes.
     for (orig, rt) in g.nodes.iter().zip(back.nodes.iter()) {
@@ -295,25 +308,25 @@ fn prune_graphs_except_keeps_live_graph_and_removes_the_rest() {
     let t3 = TreeOid::new("tree-keep");
     store.put_graph(&t1, None, &sample_graph()).unwrap();
     store.put_graph(&t2, None, &sample_graph()).unwrap();
-    let keep_id = store.put_graph(&t3, None, &sample_graph()).unwrap();
+    store.put_graph(&t3, None, &sample_graph()).unwrap();
 
     let removed = store.prune_graphs_except(&[&t3]).unwrap();
     assert_eq!(removed, 2, "the two superseded graphs are GC'd");
 
     // The kept graph still loads correctly (read-path regression guard).
-    assert_eq!(store.read_graph(keep_id).unwrap(), sample_graph());
-    assert!(store.graph_for(&t1).unwrap().is_none());
-    assert!(store.graph_for(&t2).unwrap().is_none());
-    assert_eq!(store.graph_for(&t3).unwrap(), Some(keep_id));
+    assert_eq!(store.read_graph(&t3).unwrap(), sample_graph());
+    assert!(!store.graph_for(&t1).unwrap());
+    assert!(!store.graph_for(&t2).unwrap());
+    assert!(store.graph_for(&t3).unwrap());
 
-    // Cascade reclaimed the dead graphs' node/edge rows (no orphans).
-    let kept = keep_id.0;
-    let orphan_nodes = store
-        .query_count(&format!(
-            "SELECT COUNT(*) FROM nodes WHERE graph_id <> {kept}"
-        ))
-        .unwrap();
-    assert_eq!(orphan_nodes, 0, "FK cascade removed dead graphs' nodes");
+    // Cascade reclaimed the dead graphs' node rows (no orphans): only the kept
+    // graph's nodes survive, so the total node count is exactly one graph's worth.
+    let total_nodes = store.query_count("SELECT COUNT(*) FROM nodes").unwrap();
+    assert_eq!(
+        total_nodes,
+        sample_graph().nodes.len() as i64,
+        "FK cascade removed dead graphs' nodes"
+    );
 }
 
 #[test]
@@ -323,15 +336,15 @@ fn prune_graphs_except_can_retain_multiple_graphs() {
     let a = TreeOid::new("tree-a");
     let b = TreeOid::new("tree-b");
     let c = TreeOid::new("tree-c");
-    let ida = store.put_graph(&a, None, &sample_graph()).unwrap();
-    let idb = store.put_graph(&b, None, &sample_graph()).unwrap();
+    store.put_graph(&a, None, &sample_graph()).unwrap();
+    store.put_graph(&b, None, &sample_graph()).unwrap();
     store.put_graph(&c, None, &sample_graph()).unwrap();
 
     let removed = store.prune_graphs_except(&[&a, &b]).unwrap();
     assert_eq!(removed, 1);
-    assert_eq!(store.read_graph(ida).unwrap(), sample_graph());
-    assert_eq!(store.read_graph(idb).unwrap(), sample_graph());
-    assert!(store.graph_for(&c).unwrap().is_none());
+    assert_eq!(store.read_graph(&a).unwrap(), sample_graph());
+    assert_eq!(store.read_graph(&b).unwrap(), sample_graph());
+    assert!(!store.graph_for(&c).unwrap());
 }
 
 #[test]
@@ -530,8 +543,9 @@ proptest! {
     #[test]
     fn prop_graph_round_trips(g in arb_graph()) {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let id = store.put_graph(&TreeOid::new("t"), None, &g).unwrap();
-        let back = store.read_graph(id).unwrap();
+        let tree = TreeOid::new("t");
+        store.put_graph(&tree, None, &g).unwrap();
+        let back = store.read_graph(&tree).unwrap();
         prop_assert_eq!(g, back);
     }
 
@@ -541,11 +555,28 @@ proptest! {
     fn prop_two_writes_are_byte_identical(g in arb_graph()) {
         let mut a = SqliteStore::open_in_memory().unwrap();
         let mut b = SqliteStore::open_in_memory().unwrap();
-        let ida = a.put_graph(&TreeOid::new("t"), None, &g).unwrap();
-        let idb = b.put_graph(&TreeOid::new("t"), None, &g).unwrap();
+        let tree = TreeOid::new("t");
+        a.put_graph(&tree, None, &g).unwrap();
+        b.put_graph(&tree, None, &g).unwrap();
         prop_assert_eq!(
-            a.dump_node_edge_data(ida).unwrap(),
-            b.dump_node_edge_data(idb).unwrap()
+            a.dump_node_edge_data(&tree).unwrap(),
+            b.dump_node_edge_data(&tree).unwrap()
+        );
+    }
+
+    /// Shadow parity across the generated corpus: the object-store read of a tree
+    /// is byte-identical to the SQLite read of the same tree (criterion 8).
+    #[test]
+    fn prop_object_store_read_matches_sqlite_read(g in arb_graph()) {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut objects = cgx_store::ObjectStore::open(root.path().join(".cgx")).unwrap();
+        let mut sqlite = SqliteStore::open_in_memory().unwrap();
+        let tree = TreeOid::new("t");
+        objects.put_graph(&tree, None, &g).unwrap();
+        sqlite.put_graph(&tree, None, &g).unwrap();
+        prop_assert_eq!(
+            objects.read_graph(&tree).unwrap(),
+            sqlite.read_graph(&tree).unwrap()
         );
     }
 }

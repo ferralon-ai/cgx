@@ -13,6 +13,7 @@ serde.workspace = true
 postcard.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 fd-lock = "4"
+sha1 = "0.10"
 
 [dev-dependencies]
 proptest.workspace = true

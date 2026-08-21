@@ -73,7 +73,7 @@ fn rta_narrows_a_dyn_call_to_probable_end_to_end() {
         "Triangle::area (never instantiated) is the one dropped candidate"
     );
 
-    let g = read_graph(&store, outcome.graph_id);
+    let g = read_graph(&store, &outcome.graph_key);
     let idx = GraphIndex::new(&g);
 
     // The surviving virtual-dispatch candidates are Circle::area + Square::area,

@@ -122,7 +122,7 @@ fn scip_upgrades_free_fn_call_to_certain_via_index_path() {
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
 
-    let g = read_graph(&store, outcome.graph_id);
+    let g = read_graph(&store, &outcome.graph_key);
     let idx = GraphIndex::new(&g);
 
     // E1: the cross-module free-fn call `caller -> math::add` is certain@scip
@@ -180,7 +180,7 @@ fn scip_joins_on_real_cargo_package_name_not_rust_sample() {
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
 
-    let g = read_graph(&store, outcome.graph_id);
+    let g = read_graph(&store, &outcome.graph_key);
     let idx = GraphIndex::new(&g);
 
     // The node FQNs must root at the real crate name (proves the Cargo.toml derive).
@@ -248,12 +248,12 @@ fn re_indexing_with_scip_is_byte_identical() {
     let data_a = {
         let mut store = mem_store();
         let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
-        store.dump_node_edge_data(outcome.graph_id).unwrap()
+        store.dump_node_edge_data(&cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap()
     };
     let data_b = {
         let mut store = mem_store();
         let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
-        store.dump_node_edge_data(outcome.graph_id).unwrap()
+        store.dump_node_edge_data(&cgx_store::TreeOid::new(outcome.graph_key.clone())).unwrap()
     };
 
     assert_eq!(
@@ -284,7 +284,7 @@ fn real_scip_blob_when_present() {
         dataflow: false,
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
-    let g = read_graph(&store, outcome.graph_id);
+    let g = read_graph(&store, &outcome.graph_key);
     let idx = GraphIndex::new(&g);
     assert!(
         idx.edges_between("scip_relabel::caller", "scip_relabel::math::add")

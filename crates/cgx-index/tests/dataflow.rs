@@ -8,7 +8,7 @@ use cgx_core::{EdgeKind, SymbolKind};
 use cgx_index::{default_registry, index_path, IndexOpts};
 use common::*;
 
-fn index_with(dataflow: bool) -> (tempfile::TempDir, cgx_store::SqliteStore, cgx_store::GraphId) {
+fn index_with(dataflow: bool) -> (tempfile::TempDir, cgx_store::SqliteStore, String) {
     let (tmp, repo) = init_fixture_repo("rust-sample");
     let registry = default_registry();
     let mut store = mem_store();
@@ -17,14 +17,14 @@ fn index_with(dataflow: bool) -> (tempfile::TempDir, cgx_store::SqliteStore, cgx
         ..Default::default()
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
-    (tmp, store, outcome.graph_id)
+    (tmp, store, outcome.graph_key)
 }
 
 #[test]
 fn dataflow_index_emits_value_nodes_and_derives_from_edges() {
     // Criterion 1: SSA value nodes + DerivesFrom edges appear with --dataflow.
     let (_t, store, id) = index_with(true);
-    let g = read_graph(&store, id);
+    let g = read_graph(&store, &id);
 
     let value_nodes = g
         .nodes
@@ -45,7 +45,7 @@ fn dataflow_index_emits_value_nodes_and_derives_from_edges() {
 fn reassignment_in_fixture_yields_two_distinct_value_nodes() {
     // Criterion 2: flow_example's `b` is assigned twice → b#1 and b#2.
     let (_t, store, id) = index_with(true);
-    let g = read_graph(&store, id);
+    let g = read_graph(&store, &id);
     let b_versions = g
         .nodes
         .iter()
@@ -105,9 +105,9 @@ fn base_index_node_and_edge_counts_unchanged_by_flag_absence() {
     // DerivesFrom edges; the dataflow index strictly *adds* both, leaving the base
     // symbol/call graph otherwise identical.
     let (_t1, base_store, base_id) = index_with(false);
-    let base = read_graph(&base_store, base_id);
+    let base = read_graph(&base_store, &base_id);
     let (_t2, df_store, df_id) = index_with(true);
-    let df = read_graph(&df_store, df_id);
+    let df = read_graph(&df_store, &df_id);
 
     // No value nodes / DerivesFrom in the base.
     assert!(base
@@ -138,8 +138,8 @@ fn dataflow_reindex_is_byte_identical() {
     // + edge order (dump the canonical row data and compare).
     let (_t1, store1, id1) = index_with(true);
     let (_t2, store2, id2) = index_with(true);
-    let dump1 = store1.dump_node_edge_data(id1).unwrap();
-    let dump2 = store2.dump_node_edge_data(id2).unwrap();
+    let dump1 = store1.dump_node_edge_data(&cgx_store::TreeOid::new(id1.clone())).unwrap();
+    let dump2 = store2.dump_node_edge_data(&cgx_store::TreeOid::new(id2.clone())).unwrap();
     assert_eq!(
         dump1, dump2,
         "two dataflow indexings must be byte-identical"
@@ -154,7 +154,7 @@ fn opaque_call_resolves_through_summary_in_sc4() {
     // `r ⇝ a` tagged `interprocedural` + confidence `probable` (criterion 1).
     use cgx_core::confidence::Confidence;
     let (_t, store, id) = index_with(true);
-    let g = read_graph(&store, id);
+    let g = read_graph(&store, &id);
 
     let r_node = g
         .nodes

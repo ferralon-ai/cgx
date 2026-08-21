@@ -49,8 +49,8 @@
 //! let outcome = index_path(repo_path, &registry, &mut store)?;
 //! // Or index a working directory (worktree-aware, uncommitted files included):
 //! let outcome = index_workdir(repo_path, dir, &registry, &mut store)?;
-//! // Obtain the graph to query:
-//! let graph = store.read_graph(outcome.graph_id)?;
+//! // Obtain the graph to query (keyed by the tree OID the graph was stored under):
+//! let graph = store.read_graph(&TreeOid::new(outcome.graph_key))?;
 //! ```
 
 #![forbid(unsafe_code)]
@@ -69,7 +69,7 @@ pub use pipeline::{IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 
 use cgx_frontend::FrontendRegistry;
-use cgx_store::{FactStore, GraphId};
+use cgx_store::FactStore;
 use std::path::Path;
 
 /// The result of an index run: what was indexed, and how to reach the graph.
@@ -79,9 +79,6 @@ pub struct IndexOutcome {
     /// committed index, or a synthetic `"workdir:<digest>"` key for a working
     /// directory.
     pub graph_key: String,
-    /// The stored graph's id. The caller reads it back with
-    /// [`FactStore::read_graph`](cgx_store::FactStore::read_graph) to query.
-    pub graph_id: GraphId,
     /// Pipeline counters (extraction vs. cache hits, node/edge totals).
     pub stats: IndexStats,
 }
@@ -107,10 +104,9 @@ pub fn index_path(
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);
     pipeline::apply_effects(&mut graph, &mut stats);
-    let graph_id = pipeline::store_graph(store, &tree_oid, None, graph)?;
+    pipeline::store_graph(store, &tree_oid, None, graph)?;
     Ok(IndexOutcome {
         graph_key: tree_oid,
-        graph_id,
         stats,
     })
 }
@@ -140,10 +136,9 @@ pub fn index_workdir(
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);
     pipeline::apply_effects(&mut graph, &mut stats);
-    let graph_id = pipeline::store_graph(store, &key, None, graph)?;
+    pipeline::store_graph(store, &key, None, graph)?;
     Ok(IndexOutcome {
         graph_key: key,
-        graph_id,
         stats,
     })
 }

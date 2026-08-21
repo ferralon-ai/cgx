@@ -35,7 +35,7 @@ fn two_commit_diff() -> cgx_diff::GraphDiff {
     repo.write("src/lib.rs", SRC_B);
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, _) = repo.index_head();
-    diff_trees(&repo.store, base_id, head_id).expect("diff")
+    diff_trees(&repo.store, &base_id, &head_id).expect("diff")
 }
 
 #[test]
@@ -122,7 +122,7 @@ pub fn caller(flag: bool) -> i32 { if flag { target() } else { 0 } }
     repo.write("src/lib.rs", src_b);
     repo.commit("b", "2020-02-01T00:00:00Z");
     let (head_id, _) = repo.index_head();
-    let diff = diff_trees(&repo.store, base_id, head_id).expect("diff");
+    let diff = diff_trees(&repo.store, &base_id, &head_id).expect("diff");
 
     // The changed caller->target edge is Conditional at head; filtering on
     // Conditional keeps it, filtering on Exception drops it.

@@ -33,7 +33,7 @@ use cgx_resolve::{
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
-use cgx_store::{BlobOid, FactStore, FragmentInput, GraphId, LinkedGraph, TreeOid};
+use cgx_store::{BlobOid, FactStore, FragmentInput, LinkedGraph, TreeOid};
 
 pub use scip_relabel::ScipStats;
 
@@ -333,15 +333,16 @@ pub(crate) fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.effects = run_effect_closure(graph);
 }
 
-/// Materialize `graph` into the store under `tree_oid`, returning its graph id.
+/// Materialize `graph` into the store under `tree_oid`.
 pub(crate) fn store_graph<S: FactStore>(
     store: &mut S,
     tree_oid: &str,
     created_rev: Option<&str>,
     graph: ResolvedGraph,
-) -> Result<GraphId> {
+) -> Result<()> {
     let (nodes, edges, candidates) = graph.into_linked();
     let linked = LinkedGraph::new(nodes, edges, candidates);
     let tree = TreeOid::new(tree_oid.to_string());
-    Ok(store.put_graph(&tree, created_rev, &linked)?)
+    store.put_graph(&tree, created_rev, &linked)?;
+    Ok(())
 }

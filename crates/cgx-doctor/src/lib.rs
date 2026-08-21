@@ -12,11 +12,11 @@
 //!
 //! ```no_run
 //! use cgx_doctor::{report, render_text};
-//! use cgx_store::{FactStore, GraphId, SqliteStore};
+//! use cgx_store::{SqliteStore, TreeOid};
 //!
 //! let store = SqliteStore::open("index.db").unwrap();
-//! let graph_id = GraphId(1);
-//! let rep = report(&store, graph_id).unwrap();
+//! let tree = TreeOid::new("<tree-oid>");
+//! let rep = report(&store, &tree).unwrap();
 //! println!("{}", render_text(&rep));
 //! ```
 //!
@@ -25,7 +25,7 @@
 //! ```rust,ignore
 //! // In cgx-cli, the `doctor` subcommand wires as follows:
 //! let outcome = cgx_index::index_path(repo, &registry, &mut store)?;
-//! let rep = cgx_doctor::report(&store, outcome.graph_id)?;
+//! let rep = cgx_doctor::report(&store, &TreeOid::new(outcome.graph_key))?;
 //! if json_flag {
 //!     println!("{}", cgx_doctor::render_json(&rep)?);
 //! } else {
@@ -42,9 +42,9 @@ pub mod report;
 pub use render::{render_json, render_text};
 pub use report::{AnomalyKind, ConfidenceBreakdown, CutMarkerCount, DoctorReport, TrustLevel};
 
-use cgx_store::{FactStore, GraphId, SqliteStore};
+use cgx_store::{FactStore, TreeOid};
 
-/// Compute a [`DoctorReport`] over the graph stored at `graph_id`.
+/// Compute a [`DoctorReport`] over the graph stored under `tree`.
 ///
 /// Reads the linked graph from the store and analyses every edge and node.
 /// Does not modify the store.
@@ -53,9 +53,9 @@ use cgx_store::{FactStore, GraphId, SqliteStore};
 ///
 /// Returns a [`cgx_store::StoreError`] if the graph cannot be read.
 pub fn report(
-    store: &SqliteStore,
-    graph_id: GraphId,
+    store: &impl FactStore,
+    tree: &TreeOid,
 ) -> Result<DoctorReport, cgx_store::StoreError> {
-    let graph = store.read_graph(graph_id)?;
+    let graph = store.read_graph(tree)?;
     Ok(report::compute(&graph))
 }

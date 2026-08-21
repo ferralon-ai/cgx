@@ -100,10 +100,11 @@ fn migrated_store_accepts_a_fresh_put_graph() {
     downgrade_schema_version(&db, SCHEMA_VERSION - 1);
 
     let mut store = SqliteStore::open(&db).unwrap();
-    let id = store
-        .put_graph(&TreeOid::new("tree-y"), None, &sample_graph())
+    let tree = TreeOid::new("tree-y");
+    store
+        .put_graph(&tree, None, &sample_graph())
         .unwrap();
-    let back = store.read_graph(id).unwrap();
+    let back = store.read_graph(&tree).unwrap();
     assert_eq!(back, sample_graph());
 }
 

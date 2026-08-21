@@ -53,11 +53,6 @@ impl From<&str> for TreeOid {
     }
 }
 
-/// Dense row id of a Layer-2 graph (`graphs.graph_id`). Opaque outside the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GraphId(pub i64);
-
 /// A cached Layer-1 fragment as returned by [`crate::FactStore::fragment`].
 ///
 /// `fragment` is the canonical postcard encoding of the file's facts, stored and

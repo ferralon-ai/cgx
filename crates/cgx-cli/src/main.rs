@@ -47,6 +47,19 @@ struct Cli {
     command: Command,
 }
 
+/// Output format for `cgx dump`. Deliberately its own two-value enum rather than
+/// the query-result [`Format`]: dump emits a raw graph listing, not the
+/// findings/SARIF/path-graph shapes `Format` renders, and the plan fixes its
+/// surface at `json|text` (default `text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum DumpFormat {
+    /// Human-readable listing (default).
+    #[default]
+    Text,
+    /// One JSON document: `graph_key`, `nodes`, `edges`, `candidates`.
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Index a repository or working tree and persist the graph under `.cgx/`.
@@ -228,6 +241,23 @@ enum Command {
         kind: Option<KindArg>,
         #[command(flatten)]
         query: QueryArgs,
+    },
+    /// Dump the current on-disk graph (nodes, edges, candidates) for inspection.
+    ///
+    /// Read-only: opens the store and decodes the already-materialized objects —
+    /// it never indexes and never writes. This is the sanctioned replacement for
+    /// ad-hoc `sqlite3 .cgx/index.db 'SELECT …'` debugging.
+    Dump {
+        /// Optional symbol filter (FQN or a `::`-suffix / substring of one). When
+        /// given, only matching nodes and the edges incident to them are dumped;
+        /// omitted ⇒ the whole graph.
+        symbol: Option<String>,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = DumpFormat::Text)]
+        format: DumpFormat,
     },
     /// Report on the quality of the current on-disk index.
     Doctor {
@@ -670,6 +700,7 @@ fn run(command: Command) -> Result<(), CliError> {
             no_auto_index,
         } => run_symbols(rank, kind, limit, top, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
+        Command::Dump { symbol, repo, format } => run_dump(symbol, repo, format),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
             base,
@@ -1872,6 +1903,33 @@ fn assertion_message(code: ExitCode) -> String {
         ExitCode::Vacuous => "assertion passed vacuously (exit 4)".into(),
         _ => "assertion outcome".into(),
     }
+}
+
+/// `cgx dump`: decode the current on-disk graph and print it. Pure read — it
+/// opens the store, reads the `HEAD.json` pointer, and decodes the already-
+/// materialized objects; it never indexes and never writes. The rendering logic
+/// lives in `cgx_cli::dump` so it is unit-testable without the index pipeline.
+fn run_dump(
+    symbol: Option<String>,
+    repo: Option<PathBuf>,
+    format: DumpFormat,
+) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+    let ptr = read_pointer(&repo_root)?;
+    let store = open_store(&repo_root)?;
+    let graph = store
+        .read_graph(&TreeOid::new(ptr.graph_key.clone()))
+        .map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?;
+    let rendered = cgx_cli::dump::render_dump(
+        &ptr.graph_key,
+        &graph.nodes,
+        &graph.edges,
+        &graph.candidates,
+        symbol.as_deref(),
+        matches!(format, DumpFormat::Json),
+    )?;
+    println!("{rendered}");
+    Ok(())
 }
 
 fn run_doctor(repo: Option<PathBuf>, format: Format) -> Result<(), CliError> {

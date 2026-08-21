@@ -167,6 +167,13 @@ enum Command {
         /// default case-insensitive substring match). Invalid regex → exit 2.
         #[arg(long)]
         regex: bool,
+        /// Drop the node-selector engine's family gate: a selector-grammar
+        /// `pattern` (one using `**`, `(`, or `!`) matches every symbol whose FQN
+        /// fits the pattern, regardless of source language. Default is native
+        /// (a symbol matches only via a family that owns its `lang` tag). No effect
+        /// on plain-glob or `--regex` patterns, which never touch the engine.
+        #[arg(long)]
+        agnostic: bool,
         /// Restrict to a symbol kind (e.g. `function`, `method`, `type`).
         #[arg(long, value_enum)]
         kind: Option<KindArg>,
@@ -654,12 +661,23 @@ fn run(command: Command) -> Result<(), CliError> {
             pattern,
             all,
             regex,
+            agnostic,
             kind,
             limit,
             repo,
             format,
             no_auto_index,
-        } => run_search(pattern, all, regex, kind, limit, repo, format, no_auto_index),
+        } => run_search(
+            pattern,
+            all,
+            regex,
+            agnostic,
+            kind,
+            limit,
+            repo,
+            format,
+            no_auto_index,
+        ),
         Command::Symbols {
             rank,
             kind,
@@ -1704,6 +1722,7 @@ fn run_search(
     pattern: Option<String>,
     all: bool,
     regex: bool,
+    agnostic: bool,
     kind: Option<KindArg>,
     limit: usize,
     repo: Option<PathBuf>,
@@ -1738,6 +1757,24 @@ fn run_search(
         (false, Some(p)) => SearchMatch::Pattern { pattern: p, regex },
     };
 
+    // A pattern written in selector-only grammar (`**`, `(`, `!`) routes to the
+    // node-selector engine instead of the substring/regex scan. `--regex` is an
+    // explicit opt-out (the two grammars are distinct), and `--all` carries no
+    // pattern, so both keep the legacy path.
+    if let SearchMatch::Pattern { pattern, regex } = selector {
+        if !regex && cgx_cli::pattern::looks_like_selector(pattern) {
+            return run_search_selector(
+                pattern,
+                agnostic,
+                kind,
+                limit,
+                repo,
+                format,
+                no_auto_index,
+            );
+        }
+    }
+
     let repo_root = resolve_repo(repo)?;
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
@@ -1747,6 +1784,96 @@ fn run_search(
     let kind_filter = kind.map(SymbolKind::from);
     let hits =
         search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
+
+    let freshness = freshness::envelope(Some(&repo_root), None);
+    print!("{}", render_search(format, &hits, limit, &freshness));
+    Ok(())
+}
+
+/// The selector-engine path of `cgx search`: compile the `pattern` through
+/// [`cgx_select`], resolve it against the node table via
+/// [`GraphView::resolve_select`], and render the matched symbols. Surfaces every
+/// honesty signal the engine raises — a compile failure is the engine's labeled
+/// error (never a silent empty result), and parse-time (`!*`→`*!` rewrite) and
+/// per-node (truncation, agnostic cross-language) disclosures go to stderr so the
+/// parseable stdout table/JSON stays clean.
+#[allow(clippy::too_many_arguments)]
+fn run_search_selector(
+    pattern: &str,
+    agnostic: bool,
+    kind: Option<KindArg>,
+    limit: usize,
+    repo: Option<PathBuf>,
+    format: Format,
+    no_auto_index: bool,
+) -> Result<(), CliError> {
+    // Zero clean parses is a hard, labeled error — never a silent empty match.
+    let compiled = cgx_select::compile(pattern).map_err(|e| CliError::usage(e.to_string()))?;
+
+    // Parse-time diagnostics (e.g. the degenerate `!*` → `*!` rewrite) are known
+    // before any node is scanned; disclose them up front.
+    for diag in compiled.diagnostics() {
+        match diag {
+            cgx_select::Diagnostic::NegationRewrite {
+                family,
+                original_segment,
+                rewritten_segment,
+            } => eprintln!(
+                "cgx: selector warning [{}]: `{original_segment}` rewritten to \
+                 `{rewritten_segment}` (a negation cannot bind a wildcard)",
+                family.name()
+            ),
+        }
+    }
+
+    let repo_root = resolve_repo(repo)?;
+    if !no_auto_index {
+        ensure_indexed(&repo_root)?;
+    }
+    let view = load_view(&repo_root)?;
+
+    let opts = if agnostic {
+        cgx_select::MatchOptions::agnostic()
+    } else {
+        cgx_select::MatchOptions::native()
+    };
+    let resolution = view.resolve_select(&compiled, &opts);
+
+    // Per-node honesty signals, aggregated across the scan.
+    if resolution.truncated {
+        eprintln!(
+            "cgx: selector warning: the active-state cap was reached while matching \
+             — results may be incomplete (empty ≠ absent)"
+        );
+    }
+    if !resolution.agnostic_cross_language.is_empty() {
+        eprintln!(
+            "cgx: selector note: {} match(es) came from a different source language \
+             than the selector's surface syntax (agnostic mode dropped the family gate)",
+            resolution.agnostic_cross_language.len()
+        );
+    }
+
+    let kind_filter = kind.map(SymbolKind::from);
+    let mut hits: Vec<cgx_query::SymbolHit> = resolution
+        .ids
+        .iter()
+        .map(|id| view.node(*id))
+        .filter(|node| kind_filter.is_none_or(|k| node.kind == k))
+        .map(|node| cgx_query::SymbolHit {
+            fqn: node.fqn.clone(),
+            file: node.file.clone(),
+            line: node.line_start,
+            kind: node.kind,
+        })
+        .collect();
+    // Match `search_symbols`'s FQN-ordered output for a stable, familiar table.
+    hits.sort_by(|a, b| {
+        a.fqn
+            .cmp(&b.fqn)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
 
     let freshness = freshness::envelope(Some(&repo_root), None);
     print!("{}", render_search(format, &hits, limit, &freshness));

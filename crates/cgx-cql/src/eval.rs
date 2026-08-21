@@ -1488,11 +1488,102 @@ fn eval_function(
                 )),
             }
         }
+        "select" => eval_select(view, name, args, b),
         _ => Err(CqlError::plan(
             name.span.clone(),
             format!("function `{fname}` is not supported in this release"),
         )),
     }
+}
+
+/// Evaluate the reserved `select(node, "<selector>" [, agnostic])` predicate: the
+/// node-selector engine ([`cgx_select`]) as a CQL `WHERE` predicate, so a selector
+/// composes with the rest of the language via the existing boolean operators
+/// (`select(n, "a::**") AND NOT select(n, "*::*Test")` is the whitelist/blacklist
+/// algebra with no new combinator).
+///
+/// The AST stays pure data: the selector travels as its **source string**, not a
+/// compiled matcher (which is neither `Clone`-cheap nor `PartialEq` for the
+/// `Expr` derive), and is compiled here at eval time. A selector that fails to
+/// compile surfaces the engine's labeled [`cgx_select::SelectorError`] as a CQL
+/// eval error — never a silent `false`.
+fn eval_select(
+    view: &GraphView,
+    name: &crate::ast::Spanned<String>,
+    args: &[Expr],
+    b: &Binding,
+) -> Result<Value, CqlError> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(CqlError::eval(
+            name.span.clone(),
+            format!(
+                "select: expected 2 or 3 arguments \
+                 (node, \"<selector>\" [, agnostic]), got {}",
+                args.len()
+            ),
+        ));
+    }
+
+    // Arg 0: the node to test. A non-node (or a null from an optional match)
+    // simply does not match — mirrors three-valued predicate handling elsewhere.
+    let id = match eval_expr(view, &args[0], b)? {
+        Value::Node(id) => id,
+        Value::Null => return Ok(Value::Bool(false)),
+        other => {
+            return Err(CqlError::eval(
+                name.span.clone(),
+                format!(
+                    "select: first argument must be a node, got a {} value",
+                    value_type_name(&other)
+                ),
+            ))
+        }
+    };
+
+    // Arg 1: the selector source string.
+    let src = match eval_expr(view, &args[1], b)? {
+        Value::Str(s) => s,
+        other => {
+            return Err(CqlError::eval(
+                name.span.clone(),
+                format!(
+                    "select: second argument must be a selector string, got a {} value",
+                    value_type_name(&other)
+                ),
+            ))
+        }
+    };
+
+    // Arg 2 (optional): the agnostic flag; default native (family-gated).
+    let agnostic = match args.get(2) {
+        None => false,
+        Some(expr) => match eval_expr(view, expr, b)? {
+            Value::Bool(flag) => flag,
+            other => {
+                return Err(CqlError::eval(
+                    name.span.clone(),
+                    format!(
+                        "select: third argument (agnostic) must be a boolean, got a {} value",
+                        value_type_name(&other)
+                    ),
+                ))
+            }
+        },
+    };
+
+    let selector = cgx_select::compile(&src)
+        .map_err(|e| CqlError::eval(name.span.clone(), format!("select: {e}")))?;
+
+    let node = view
+        .try_node(id)
+        .ok_or_else(|| CqlError::eval(name.span.clone(), "select: dangling node id"))?;
+
+    let opts = if agnostic {
+        cgx_select::MatchOptions::agnostic()
+    } else {
+        cgx_select::MatchOptions::native()
+    };
+    Ok(Value::Bool(selector.matches(node, &opts)))
 }
 
 /// Evaluate a single-argument path function's argument to a [`PathValue`].

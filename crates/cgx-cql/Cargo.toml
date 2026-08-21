@@ -10,6 +10,7 @@ description = "cgx Layer-2 query language: a Cypher subset that lowers MATCH pat
 [dependencies]
 cgx-core.workspace = true
 cgx-query = { path = "../cgx-query" }
+cgx-select = { path = "../cgx-select" }
 
 [dev-dependencies]
 proptest.workspace = true

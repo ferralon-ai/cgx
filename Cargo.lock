@@ -193,6 +193,7 @@ dependencies = [
  "cgx-index",
  "cgx-mcp",
  "cgx-query",
+ "cgx-select",
  "cgx-store",
  "clap",
  "predicates",
@@ -217,6 +218,7 @@ version = "0.3.0"
 dependencies = [
  "cgx-core",
  "cgx-query",
+ "cgx-select",
  "proptest",
 ]
 
@@ -362,6 +364,7 @@ name = "cgx-query"
 version = "0.3.0"
 dependencies = [
  "cgx-core",
+ "cgx-select",
  "cgx-store",
  "regex",
  "serde",
@@ -384,6 +387,16 @@ name = "cgx-scip"
 version = "0.3.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "cgx-select"
+version = "0.3.0"
+dependencies = [
+ "cgx-core",
+ "inventory",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1564,6 +1577,15 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]

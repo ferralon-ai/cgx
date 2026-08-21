@@ -23,6 +23,8 @@ use cgx_core::{
     Candidate, EdgeId, EdgeRecord, NodeId, NodeRecord, PatternKind, SymbolKind, SymbolPattern,
 };
 
+use cgx_select::{MatchOptions, Selector};
+
 use crate::filter::{Direction, EdgeFilter};
 
 /// A linked graph prepared for traversal.
@@ -163,6 +165,36 @@ impl GraphView {
             .collect()
     }
 
+    /// Resolve a compiled [`cgx_select::Selector`] against the node table via the
+    /// same regime-(b) linear scan as [`resolve_symbol`](Self::resolve_symbol),
+    /// preserving ascending id order — but threading the engine's per-node honesty
+    /// signals back out rather than discarding them.
+    ///
+    /// The matcher core is identical to `resolve_symbol`'s (a per-node predicate
+    /// over the loaded view); only the feeder differs. Parse-time diagnostics (e.g.
+    /// the `!*`→`*!` rewrite) stay on the [`Selector`](cgx_select::Selector) the
+    /// caller already holds; the two *per-node* disclosures — truncation
+    /// (empty ≠ absent) and agnostic cross-language provenance — are aggregated here
+    /// into [`SelectResolution`] so the caller can surface them.
+    pub fn resolve_select(&self, selector: &Selector, opts: &MatchOptions) -> SelectResolution {
+        let mut res = SelectResolution::default();
+        for node in &self.nodes {
+            let m = selector.evaluate(node, opts);
+            // Truncation is a property of the scan, surfaced even for non-matches
+            // (the cap tripped, so *this* node's answer may be incomplete).
+            if m.truncated {
+                res.truncated = true;
+            }
+            if m.matched {
+                res.ids.push(node.id);
+                if m.agnostic_cross_language {
+                    res.agnostic_cross_language.push(node.id);
+                }
+            }
+        }
+        res
+    }
+
     /// Resolve a single symbol, returning an error string when the pattern matches
     /// zero or (for non-glob patterns) more than one node. Glob/short-name patterns
     /// that match many are allowed by [`resolve_symbol`](Self::resolve_symbol);
@@ -238,6 +270,25 @@ impl GraphView {
     }
 }
 
+/// The outcome of a [`GraphView::resolve_select`] scan: the matched node ids in
+/// ascending (canonical) id order, plus the two per-node honesty signals the
+/// selector engine raises, aggregated across the scan.
+///
+/// A `SelectResolution` never silently swallows an incomplete answer: `truncated`
+/// records that the active-state cap tripped somewhere in the scan (so a node's
+/// answer may be incomplete — empty ≠ absent), and `agnostic_cross_language` lists
+/// exactly the nodes that matched *only* because the agnostic flag dropped the
+/// family gate (a cross-language provenance surprise the caller must disclose).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectResolution {
+    /// Matched node ids, ascending id order (canonical `(file, line_start, fqn)`).
+    pub ids: Vec<NodeId>,
+    /// The active-state cap tripped on at least one node during the scan.
+    pub truncated: bool,
+    /// Nodes selected only via the dropped family gate under the agnostic flag.
+    pub agnostic_cross_language: Vec<NodeId>,
+}
+
 /// Failure modes of [`GraphView::resolve_one`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
@@ -264,3 +315,77 @@ impl std::fmt::Display for ResolveError {
 }
 
 impl std::error::Error for ResolveError {}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+    use cgx_core::{NodeId, NodeRecord, SymbolKind, Visibility};
+
+    fn node(id: u32, fqn: &str, lang: &str) -> NodeRecord {
+        NodeRecord {
+            id: NodeId(id),
+            kind: SymbolKind::Type,
+            fqn: fqn.to_string(),
+            file: format!("f{id}.rs"),
+            line_start: id,
+            line_end: id,
+            lang: lang.to_string(),
+            visibility: Visibility::Public,
+            is_abstract: false,
+            entrypoint_kind: None,
+            signature: None,
+            own_effects: Default::default(),
+            transitive_effects: Default::default(),
+            unresolved_calls: 0,
+        }
+    }
+
+    fn view() -> GraphView {
+        // Ids are dense positions; kept in ascending id order deliberately so the
+        // scan-order assertion is meaningful.
+        let nodes = vec![
+            node(0, "com::foo::UserService", "rust"),
+            node(1, "com::foo::MockService", "rust"),
+            node(2, "com::foo::bar::OrderService", "rust"),
+            node(3, "com::foo::Helper", "rust"),
+            node(4, "com::foo::PaymentService", "go"),
+        ];
+        GraphView::new(nodes, vec![], vec![])
+    }
+
+    #[test]
+    fn resolve_select_scans_in_ascending_id_order() {
+        let v = view();
+        // `**` globstar then any segment ending in `Service`.
+        let sel = cgx_select::compile("com::foo::**::*Service").expect("compiles");
+        let res = v.resolve_select(&sel, &MatchOptions::native());
+        // Native (rust) matches only: UserService(0), MockService(1),
+        // OrderService(2). PaymentService(4) is Go, gated out under native.
+        assert_eq!(res.ids, vec![NodeId(0), NodeId(1), NodeId(2)]);
+        assert!(!res.truncated);
+        assert!(res.agnostic_cross_language.is_empty());
+    }
+
+    #[test]
+    fn resolve_select_agnostic_flags_cross_language() {
+        let v = view();
+        let sel = cgx_select::compile("com::foo::**::*Service").expect("compiles");
+        let res = v.resolve_select(&sel, &MatchOptions::agnostic());
+        // Agnostic drops the family gate: the Go PaymentService(4) now matches too.
+        assert_eq!(res.ids, vec![NodeId(0), NodeId(1), NodeId(2), NodeId(4)]);
+        // Only the Go node matched *purely* via the dropped gate; the rust nodes
+        // would have matched natively, so they are not cross-language surprises.
+        assert_eq!(res.agnostic_cross_language, vec![NodeId(4)]);
+    }
+
+    #[test]
+    fn resolve_select_negation_excludes() {
+        let v = view();
+        // Segments ending in `Service` but not starting with `Mock`.
+        let sel = cgx_select::compile("com::foo::!Mock*Service").expect("compiles");
+        let res = v.resolve_select(&sel, &MatchOptions::native());
+        // UserService(0) matches; MockService(1) excluded by `!Mock`; OrderService
+        // is under a deeper `bar` segment so the fixed-depth pattern misses it.
+        assert_eq!(res.ids, vec![NodeId(0)]);
+    }
+}

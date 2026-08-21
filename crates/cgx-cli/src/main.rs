@@ -266,6 +266,49 @@ enum Command {
         #[arg(long, value_enum, default_value_t = DumpFormat::Text)]
         format: DumpFormat,
     },
+    /// Promote the local `.cgx` committable index into git's object DB under the
+    /// custom ref `refs/cgx/index` and push it to a remote.
+    ///
+    /// The index is wrapped in a deterministic parentless commit and advanced via
+    /// compare-and-swap; it never writes `refs/heads/*` and creates no commit on
+    /// any branch, so `git log`/`git blame`/branch diffs are unaffected. Prints
+    /// the commit OID and the count of objects promoted (success is never silent).
+    Push {
+        /// Remote to push to (defaults to `origin`).
+        remote: Option<String>,
+        /// Path to the indexed repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Fetch `refs/cgx/index` from a remote and materialize `.cgx/` locally,
+    /// byte-identical to a fresh index of the same tree.
+    ///
+    /// Each object's bytes are re-hashed against its OID (a mismatch is a hard
+    /// error, never served). If the remote advertises no `refs/cgx/index`, the
+    /// pull FAILS LOUDLY with a refspec fix-hint (exit 3) — never a silent,
+    /// empty exit-0. Prints the count of objects materialized.
+    Pull {
+        /// Remote to pull from (defaults to `origin`).
+        remote: Option<String>,
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Configure a remote so `refs/cgx/*` round-trips through plain
+    /// `git fetch`/`git push`.
+    ///
+    /// Writes `remote.<remote>.fetch`/`.push = +refs/cgx/*:refs/cgx/*` into THIS
+    /// repository's git config (idempotent). `cgx pull` already passes an explicit
+    /// refspec and so works without this; it matters for bare `git fetch` and CI.
+    ///
+    /// LIMIT: this edits only the current repo's config. It CANNOT fix a CI
+    /// runner's default fetch refspec — the runner's own git config also needs
+    /// `fetch = +refs/cgx/*:refs/cgx/*`, or `cgx pull` there will not see the
+    /// index. See the cgx transport docs for the CI-runner git-config line.
+    ConfigureRemote {
+        /// Remote to configure (defaults to `origin`).
+        remote: Option<String>,
+    },
     /// Report on the quality of the current on-disk index.
     Doctor {
         /// Path to the indexed repository (defaults to the current directory).
@@ -719,6 +762,9 @@ fn run(command: Command) -> Result<(), CliError> {
         } => run_symbols(rank, kind, limit, top, repo, format, no_auto_index),
         Command::Unused { kind, query } => run_unused(kind, query),
         Command::Dump { symbol, repo, format } => run_dump(symbol, repo, format),
+        Command::Push { remote, repo } => run_push(remote, repo),
+        Command::Pull { remote, repo } => run_pull(remote, repo),
+        Command::ConfigureRemote { remote } => run_configure_remote(remote),
         Command::Doctor { repo, format } => run_doctor(repo, format),
         Command::Diff {
             base,
@@ -2056,6 +2102,63 @@ fn run_dump(
         matches!(format, DumpFormat::Json),
     )?;
     println!("{rendered}");
+    Ok(())
+}
+
+/// The default git remote for `push`/`pull`/`configure-remote` when none is given.
+const DEFAULT_REMOTE: &str = "origin";
+
+/// `cgx push`: hand the repo root to `cgx-transport`, which promotes the local
+/// `.cgx` committable set into git and advances `refs/cgx/index`. The CLI only
+/// resolves the root, defaults the remote, maps the error to exit 3, and prints
+/// the outcome counts so a push is never a silent success.
+fn run_push(remote: Option<String>, repo: Option<PathBuf>) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+    let remote = remote.as_deref().unwrap_or(DEFAULT_REMOTE);
+    let outcome =
+        cgx_transport::push(&repo_root, remote).map_err(|e| CliError::graph(e.to_string()))?;
+    let state = if outcome.ref_advanced {
+        "advanced to"
+    } else {
+        "already at"
+    };
+    println!(
+        "pushed {} object(s) to {remote}: {} {state} {}",
+        outcome.objects_promoted,
+        cgx_transport::CGX_REF,
+        outcome.commit_oid
+    );
+    Ok(())
+}
+
+/// `cgx pull`: fetch `refs/cgx/index` and materialize `.cgx/` via `cgx-transport`.
+/// A `TransportError::RefAbsent` (the remote has no index) carries a refspec
+/// fix-hint that is surfaced verbatim through the graph error — a loud exit 3,
+/// never a silent empty pull (criterion 4 honesty spine).
+fn run_pull(remote: Option<String>, repo: Option<PathBuf>) -> Result<(), CliError> {
+    let repo_root = resolve_repo(repo)?;
+    let remote = remote.as_deref().unwrap_or(DEFAULT_REMOTE);
+    let outcome =
+        cgx_transport::pull(&repo_root, remote).map_err(|e| CliError::graph(e.to_string()))?;
+    println!(
+        "pulled from {remote}: materialized {} object(s) across {} graph(s)",
+        outcome.objects_materialized, outcome.graph_keys
+    );
+    Ok(())
+}
+
+/// `cgx configure-remote`: write the `+refs/cgx/*:refs/cgx/*` fetch/push refspec
+/// into this repo's git config (idempotent). Operates on the current directory's
+/// repo — see the `--help` limit on CI-runner defaults.
+fn run_configure_remote(remote: Option<String>) -> Result<(), CliError> {
+    let repo_root = resolve_repo(None)?;
+    let remote = remote.as_deref().unwrap_or(DEFAULT_REMOTE);
+    cgx_transport::configure_remote(&repo_root, remote)
+        .map_err(|e| CliError::graph(e.to_string()))?;
+    println!(
+        "configured remote {remote}: fetch/push refspec {} (idempotent)",
+        cgx_transport::CGX_REFSPEC
+    );
     Ok(())
 }
 

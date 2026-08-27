@@ -35,7 +35,7 @@ Start with docs 01 and 02 to understand the product commitments and the question
 Docs 03–09 cover implementation concerns in any order; **09 describes the system as
 built**, and is the fastest way to see how far the design and the implementation have
 diverged. Docs 10–12 cover market positioning, planning, and framework-pack design. Docs
-13–15 are reference: glossary, status matrix, and the forward capability ledger.
+13–14 are reference: glossary and the status matrix.
 
 **These docs are design-forward.** The tree describes intent as well as shipped surface,
 and it is meant to: the design leads the implementation on purpose. What is not
@@ -78,12 +78,9 @@ help text.
 | 12 | [12-language-primitives-and-frameworks.md](12-language-primitives-and-frameworks.md) | Framework-pack design and semantic-class catalog: seven metadata semantic classes (`entrypoint`, `guard`, `negative-guard`, `interception`, `generated-member`, `keep-alive`, `contract`); per-framework worked mappings (Spring, Flask/Django, ASP.NET, NestJS, tokio/actix); mediated edges with `established-by` provenance; build-configuration variance; reflection packs. Maps language/framework constructs onto the primitives defined in docs/03 (GM-15..19) and docs/04 (DF-20) |
 | 13 | [13-glossary.md](13-glossary.md) | Alphabetical dictionary of all terms of art used across the `cgx` documentation: graph vocabulary (node, edge, edge conditions, exceptional class, transience), path concepts (reachability, dominance, must-pass-through), provenance and taint vocabulary (pedigree, source, sink, sanitizer, typed taint, union/join pedigree), confidence ladder, status tags (core-extension/schema-room/roadmap), query-language terms (Layer 1/Layer 2, MATCH, predicate, procedure, COMPATIBLE_WITH, IS EMPTY), cycle-3 vocabulary (metadata fact, seven semantic classes, framework pack, established-by, capture edge, mutability, function value, coerce, lineage type reconstruction), and indexing terms |
 | 14 | [14-implementation-status-matrix.md](14-implementation-status-matrix.md) | Feature×language implementation status matrix, and the tree's ledger of what is actually built. Section 1: adapter capabilities (parse, defs, refs, imports, inheritance, entrypoints, cut hints, effects, dataflow, concurrency, implicit call sites, SCIP, framework packs). Section 2: the query surface — every shipped subcommand, including `symbols` and `coupling` — by language (Rust · TS/JS · Go · Python · Java · C#). Section 3: which surfaces carry the approximation contract and the freshness envelope. **Read the matrix itself rather than this description for the row list; it grows.** |
-
 | — | [questions/README.md](questions/README.md) | Index of the 13 question-cookbook theme files (138 questions total): file names, themes, question ID ranges, and counts; plus an explanation of the entry template (how to read personas/status/query/breakdown/result sections) and pointers to docs/13 and docs/05 |
-| — | [commands/](commands/) | Per-subcommand reference for the CLI surface: flags, formats, exit codes, worked examples, and stated limits. The authority on what a command accepts today; docs 01–15 are the authority on what it is *for* |
+| — | [commands/](commands/) | Per-subcommand reference for the CLI surface: flags, formats, exit codes, worked examples, and stated limits. The authority on what a command accepts today; docs 01–14 are the authority on what it is *for* |
 | — | [mcp-tools/](mcp-tools/) | Per-tool reference for the MCP surface: input schemas, response shapes, and which envelope fields each tool carries |
-| — | [research/](research/) | Dated research snapshots feeding the capability ledger (doc 15). Historical, not living spec — read for provenance, not for current state |
-
 
 ## Who Should Read What
 
@@ -120,9 +117,7 @@ it.
 
 ## Doc Status
 
-All fifteen numbered docs plus the question cookbook are written. They are living
+All fourteen numbered docs plus the question cookbook are written. They are living
 documents, not a delivered artifact: docs 03–05, 08, and 12 in particular specify a
 model well ahead of the implementation, and doc 14 is the ledger that says how far
-ahead. Docs under `research/` and `reviews/` are dated snapshots and are deliberately
-not refreshed — a review is evidence of what was believed on its date, and editing it
-destroys that.
+ahead.

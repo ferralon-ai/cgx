@@ -565,8 +565,6 @@ The residual risk moved rather than vanished: it is now graph *load* time and pe
 
 ### Risk 10: Proc-macro blind spot in Rust indexing
 
-
-
 **Description.** `cgx` runs no macro expander. (The Rust adapter parses with
 `tree-sitter-rust`; an earlier draft of AR-3 named `syn` here, but `syn` is not a
 dependency of any `cgx` crate — it appears in `Cargo.lock` only under derive-macro

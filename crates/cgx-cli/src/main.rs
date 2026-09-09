@@ -11,8 +11,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as ProcExitCode;
+use std::sync::OnceLock;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::{impacted::Sides, BlameRepo};
@@ -39,12 +40,50 @@ use cgx_cli::shadow_store::ShadowStore;
 use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, FlipOutcome, IndexPointer};
 use cgx_cli::CliError;
 
+/// The full LICENSE text, embedded at build time. At release-build time
+/// (`release.yml`) this is the STAMPED copy — `Change Date` filled in, not
+/// `TBD` — because the release build checks out the stamp commit before
+/// compiling. A plain `cargo build` off `main` embeds the `TBD` copy, which
+/// is correct: `main` itself is never BUSL-dated, only tagged releases are.
+const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
+
+/// Read a `Label:      value` line out of [`LICENSE_TEXT`] and return the
+/// trimmed value, or `"unknown"` if the label isn't present.
+fn license_field(label: &str) -> &'static str {
+    LICENSE_TEXT
+        .lines()
+        .find_map(|line| line.strip_prefix(label))
+        .map(str::trim)
+        .unwrap_or("unknown")
+}
+
+/// `cgx <version>` plus a one-line license summary, parsed from
+/// [`LICENSE_TEXT`]'s `Change Date:` / `Change License:` lines so `--version`
+/// and `--license` can never drift from each other.
+fn cgx_version_string() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            format!(
+                "{}\nLicense: Business Source License 1.1 — Change Date {}, converts to {}",
+                env!("CARGO_PKG_VERSION"),
+                license_field("Change Date:"),
+                license_field("Change License:"),
+            )
+        })
+        .as_str()
+}
+
 /// cgx — a deterministic, language-agnostic call-graph tool.
 #[derive(Parser)]
-#[command(name = "cgx", version, about, long_about = None)]
+#[command(name = "cgx", version = cgx_version_string(), about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+
+    /// Print the full LICENSE text and exit.
+    #[arg(long, exclusive = true)]
+    license: bool,
 }
 
 /// Output format for `cgx dump`. Deliberately its own two-value enum rather than
@@ -673,7 +712,25 @@ impl From<ConfidenceArg> for cgx_core::Confidence {
 
 fn main() -> ProcExitCode {
     let cli = Cli::parse();
-    match run(cli.command) {
+    if cli.license {
+        print!("{LICENSE_TEXT}");
+        return ProcExitCode::from(ExitCode::Ok.code() as u8);
+    }
+    // `#[command(subcommand)]` on a non-`Option` field would make clap
+    // reject `--license` alone (subcommand_required is checked ahead of
+    // `exclusive`), so `command` is `Option<Command>` and the "no
+    // subcommand" case is handled here instead, after the `--license`
+    // short-circuit above has had its chance.
+    let command = match cli.command {
+        Some(command) => command,
+        None => Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "'cgx' requires a subcommand but one was not provided",
+            )
+            .exit(),
+    };
+    match run(command) {
         Ok(()) => ProcExitCode::from(ExitCode::Ok.code() as u8),
         Err(e) => {
             eprintln!("cgx: {e}");

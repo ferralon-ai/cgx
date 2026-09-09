@@ -1,0 +1,209 @@
+# DRAFT — for orchestrator/Eric review. Not wired into any repo.
+#
+# release.yml — mints a dated BUSL LICENSE at release time and ships a
+# reproducible cgx binary built from that dated commit.
+#
+# Mint mechanic (Eric-decided, see dispatch 02):
+#   - A tag `vX.Y.Z` is pushed pointing at commit T (already on main).
+#   - This workflow creates a STAMP commit S that is a *child of T*,
+#     author-dated to T's own author date, whose only change is filling in
+#     LICENSE's `Change Date:` (T's date + 4 years). S is NEVER merged to
+#     main — main stays exactly as it was tagged.
+#   - The tag `vX.Y.Z` is then force-moved to point at S instead of T.
+#   - The release binary is built FROM S (so the shipped tarball's LICENSE
+#     file is the dated one, not the `TBD` one that's actually on main/T).
+#
+# Re-entrancy: moving the tag with the workflow's own GITHUB_TOKEN does NOT
+# recursively retrigger this workflow — GitHub does not fire new workflow
+# runs for pushes made with the default GITHUB_TOKEN. The "already stamped"
+# guard below is defense in depth in case this ever runs with a PAT instead
+# (see NOTES.md open question).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to move the tag and create the GitHub Release
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+  BIN_NAME: cgx
+
+jobs:
+  stamp-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history, tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history: commit-tree needs the tagged commit's tree/parent
+          ref: ${{ github.ref }}
+
+      - name: Resolve tagged commit
+        id: tagged
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          TAGGED_SHA="$(git rev-parse "${TAG}^{commit}")"
+          AUTHOR_DATE_ISO="$(git show -s --format=%aI "${TAGGED_SHA}")"   # e.g. 2026-09-09T13:25:00-07:00
+          AUTHOR_NAME="$(git show -s --format=%an "${TAGGED_SHA}")"
+          AUTHOR_EMAIL="$(git show -s --format=%ae "${TAGGED_SHA}")"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${TAGGED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "author_date=${AUTHOR_DATE_ISO}" >> "$GITHUB_OUTPUT"
+          echo "author_name=${AUTHOR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "author_email=${AUTHOR_EMAIL}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute Change Date (tagged commit date + 4 years)
+        id: change_date
+        run: |
+          set -euo pipefail
+          # date -d needs GNU coreutils (ubuntu-latest has it). Parse the
+          # commit's author date and add exactly 4 calendar years.
+          SRC_DATE="${{ steps.tagged.outputs.author_date }}"
+          CHANGE_DATE="$(date -u -d "${SRC_DATE} +4 years" +%Y-%m-%d)"
+          echo "date=${CHANGE_DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Idempotency guard — is the tag already stamped?
+        id: guard
+        run: |
+          set -euo pipefail
+          # If LICENSE at the tagged commit already has a non-TBD Change Date
+          # equal to what we'd compute, this tag was already stamped by a
+          # prior run of this workflow (e.g. a re-run, or a retrigger from a
+          # PAT-based tag push). Skip straight to build-from-current-tag
+          # instead of stamping/moving the tag again.
+          CURRENT_LICENSE_LINE="$(git show '${{ steps.tagged.outputs.sha }}:LICENSE' | grep '^Change Date:' || true)"
+          if echo "${CURRENT_LICENSE_LINE}" | grep -q "${{ steps.change_date.outputs.date }}"; then
+            echo "already_stamped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_stamped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create stamp commit (child of tagged commit, author-dated to it)
+        if: steps.guard.outputs.already_stamped == 'false'
+        id: stamp
+        run: |
+          set -euo pipefail
+          TAGGED_SHA="${{ steps.tagged.outputs.sha }}"
+          CHANGE_DATE="${{ steps.change_date.outputs.date }}"
+
+          # Materialize the tagged tree in the index/worktree so we can edit
+          # LICENSE without disturbing anything else.
+          git checkout --quiet "${TAGGED_SHA}"
+
+          # Edit ONLY the Change Date line; preserve column alignment and
+          # every other byte of LICENSE untouched. Change License is already
+          # "MIT" in the body per the mint mechanic — this asserts that
+          # rather than silently accepting drift.
+          if ! grep -q '^Change License:       MIT$' LICENSE; then
+            echo "::error::LICENSE Change License line is not 'MIT' as expected — aborting stamp" >&2
+            exit 1
+          fi
+          sed -i "s/^Change Date:.*\$/Change Date:          ${CHANGE_DATE}/" LICENSE
+
+          # Sanity: exactly one line changed, and it's the Change Date line.
+          if [ "$(git diff --stat -- LICENSE | wc -l)" -ne 1 ]; then
+            echo "::error::LICENSE diff touched more than expected" >&2
+            git diff -- LICENSE >&2
+            exit 1
+          fi
+
+          git add LICENSE
+          NEW_TREE="$(git write-tree)"
+
+          # Author date AND committer date are both pinned to the ORIGINAL
+          # tagged commit's author date, so the stamp SHA is deterministic
+          # across re-runs (same tree + parent + author-date + committer-date
+          # + identities + message ⇒ same commit-tree hash every time).
+          STAMP_SHA="$(GIT_AUTHOR_NAME="${{ steps.tagged.outputs.author_name }}" \
+            GIT_AUTHOR_EMAIL="${{ steps.tagged.outputs.author_email }}" \
+            GIT_AUTHOR_DATE="${{ steps.tagged.outputs.author_date }}" \
+            GIT_COMMITTER_NAME="cgx-release-bot" \
+            GIT_COMMITTER_EMAIL="release@ferralon.com" \
+            GIT_COMMITTER_DATE="${{ steps.tagged.outputs.author_date }}" \
+            git commit-tree "${NEW_TREE}" -p "${TAGGED_SHA}" \
+              -m "chore(license): stamp Change Date for ${{ steps.tagged.outputs.tag }}" \
+              -m "Sets LICENSE Change Date to ${CHANGE_DATE} (tagged commit date + 4 years)." \
+              -m "This commit is a mint artifact: it is the child of ${TAGGED_SHA}," \
+              -m "author-dated to that commit, and is NEVER merged to main. The tag" \
+              -m "${{ steps.tagged.outputs.tag }} is moved to point here; main is untouched.")"
+
+          echo "sha=${STAMP_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Re-point the tag at the stamp commit
+        if: steps.guard.outputs.already_stamped == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tagged.outputs.tag }}"
+          STAMP_SHA="${{ steps.stamp.outputs.sha }}"
+
+          # Move the local tag ref, then force-push it. This does NOT touch
+          # any branch — main is never advanced, checked out, or merged into.
+          # `git push --force` on a TAG ref only overwrites that one ref.
+          git tag -f "${TAG}" "${STAMP_SHA}"
+          git push --force origin "refs/tags/${TAG}"
+
+      - name: Resolve build ref (stamp commit, or already-stamped tag)
+        id: build_ref
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.guard.outputs.already_stamped }}" = "true" ]; then
+            echo "sha=${{ steps.tagged.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ steps.stamp.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout stamp commit for the build
+        run: |
+          set -euo pipefail
+          git checkout --quiet "${{ steps.build_ref.outputs.sha }}"
+          # Confirm we are building from the dated LICENSE, not TBD.
+          grep '^Change Date:' LICENSE
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml — see NOTES.md
+          targets: ${{ env.TARGET }}
+
+      - name: Reproducible build
+        run: |
+          chmod +x ./reproducible-build.sh
+          ./reproducible-build.sh "${TARGET}"
+        # reproducible-build.sh is expected to live at repo root once this
+        # draft is applied for real; see NOTES.md for where it's copied from.
+
+      - name: Package tarball (binary + dated LICENSE)
+        id: package
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tagged.outputs.tag }}"
+          STAGE="dist/${BIN_NAME}-${TAG}-${TARGET}"
+          mkdir -p "${STAGE}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "${STAGE}/"
+          cp LICENSE "${STAGE}/LICENSE"      # the DATED LICENSE from the stamp commit
+          cp README.md "${STAGE}/README.md" 2>/dev/null || true
+          TARBALL="dist/${BIN_NAME}-${TAG}-${TARGET}.tar.gz"
+          tar -C dist -czf "${TARBALL}" "$(basename "${STAGE}")"
+          echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
+          sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+
+      - name: Create/update GitHub Release and attach tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tagged.outputs.tag }}"
+          TARBALL="${{ steps.package.outputs.tarball }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${TARBALL}" "${TARBALL}.sha256" --clobber
+          else
+            gh release create "${TAG}" "${TARBALL}" "${TARBALL}.sha256" \
+              --title "${TAG}" \
+              --notes "Automated release build. LICENSE Change Date stamped to ${{ steps.change_date.outputs.date }}."
+          fi

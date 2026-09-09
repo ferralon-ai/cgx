@@ -1,5 +1,3 @@
-# DRAFT — for orchestrator/Eric review. Not wired into any repo.
-#
 # release.yml — mints a dated BUSL LICENSE at release time and ships a
 # reproducible cgx binary built from that dated commit.
 #
@@ -16,8 +14,7 @@
 # Re-entrancy: moving the tag with the workflow's own GITHUB_TOKEN does NOT
 # recursively retrigger this workflow — GitHub does not fire new workflow
 # runs for pushes made with the default GITHUB_TOKEN. The "already stamped"
-# guard below is defense in depth in case this ever runs with a PAT instead
-# (see NOTES.md open question).
+# guard below is defense in depth in case this ever runs with a PAT instead.
 
 name: release
 

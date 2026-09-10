@@ -11,6 +11,13 @@
 #   - The release binary is built FROM S (so the shipped tarball's LICENSE
 #     file is the dated one, not the `TBD` one that's actually on main/T).
 #
+# Release notes (required): the human-written description of the release must
+# exist at `docs/releases/<tag>.md`, committed on main before the tag is
+# pushed. The workflow reads it from the tagged commit and uses it verbatim
+# (plus a Change-Date footnote) as BOTH the stamp commit message and the
+# GitHub Release body; a missing or empty file fails the run. See
+# docs/releases/README.md for the process.
+#
 # Re-entrancy: moving the tag with the workflow's own GITHUB_TOKEN does NOT
 # recursively retrigger this workflow — GitHub does not fire new workflow
 # runs for pushes made with the default GITHUB_TOKEN. The "already stamped"
@@ -71,6 +78,41 @@ jobs:
           CHANGE_DATE="$(date -d "${SRC_DAY} +4 years" +%Y-%m-%d)"
           echo "date=${CHANGE_DATE}" >> "$GITHUB_OUTPUT"
 
+      - name: Load release notes (fail if missing)
+        id: notes
+        env:
+          TAGGED_SHA: ${{ steps.tagged.outputs.sha }}
+          TAG: ${{ steps.tagged.outputs.tag }}
+          CHANGE_DATE: ${{ steps.change_date.outputs.date }}
+        run: |
+          set -euo pipefail
+          # The human-written description of this release. It is committed on
+          # main *before* the tag is pushed (see docs/releases/README.md), so
+          # we read it from the TAGGED commit's tree — independent of any
+          # checkout state — and fail fast if it is absent or empty. Both the
+          # stamp commit message and the GitHub Release body are built from it.
+          NOTES_PATH="docs/releases/${TAG}.md"
+          if ! git cat-file -e "${TAGGED_SHA}:${NOTES_PATH}" 2>/dev/null; then
+            echo "::error::Release notes not found at ${NOTES_PATH} for ${TAG}. Write them before tagging — see docs/releases/README.md." >&2
+            exit 1
+          fi
+          BODY_FILE="${RUNNER_TEMP}/release-notes.md"
+          git show "${TAGGED_SHA}:${NOTES_PATH}" > "${BODY_FILE}"
+          # A present-but-blank file is as useless as a missing one.
+          if ! grep -q '[^[:space:]]' "${BODY_FILE}"; then
+            echo "::error::Release notes ${NOTES_PATH} is empty." >&2
+            exit 1
+          fi
+          # Append the mint footnote: what the LICENSE Change Date was stamped
+          # to for this release. Kept identical in the commit message and the
+          # release body. BODY_FILE lives under RUNNER_TEMP (outside the repo),
+          # so the `git checkout` in the stamp step never sees or disturbs it.
+          {
+            printf '\n---\n\n'
+            printf "This release's BUSL-1.1 Change Date is stamped %s 00:00:00Z (converts to MIT on that date).\n" "${CHANGE_DATE}"
+          } >> "${BODY_FILE}"
+          echo "body_file=${BODY_FILE}" >> "$GITHUB_OUTPUT"
+
       - name: Idempotency guard — is the tag already stamped?
         id: guard
         env:
@@ -100,6 +142,7 @@ jobs:
           AUTHOR_EMAIL: ${{ steps.tagged.outputs.author_email }}
           AUTHOR_DATE: ${{ steps.tagged.outputs.author_date }}
           TAG: ${{ steps.tagged.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body_file }}
         run: |
           set -euo pipefail
 
@@ -143,11 +186,7 @@ jobs:
             GIT_COMMITTER_EMAIL="release@ferralon.com" \
             GIT_COMMITTER_DATE="${AUTHOR_DATE}" \
             git commit-tree "${NEW_TREE}" -p "${TAGGED_SHA}" \
-              -m "chore(license): stamp Change Date for ${TAG}" \
-              -m "Sets LICENSE Change Date to ${CHANGE_DATE} (tagged commit date + 4 years)." \
-              -m "This commit is a mint artifact: it is the child of ${TAGGED_SHA}," \
-              -m "author-dated to that commit, and is NEVER merged to main. The tag" \
-              -m "${TAG} is moved to point here; main is untouched.")"
+              -F "${BODY_FILE}")"
 
           echo "sha=${STAMP_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -242,13 +281,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tagged.outputs.tag }}
           TARBALL: ${{ steps.package.outputs.tarball }}
-          CHANGE_DATE: ${{ steps.change_date.outputs.date }}
+          BODY_FILE: ${{ steps.notes.outputs.body_file }}
         run: |
           set -euo pipefail
           if gh release view "${TAG}" >/dev/null 2>&1; then
+            # Re-run against an existing release: refresh assets and body from
+            # the same source, so a re-run converges rather than leaving stale
+            # notes behind.
             gh release upload "${TAG}" "${TARBALL}" "${TARBALL}.sha256" --clobber
+            gh release edit "${TAG}" --notes-file "${BODY_FILE}"
           else
             gh release create "${TAG}" "${TARBALL}" "${TARBALL}.sha256" \
               --title "${TAG}" \
-              --notes "Automated release build. LICENSE Change Date stamped to ${CHANGE_DATE}."
+              --notes-file "${BODY_FILE}"
           fi

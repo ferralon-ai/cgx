@@ -1,9 +1,16 @@
 # cgx
 
-A deterministic call-graph tool implemented in Rust. It answers structural
-questions about a codebase — who calls this, what does this reach, what changed
-between two refs, which files change together — from a graph persisted under
-`.cgx/`. There is no daemon and no warm-up: a query loads the store and answers.
+cgx maps how a codebase calls itself, so you can ask it structural questions
+directly: who calls this function, what a change can reach or break, what's
+reachable from an entry point, what changed between two refs, which files change
+together. It answers from a graph persisted under `.cgx/` — no daemon, no
+warm-up.
+
+Three kinds of reader, one engine: **developers** navigating and refactoring,
+**security analysts** tracing reachability and blast radius, and **AI agents**
+querying call structure over MCP instead of inferring it. `cgx <command>` is the
+human and CI surface (exit-code contract, JSON/SARIF output); `cgx mcp` serves
+the same answers to agents over MCP.
 
 Language adapters ship for Rust, TypeScript/JavaScript, Go, Java and Python
 (`crates/cgx-lang-*`). Files in any other language are counted as unsupported in
@@ -20,91 +27,74 @@ graph model, query surface, interfaces, indexing, and roadmap — lives in
 cargo build --release          # -> target/release/cgx
 ```
 
-Any git repository works. A two-file example, so the output below is
-reproducible:
+cgx auto-indexes on the first query — there is no separate `index` step (pass
+`--no-auto-index` to require an explicit `cgx index` instead). The questions
+below run against this repository's own checked-in fixture corpus
+([`fixtures/rust-sample/`](fixtures/rust-sample/), a small hand-audited tree), so
+you can reproduce them exactly from a fresh clone.
 
-```sh
-mkdir -p /tmp/cgx-demo/src && cd /tmp/cgx-demo && git init -q
-printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
-cat > src/main.rs <<'RS'
-trait Store {
-    fn get(&self, key: &str) -> Option<String>;
-}
-
-struct MemStore;
-
-impl Store for MemStore {
-    fn get(&self, key: &str) -> Option<String> {
-        Some(key.to_string())
-    }
-}
-
-fn lookup(store: &dyn Store, key: &str) -> String {
-    store.get(key).unwrap_or_default()
-}
-
-fn handle_request(key: &str) -> String {
-    lookup(&MemStore, key)
-}
-
-fn main() {
-    let out = handle_request("a");
-    println!("{out}");
-}
-RS
-git add -A && git commit -qm init
-```
-
-Index it, then ask who reaches the trait implementation:
+**What does this function call?** `direct::chain` makes three ordinary calls, so
+the answer is exact — every edge is a direct static binding:
 
 ```console
-$ cgx index .
-Indexed … (3c498b792825ed74404c6b1e48e3a4050ae3a358)
-  blobs: 1 indexed, 1 extracted, 0 cached, 1 unsupported
-  graph: 17 nodes, 5 edges, 3 unresolved
-  …
-
-$ cgx callers demo::MemStore::get
-demo::MemStore::get  src/main.rs:8
-└─ demo::lookup  src/main.rs:13  [probable]
-   └─ demo::handle_request  src/main.rs:17
-approximation: under-approximate — search stopped at depth 2; deeper edges were not explored
-freshness: current | indexed tree 3c498b7, working tree clean
+$ cgx callees rust_sample::direct::chain
+rust_sample::direct::chain  fixtures/rust-sample/src/direct.rs:47
+├─ rust_sample::direct::step_a  fixtures/rust-sample/src/direct.rs:53
+├─ rust_sample::direct::step_b  fixtures/rust-sample/src/direct.rs:54
+└─ rust_sample::direct::step_c  fixtures/rust-sample/src/direct.rs:55
+approximation: exact (within modeled graph)
+freshness: current | indexed tree 706ab89, working tree clean
 ```
 
-In the `cgx index` output, `…` elides the absolute repository path and three
-trailing counter lines (`cha`, `rta`, `dataflow`). The last two lines of the
-`callers` answer are the part worth reading closely.
+**What does a dynamic call dispatch to?** `make_speak` takes a `&dyn Speak`, so
+the target is a candidate set, not a single binding. cgx labels every such edge
+`[possible]` and states the over-approximation rather than pretending to one
+answer:
+
+```console
+$ cgx callees rust_sample::virtual_dispatch::make_speak
+rust_sample::virtual_dispatch::make_speak  fixtures/rust-sample/src/virtual_dispatch.rs:36
+├─ rust_sample::virtual_dispatch::Cat::speak  fixtures/rust-sample/src/virtual_dispatch.rs:24  [possible]
+├─ rust_sample::virtual_dispatch::Dog::speak  fixtures/rust-sample/src/virtual_dispatch.rs:18  [possible]
+└─ rust_sample::virtual_dispatch::Speak::speak  fixtures/rust-sample/src/virtual_dispatch.rs:6  [possible]
+approximation: over- and under-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur; 2 call(s) in the searched region resolved to no in-repo target (external/unindexed callee; no SCIP) and could not be followed
+freshness: current | indexed tree 706ab89, working tree clean
+```
+
+The last two lines of each answer — the approximation contract and the freshness
+envelope — are the part worth reading closely.
 
 ## Every answer states what it is worth
 
 **Confidence is three-valued, per edge.** `certain` is a direct static binding
-with no ambiguity left; `probable` is a small, credible candidate set (a unique
-name match in scope, class-hierarchy analysis with few overrides); `possible` is
-an over-approximation. Above, the `store.get(key)` call through `&dyn Store` is
-`probable`, not `certain`: the target came from class-hierarchy analysis over the
-trait's implementors, not from a static binding. `cgx explain` shows the tier and
-the rule behind each edge:
+with no ambiguity left — the `chain` edges above carry no label because they are
+certain. `probable` is a small, credible candidate set (a unique name match in
+scope, class-hierarchy analysis with few overrides). `possible` is an
+over-approximation: every `make_speak` edge above is `possible` because the
+target was resolved by matching the method name across the trait's implementors,
+not from a static binding. `cgx explain` shows the tier and the rule behind each
+edge:
 
 ```console
-$ cgx explain demo::lookup
-demo::lookup  (src/main.rs:13)
+$ cgx explain rust_sample::virtual_dispatch::make_speak
+rust_sample::virtual_dispatch::make_speak  (fixtures/rust-sample/src/virtual_dispatch.rs:36)
   kind: function
-  callers: 1, callees: 1
+  callers: 0, callees: 3
   edges:
-    <- demo::handle_request  (src/main.rs:17)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/main.rs:17
-    -> demo::MemStore::get  (src/main.rs:8)  [always]  [probable]  tier=cha_rta  rule=cha-trait-set  site=src/main.rs:13
-freshness: current | indexed tree 3c498b7, working tree clean
+    -> rust_sample::virtual_dispatch::Speak::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:6)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
+    -> rust_sample::virtual_dispatch::Dog::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:18)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
+    -> rust_sample::virtual_dispatch::Cat::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:24)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
+freshness: current | indexed tree 706ab89, working tree clean
 ```
 
 **Answers carry an approximation contract and a freshness envelope.** The
 contract says whether the answer is exact within the modeled graph, an
-under-approximation, or an over-approximation, and names the reason — above, a
-depth bound the caller can lift. The envelope says which tree the answer
+under-approximation, or an over-approximation, and names the reason — above,
+dynamic dispatch through a candidate set. The envelope says which tree the answer
 describes and whether the working tree has moved since. Which of the two lines a
 command emits depends on what that command touches: `explain` carries freshness
-only, and `coupling` reads committed git history without opening the index, so
-it carries the contract and no freshness line at all.
+only, and `coupling` reads committed git history without opening the index, so it
+carries the contract and no freshness line at all.
 
 **Query answers are byte-identical across runs.** The same query over the same
 tree produces the same bytes — including across two indexes built independently

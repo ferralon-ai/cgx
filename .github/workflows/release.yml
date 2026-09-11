@@ -1,27 +1,44 @@
 # release.yml — mints a dated BUSL LICENSE at release time and ships a
 # reproducible cgx binary built from that dated commit.
 #
+# Two ways to cut a release, one shared mint/build/publish path:
+#
+#   • push a tag `vX.Y.Z` (forward release) — the tagged commit is on main and
+#     already carries this workflow. The cleave point is the tagged commit.
+#
+#   • run it via workflow_dispatch (backfill) — supply `version`, `cleave_sha`,
+#     and `publication_date`. Runs from main (which has this workflow), so the
+#     cleave point can be ANY historical commit, including ones that predate
+#     this file. This is how v0.1.0 / v0.2.0 are minted from old cleave points.
+#
 # Mint mechanic (Eric-decided, see dispatch 02):
-#   - A tag `vX.Y.Z` is pushed pointing at commit T (already on main).
-#   - This workflow creates a STAMP commit S that is a *child of T*,
-#     author-dated to T's own author date, whose only change is filling in
-#     LICENSE's `Change Date:` (T's date + 4 years). S is NEVER merged to
-#     main — main stays exactly as it was tagged.
-#   - The tag `vX.Y.Z` is then force-moved to point at S instead of T.
-#   - The release binary is built FROM S (so the shipped tarball's LICENSE
-#     file is the dated one, not the `TBD` one that's actually on main/T).
+#   - The cleave point is a commit C.
+#   - This workflow creates a STAMP commit S that is a *child of C*,
+#     author-dated to C's own author date, whose only change is filling in
+#     LICENSE's `Change Date:`. S is NEVER merged to main — main is untouched.
+#   - The tag `vX.Y.Z` is (re)created as an ANNOTATED tag pointing at S, dated
+#     to the publication date.
+#   - The release binary is built FROM S, so the shipped tarball's LICENSE is
+#     the dated one, not the `TBD` one on main.
 #
-# Release notes (required): the human-written description of the release must
-# exist at `docs/releases/<tag>.md`, committed on main before the tag is
-# pushed. The workflow reads it from the tagged commit and uses it verbatim
-# (plus a Change-Date footnote) as BOTH the stamp commit message and the
-# GitHub Release body; a missing or empty file fails the run. See
-# docs/releases/README.md for the process.
+# Change Date basis (publication, not authorship): Change Date = publication
+# date + 4 years. For a forward tag-push, the publication date is the tag's own
+# date (annotated tagger date if present, else the cleave commit's author date —
+# which for a fresh release is "today"). For a backfill, it is the explicit
+# `publication_date` input. This keeps every version's Change Date keyed to when
+# it was actually published, not to when its code happened to be authored.
 #
-# Re-entrancy: moving the tag with the workflow's own GITHUB_TOKEN does NOT
-# recursively retrigger this workflow — GitHub does not fire new workflow
-# runs for pushes made with the default GITHUB_TOKEN. The "already stamped"
-# guard below is defense in depth in case this ever runs with a PAT instead.
+# Release notes (required): the human-written description must exist at
+# `docs/releases/<tag>.md` ON MAIN. The workflow reads it from origin/main
+# (independent of the cleave point, so backfills work) and uses it verbatim,
+# plus an auto-appended Change-Date footnote, as BOTH the stamp commit message
+# and the GitHub Release body. A missing or empty file fails the run. See
+# docs/releases/README.md.
+#
+# Re-entrancy / idempotency: the stamp SHA is deterministic (fixed tree, parent,
+# author/committer dates, identities, and message), so re-running converges on
+# the same commit. The guard below additionally short-circuits to a plain
+# rebuild when the tag already points at a correctly-stamped commit.
 
 name: release
 
@@ -29,9 +46,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to create, e.g. v0.1.0"
+        required: true
+      cleave_sha:
+        description: "Commit (SHA or ref) to cut the release from"
+        required: true
+      publication_date:
+        description: "Publication date YYYY-MM-DD; Change Date = this + 4 years"
+        required: true
+        default: "2026-09-10"
 
 permissions:
-  contents: write # needed to move the tag and create the GitHub Release
+  contents: write # needed to create/move the tag and the GitHub Release
 
 env:
   TARGET: x86_64-unknown-linux-gnu
@@ -44,69 +73,97 @@ jobs:
       - name: Checkout (full history, tags)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # need full history: commit-tree needs the tagged commit's tree/parent
-          ref: ${{ github.ref }}
+          fetch-depth: 0 # commit-tree needs the cleave commit's tree/parent; full history for old cleave points
 
-      - name: Resolve tagged commit
-        id: tagged
+      - name: Resolve release parameters
+        id: params
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_VERSION: ${{ github.event.inputs.version }}
+          IN_CLEAVE: ${{ github.event.inputs.cleave_sha }}
+          IN_PUBDATE: ${{ github.event.inputs.publication_date }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          TAGGED_SHA="$(git rev-parse "${TAG}^{commit}")"
-          AUTHOR_DATE_ISO="$(git show -s --format=%aI "${TAGGED_SHA}")"   # e.g. 2026-09-09T13:25:00-07:00
-          AUTHOR_NAME="$(git show -s --format=%an "${TAGGED_SHA}")"
-          AUTHOR_EMAIL="$(git show -s --format=%ae "${TAGGED_SHA}")"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=${TAGGED_SHA}" >> "$GITHUB_OUTPUT"
-          echo "author_date=${AUTHOR_DATE_ISO}" >> "$GITHUB_OUTPUT"
-          echo "author_name=${AUTHOR_NAME}" >> "$GITHUB_OUTPUT"
-          echo "author_email=${AUTHOR_EMAIL}" >> "$GITHUB_OUTPUT"
+          # Make main and all tags resolvable regardless of which ref triggered
+          # us (a tag-push checks out the tag; a dispatch checks out main).
+          git fetch --force origin "refs/heads/main:refs/remotes/origin/main"
+          git fetch --force origin "refs/tags/*:refs/tags/*"
 
-      - name: Compute Change Date (tagged commit date + 4 years)
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            TAG="${IN_VERSION}"
+            CLEAVE_SHA="$(git rev-parse "${IN_CLEAVE}^{commit}")"
+            PUB_DAY="${IN_PUBDATE}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            CLEAVE_SHA="$(git rev-parse "${TAG}^{commit}")"
+            # Publication day: annotated tagger date if the tag is annotated,
+            # else the cleave commit's author date (for a fresh release, today).
+            OBJTYPE="$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || echo commit)"
+            if [ "${OBJTYPE}" = "tag" ]; then
+              PUB_DAY="$(git for-each-ref --format='%(taggerdate:short)' "refs/tags/${TAG}")"
+            else
+              PUB_DAY="$(git show -s --format=%ad --date=short "${CLEAVE_SHA}")"
+            fi
+          fi
+
+          case "${TAG}" in
+            v*) ;;
+            *) echo "::error::version/tag must start with 'v' (got '${TAG}')" >&2; exit 1 ;;
+          esac
+          case "${PUB_DAY}" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *) echo "::error::publication date must be YYYY-MM-DD (got '${PUB_DAY}')" >&2; exit 1 ;;
+          esac
+
+          AUTHOR_DATE_ISO="$(git show -s --format=%aI "${CLEAVE_SHA}")"
+          AUTHOR_NAME="$(git show -s --format=%an "${CLEAVE_SHA}")"
+          AUTHOR_EMAIL="$(git show -s --format=%ae "${CLEAVE_SHA}")"
+          {
+            echo "tag=${TAG}"
+            echo "cleave_sha=${CLEAVE_SHA}"
+            echo "pub_day=${PUB_DAY}"
+            echo "author_date=${AUTHOR_DATE_ISO}"
+            echo "author_name=${AUTHOR_NAME}"
+            echo "author_email=${AUTHOR_EMAIL}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute Change Date (publication date + 4 years)
         id: change_date
         env:
-          SRC_DATE: ${{ steps.tagged.outputs.author_date }}
+          PUB_DAY: ${{ steps.params.outputs.pub_day }}
         run: |
           set -euo pipefail
-          # date -d needs GNU coreutils (ubuntu-latest has it). The Change
-          # Date is "author date + 4 years" on the AS-AUTHORED calendar date
-          # — so we operate on the date component only (strip at "T", no
-          # `-u`). Reinterpreting the tz-local timestamp in UTC first (the
-          # previous approach) can shift the calendar date by a day
-          # depending on the author's offset; this is tz-independent.
-          SRC_DAY="${SRC_DATE%%T*}"
-          CHANGE_DATE="$(date -d "${SRC_DAY} +4 years" +%Y-%m-%d)"
+          # GNU date (ubuntu-latest). Operate on the calendar date only — no
+          # tz reinterpretation — so the Change Date can't drift by a day.
+          CHANGE_DATE="$(date -d "${PUB_DAY} +4 years" +%Y-%m-%d)"
           echo "date=${CHANGE_DATE}" >> "$GITHUB_OUTPUT"
 
-      - name: Load release notes (fail if missing)
+      - name: Load release notes from main (fail if missing)
         id: notes
         env:
-          TAGGED_SHA: ${{ steps.tagged.outputs.sha }}
-          TAG: ${{ steps.tagged.outputs.tag }}
+          TAG: ${{ steps.params.outputs.tag }}
           CHANGE_DATE: ${{ steps.change_date.outputs.date }}
         run: |
           set -euo pipefail
-          # The human-written description of this release. It is committed on
-          # main *before* the tag is pushed (see docs/releases/README.md), so
-          # we read it from the TAGGED commit's tree — independent of any
-          # checkout state — and fail fast if it is absent or empty. Both the
-          # stamp commit message and the GitHub Release body are built from it.
+          # Read from origin/main, NOT the cleave commit — the notes live on
+          # main and a backfilled cleave point predates them. Fail fast if the
+          # file is absent or empty. Both the stamp commit message and the
+          # GitHub Release body are built from it.
           NOTES_PATH="docs/releases/${TAG}.md"
-          if ! git cat-file -e "${TAGGED_SHA}:${NOTES_PATH}" 2>/dev/null; then
-            echo "::error::Release notes not found at ${NOTES_PATH} for ${TAG}. Write them before tagging — see docs/releases/README.md." >&2
+          if ! git cat-file -e "origin/main:${NOTES_PATH}" 2>/dev/null; then
+            echo "::error::Release notes not found at ${NOTES_PATH} on main. Write them before releasing — see docs/releases/README.md." >&2
             exit 1
           fi
           BODY_FILE="${RUNNER_TEMP}/release-notes.md"
-          git show "${TAGGED_SHA}:${NOTES_PATH}" > "${BODY_FILE}"
-          # A present-but-blank file is as useless as a missing one.
+          git show "origin/main:${NOTES_PATH}" > "${BODY_FILE}"
           if ! grep -q '[^[:space:]]' "${BODY_FILE}"; then
             echo "::error::Release notes ${NOTES_PATH} is empty." >&2
             exit 1
           fi
-          # Append the mint footnote: what the LICENSE Change Date was stamped
-          # to for this release. Kept identical in the commit message and the
-          # release body. BODY_FILE lives under RUNNER_TEMP (outside the repo),
-          # so the `git checkout` in the stamp step never sees or disturbs it.
+          # Append the mint footnote: the LICENSE Change Date for this release.
+          # Identical in the commit message and the release body. BODY_FILE is
+          # under RUNNER_TEMP (outside the repo), so the stamp step's
+          # `git checkout` never sees or disturbs it.
           {
             printf '\n---\n\n'
             printf "This release's BUSL-1.1 Change Date is stamped %s 00:00:00Z (converts to MIT on that date).\n" "${CHANGE_DATE}"
@@ -116,55 +173,50 @@ jobs:
       - name: Idempotency guard — is the tag already stamped?
         id: guard
         env:
-          TAGGED_SHA: ${{ steps.tagged.outputs.sha }}
+          TAG: ${{ steps.params.outputs.tag }}
           CHANGE_DATE: ${{ steps.change_date.outputs.date }}
         run: |
           set -euo pipefail
-          # If LICENSE at the tagged commit already has a non-TBD Change Date
-          # equal to what we'd compute, this tag was already stamped by a
-          # prior run of this workflow (e.g. a re-run, or a retrigger from a
-          # PAT-based tag push). Skip straight to build-from-current-tag
-          # instead of stamping/moving the tag again.
-          CURRENT_LICENSE_LINE="$(git show "${TAGGED_SHA}:LICENSE" | grep '^Change Date:' || true)"
-          if echo "${CURRENT_LICENSE_LINE}" | grep -q "${CHANGE_DATE}"; then
-            echo "already_stamped=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "already_stamped=false" >> "$GITHUB_OUTPUT"
+          # Already done iff the tag exists AND its commit's LICENSE already
+          # carries the target Change Date. Covers re-runs on both paths (a
+          # dispatch tag doesn't exist yet on the first run → not stamped).
+          already=false
+          if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
+            TAG_COMMIT="$(git rev-parse "${TAG}^{commit}")"
+            if git show "${TAG_COMMIT}:LICENSE" 2>/dev/null | grep -qE "^Change Date: +${CHANGE_DATE}\$"; then
+              already=true
+            fi
           fi
+          echo "already_stamped=${already}" >> "$GITHUB_OUTPUT"
 
-      - name: Create stamp commit (child of tagged commit, author-dated to it)
+      - name: Create stamp commit (child of cleave, author-dated to it)
         if: steps.guard.outputs.already_stamped == 'false'
         id: stamp
         env:
-          TAGGED_SHA: ${{ steps.tagged.outputs.sha }}
+          CLEAVE_SHA: ${{ steps.params.outputs.cleave_sha }}
           CHANGE_DATE: ${{ steps.change_date.outputs.date }}
-          AUTHOR_NAME: ${{ steps.tagged.outputs.author_name }}
-          AUTHOR_EMAIL: ${{ steps.tagged.outputs.author_email }}
-          AUTHOR_DATE: ${{ steps.tagged.outputs.author_date }}
-          TAG: ${{ steps.tagged.outputs.tag }}
+          AUTHOR_NAME: ${{ steps.params.outputs.author_name }}
+          AUTHOR_EMAIL: ${{ steps.params.outputs.author_email }}
+          AUTHOR_DATE: ${{ steps.params.outputs.author_date }}
           BODY_FILE: ${{ steps.notes.outputs.body_file }}
         run: |
           set -euo pipefail
 
-          # Materialize the tagged tree in the index/worktree so we can edit
-          # LICENSE without disturbing anything else.
-          git checkout --quiet "${TAGGED_SHA}"
+          # Materialize the cleave tree so we can edit LICENSE without touching
+          # anything else.
+          git checkout --quiet "${CLEAVE_SHA}"
 
-          # Edit ONLY the Change Date line; preserve column alignment and
-          # every other byte of LICENSE untouched. Change License is already
-          # "MIT" in the body per the mint mechanic — this asserts that
-          # rather than silently accepting drift.
+          # Edit ONLY the Change Date line; preserve column alignment and every
+          # other byte. Change License must already be "MIT" — assert it rather
+          # than accept drift.
           if ! grep -q '^Change License:       MIT$' LICENSE; then
             echo "::error::LICENSE Change License line is not 'MIT' as expected — aborting stamp" >&2
             exit 1
           fi
           sed -i "s/^Change Date:.*\$/Change Date:          ${CHANGE_DATE}/" LICENSE
 
-          # Sanity: exactly one FILE changed by the sed above, and it's
-          # LICENSE. `git diff --stat` emits TWO lines for a single-file
-          # change (the "LICENSE | 2 +-" line plus the "1 file changed..."
-          # summary line), so counting stat lines always aborts here — count
-          # changed files via --name-only instead.
+          # Sanity: exactly one FILE changed, and it's LICENSE. Count changed
+          # files via --name-only (--stat emits an extra summary line).
           CHANGED="$(git diff --name-only -- LICENSE | wc -l | tr -d ' ')"
           if [ "${CHANGED}" -ne 1 ]; then
             echo "::error::LICENSE diff touched an unexpected number of files (${CHANGED})" >&2
@@ -175,45 +227,51 @@ jobs:
           git add LICENSE
           NEW_TREE="$(git write-tree)"
 
-          # Author date AND committer date are both pinned to the ORIGINAL
-          # tagged commit's author date, so the stamp SHA is deterministic
-          # across re-runs (same tree + parent + author-date + committer-date
-          # + identities + message ⇒ same commit-tree hash every time).
+          # Author AND committer date pinned to the cleave commit's author date,
+          # so the stamp SHA is deterministic across re-runs (same tree + parent
+          # + dates + identities + message ⇒ same commit-tree hash).
           STAMP_SHA="$(GIT_AUTHOR_NAME="${AUTHOR_NAME}" \
             GIT_AUTHOR_EMAIL="${AUTHOR_EMAIL}" \
             GIT_AUTHOR_DATE="${AUTHOR_DATE}" \
             GIT_COMMITTER_NAME="cgx-release-bot" \
             GIT_COMMITTER_EMAIL="release@ferralon.com" \
             GIT_COMMITTER_DATE="${AUTHOR_DATE}" \
-            git commit-tree "${NEW_TREE}" -p "${TAGGED_SHA}" \
+            git commit-tree "${NEW_TREE}" -p "${CLEAVE_SHA}" \
               -F "${BODY_FILE}")"
 
           echo "sha=${STAMP_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Re-point the tag at the stamp commit
+      - name: Create annotated tag at the stamp commit
         if: steps.guard.outputs.already_stamped == 'false'
         env:
-          TAG: ${{ steps.tagged.outputs.tag }}
+          TAG: ${{ steps.params.outputs.tag }}
           STAMP_SHA: ${{ steps.stamp.outputs.sha }}
+          PUB_DAY: ${{ steps.params.outputs.pub_day }}
+          CHANGE_DATE: ${{ steps.change_date.outputs.date }}
         run: |
           set -euo pipefail
-
-          # Move the local tag ref, then force-push it. This does NOT touch
-          # any branch — main is never advanced, checked out, or merged into.
-          # `git push --force` on a TAG ref only overwrites that one ref.
-          git tag -f "${TAG}" "${STAMP_SHA}"
+          # Annotated tag dated to the publication day (midnight UTC). -f so a
+          # forward tag-push (whose lightweight tag already exists) is converted
+          # to this annotated tag at the stamp. Force-pushing a TAG ref touches
+          # no branch — main is never advanced, checked out, or merged into.
+          GIT_COMMITTER_NAME="cgx-release-bot" \
+          GIT_COMMITTER_EMAIL="release@ferralon.com" \
+          GIT_COMMITTER_DATE="${PUB_DAY}T00:00:00Z" \
+            git tag -f -a "${TAG}" "${STAMP_SHA}" \
+              -m "cgx ${TAG}" \
+              -m "BUSL-1.1 Change Date: ${CHANGE_DATE} (converts to MIT)."
           git push --force origin "refs/tags/${TAG}"
 
-      - name: Resolve build ref (stamp commit, or already-stamped tag)
+      - name: Resolve build ref (stamp, or already-stamped tag)
         id: build_ref
         env:
           ALREADY_STAMPED: ${{ steps.guard.outputs.already_stamped }}
-          TAGGED_SHA: ${{ steps.tagged.outputs.sha }}
+          TAG: ${{ steps.params.outputs.tag }}
           STAMP_SHA: ${{ steps.stamp.outputs.sha }}
         run: |
           set -euo pipefail
           if [ "${ALREADY_STAMPED}" = "true" ]; then
-            echo "sha=${TAGGED_SHA}" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse "${TAG}^{commit}")" >> "$GITHUB_OUTPUT"
           else
             echo "sha=${STAMP_SHA}" >> "$GITHUB_OUTPUT"
           fi
@@ -224,26 +282,24 @@ jobs:
         run: |
           set -euo pipefail
           git checkout --quiet "${BUILD_SHA}"
-          # Confirm we are building from the dated LICENSE, not TBD.
+          # Confirm we build from the dated LICENSE, not TBD.
           grep '^Change Date:' LICENSE
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml — see NOTES.md
+          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml
           targets: ${{ env.TARGET }}
 
       - name: Reproducible build
         run: |
           chmod +x ./reproducible-build.sh
           ./reproducible-build.sh "${TARGET}"
-        # reproducible-build.sh is expected to live at repo root once this
-        # draft is applied for real; see NOTES.md for where it's copied from.
 
       - name: Package tarball (binary + dated LICENSE)
         id: package
         env:
-          TAG: ${{ steps.tagged.outputs.tag }}
+          TAG: ${{ steps.params.outputs.tag }}
         run: |
           set -euo pipefail
           STAGE="dist/${BIN_NAME}-${TAG}-${TARGET}"
@@ -252,20 +308,11 @@ jobs:
           cp LICENSE "${STAGE}/LICENSE"      # the DATED LICENSE from the stamp commit
           cp README.md "${STAGE}/README.md" 2>/dev/null || true
 
-          # Deterministic archive: the binary is already reproducible
-          # (reproducible-build.sh), but tar/gzip wrappers are not by
-          # default — gzip stamps its own mtime in the header, and tar
-          # records file mtimes/uid/gid and (absent a sort) directory
-          # iteration order, so a byte-identical binary can still produce a
-          # different .tar.gz. Pin all of that so the published .sha256 is a
-          # real third-party-reproducible attestation of the TARBALL, not
-          # just the binary inside it. GNU tar (--sort, --mtime, --owner,
-          # --group, --numeric-owner) and GNU gzip (-n) are both available
-          # on ubuntu-latest.
-          #
-          # Recompute SOURCE_DATE_EPOCH the same way reproducible-build.sh
-          # did (git log -1 --format=%at HEAD) — HEAD here is still the
-          # build commit checked out earlier in the job.
+          # Deterministic archive so the published .sha256 is a real
+          # third-party-reproducible attestation of the TARBALL, not just the
+          # binary inside it. GNU tar + gzip -n on ubuntu-latest. Recompute
+          # SOURCE_DATE_EPOCH the same way reproducible-build.sh did
+          # (git log -1 --format=%at HEAD) — HEAD is still the build commit.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%at HEAD)"
           TAR="dist/${BIN_NAME}-${TAG}-${TARGET}.tar"
           TARBALL="${TAR}.gz"
@@ -279,15 +326,15 @@ jobs:
       - name: Create/update GitHub Release and attach tarball
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tagged.outputs.tag }}
+          TAG: ${{ steps.params.outputs.tag }}
           TARBALL: ${{ steps.package.outputs.tarball }}
           BODY_FILE: ${{ steps.notes.outputs.body_file }}
         run: |
           set -euo pipefail
           if gh release view "${TAG}" >/dev/null 2>&1; then
             # Re-run against an existing release: refresh assets and body from
-            # the same source, so a re-run converges rather than leaving stale
-            # notes behind.
+            # the same source so a re-run converges rather than leaving stale
+            # content behind.
             gh release upload "${TAG}" "${TARBALL}" "${TARBALL}.sha256" --clobber
             gh release edit "${TAG}" --notes-file "${BODY_FILE}"
           else

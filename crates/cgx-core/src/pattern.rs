@@ -74,6 +74,58 @@ fn short_name(fqn: &str) -> &str {
     fqn.rsplit("::").next().unwrap_or(fqn)
 }
 
+/// Render a canonical `::`-joined FQN in its source language's native symbol
+/// grammar, keyed on the symbol's **own** `lang`.
+///
+/// - `rust` (and any unknown language) → returned unchanged (`::` is Rust's own
+///   grammar, and identity is the safe default for a tag we don't model).
+/// - `go` | `java` | `python` | `typescript` → each joins segments with `.`, so
+///   the transform is a `::` → `.` separator remap. The language-specific segment
+///   shape (e.g. Go's embedded receiver token `(*Type)` / `Type`) already lives in
+///   the FQN segments, so `go::(*Chain)::chain` → `go.(*Chain).chain` needs no
+///   special-casing.
+///
+/// Pure display transform: the canonical stored FQN is never altered. The inverse
+/// (native → canonical) for queries is [`normalize_pattern_text`], which is
+/// language-blind on purpose.
+pub fn render_fqn(fqn: &str, lang: &str) -> String {
+    match lang {
+        // "ts" accepted as an alias though the adapter stamps "typescript".
+        "go" | "java" | "python" | "typescript" | "ts" => fqn.replace("::", "."),
+        _ => fqn.to_string(),
+    }
+}
+
+/// Normalize a user-supplied symbol pattern to canonical separator form.
+///
+/// Language-blind: treat both `.` and `::` (and any run mixing them) as one
+/// segment separator, collapsing each run to a single canonical `::`. Glob
+/// metacharacters (`*`, `?`) and every other character — including a Go receiver
+/// token's `(`, `*`, `)` — are preserved verbatim. `a.b.c` → `a::b::c`;
+/// `auth.*` → `auth::*`; `a::b` unchanged; `go.(*Chain).chain` →
+/// `go::(*Chain)::chain`.
+///
+/// Applied to the raw query string *before* [`SymbolPattern`] construction, so a
+/// native query in any language's separator resolves against the canonical FQN
+/// (matching is over `::`). Purely additive: an existing `::` input is unchanged.
+pub fn normalize_pattern_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c == '.' || c == ':' {
+            // Collapse the maximal run of separator characters to one "::".
+            while matches!(chars.peek(), Some('.') | Some(':')) {
+                chars.next();
+            }
+            out.push_str("::");
+        } else {
+            out.push(c);
+            chars.next();
+        }
+    }
+    out
+}
+
 /// A deterministic glob matcher over an FQN.
 ///
 /// Tokens: `**` matches any run of characters including `::`; `*` matches any run
@@ -129,5 +181,127 @@ fn glob_match_at(pat: &[u8], text: &[u8]) -> bool {
             }
         }
         (Some(&p), Some(&c)) => p == c && glob_match_at(&pat[1..], &text[1..]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_fqn_per_language() {
+        struct Case {
+            lang: &'static str,
+            canonical: &'static str,
+            native: &'static str,
+        }
+        let cases = [
+            // Rust keeps `::` (identity).
+            Case {
+                lang: "rust",
+                canonical: "rust_sample::direct::Counter::add_one",
+                native: "rust_sample::direct::Counter::add_one",
+            },
+            // Go: `::` → `.`; pointer receiver token survives in-segment.
+            Case {
+                lang: "go",
+                canonical: "go::(*Chain)::chain",
+                native: "go.(*Chain).chain",
+            },
+            // Go value receiver.
+            Case {
+                lang: "go",
+                canonical: "go::Chain::chain",
+                native: "go.Chain.chain",
+            },
+            // Go bare type.
+            Case {
+                lang: "go",
+                canonical: "go::Chain",
+                native: "go.Chain",
+            },
+            Case {
+                lang: "java",
+                canonical: "com::example::direct::Direct::chain",
+                native: "com.example.direct.Direct.chain",
+            },
+            Case {
+                lang: "python",
+                canonical: "fixtures::python::direct_chain::step_a",
+                native: "fixtures.python.direct_chain.step_a",
+            },
+            Case {
+                lang: "typescript",
+                canonical: "mod::Class::method",
+                native: "mod.Class.method",
+            },
+            // Unknown language → identity (safe default).
+            Case {
+                lang: "cobol",
+                canonical: "a::b::c",
+                native: "a::b::c",
+            },
+        ];
+        for c in cases {
+            assert_eq!(
+                render_fqn(c.canonical, c.lang),
+                c.native,
+                "render_fqn({:?}, {:?})",
+                c.canonical,
+                c.lang
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_pattern_text_cases() {
+        let cases = [
+            ("a.b.c", "a::b::c"),
+            ("a::b", "a::b"),
+            ("a::b::c", "a::b::c"),
+            ("auth.*", "auth::*"),
+            ("auth::*", "auth::*"),
+            // Glob metachars survive, including globstar.
+            ("**::sink", "**::sink"),
+            ("Parser*", "Parser*"),
+            ("valid?te", "valid?te"),
+            // Mixed / repeated separators collapse to one `::`.
+            ("a.::b", "a::b"),
+            ("a...b", "a::b"),
+            // Bare short name unchanged.
+            ("validate", "validate"),
+            // Go native receiver form → canonical; receiver token preserved.
+            ("go.(*Chain).chain", "go::(*Chain)::chain"),
+            ("go.Chain.chain", "go::Chain::chain"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                normalize_pattern_text(input),
+                want,
+                "normalize_pattern_text({input:?})"
+            );
+        }
+    }
+
+    /// The load-bearing invariant: a native string cgx renders must re-parse
+    /// (via normalize) back to the exact canonical FQN it came from.
+    #[test]
+    fn render_then_normalize_round_trips_to_canonical() {
+        let fqns = [
+            ("go", "go::(*Chain)::chain"),
+            ("go", "go::Chain::chain"),
+            ("java", "com::example::Direct::chain"),
+            ("python", "fixtures::python::direct_chain::step_a"),
+            ("typescript", "mod::Class::method"),
+            ("rust", "rust_sample::direct::Counter::add_one"),
+        ];
+        for (lang, canonical) in fqns {
+            let native = render_fqn(canonical, lang);
+            assert_eq!(
+                normalize_pattern_text(&native),
+                canonical,
+                "round-trip {lang} {canonical} via native {native:?}"
+            );
+        }
     }
 }

@@ -76,13 +76,13 @@ freshness: current | indexed tree b52f0a0, working tree clean
 is exact, every edge a direct static binding:
 
 ```console
-$ cgx callees go::Chain
-go::Chain  fixtures/go/direct_chain.go:4
-├─ go::StepA  fixtures/go/direct_chain.go:10
-├─ go::StepB  fixtures/go/direct_chain.go:11
-└─ go::StepC  fixtures/go/direct_chain.go:12
+$ cgx callees go.Chain
+go.Chain  fixtures/go/direct_chain.go:4
+├─ go.StepA  fixtures/go/direct_chain.go:10
+├─ go.StepB  fixtures/go/direct_chain.go:11
+└─ go.StepC  fixtures/go/direct_chain.go:12
 approximation: exact (within modeled graph)
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `MakeBark` calls through the `Barker`
@@ -90,12 +90,12 @@ interface, so the target is a candidate set. cgx labels every such edge
 `[possible]` and states the over-approximation:
 
 ```console
-$ cgx callees go::MakeBark
-go::MakeBark  fixtures/go/virtual_dispatch.go:14
-├─ go::(*Cat)::Bark  fixtures/go/virtual_dispatch.go:12  [possible]
-└─ go::(*Dog)::Bark  fixtures/go/virtual_dispatch.go:11  [possible]
+$ cgx callees go.MakeBark
+go.MakeBark  fixtures/go/virtual_dispatch.go:14
+├─ go.(*Cat).Bark  fixtures/go/virtual_dispatch.go:12  [possible]
+└─ go.(*Dog).Bark  fixtures/go/virtual_dispatch.go:11  [possible]
 approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 </details>
 
@@ -106,13 +106,13 @@ freshness: current | indexed tree b52f0a0, working tree clean
 is exact, every edge a direct static binding:
 
 ```console
-$ cgx callees ts::direct_chain::chain
-ts::direct_chain::chain  fixtures/ts/src/direct_chain.ts:17
-├─ ts::direct_chain::stepA  fixtures/ts/src/direct_chain.ts:4
-├─ ts::direct_chain::stepB  fixtures/ts/src/direct_chain.ts:8
-└─ ts::direct_chain::stepC  fixtures/ts/src/direct_chain.ts:12
+$ cgx callees ts.direct_chain.chain
+ts.direct_chain.chain  fixtures/ts/src/direct_chain.ts:17
+├─ ts.direct_chain.stepA  fixtures/ts/src/direct_chain.ts:4
+├─ ts.direct_chain.stepB  fixtures/ts/src/direct_chain.ts:8
+└─ ts.direct_chain.stepC  fixtures/ts/src/direct_chain.ts:12
 approximation: exact (within modeled graph)
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `dispatchVocal` calls through the
@@ -120,13 +120,13 @@ freshness: current | indexed tree b52f0a0, working tree clean
 edge `[possible]` and states the over-approximation:
 
 ```console
-$ cgx callees ts::polymorphism::dispatchVocal
-ts::polymorphism::dispatchVocal  fixtures/ts/src/polymorphism.ts:26
-├─ ts::polymorphism::Cat::vocalize  fixtures/ts/src/polymorphism.ts:19  [possible]
-├─ ts::polymorphism::Dog::vocalize  fixtures/ts/src/polymorphism.ts:13  [possible]
-└─ ts::polymorphism::Vocalizer::vocalize  fixtures/ts/src/polymorphism.ts:9  [possible]
+$ cgx callees ts.polymorphism.dispatchVocal
+ts.polymorphism.dispatchVocal  fixtures/ts/src/polymorphism.ts:26
+├─ ts.polymorphism.Cat.vocalize  fixtures/ts/src/polymorphism.ts:19  [possible]
+├─ ts.polymorphism.Dog.vocalize  fixtures/ts/src/polymorphism.ts:13  [possible]
+└─ ts.polymorphism.Vocalizer.vocalize  fixtures/ts/src/polymorphism.ts:9  [possible]
 approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 </details>
 
@@ -137,13 +137,13 @@ freshness: current | indexed tree b52f0a0, working tree clean
 answer is exact, every edge a direct static binding:
 
 ```console
-$ cgx callees com::example::direct::Direct::chain
-com::example::direct::Direct::chain  fixtures/java/Direct.java:4
-├─ com::example::direct::Direct::stepA  fixtures/java/Direct.java:10
-├─ com::example::direct::Direct::stepB  fixtures/java/Direct.java:14
-└─ com::example::direct::Direct::stepC  fixtures/java/Direct.java:18
+$ cgx callees com.example.direct.Direct.chain
+com.example.direct.Direct.chain  fixtures/java/Direct.java:4
+├─ com.example.direct.Direct.stepA  fixtures/java/Direct.java:10
+├─ com.example.direct.Direct.stepB  fixtures/java/Direct.java:14
+└─ com.example.direct.Direct.stepC  fixtures/java/Direct.java:18
 approximation: exact (within modeled graph)
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `makeChirp` calls through the `Chirper`
@@ -151,12 +151,12 @@ interface, so the target is a candidate set. cgx labels every such edge
 `[possible]` and states the over-approximation:
 
 ```console
-$ cgx callees com::example::dispatch::VirtualDispatch::makeChirp
-com::example::dispatch::VirtualDispatch::makeChirp  fixtures/java/VirtualDispatch.java:4
-├─ com::example::dispatch::Cat::chirp  fixtures/java/VirtualDispatch.java:22  [possible]
-└─ com::example::dispatch::Dog::chirp  fixtures/java/VirtualDispatch.java:15  [possible]
+$ cgx callees com.example.dispatch.VirtualDispatch.makeChirp
+com.example.dispatch.VirtualDispatch.makeChirp  fixtures/java/VirtualDispatch.java:4
+├─ com.example.dispatch.Cat.chirp  fixtures/java/VirtualDispatch.java:22  [possible]
+└─ com.example.dispatch.Dog.chirp  fixtures/java/VirtualDispatch.java:15  [possible]
 approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 </details>
 
@@ -167,13 +167,13 @@ freshness: current | indexed tree b52f0a0, working tree clean
 is exact, every edge a direct static binding:
 
 ```console
-$ cgx callees fixtures::python::direct_chain::chain
-fixtures::python::direct_chain::chain  fixtures/python/direct_chain.py:17
-├─ fixtures::python::direct_chain::step_a  fixtures/python/direct_chain.py:5
-├─ fixtures::python::direct_chain::step_b  fixtures/python/direct_chain.py:9
-└─ fixtures::python::direct_chain::step_c  fixtures/python/direct_chain.py:13
+$ cgx callees fixtures.python.direct_chain.chain
+fixtures.python.direct_chain.chain  fixtures/python/direct_chain.py:17
+├─ fixtures.python.direct_chain.step_a  fixtures/python/direct_chain.py:5
+├─ fixtures.python.direct_chain.step_b  fixtures/python/direct_chain.py:9
+└─ fixtures.python.direct_chain.step_c  fixtures/python/direct_chain.py:13
 approximation: exact (within modeled graph)
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `make_howl` calls `.howl()` on an
@@ -181,13 +181,13 @@ untyped parameter, so the target is a candidate set. cgx labels every such edge
 `[possible]` and states the over-approximation:
 
 ```console
-$ cgx callees fixtures::python::virtual_dispatch::make_howl
-fixtures::python::virtual_dispatch::make_howl  fixtures/python/virtual_dispatch.py:20
-├─ fixtures::python::virtual_dispatch::Cat::howl  fixtures/python/virtual_dispatch.py:16  [possible]
-├─ fixtures::python::virtual_dispatch::Dog::howl  fixtures/python/virtual_dispatch.py:11  [possible]
-└─ fixtures::python::virtual_dispatch::Howler::howl  fixtures/python/virtual_dispatch.py:6  [possible]
+$ cgx callees fixtures.python.virtual_dispatch.make_howl
+fixtures.python.virtual_dispatch.make_howl  fixtures/python/virtual_dispatch.py:20
+├─ fixtures.python.virtual_dispatch.Cat.howl  fixtures/python/virtual_dispatch.py:16  [possible]
+├─ fixtures.python.virtual_dispatch.Dog.howl  fixtures/python/virtual_dispatch.py:11  [possible]
+└─ fixtures.python.virtual_dispatch.Howler.howl  fixtures/python/virtual_dispatch.py:6  [possible]
 approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
-freshness: current | indexed tree b52f0a0, working tree clean
+freshness: current | indexed tree 5d64553, working tree clean
 ```
 </details>
 

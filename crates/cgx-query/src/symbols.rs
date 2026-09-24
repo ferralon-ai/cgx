@@ -95,6 +95,9 @@ impl EdgeBreakdown {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRank {
     pub fqn: String,
+    /// Source language tag, retained so the CLI can render the FQN in its native
+    /// grammar at the display boundary.
+    pub lang: String,
     pub file: String,
     pub line: u32,
     pub kind: SymbolKind,
@@ -175,6 +178,7 @@ pub fn rank_symbols(
         .filter(|(_, node)| kind_filter.is_none_or(|k| node.kind == k))
         .map(|(i, node)| SymbolRank {
             fqn: node.fqn.clone(),
+            lang: node.lang.clone(),
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,

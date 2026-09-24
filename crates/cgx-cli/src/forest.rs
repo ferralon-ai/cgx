@@ -218,7 +218,10 @@ impl<'a> Forest<'a> {
             let child = self.node(edge.dst);
 
             if ancestors.contains(&edge.dst) {
-                w.out.push_str(&format!("{prefix}↺ {} (cycle)\n", child.fqn));
+                w.out.push_str(&format!(
+                    "{prefix}↺ {} (cycle)\n",
+                    cgx_core::render_fqn(&child.fqn, &child.lang)
+                ));
                 continue;
             }
 
@@ -370,9 +373,15 @@ fn tree_prefix(parents_is_last: &[bool], is_last: bool) -> String {
     s
 }
 
-/// The bare `fqn  file:line` line (root nodes; no edge context).
+/// The bare `fqn  file:line` line (root nodes; no edge context). The FQN is
+/// rendered in the symbol's own language grammar (native by default).
 fn base_line(n: &NodeRecord) -> String {
-    format!("{}  {}:{}", n.fqn, n.file, n.line_start)
+    format!(
+        "{}  {}:{}",
+        cgx_core::render_fqn(&n.fqn, &n.lang),
+        n.file,
+        n.line_start
+    )
 }
 
 /// A child line: `fqn  file:line` plus the non-default condition/confidence tags.

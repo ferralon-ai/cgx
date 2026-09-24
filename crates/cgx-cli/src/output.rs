@@ -130,7 +130,9 @@ impl<'a> Finding<'a> {
     fn human_line(&self) -> String {
         let mut s = format!(
             "{}  ({}:{})",
-            self.subject.fqn, self.subject.file, self.subject.line_start
+            cgx_core::render_fqn(&self.subject.fqn, &self.subject.lang),
+            self.subject.file,
+            self.subject.line_start
         );
         if let Some(d) = self.depth {
             s.push_str(&format!("  depth={d}"));
@@ -152,7 +154,7 @@ impl<'a> Finding<'a> {
 
     fn json(&self) -> Value {
         let mut obj = json!({
-            "fqn": self.subject.fqn,
+            "fqn": cgx_core::render_fqn(&self.subject.fqn, &self.subject.lang),
             "file": self.subject.file,
             "line": self.subject.line_start,
             "kind": self.subject.kind,
@@ -199,14 +201,14 @@ impl<'a> Finding<'a> {
         json!({
             "ruleId": rule_id,
             "level": "note",
-            "message": { "text": format!("{} ({})", self.subject.fqn, sarif_kind(self.subject)) },
+            "message": { "text": format!("{} ({})", cgx_core::render_fqn(&self.subject.fqn, &self.subject.lang), sarif_kind(self.subject)) },
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": self.subject.file },
                     "region": { "startLine": self.subject.line_start.max(1) }
                 },
                 "logicalLocations": [{
-                    "fullyQualifiedName": self.subject.fqn,
+                    "fullyQualifiedName": cgx_core::render_fqn(&self.subject.fqn, &self.subject.lang),
                     "kind": "function"
                 }]
             }],
@@ -260,9 +262,12 @@ pub enum Cell {
     Float(f64),
     Str(String),
     List(Vec<Cell>),
-    /// A bound node, resolved to its location fields.
+    /// A bound node, resolved to its location fields. `lang` is retained so the
+    /// FQN can be rendered in its native grammar at the display/JSON boundary
+    /// without a further `GraphView` lookup.
     Node {
         fqn: String,
+        lang: String,
         file: String,
         line: u32,
         kind: String,
@@ -307,6 +312,7 @@ impl Cell {
             V::Node(id) => match view.try_node(*id) {
                 Some(n) => Cell::Node {
                     fqn: n.fqn.clone(),
+                    lang: n.lang.clone(),
                     file: n.file.clone(),
                     line: n.line_start,
                     kind: node_kind_str(n),
@@ -325,7 +331,7 @@ impl Cell {
                 p.nodes
                     .iter()
                     .map(|n| match view.try_node(*n) {
-                        Some(rec) => rec.fqn.clone(),
+                        Some(rec) => cgx_core::render_fqn(&rec.fqn, &rec.lang),
                         None => String::new(),
                     })
                     .collect(),
@@ -346,7 +352,9 @@ impl Cell {
                 let inner: Vec<String> = items.iter().map(Cell::display).collect();
                 format!("[{}]", inner.join(", "))
             }
-            Cell::Node { fqn, file, line, .. } => format!("{fqn} ({file}:{line})"),
+            Cell::Node {
+                fqn, lang, file, line, ..
+            } => format!("{} ({file}:{line})", cgx_core::render_fqn(fqn, lang)),
             Cell::Edge {
                 kind,
                 condition,
@@ -372,10 +380,11 @@ impl Cell {
             Cell::List(items) => Value::Array(items.iter().map(Cell::json).collect()),
             Cell::Node {
                 fqn,
+                lang,
                 file,
                 line,
                 kind,
-            } => json!({ "fqn": fqn, "file": file, "line": line, "kind": kind }),
+            } => json!({ "fqn": cgx_core::render_fqn(fqn, lang), "file": file, "line": line, "kind": kind }),
             Cell::Edge {
                 kind,
                 condition,
@@ -549,7 +558,7 @@ fn graph_data(results: &ResultSet) -> GraphData {
     if let ResultSet::Paths(set) = results {
         for p in &set.paths {
             for step in &p.steps {
-                g.push_node(&step.node.fqn);
+                g.push_node(&cgx_core::render_fqn(&step.node.fqn, &step.node.lang));
             }
             for pair in p.steps.windows(2) {
                 let label = pair[1]
@@ -557,7 +566,11 @@ fn graph_data(results: &ResultSet) -> GraphData {
                     .as_ref()
                     .map(|e| condition_str(e.condition).to_string())
                     .unwrap_or_default();
-                g.push_edge(&pair[0].node.fqn, &pair[1].node.fqn, &label);
+                g.push_edge(
+                    &cgx_core::render_fqn(&pair[0].node.fqn, &pair[0].node.lang),
+                    &cgx_core::render_fqn(&pair[1].node.fqn, &pair[1].node.lang),
+                    &label,
+                );
             }
         }
     }
@@ -1028,7 +1041,11 @@ fn render_human(results: &ResultSet) -> String {
                         .unwrap_or_default();
                     lines.push(format!(
                         "{}{}  ({}:{}){}",
-                        arrow, step.node.fqn, step.node.file, step.node.line_start, cond
+                        arrow,
+                        cgx_core::render_fqn(&step.node.fqn, &step.node.lang),
+                        step.node.file,
+                        step.node.line_start,
+                        cond
                     ));
                 }
             }
@@ -1194,7 +1211,7 @@ fn path_json(p: &PathResult) -> Value {
         .iter()
         .map(|s| {
             let mut obj = json!({
-                "fqn": s.node.fqn,
+                "fqn": cgx_core::render_fqn(&s.node.fqn, &s.node.lang),
                 "file": s.node.file,
                 "line": s.node.line_start,
             });
@@ -1340,8 +1357,8 @@ fn sarif_table_row(t: &TableData, row: &[Cell], rule_id: &str) -> Value {
     // Else the first node cell's location.
     let node_loc = row.iter().find_map(|c| match c {
         Cell::Node {
-            fqn, file, line, ..
-        } => Some((fqn.clone(), file.clone(), (*line).max(1))),
+            fqn, lang, file, line, ..
+        } => Some((cgx_core::render_fqn(fqn, lang), file.clone(), (*line).max(1))),
         _ => None,
     });
 
@@ -1351,7 +1368,7 @@ fn sarif_table_row(t: &TableData, row: &[Cell], rule_id: &str) -> Value {
         .or_else(|| col("fqn"))
         .and_then(|c| match c {
             Cell::Str(s) => Some(s.clone()),
-            Cell::Node { fqn, .. } => Some(fqn.clone()),
+            Cell::Node { fqn, lang, .. } => Some(cgx_core::render_fqn(fqn, lang)),
             _ => None,
         })
         .or_else(|| node_loc.as_ref().map(|(fqn, _, _)| fqn.clone()))
@@ -1409,7 +1426,7 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
                     "artifactLocation": { "uri": n.file },
                     "region": { "startLine": n.line_start.max(1) }
                 },
-                "logicalLocations": [{ "fullyQualifiedName": n.fqn, "kind": "function" }]
+                "logicalLocations": [{ "fullyQualifiedName": cgx_core::render_fqn(&n.fqn, &n.lang), "kind": "function" }]
             }])
         })
         .unwrap_or_else(|| json!([]));
@@ -1424,7 +1441,7 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
                         "artifactLocation": { "uri": s.node.file },
                         "region": { "startLine": s.node.line_start.max(1) }
                     },
-                    "logicalLocations": [{ "fullyQualifiedName": s.node.fqn }]
+                    "logicalLocations": [{ "fullyQualifiedName": cgx_core::render_fqn(&s.node.fqn, &s.node.lang) }]
                 }
             })
         })
@@ -1433,8 +1450,8 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
     let msg = match (source, sink) {
         (Some(s), Some(d)) => format!(
             "Path from {} to {} ({} hops, {})",
-            s.fqn,
-            d.fqn,
+            cgx_core::render_fqn(&s.fqn, &s.lang),
+            cgx_core::render_fqn(&d.fqn, &d.lang),
             p.hops(),
             confidence_str(p.min_confidence)
         ),
@@ -1493,7 +1510,7 @@ pub fn render_search(
                 .iter()
                 .map(|h| {
                     json!({
-                        "fqn": h.fqn,
+                        "fqn": cgx_core::render_fqn(&h.fqn, &h.lang),
                         "file": h.file,
                         "line": h.line,
                         "kind": kind_str(h.kind),
@@ -1521,13 +1538,18 @@ pub fn render_search(
                 return out;
             }
             // Align on the FQN column so `file:line` starts at a fixed offset.
-            let fqn_width = visible.iter().map(|h| h.fqn.chars().count()).max().unwrap_or(0);
+            // Widths are computed over the *rendered* (native) FQN.
+            let rendered: Vec<String> = visible
+                .iter()
+                .map(|h| cgx_core::render_fqn(&h.fqn, &h.lang))
+                .collect();
+            let fqn_width = rendered.iter().map(|f| f.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
-            for h in visible {
-                let pad = fqn_width.saturating_sub(h.fqn.chars().count());
+            for (h, fqn) in visible.iter().zip(rendered.iter()) {
+                let pad = fqn_width.saturating_sub(fqn.chars().count());
                 out.push_str(&format!(
                     "{}{}  {}:{}  [{}]\n",
-                    h.fqn,
+                    fqn,
                     " ".repeat(pad),
                     h.file,
                     h.line,
@@ -1589,13 +1611,17 @@ pub fn render_symbols(
                 out.push('\n');
                 return out;
             }
-            let fqn_width = visible.iter().map(|r| r.fqn.chars().count()).max().unwrap_or(0);
+            let rendered: Vec<String> = visible
+                .iter()
+                .map(|r| cgx_core::render_fqn(&r.fqn, &r.lang))
+                .collect();
+            let fqn_width = rendered.iter().map(|f| f.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
-            for r in visible {
-                let pad = fqn_width.saturating_sub(r.fqn.chars().count());
+            for (r, fqn) in visible.iter().zip(rendered.iter()) {
+                let pad = fqn_width.saturating_sub(fqn.chars().count());
                 out.push_str(&format!(
                     "{}{}  ({}:{})  [{}]  in={} out={}  in:{}  out:{}\n",
-                    r.fqn,
+                    fqn,
                     " ".repeat(pad),
                     r.file,
                     r.line,
@@ -1640,7 +1666,7 @@ fn breakdown_human(b: &cgx_query::EdgeBreakdown) -> String {
 /// breakdown objects (each with `total` and the family/condition/confidence maps).
 fn symbol_rank_json(r: &cgx_query::SymbolRank) -> Value {
     json!({
-        "fqn": r.fqn,
+        "fqn": cgx_core::render_fqn(&r.fqn, &r.lang),
         "file": r.file,
         "line": r.line,
         "kind": kind_str(r.kind),
@@ -1774,7 +1800,7 @@ fn explanation_human(e: &Explanation) -> String {
     let n = &e.node;
     let mut out = format!(
         "{}  ({}:{})\n  kind: {}\n  callers: {}, callees: {}\n",
-        n.fqn,
+        cgx_core::render_fqn(&n.fqn, &n.lang),
         n.file,
         n.line_start,
         node_kind_str(n),
@@ -1791,7 +1817,7 @@ fn explanation_human(e: &Explanation) -> String {
         out.push_str(&format!(
             "    {} {}  ({}:{})  [{}]  [{}]  tier={}  rule={}",
             arrow,
-            edge.peer.fqn,
+            cgx_core::render_fqn(&edge.peer.fqn, &edge.peer.lang),
             edge.peer.file,
             edge.peer.line_start,
             condition_str(edge.condition),
@@ -1818,7 +1844,7 @@ fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
         .map(|edge| {
             json!({
                 "direction": if edge.incoming { "incoming" } else { "outgoing" },
-                "peer": edge.peer.fqn,
+                "peer": cgx_core::render_fqn(&edge.peer.fqn, &edge.peer.lang),
                 "peer_file": edge.peer.file,
                 "peer_line": edge.peer.line_start,
                 "condition": condition_str(edge.condition),
@@ -1831,7 +1857,7 @@ fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
         })
         .collect();
     let doc = json!({
-        "symbol": n.fqn,
+        "symbol": cgx_core::render_fqn(&n.fqn, &n.lang),
         "file": n.file,
         "line": n.line_start,
         "kind": node_kind_str(n),

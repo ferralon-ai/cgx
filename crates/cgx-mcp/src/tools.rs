@@ -9,7 +9,10 @@
 //! tool performs any network or LLM call; given the same tree, every tool is a
 //! pure function of its arguments.
 
-use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
+use cgx_core::{
+    normalize_pattern_text, render_fqn, Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind,
+    SymbolPattern, Tier,
+};
 use cgx_diff::impacted::Sides;
 use cgx_query::{
     callees, callers, contract, entrypoint_roots, explain, impacted::ImpactedWitness,
@@ -558,8 +561,12 @@ fn session_for(args: &Value) -> Result<GraphSession, ToolError> {
 
 /// Resolve a `--symbol`-style argument to a unique node, surfacing a clean error.
 fn resolve(view: &GraphView, name: &str) -> Result<NodeId, ToolError> {
-    resolve_anchor(view, &SymbolPattern::fqn(name))
-        .or_else(|_| resolve_anchor(view, &SymbolPattern::short_name(name)))
+    // Accept native separators (`.`) as well as canonical `::`. Language-blind,
+    // additive: an existing `::` name is unchanged. The short-name fallback keys
+    // off the last segment, so it takes the normalized form too.
+    let name = normalize_pattern_text(name);
+    resolve_anchor(view, &SymbolPattern::fqn(&name))
+        .or_else(|_| resolve_anchor(view, &SymbolPattern::short_name(&name)))
         .map_err(|e| ToolError::resolve(e.to_string()))
 }
 
@@ -567,7 +574,7 @@ fn resolve(view: &GraphView, name: &str) -> Result<NodeId, ToolError> {
 
 fn neighbor_json(r: &NeighborResult) -> Value {
     json!({
-        "name": r.node.fqn,
+        "name": render_fqn(&r.node.fqn, &r.node.lang),
         "file": r.node.file,
         "line": r.node.line_start,
         "depth": r.depth,
@@ -584,7 +591,7 @@ fn path_json(p: &PathResult) -> Value {
         .iter()
         .map(|s| {
             json!({
-                "name": s.node.fqn,
+                "name": render_fqn(&s.node.fqn, &s.node.lang),
                 "file": s.node.file,
                 "line": s.node.line_start,
                 "edge_condition": s.via.as_ref().map(|e| condition_token(e.condition)),
@@ -770,7 +777,7 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
         .iter()
         .map(|n| {
             json!({
-                "name": n.fqn,
+                "name": render_fqn(&n.fqn, &n.lang),
                 "file": n.file,
                 "line": n.line_start,
                 "kind": format!("{:?}", n.kind).to_lowercase()
@@ -939,7 +946,7 @@ fn impacted_row_json(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) 
     let map = obj.as_object_mut().expect("neighbor row is an object");
     map.insert(
         "reached_change".into(),
-        json!(view.try_node(w.root).map(|n| n.fqn.as_str())),
+        json!(view.try_node(w.root).map(|n| render_fqn(&n.fqn, &n.lang))),
     );
     map.insert("via_containment_lift".into(), json!(w.via_containment_lift));
     obj
@@ -959,7 +966,7 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
         .map(|e| {
             json!({
                 "direction": if e.incoming { "incoming" } else { "outgoing" },
-                "peer": e.peer.fqn,
+                "peer": render_fqn(&e.peer.fqn, &e.peer.lang),
                 "condition": condition_token(e.condition),
                 "confidence": confidence_token(e.confidence),
                 "peer_file": e.peer.file,
@@ -974,7 +981,7 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
 
     let node = &explanation.node;
     let body = json!({
-        "symbol": node.fqn,
+        "symbol": render_fqn(&node.fqn, &node.lang),
         "file": node.file,
         "line": node.line_start,
         "kind": format!("{:?}", node.kind).to_lowercase(),
@@ -1173,7 +1180,7 @@ fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
 
 fn symbol_hit_json(h: &SymbolHit) -> Value {
     json!({
-        "fqn": h.fqn,
+        "fqn": render_fqn(&h.fqn, &h.lang),
         "file": h.file,
         "line": h.line,
         "kind": format!("{:?}", h.kind).to_lowercase(),
@@ -1182,7 +1189,7 @@ fn symbol_hit_json(h: &SymbolHit) -> Value {
 
 fn symbol_rank_json(r: &SymbolRank) -> Value {
     json!({
-        "fqn": r.fqn,
+        "fqn": render_fqn(&r.fqn, &r.lang),
         "file": r.file,
         "line": r.line,
         "kind": format!("{:?}", r.kind).to_lowercase(),
@@ -1334,7 +1341,7 @@ fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
         V::List(items) => Value::Array(items.iter().map(|i| cql_cell_json(view, i)).collect()),
         V::Node(id) => match view.try_node(*id) {
             Some(n) => json!({
-                "fqn": n.fqn,
+                "fqn": render_fqn(&n.fqn, &n.lang),
                 "file": n.file,
                 "line": n.line_start,
                 "kind": format!("{:?}", n.kind).to_lowercase(),
@@ -1353,7 +1360,7 @@ fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
             p.nodes
                 .iter()
                 .map(|n| match view.try_node(*n) {
-                    Some(rec) => json!(rec.fqn),
+                    Some(rec) => json!(render_fqn(&rec.fqn, &rec.lang)),
                     None => json!(""),
                 })
                 .collect(),

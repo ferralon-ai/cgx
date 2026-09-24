@@ -132,10 +132,13 @@ fn structural_callers_resolves_go_spawn_edge() {
     // structural call graph resolves Go refs end-to-end.
     let (_tmp, repo) = fixture_repo();
     index(&repo);
+    // The query accepts canonical `::` (normalized identically to native `.`); the
+    // rendered `fqn` is now the Go-native dotted form (cycle decision: native at
+    // every boundary, JSON included).
     let callers = result_fqns(&repo, &["callers", "go_sample::worker", "--format", "json"]);
     assert!(
-        callers.iter().any(|f| f == "go_sample::Spawn"),
-        "callers of worker must include Spawn, got {callers:?}"
+        callers.iter().any(|f| f == "go_sample.Spawn"),
+        "callers of worker must include Spawn (native-rendered), got {callers:?}"
     );
 }
 

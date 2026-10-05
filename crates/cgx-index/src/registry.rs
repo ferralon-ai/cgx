@@ -7,6 +7,7 @@
 //! facts, even those no adapter claims.
 
 use cgx_frontend::{FallbackFrontend, FrontendRegistry};
+use cgx_lang_c::CFrontend;
 use cgx_lang_go::GoFrontend;
 use cgx_lang_java::JavaFrontend;
 use cgx_lang_python::PythonFrontend;
@@ -25,5 +26,35 @@ pub fn default_registry() -> FrontendRegistry {
     registry.register(Arc::new(GoFrontend::new()));
     registry.register(Arc::new(JavaFrontend::new()));
     registry.register(Arc::new(PythonFrontend::new()));
+    registry.register(Arc::new(CFrontend::new()));
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_registry;
+    use cgx_frontend::{FileCtx, RelPath};
+
+    /// C files dispatch to the dedicated (Tier-0-backed) C frontend, not the
+    /// registry's generic JSON fallback, and extraction over a tiny fixture
+    /// yields a non-empty def/call census.
+    #[test]
+    fn c_registers_and_produces_a_census() {
+        let registry = default_registry();
+
+        let c_path = RelPath::new("add.c");
+        assert!(registry.has_adapter_for(&c_path));
+        assert_eq!(registry.lang_for(&c_path).tag(), "c");
+
+        let c_src = b"int helper(int x) { return x + 1; }\nint main(void) { return helper(1); }\n";
+        let c_ctx = FileCtx::new("add.c", "c-oid");
+        let c_facts = registry.extract(c_src, &c_ctx).unwrap();
+        assert!(
+            c_facts.defs.iter().any(|d| d.fqn == "helper")
+                && c_facts.defs.iter().any(|d| d.fqn == "main"),
+            "expected helper/main defs, got {:?}",
+            c_facts.defs
+        );
+        assert!(!c_facts.refs.is_empty(), "expected at least one call ref");
+    }
 }

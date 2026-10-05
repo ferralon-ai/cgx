@@ -274,7 +274,6 @@ dependencies = [
  "cgx-core",
  "cgx-frontend",
  "cgx-lang-c",
- "cgx-lang-cpp",
  "cgx-lang-go",
  "cgx-lang-java",
  "cgx-lang-python",

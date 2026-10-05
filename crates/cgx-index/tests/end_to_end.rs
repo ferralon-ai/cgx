@@ -138,6 +138,39 @@ fn rust_virtual_dispatch_produces_candidate_set() {
 }
 
 #[test]
+fn rust_closure_fqn_round_trips_through_render_and_normalize() {
+    // Regression for the gap that let a real cgx-core bug through review: a
+    // synthetic `{closure@LINE:COL}` FQN emitted for a real indexed node must
+    // survive the full render (canonical -> native display) and normalize
+    // (native query text -> canonical match key) round trip, because that is
+    // exactly the path `cgx search` -> `cgx callers <emitted fqn>` exercises.
+    // A pure `normalize_pattern_text` unit test over hand-written strings is
+    // necessary but not sufficient — it doesn't prove the FQN cgx actually
+    // emits for a real closure survives; indexing the fixture does.
+    let (_t, _s, h) = index_fixture("rust-sample");
+    let idx = h.idx();
+    let canonical = "rust_sample::imports::animal_chorus::{closure@28:24}";
+    assert!(
+        idx.has_node(canonical),
+        "fixture no longer defines the expected closure node: {canonical}"
+    );
+
+    // "rust" is identity under render_fqn, so the native text cgx would show
+    // the user is the canonical FQN itself.
+    let native = cgx_core::pattern::render_fqn(canonical, "rust");
+    // Feed that native text back through the same normalize path a query
+    // string takes before matching, and confirm it still resolves to the
+    // exact node that was indexed — the lone `:` inside `{closure@28:24}`
+    // must not have been mangled into `{closure@28::24}`.
+    let round_tripped = cgx_core::pattern::normalize_pattern_text(&native);
+    assert_eq!(round_tripped, canonical, "closure FQN failed to round-trip");
+    assert!(
+        idx.has_node(&round_tripped),
+        "round-tripped closure FQN no longer resolves: {round_tripped}"
+    );
+}
+
+#[test]
 fn rust_loop_and_conditional_edge_labels() {
     let (_t, _s, h) = index_fixture("rust-sample");
     let idx = h.idx();

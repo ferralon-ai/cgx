@@ -38,9 +38,13 @@ pub fn module_path_for(rel_path: &str) -> String {
 /// off the path.
 ///
 /// Crate-root precedence:
-/// 1. the directory immediately before `src/` (workspace layout — unchanged);
-/// 2. else `package` (single-crate-at-root / no-`src` layout);
-/// 3. else [`DEFAULT_CRATE`] (no `Cargo.toml` was found).
+/// 1. `package` (the resolved `Cargo.toml` package name is authoritative —
+///    it is the crate identity rust-analyzer's SCIP symbols use, regardless
+///    of what the containing directory happens to be named);
+/// 2. else the directory immediately before `src/` (workspace layout, used
+///    only when no owning package was found);
+/// 3. else [`DEFAULT_CRATE`] (no `Cargo.toml` was found and no `src/` directory
+///    to read a name off).
 ///
 /// `package` is assumed already normalized (hyphens → underscores); the indexer
 /// normalizes when it parses `Cargo.toml` so the FQN matches the crate
@@ -49,27 +53,28 @@ pub fn module_path_for_pkg(rel_path: &str, package: Option<&str>) -> String {
     let norm = rel_path.replace('\\', "/");
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
 
-    // The fallback crate root for the cases where the path carries no crate
-    // directory: the owning package (preferred) or the last-resort default.
-    let fallback_crate = || package.map(str::to_string).unwrap_or_else(|| DEFAULT_CRATE.to_string());
+    // The fallback crate root for when `package` is unknown: read off the path,
+    // or the last-resort default.
+    let fallback_crate = |segments: &[&str], src_idx: Option<usize>| match src_idx {
+        Some(i) if i > 0 => to_crate_ident(segments[i - 1]),
+        _ => DEFAULT_CRATE.to_string(),
+    };
 
     // Find the `src` boundary. Everything before it (if anything) is the crate
     // directory; everything after it forms the module path.
     let src_idx = segments.iter().position(|s| *s == "src");
 
-    let (crate_name, mod_segments): (String, &[&str]) = match src_idx {
-        Some(i) => {
-            let crate_name = if i == 0 {
-                fallback_crate()
-            } else {
-                // The directory immediately before `src` is the crate name.
-                to_crate_ident(segments[i - 1])
-            };
-            (crate_name, &segments[i + 1..])
-        }
-        // No `src/` in the path: treat the whole thing as module segments under
-        // the owning package (or the default).
-        None => (fallback_crate(), &segments[..]),
+    // The owning `Cargo.toml` package, when known, is the crate root
+    // unconditionally — it is authoritative even when a `src/`-preceding
+    // directory exists and happens to disagree with it. Only fall back to
+    // reading the crate name off the path when no package was supplied.
+    let crate_name = match package {
+        Some(pkg) => pkg.to_string(),
+        None => fallback_crate(&segments, src_idx),
+    };
+    let mod_segments: &[&str] = match src_idx {
+        Some(i) => &segments[i + 1..],
+        None => &segments[..],
     };
 
     let mut out = crate_name;
@@ -121,5 +126,35 @@ mod tests {
     #[test]
     fn crate_directory_before_src_is_the_crate_name() {
         assert_eq!(module_path_for("my-crate/src/x.rs"), "my_crate::x");
+    }
+
+    #[test]
+    fn package_wins_even_when_dir_before_src_disagrees() {
+        assert_eq!(
+            module_path_for_pkg("crates/billing/utils/src/lib.rs", Some("acme_billing_utils")),
+            "acme_billing_utils",
+        );
+    }
+
+    #[test]
+    fn package_resolves_the_same_dir_basename_collision() {
+        let a = module_path_for_pkg("crates/billing/utils/src/x.rs", Some("acme_billing_utils"));
+        let b = module_path_for_pkg("services/ingest/utils/src/x.rs", Some("ingest_utils"));
+        assert_ne!(a, b);
+        assert_eq!(a, "acme_billing_utils::x");
+        assert_eq!(b, "ingest_utils::x");
+    }
+
+    #[test]
+    fn package_none_falls_back_to_dir_before_src() {
+        assert_eq!(module_path_for_pkg("my-crate/src/x.rs", None), "my_crate::x");
+    }
+
+    #[test]
+    fn package_matching_dir_name_is_unchanged() {
+        assert_eq!(
+            module_path_for_pkg("my-crate/src/x.rs", Some("my_crate")),
+            "my_crate::x",
+        );
     }
 }

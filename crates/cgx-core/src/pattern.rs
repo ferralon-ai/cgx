@@ -98,12 +98,22 @@ pub fn render_fqn(fqn: &str, lang: &str) -> String {
 
 /// Normalize a user-supplied symbol pattern to canonical separator form.
 ///
-/// Language-blind: treat both `.` and `::` (and any run mixing them) as one
-/// segment separator, collapsing each run to a single canonical `::`. Glob
-/// metacharacters (`*`, `?`) and every other character — including a Go receiver
-/// token's `(`, `*`, `)` — are preserved verbatim. `a.b.c` → `a::b::c`;
-/// `auth.*` → `auth::*`; `a::b` unchanged; `go.(*Chain).chain` →
-/// `go::(*Chain)::chain`.
+/// Language-blind: treat `.` and a colon **pair** (`::`, or any longer run of
+/// colons/dots) as one segment separator, collapsing each such run to a single
+/// canonical `::`. A **lone single `:`** — a run of exactly one colon, with no
+/// adjacent `.` — is left as a literal character, not a separator: no native
+/// grammar uses a bare `:` as a segment separator, but the synthetic
+/// `{closure@LINE:COL}` / `{func@LINE:COL}` segments anonymous Rust closures and
+/// Go func literals canonicalize to use a bare `:` between line and column, and
+/// that must round-trip unchanged. Glob metacharacters (`*`, `?`) and every other
+/// character — including a Go receiver token's `(`, `*`, `)` — are preserved
+/// verbatim.
+///
+/// Examples: `a.b.c` → `a::b::c`; `auth.*` → `auth::*`; `a::b` unchanged;
+/// `a.::b` → `a::b` (a mixed run still collapses — it contains a `.`, so it's
+/// unambiguously a separator); `go.(*Chain).chain` → `go::(*Chain)::chain`;
+/// `go.{func@10:4}` → `go::{func@10:4}` (the lone `:` inside the segment
+/// survives); `rust_sample::rs::c::make::{closure@2:13}` unchanged.
 ///
 /// Applied to the raw query string *before* [`SymbolPattern`] construction, so a
 /// native query in any language's separator resolves against the canonical FQN
@@ -113,11 +123,24 @@ pub fn normalize_pattern_text(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(&c) = chars.peek() {
         if c == '.' || c == ':' {
-            // Collapse the maximal run of separator characters to one "::".
+            // Collect the maximal run of separator characters.
+            let mut run_len = 0usize;
+            let mut run_has_dot = false;
             while matches!(chars.peek(), Some('.') | Some(':')) {
-                chars.next();
+                if chars.next() == Some('.') {
+                    run_has_dot = true;
+                }
+                run_len += 1;
             }
-            out.push_str("::");
+            // A run is a literal lone `:` only if it is exactly one colon with no
+            // dot anywhere in the run. Any dot, or any run of 2+ colons, is a
+            // separator and collapses to "::" — this keeps `:::`-style runs
+            // (3+ colons) sane by treating them the same as a plain `::` pair.
+            if run_len == 1 && !run_has_dot {
+                out.push(':');
+            } else {
+                out.push_str("::");
+            }
         } else {
             out.push(c);
             chars.next();
@@ -273,6 +296,18 @@ mod tests {
             // Go native receiver form → canonical; receiver token preserved.
             ("go.(*Chain).chain", "go::(*Chain)::chain"),
             ("go.Chain.chain", "go::Chain::chain"),
+            // Lone single `:` inside a synthetic `{closure@LINE:COL}` /
+            // `{func@LINE:COL}` segment is NOT a separator — it's literal,
+            // because no native grammar uses a bare `:` to join segments.
+            (
+                "rust_sample::rs::c::make::{closure@2:13}",
+                "rust_sample::rs::c::make::{closure@2:13}",
+            ),
+            ("go.{func@10:4}", "go::{func@10:4}"),
+            // A run of 2+ colons (or any run containing a dot) still collapses,
+            // even immediately adjacent to a synthetic segment.
+            ("a:::b", "a::b"),
+            ("go.{func@10:4}.next", "go::{func@10:4}::next"),
         ];
         for (input, want) in cases {
             assert_eq!(
@@ -294,6 +329,10 @@ mod tests {
             ("python", "fixtures::python::direct_chain::step_a"),
             ("typescript", "mod::Class::method"),
             ("rust", "rust_sample::direct::Counter::add_one"),
+            // Anonymous callables: the lone `:` in their synthetic segment must
+            // survive the render -> normalize round trip unscathed.
+            ("rust", "rust_sample::rs::c::make::{closure@2:13}"),
+            ("go", "go::pkg::Fn::{func@10:4}"),
         ];
         for (lang, canonical) in fqns {
             let native = render_fqn(canonical, lang);

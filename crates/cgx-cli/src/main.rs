@@ -1996,6 +1996,7 @@ fn run_search_selector(
         .filter(|node| kind_filter.is_none_or(|k| node.kind == k))
         .map(|node| cgx_query::SymbolHit {
             fqn: node.fqn.clone(),
+            lang: node.lang.clone(),
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,

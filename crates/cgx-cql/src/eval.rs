@@ -643,12 +643,15 @@ fn peer_matches(view: &GraphView, plan: &PatternPlan, peer: NodeId) -> bool {
 /// design §3.1 heuristics (glob if `*`/`?`, FQN if it contains `::`, else
 /// short-name).
 pub(crate) fn name_pattern(s: &str) -> SymbolPattern {
+    // Accept native separators (`.`) identically to canonical `::`; language-blind
+    // and additive (an existing `::` string is unchanged).
+    let s = cgx_core::normalize_pattern_text(s);
     if s.contains('*') || s.contains('?') {
-        SymbolPattern::glob(s.to_string())
+        SymbolPattern::glob(s)
     } else if s.contains("::") {
-        SymbolPattern::fqn(s.to_string())
+        SymbolPattern::fqn(s)
     } else {
-        SymbolPattern::short_name(s.to_string())
+        SymbolPattern::short_name(s)
     }
 }
 

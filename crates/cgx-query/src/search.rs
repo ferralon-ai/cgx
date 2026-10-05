@@ -17,6 +17,9 @@ use crate::view::GraphView;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolHit {
     pub fqn: String,
+    /// Source language tag, retained so the CLI can render the FQN in its native
+    /// grammar at the display boundary.
+    pub lang: String,
     pub file: String,
     pub line: u32,
     pub kind: SymbolKind,
@@ -107,6 +110,7 @@ pub fn search_symbols(
         })
         .map(|node| SymbolHit {
             fqn: node.fqn.clone(),
+            lang: node.lang.clone(),
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,

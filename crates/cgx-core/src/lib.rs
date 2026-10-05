@@ -62,7 +62,7 @@ pub use node::{
     CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, ValueNode,
     Visibility,
 };
-pub use pattern::{PatternKind, SymbolPattern};
+pub use pattern::{normalize_pattern_text, render_fqn, PatternKind, SymbolPattern};
 pub use provenance::{Provenance, Span};
 pub use signature::{Param, Signature};
 pub use sort::EdgeIdentity;

@@ -348,12 +348,15 @@ fn symbol_pattern_from(value: &Value) -> Option<SymbolPattern> {
         Value::Str(s) => s,
         _ => return None,
     };
+    // Accept native separators (`.`) identically to canonical `::`; language-blind
+    // and additive (an existing `::` string is unchanged).
+    let s = cgx_core::normalize_pattern_text(s);
     if s.contains('*') || s.contains('?') {
-        Some(SymbolPattern::glob(s.clone()))
+        Some(SymbolPattern::glob(s))
     } else if s.contains("::") {
-        Some(SymbolPattern::fqn(s.clone()))
+        Some(SymbolPattern::fqn(s))
     } else {
-        Some(SymbolPattern::short_name(s.clone()))
+        Some(SymbolPattern::short_name(s))
     }
 }
 

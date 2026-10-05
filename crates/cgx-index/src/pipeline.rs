@@ -272,7 +272,19 @@ pub(crate) fn apply_scip(
     let bytes = read_scip(scip_path)?;
     let resolver = ScipResolver::from_bytes(&bytes)
         .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
-    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    // FAIL-CLOSED compdb policy (ADR B2 Decision 3): rust-analyzer indices have
+    // no compile_commands.json, so the gate does not apply. A scip-clang index
+    // caps at `probable` until its compdb completeness is verified — the honest
+    // floor while compdb ingestion/verification (handoff items 4–5) is unwired.
+    let compdb = match resolver.scheme() {
+        cgx_scip::SymbolScheme::RustAnalyzer => scip_relabel::CompdbCompleteness::NotApplicable,
+        cgx_scip::SymbolScheme::ScipClang => scip_relabel::CompdbCompleteness::Partial,
+    };
+    let opts = scip_relabel::ScipRelabelOpts {
+        local_packages: Vec::new(),
+        compdb,
+    };
+    let scip_stats = scip_relabel::relabel(graph, &resolver, &opts);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
     stats.scip = Some(scip_stats);

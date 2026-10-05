@@ -105,11 +105,16 @@ enum Command {
     Index {
         /// Path to the repository (defaults to the current directory).
         path: Option<PathBuf>,
-        /// Path to a `.scip` index (e.g. from `rust-analyzer scip`) to ingest for
-        /// the SCIP semantic-precision re-label pass: name-matched call edges are
-        /// upgraded to `certain`/`probable` where SCIP gives a precise resolution,
-        /// and cross-crate dependency edges are recorded (Phase 2). Omitted ⇒ the
-        /// Phase-1 syntactic graph, unchanged.
+        /// Path to a `.scip` index to ingest for the SCIP semantic-precision
+        /// re-label pass: name-matched call edges are upgraded to
+        /// `certain`/`probable` where SCIP gives a precise resolution, and
+        /// cross-crate dependency edges are recorded (Phase 2). The producer is
+        /// auto-detected from the index metadata: `rust-analyzer scip` for Rust,
+        /// or `scip-clang` for C/C++ (overload/ADL/template resolution, keyed on
+        /// the overload disambiguator). A scip-clang index needs a
+        /// `compile_commands.json`-backed build; its promotions are fail-closed
+        /// (capped at `probable`) until the compdb is verified complete. Omitted
+        /// ⇒ the Phase-1 syntactic graph, unchanged.
         #[arg(long, value_name = "SCIP_INDEX")]
         scip: Option<PathBuf>,
         /// Skip the v0.3 DATA_FLOW layer (SSA value nodes + `derives-from` edges,
@@ -934,8 +939,12 @@ fn run_index(
     );
     if let Some(scip) = &s.scip {
         println!(
-            "  scip: {} certain, {} probable, {} dep edges, {} collisions",
-            scip.upgraded_certain, scip.upgraded_probable, scip.dep_edges, scip.collisions
+            "  scip: {} certain, {} probable, {} dep edges, {} collisions, {} capped (partial compdb)",
+            scip.upgraded_certain,
+            scip.upgraded_probable,
+            scip.dep_edges,
+            scip.collisions,
+            scip.capped_partial_compdb
         );
     }
     if s.cha.sites_rescoped > 0 {

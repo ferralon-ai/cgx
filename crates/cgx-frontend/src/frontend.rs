@@ -85,13 +85,50 @@ impl fmt::Display for RelPath {
     }
 }
 
+/// The kind of build manifest a [`ManifestInfo`] was resolved from.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ManifestKind {
+    /// Rust `Cargo.toml`.
+    Cargo,
+    /// Go `go.mod`.
+    GoMod,
+    /// Node `package.json`.
+    PackageJson,
+    /// Python `pyproject.toml` / `setup.py`.
+    PyProject,
+}
+
+/// Manifest-declared facts about the module/package that owns a file, resolved
+/// pipeline-side from the nearest-ancestor manifest (the only place that sees
+/// sibling files — a per-file [`extract`](LanguageFrontend::extract) cannot read
+/// its own `go.mod` / `package.json` / `pyproject.toml`).
+///
+/// Behaviour-neutral until an adapter reads it: carried alongside the legacy
+/// [`FileCtx::package`] field, which Rust keeps consuming unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestInfo {
+    /// Which manifest kind this came from.
+    pub kind: ManifestKind,
+    /// The manifest-declared identity, **verbatim**: the go.mod module path, the
+    /// package.json `name` (scope preserved, e.g. `@acme/utils`). `None` when the
+    /// manifest declares no identity string (Python: the importable path is
+    /// filesystem-derived, so only [`root_dir`](Self::root_dir) is meaningful).
+    pub identity: Option<String>,
+    /// The repo-relative directory that anchors module-path derivation: the
+    /// owning manifest's directory for Cargo/Go/Node; for Python the src-aware
+    /// import root (the pyproject dir plus `/src` when a `src/` subdir exists).
+    pub root_dir: String,
+}
+
 /// Context passed to [`LanguageFrontend::extract`] for one file.
 ///
 /// Carries only what extraction needs and nothing the frontend must not see
 /// (no store handle, no git): the repo-relative path (drives module-path
-/// construction), the blob OID (stamped into provenance as `index_id`), and the
+/// construction), the blob OID (stamped into provenance as `index_id`), the
 /// owning package name (the crate root for FQN derivation when it cannot be read
-/// off the path — e.g. a `src/`-at-root single-crate layout).
+/// off the path — e.g. a `src/`-at-root single-crate layout), and the resolved
+/// manifest facts ([`ManifestInfo`]) for adapters whose canonical root is a
+/// manifest-declared identity.
 #[derive(Debug, Clone)]
 pub struct FileCtx {
     /// Repo-relative path of the file being extracted.
@@ -103,6 +140,10 @@ pub struct FileCtx {
     /// (hyphens → underscores). `None` ⇒ the frontend derives the crate root
     /// from the path alone (the workspace-layout case, unchanged).
     pub package: Option<String>,
+    /// The nearest-ancestor build manifest's resolved facts, if any. `None` ⇒ no
+    /// manifest of a resolved kind is an ancestor (a file falls through to its
+    /// path-derived root). Not read by any adapter yet.
+    pub manifest: Option<ManifestInfo>,
 }
 
 impl FileCtx {
@@ -111,6 +152,7 @@ impl FileCtx {
             path: RelPath::new(path),
             blob_oid: blob_oid.into(),
             package: None,
+            manifest: None,
         }
     }
 
@@ -118,6 +160,12 @@ impl FileCtx {
     /// the path carries no crate directory before `src/`).
     pub fn with_package(mut self, package: Option<String>) -> Self {
         self.package = package;
+        self
+    }
+
+    /// Set the resolved manifest facts for this file.
+    pub fn with_manifest(mut self, manifest: Option<ManifestInfo>) -> Self {
+        self.manifest = manifest;
         self
     }
 }
@@ -168,4 +216,30 @@ pub trait LanguageFrontend: Send + Sync {
     ///
     /// [`extract`]: crate::registry::FrontendRegistry::extract
     fn extract(&self, src: &[u8], ctx: &FileCtx) -> Result<FileFacts, FrontendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_ctx_defaults_have_no_manifest_or_package() {
+        let ctx = FileCtx::new("src/a.rs", "oid");
+        assert_eq!(ctx.package, None);
+        assert_eq!(ctx.manifest, None);
+    }
+
+    #[test]
+    fn with_manifest_round_trips_and_leaves_package_intact() {
+        let info = ManifestInfo {
+            kind: ManifestKind::GoMod,
+            identity: Some("example.com/app".to_string()),
+            root_dir: "svc".to_string(),
+        };
+        let ctx = FileCtx::new("svc/db.go", "oid")
+            .with_package(Some("pkg".to_string()))
+            .with_manifest(Some(info.clone()));
+        assert_eq!(ctx.package.as_deref(), Some("pkg"));
+        assert_eq!(ctx.manifest, Some(info));
+    }
 }

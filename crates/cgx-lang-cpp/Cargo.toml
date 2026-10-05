@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "cgx C++ language adapter: Tier-0 FallbackFrontend over tree-sitter-cpp. Scaffold milestone; dedicated extraction lands in a later phase."
+description = "cgx C++ language adapter: tree-sitter-cpp frontend emitting classes/structs/methods/ctors/dtors, namespaces + FQN, inheritance/overrides, CHA virtual dispatch via CallVirtualReceiver, throw/catch exception edges, templates and overload candidate sets (possible), free/member calls, and grammar-only preprocessor handling."
 
 [dependencies]
+cgx-core.workspace = true
 cgx-frontend.workspace = true
+smallvec.workspace = true
 tree-sitter.workspace = true
 tree-sitter-cpp.workspace = true
+
+[dev-dependencies]
+cgx-resolve = { path = "../cgx-resolve" }

@@ -2,8 +2,9 @@
 //! deterministic, read-only handlers for `tools/call`.
 //!
 //! Each handler maps a tool's arguments onto the typed query functions in
-//! `cgx-query` over a [`GraphSession`] acquired per call (with the ADR-06
-//! `include_dirty` overlay). Results surface the confidence ladder (GM-5) and the
+//! `cgx-query` over a [`GraphSession`] from a [`SessionProvider`]: acquired per
+//! call (with the ADR-06 `include_dirty` overlay) by the MCP server, or held by a
+//! long-lived session. Results surface the confidence ladder (GM-5) and the
 //! edge-condition context (GM-3) — the same honesty the CLI emits — plus the
 //! `graph_version`/`dirty`/`dirty_files_analyzed` metadata ADR-06 requires. No
 //! tool performs any network or LLM call; given the same tree, every tool is a
@@ -391,21 +392,66 @@ fn impacted_tests_tool() -> Value {
     })
 }
 
+/// Where a graph-reading tool gets the graph it answers from.
+///
+/// The MCP server acquires one per call ([`AcquirePerCall`]); a long-lived
+/// session that already holds a graph hands that one out instead, so the same
+/// handlers answer from it without re-indexing.
+pub trait SessionProvider {
+    /// The session for one call with `args` (the tool's arguments).
+    fn session(&self, args: &Value) -> Result<SessionRef<'_>, ToolError>;
+}
+
+/// A [`GraphSession`] acquired for one call, or borrowed from its holder.
+#[derive(Debug)]
+pub enum SessionRef<'a> {
+    Owned(Box<GraphSession>),
+    Borrowed(&'a GraphSession),
+}
+
+impl std::ops::Deref for SessionRef<'_> {
+    type Target = GraphSession;
+
+    fn deref(&self) -> &GraphSession {
+        match self {
+            SessionRef::Owned(s) => s,
+            SessionRef::Borrowed(s) => s,
+        }
+    }
+}
+
+/// The MCP server's provider: index the repository at the call's `root` for each
+/// call, with the ADR-06 `include_dirty` overlay ([`session::acquire`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcquirePerCall;
+
+impl SessionProvider for AcquirePerCall {
+    fn session(&self, args: &Value) -> Result<SessionRef<'_>, ToolError> {
+        let root = PathBuf::from(req_str(args, "root")?);
+        session::acquire(&root, include_dirty(args)?).map(|s| SessionRef::Owned(Box::new(s)))
+    }
+}
+
 /// Dispatch a `tools/call` by tool name. Returns the `structuredContent` body
 /// (without the surrounding `content`/`isError` wrapper, which the server adds).
 pub fn call(name: &str, args: &Value) -> Result<Value, ToolError> {
+    call_with(name, args, &AcquirePerCall)
+}
+
+/// [`call`] with the graph supplied by `provider`.
+pub fn call_with(name: &str, args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
     match name {
-        "callers" => neighbor_call(args, Direction::Backward),
-        "callees" => neighbor_call(args, Direction::Forward),
-        "reaches" => reaches_call(args),
-        "paths" => paths_call(args),
-        "unused" => unused_call(args),
-        "explain" => explain_call(args),
-        "search" => search_call(args),
-        "symbols" => symbols_call(args),
-        "flows_to" => flow_call(args, FlowDir::To),
-        "flows_from" => flow_call(args, FlowDir::From),
-        "graph_query" => graph_query_call(args),
+        "callers" => neighbor_call(args, Direction::Backward, provider),
+        "callees" => neighbor_call(args, Direction::Forward, provider),
+        "reaches" => reaches_call(args, provider),
+        "paths" => paths_call(args, provider),
+        "unused" => unused_call(args, provider),
+        "explain" => explain_call(args, provider),
+        "search" => search_call(args, provider),
+        "symbols" => symbols_call(args, provider),
+        "flows_to" => flow_call(args, FlowDir::To, provider),
+        "flows_from" => flow_call(args, FlowDir::From, provider),
+        "graph_query" => graph_query_call(args, provider),
         "coupling" => coupling_call(args),
         "impacted_tests" => impacted_tests_call(args),
         other => Err(ToolError::unimplemented(format!("unknown tool `{other}`"))),
@@ -565,12 +611,6 @@ fn parse_symbol_kind(args: &Value) -> Result<Option<SymbolKind>, ToolError> {
     }
 }
 
-/// Resolve `root` to a session (acquires the graph with the dirty overlay).
-fn session_for(args: &Value) -> Result<GraphSession, ToolError> {
-    let root = PathBuf::from(req_str(args, "root")?);
-    session::acquire(&root, include_dirty(args)?)
-}
-
 /// Resolve a `--symbol`-style argument to a unique node, surfacing a clean error.
 fn resolve(view: &GraphView, name: &str) -> Result<NodeId, ToolError> {
     resolve_anchor(view, &SymbolPattern::fqn(name))
@@ -660,9 +700,13 @@ fn session_meta(session: &GraphSession) -> SessionMeta {
 
 // --- handlers ---------------------------------------------------------------
 
-fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
+fn neighbor_call(
+    args: &Value,
+    dir: Direction,
+    provider: &dyn SessionProvider,
+) -> Result<Value, ToolError> {
     let symbol = req_str(args, "symbol")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let anchor = resolve(&session.view, symbol)?;
 
     let walker = PathWalker {
@@ -690,10 +734,10 @@ fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
     }))
 }
 
-fn paths_call(args: &Value) -> Result<Value, ToolError> {
+fn paths_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
     let from = req_str(args, "from")?;
     let to = req_str(args, "to")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let from_id = resolve(&session.view, from)?;
     let to_id = resolve(&session.view, to)?;
 
@@ -737,8 +781,8 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
     }))
 }
 
-fn unused_call(args: &Value) -> Result<Value, ToolError> {
-    let session = session_for(args)?;
+fn unused_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
+    let session = provider.session(args)?;
 
     let kinds: Vec<SymbolKind> = match opt_str(args, "kind").unwrap_or("all") {
         "all" => vec![],
@@ -933,9 +977,9 @@ fn impacted_row(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) -> Im
     }
 }
 
-fn explain_call(args: &Value) -> Result<Value, ToolError> {
+fn explain_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
     let symbol = req_str(args, "symbol")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let view = &session.view;
     let anchor = resolve(view, symbol)?;
     let explanation = explain(view, anchor)
@@ -981,9 +1025,9 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
 /// `reaches` (Q-19): with `to`, a single reachability answer plus its witness
 /// path; without `to`, the `from → *` reachable set (identical machinery to
 /// `callees`, bounded by the forest depth default). Same engine as `cgx reaches`.
-fn reaches_call(args: &Value) -> Result<Value, ToolError> {
+fn reaches_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
     let from = req_str(args, "from")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let view = &session.view;
     let from_id = resolve(view, from)?;
 
@@ -1044,8 +1088,8 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
 /// `search` (B-1): a pure node-table scan resolving a name pattern (or `all`) to
 /// exact definitions. Reuses `cgx_query::search_symbols`; empty/invalid patterns
 /// return an actionable `invalid_params` (the CLI's exit-2 usage path).
-fn search_call(args: &Value) -> Result<Value, ToolError> {
-    let session = session_for(args)?;
+fn search_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
+    let session = provider.session(args)?;
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
     let pattern = opt_str(args, "pattern");
@@ -1081,8 +1125,8 @@ fn search_call(args: &Value) -> Result<Value, ToolError> {
 
 /// `symbols` (B-2): rank symbols by reference count with a per-symbol edge
 /// breakdown. Reuses `cgx_query::rank_symbols`; same shape the CLI JSON emits.
-fn symbols_call(args: &Value) -> Result<Value, ToolError> {
-    let session = session_for(args)?;
+fn symbols_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, ToolError> {
+    let session = provider.session(args)?;
     let rank_by = match opt_str(args, "rank").unwrap_or("total") {
         "total" => RankBy::Total,
         "inbound" => RankBy::Inbound,
@@ -1115,9 +1159,13 @@ enum FlowDir {
 /// `flows_to` / `flows_from` (docs/04): the same neighbor walk as
 /// `callers`/`callees` with the edge scope swapped from the call family to
 /// `DerivesFrom` — no second execution path, mirroring `cgx flows-to`/`flows-from`.
-fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
+fn flow_call(
+    args: &Value,
+    dir: FlowDir,
+    provider: &dyn SessionProvider,
+) -> Result<Value, ToolError> {
     let symbol = req_str(args, "symbol")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let view = &session.view;
     let anchor = resolve(view, symbol)?;
 
@@ -1193,9 +1241,12 @@ fn breakdown(b: &EdgeBreakdown) -> output::EdgeBreakdown {
 /// engine `cgx query` drives, no fork. A tabular result surfaces `columns`/`rows`;
 /// a `RETURN path` query surfaces a `paths` channel (the `paths`-tool shape).
 /// Parse/plan/eval rejects map to an actionable `invalid_params` error.
-fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
+fn graph_query_call(
+    args: &Value,
+    provider: &dyn SessionProvider,
+) -> Result<Value, ToolError> {
     let query = req_str(args, "query")?;
-    let session = session_for(args)?;
+    let session = provider.session(args)?;
     let view = &session.view;
 
     let table =
@@ -1253,12 +1304,12 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
 /// 1. **No output type in [`crate::output`].** `CouplingReport` already is the
 ///    typed answer, approximation contract included, so it is serialized and
 ///    schema'd as-is.
-/// 2. **No `session_for(..)`/[`SessionMeta`].** `graph_version`/`dirty`/
+/// 2. **No [`SessionProvider`]/[`SessionMeta`].** `graph_version`/`dirty`/
 ///    `dirty_files_analyzed` describe the ADR-06 working-tree overlay on the call
 ///    graph. Coupling never opens the graph and needs no index to exist at all, so
-///    `session_for` would trigger an unnecessary — possibly failing — index for an
-///    answer that does not use it, and `dirty: false` would assert something about
-///    a graph this answer never consulted.
+///    asking a provider for a session would trigger an unnecessary — possibly
+///    failing — index for an answer that does not use it, and `dirty: false` would
+///    assert something about a graph this answer never consulted.
 fn coupling_call(args: &Value) -> Result<Value, ToolError> {
     let root = req_str(args, "root")?;
     let base = req_str(args, "base")?;

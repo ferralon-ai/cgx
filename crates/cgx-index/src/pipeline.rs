@@ -31,7 +31,7 @@ use crate::error::{IndexError, Result};
 use crate::manifest::ManifestMap;
 use crate::source::SourceFile;
 use cgx_core::codec::encode;
-use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
+use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, ManifestKind, RelPath};
 use cgx_resolve::{
     link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
@@ -225,11 +225,38 @@ pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     out
 }
 
-/// Whether [`plan`] reads the content of the source at `path`. Every other
-/// source's `content` is ignored by planning, so a host that supplies sources
-/// itself sends content only for these paths and may leave the rest empty.
+/// The manifest table: each manifest file name (matched against a path's final
+/// segment, at any depth) and the kind of manifest it is, which selects the
+/// resolver that reads it. Extend this table — and only this table — when
+/// planning starts reading another manifest kind.
+const MANIFEST_FILES: &[(&str, ManifestKind)] = &[
+    ("Cargo.toml", ManifestKind::Cargo),
+    ("go.mod", ManifestKind::GoMod),
+    ("package.json", ManifestKind::PackageJson),
+    ("pyproject.toml", ManifestKind::PyProject),
+    ("setup.py", ManifestKind::PyProject),
+];
+
+/// The kind of manifest `path` is (see [`is_manifest_path`]), or `None`.
+pub(crate) fn manifest_kind(path: &str) -> Option<ManifestKind> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    MANIFEST_FILES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .map(|(_, kind)| kind.clone())
+}
+
+/// Whether `path` is a manifest: **the single manifest-filename predicate in
+/// cgx-index.** Every manifest resolver (the Cargo package map and the
+/// go.mod / package.json / Python manifest map) selects its files through it,
+/// dispatching on the matched kind, and [`plan`] reads the
+/// content of these sources and of no others, so a host that supplies sources
+/// itself sends content only for these paths and may leave the rest empty. A
+/// resolver that reads a file this predicate rejects would see empty content on
+/// such a host and silently diverge; `tests/manifest_predicate.rs` guards that
+/// over the fixtures.
 pub fn is_manifest_path(path: &str) -> bool {
-    crate::cargo_pkg::is_cargo_manifest(path) || crate::manifest::is_resolved_manifest(path)
+    manifest_kind(path).is_some()
 }
 
 /// Pass 1 of [`extract_and_link`]: probe the store's Layer-1 fragment cache for

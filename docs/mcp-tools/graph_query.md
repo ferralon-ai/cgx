@@ -69,6 +69,12 @@ omits `paths`.
 Projecting a property (`RETURN a.fqn`) yields a scalar cell; projecting the
 binding itself (`RETURN a`) yields the object form.
 
+The JSON alone does not always tell these apart. `Int` and `Float` are both JSON
+numbers, so `1` and `1.0` differ only in the raw text, and a path is the same JSON
+as a list of strings. A typed client should decode cells lazily (in Go,
+`json.RawMessage`, with numbers via `json.Number`) and use `columns` plus the
+query's own `RETURN` clause to know which column holds a path.
+
 ## Examples
 
 All three were captured against the two-fixture tree described in

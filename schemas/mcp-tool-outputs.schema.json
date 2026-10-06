@@ -1,0 +1,1796 @@
+{
+  "$defs": {
+    "ApproxDirection": {
+      "description": "The direction an answer can be wrong (GM-5 assertion-honesty). The fold of the\nper-reason directions: no reasons ⇒ [`Exact`](ApproxDirection::Exact).",
+      "enum": [
+        "exact",
+        "over",
+        "under",
+        "over_under"
+      ],
+      "type": "string"
+    },
+    "ApproxReason": {
+      "description": "One machine-readable reason contributing to the [`ApproxDirection`]. `code` is\na stable kebab-case token a CI consumer can match on; `detail` is a compact\nhuman phrase.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "direction": {
+          "$ref": "#/$defs/ReasonDirection"
+        }
+      },
+      "required": [
+        "direction",
+        "code",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ApproximationContract": {
+      "description": "The per-answer approximation contract attached to every query answer.",
+      "properties": {
+        "direction": {
+          "$ref": "#/$defs/ApproxDirection"
+        },
+        "modeled_graph": {
+          "description": "The modeling boundary the whole contract (including `exact`) is relative\nto. A property of *this answer*, not of the binary: every call-graph\nanswer carries [`MODELED_GRAPH`], while an answer derived from git\nhistory supplies its own boundary via [`for_history`]. The field name is\nhistorical — it is the answer's modeled domain, which is the call graph\nonly for the call-graph builders.",
+          "type": "string"
+        },
+        "reasons": {
+          "items": {
+            "$ref": "#/$defs/ApproxReason"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NegativeScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only for a *negative*/absence answer (A4)."
+        }
+      },
+      "required": [
+        "direction",
+        "reasons",
+        "modeled_graph"
+      ],
+      "type": "object"
+    },
+    "Confidence": {
+      "description": "How sure `cgx` is of an edge's target (GM-5.1).\n\nDiscriminants ascend with certainty so the derived `Ord` answers \"is this at\nleast `probable`?\" via `>=`, and so that \"the weakest confidence of any\ncontributing fact\" (GM-1.3 node confidence) is a plain `min`.",
+      "enum": [
+        "possible",
+        "probable",
+        "certain"
+      ],
+      "type": "string"
+    },
+    "CouplingPair": {
+      "description": "One co-changed file pair. Every number here is a raw count of commits; the\nanswer contains no derived, weighted, or fused quantity. `support` is\n`cochanges / commits_considered` and `confidence` is `cochanges / changes_a` —\nboth inputs of both are emitted, so a caller that wants a ratio computes it\nand owns its definition.",
+      "properties": {
+        "changes_a": {
+          "description": "Commits in range in which `file_a` changed, with or without `file_b`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "changes_b": {
+          "description": "Commits in range in which `file_b` changed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cochanges": {
+          "description": "Commits in range in which **both** paths changed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_a": {
+          "description": "The smaller of the pair's two paths ordered on **path bytes**, rendered\nlossily as UTF-8.\n\nThe normalization happens on the raw bytes, which is what makes the answer\nreproducible; the rendering happens afterwards and is *not* order-preserving\n(an invalid byte becomes U+FFFD, which sorts below a valid U+FFFE even though\n`0xFF > 0xEF` on bytes). So `file_a < file_b` holds on the path bytes and on\nthese strings whenever both paths are valid UTF-8, but not in general.",
+          "type": "string"
+        },
+        "file_b": {
+          "description": "The larger of the pair's two paths ordered on **path bytes**, rendered\nlossily as UTF-8. See [`CouplingPair::file_a`] for why that is not\nnecessarily `file_a < file_b` as rendered.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_a",
+        "file_b",
+        "cochanges",
+        "changes_a",
+        "changes_b"
+      ],
+      "type": "object"
+    },
+    "CouplingReport": {
+      "description": "The answer envelope: what was asked, what was walked, the knobs, the pairs,\nand the approximation contract.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract",
+          "description": "Which direction this answer can be wrong, and why."
+        },
+        "base_commit": {
+          "description": "`base_rev` resolved to a 40-hex OID.",
+          "type": "string"
+        },
+        "base_rev": {
+          "description": "The base revspec as the caller typed it.",
+          "type": "string"
+        },
+        "commits_considered": {
+          "description": "Single-parent commits that contributed counts.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "commits_large_excluded": {
+          "description": "Commits in range over `max_files_per_commit` (skipped).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "commits_merge_excluded": {
+          "description": "Commits in range with more than one parent (skipped).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "commits_root_excluded": {
+          "description": "Commits in range with no parent (skipped).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "head_commit": {
+          "description": "`head_rev` resolved to a 40-hex OID.",
+          "type": "string"
+        },
+        "head_rev": {
+          "description": "The head revspec as the caller typed it.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Echo of [`CouplingOptions::limit`].",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_files_per_commit": {
+          "description": "Echo of [`CouplingOptions::max_files_per_commit`].",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_cochanges": {
+          "description": "Echo of [`CouplingOptions::min_cochanges`].",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pairs": {
+          "description": "The reported pairs, sorted by `(Reverse(cochanges), file_a, file_b)`.",
+          "items": {
+            "$ref": "#/$defs/CouplingPair"
+          },
+          "type": "array"
+        },
+        "pairs_total": {
+          "description": "Pairs meeting `min_cochanges`, **before** `limit`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shallow_repository": {
+          "description": "The repository is a shallow clone.",
+          "type": "boolean"
+        },
+        "truncated_at_history_boundary": {
+          "description": "The walk stopped early on an unreadable/missing object.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "base_rev",
+        "base_commit",
+        "head_rev",
+        "head_commit",
+        "commits_considered",
+        "commits_merge_excluded",
+        "commits_root_excluded",
+        "commits_large_excluded",
+        "truncated_at_history_boundary",
+        "shallow_repository",
+        "max_files_per_commit",
+        "min_cochanges",
+        "limit",
+        "pairs_total",
+        "pairs",
+        "approximation"
+      ],
+      "type": "object"
+    },
+    "CqlCell": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/CqlNode"
+        },
+        {
+          "$ref": "#/$defs/CqlEdge"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/CqlCell"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "One cell of a `graph_query` table row. Untagged: the JSON type selects the\nvariant, and a bound path renders as an array of FQN strings."
+    },
+    "CqlEdge": {
+      "description": "A bound relationship in a `graph_query` cell.",
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/EdgeCondition",
+          "description": "Edge condition."
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Edge confidence."
+        },
+        "kind": {
+          "$ref": "#/$defs/EdgeKind",
+          "description": "Edge kind."
+        }
+      },
+      "required": [
+        "kind",
+        "condition",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "CqlNode": {
+      "description": "A bound node in a `graph_query` cell.",
+      "properties": {
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "fqn": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SymbolKind",
+          "description": "Symbol kind."
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fqn",
+        "file",
+        "line",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "EdgeBreakdown": {
+      "description": "Incident edges in one direction, tallied three ways.",
+      "properties": {
+        "by_condition": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Count per edge condition token.",
+          "type": "object"
+        },
+        "by_confidence": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Count per confidence token.",
+          "type": "object"
+        },
+        "by_family": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Count per edge family (`calls`, `derives_from`).",
+          "type": "object"
+        },
+        "total": {
+          "description": "Total edges in this direction.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "by_family",
+        "by_condition",
+        "by_confidence"
+      ],
+      "type": "object"
+    },
+    "EdgeCondition": {
+      "description": "The runtime condition under which a call edge is taken (GM-3).\n\nThe five-value set is frozen. The discriminant values are assigned in\nascending precedence order so that [`EdgeCondition::max`] is a plain integer\ncomparison and the derived `Ord` matches the ADR-03 precedence total order.",
+      "enum": [
+        "always",
+        "conditional",
+        "loop",
+        "exception",
+        "panic"
+      ],
+      "type": "string"
+    },
+    "EdgeDirection": {
+      "description": "Which way an `explain` edge points relative to the explained symbol.",
+      "enum": [
+        "incoming",
+        "outgoing"
+      ],
+      "type": "string"
+    },
+    "EdgeKind": {
+      "description": "Edge kinds (GM-2.1 call edges, GM-2.2 structural/dataflow, GM-9 `spawns`).\n\n`spawns` is an edge *kind*, orthogonal to the edge-condition label set\n(GM-9.1); a spawn inside a `catch` is `Spawns` with condition `Exception`.",
+      "enum": [
+        "calls",
+        "calls-virtual",
+        "calls-closure",
+        "calls-callback",
+        "calls-async",
+        "calls-indirect",
+        "spawns",
+        "contains",
+        "imports",
+        "derives-from",
+        "overrides",
+        "implements",
+        "inherits",
+        "references",
+        "instantiates",
+        "throws",
+        "catches",
+        "reads-field",
+        "writes-field"
+      ],
+      "type": "string"
+    },
+    "ExplainEdgeRow": {
+      "description": "One edge incident on the explained symbol, with its provenance.",
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/EdgeCondition",
+          "description": "Edge condition."
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Edge confidence."
+        },
+        "direction": {
+          "$ref": "#/$defs/EdgeDirection",
+          "description": "Incoming (`peer` calls the symbol) or outgoing (the symbol calls `peer`)."
+        },
+        "peer": {
+          "description": "Fully qualified name of the other endpoint (opaque).",
+          "type": "string"
+        },
+        "peer_file": {
+          "description": "Repo-relative definition file of `peer`.",
+          "type": "string"
+        },
+        "peer_line": {
+          "description": "1-based definition line of `peer`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resolution_source": {
+          "description": "External resolution source, when the edge was not resolved in-repo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule": {
+          "description": "The resolver rule that produced the edge.",
+          "type": "string"
+        },
+        "site": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SiteRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Call site, when recorded."
+        },
+        "tier": {
+          "$ref": "#/$defs/Tier",
+          "description": "Resolution tier that produced the edge."
+        }
+      },
+      "required": [
+        "direction",
+        "peer",
+        "condition",
+        "confidence",
+        "peer_file",
+        "peer_line",
+        "tier",
+        "rule",
+        "resolution_source",
+        "site"
+      ],
+      "type": "object"
+    },
+    "ExplainOutput": {
+      "description": "`explain`. Carries no `approximation`: it performs no traversal.",
+      "properties": {
+        "callees_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "callers_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edges": {
+          "items": {
+            "$ref": "#/$defs/ExplainEdgeRow"
+          },
+          "type": "array"
+        },
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SymbolKind",
+          "description": "Symbol kind."
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "symbol": {
+          "description": "The resolved fully qualified name (opaque).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "file",
+        "line",
+        "kind",
+        "callers_count",
+        "callees_count",
+        "edges",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "FreshnessEnvelope": {
+      "description": "How far the indexed state is from the working state (no wall-clock: this is\ndivergence, not age).\n\nConstruct with [`FreshnessEnvelope::new`] — [`stale`](Self::stale) and\n[`matches_head`](Self::matches_head) are *derived* there and are never sourced\nindependently, so the one-glance boolean cannot drift from the facts under it.",
+      "properties": {
+        "dirty_files": {
+          "description": "How many working-tree files diverge from\n[`dirty_files_base`](Self::dirty_files_base) (content differs, or the file\nwas added/removed). `null` when the surface did not inspect the working\ntree; `0` when it did and found none.\n\nIgnored paths are excluded and nested repositories (submodules) are not\ndescended into, matching what the index itself covers. The exclude rules\ngit applies include machine-global ones — `$GIT_DIR/info/exclude`,\n`core.excludesFile`, `$XDG_CONFIG_HOME/git/ignore` — which are not part of\nthe tree, so two checkouts identical byte-for-byte can report different\ncounts on differently configured machines. Repeated runs on one machine are\nbyte-stable (AR-10); the count is not portable across them.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dirty_files_base": {
+          "description": "The tree [`dirty_files`](Self::dirty_files) was measured against — the\nbase of that count, and `null` exactly when the count is.\n\nIt is **not** always [`indexed_tree`](Self::indexed_tree), which is why it\nis reported rather than inferred: the CLI measures divergence from the tree\nits index pointer names, while a working-directory MCP query measures it\nfrom `HEAD`'s tree even though the graph it answered over is a synthetic\n`workdir:` key that names no tree at all. Both are the right base for their\nown question; a count whose base a reader has to guess is not a\nself-describing account of an answer's limits.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head_tree": {
+          "description": "The tree OID of the current `HEAD` commit; `null` when no `HEAD` tree could\nbe resolved (not a git repository, or no commits yet).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "indexed_tree": {
+          "description": "The Layer-2 key of the graph this answer was computed over: a git tree OID\nfor an indexed committed tree, or a synthetic `workdir:<digest>` key when\nthe graph came from a working-directory index whose content is not some\ncommitted tree's. `null` only where the surface could not recover its own\ngraph key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matches_head": {
+          "description": "Whether [`indexed_tree`](Self::indexed_tree) is the current `HEAD` tree.\n`false` means the index is pinned to, or lagging behind, a different commit.\n`null` when either tree is unknown, or when the surface could not establish\nthe relation (see [`indeterminate_head`](Self::indeterminate_head)) — never\n`false`, which would assert a divergence nobody established, and never\n`true`, which would be a clean bill nobody established.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stale": {
+          "description": "The one-glance signal, **derived** from the fields above: `true` iff a\ndivergence was actually established — the indexed tree is known not to be\n`HEAD`'s, or at least one working-tree file is known to differ. `false` is\ntherefore \"no divergence within what this envelope reports\", not a claim\nabout what was never looked at; the `null`s above say which is which.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "indexed_tree",
+        "head_tree",
+        "matches_head",
+        "dirty_files_base",
+        "dirty_files",
+        "stale"
+      ],
+      "type": "object"
+    },
+    "GraphQueryOutput": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GraphQueryPathsOutput"
+        },
+        {
+          "$ref": "#/$defs/GraphQueryTableOutput"
+        }
+      ],
+      "description": "`graph_query`: the paths channel (`paths` present) or the table channel\n(`rows` present).",
+      "type": "object"
+    },
+    "GraphQueryPathsOutput": {
+      "description": "`graph_query` whose `RETURN` binds a path: the `paths`-tool row shape.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/PathRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TruncationReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "paths",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "truncated",
+        "truncation_reason",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "GraphQueryTableOutput": {
+      "description": "`graph_query` with a tabular `RETURN`.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "rows": {
+          "description": "One array per row, index-parallel to `columns`.",
+          "items": {
+            "items": {
+              "$ref": "#/$defs/CqlCell"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TruncationReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "truncated",
+        "truncation_reason",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "ImpactedRow": {
+      "description": "One `impacted_tests` row: a test entrypoint, how it was reached, and which\nchanged symbol it reaches.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Confidence of the edge that reached this symbol."
+        },
+        "depth": {
+          "description": "Hop distance from the anchor symbol.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edge_condition": {
+          "$ref": "#/$defs/EdgeCondition",
+          "description": "Condition of the edge that reached this symbol."
+        },
+        "exception_transient": {
+          "description": "The discovery path crossed an exceptional-class edge.",
+          "type": "boolean"
+        },
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_confidence_on_path": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Weakest edge confidence along the discovery path."
+        },
+        "name": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        },
+        "reached_change": {
+          "description": "Fully qualified name of the changed symbol this test reaches.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "via_containment_lift": {
+          "description": "The path crossed a closure-containment lift (containment is not\ninvocation, so the row is an over-approximation).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "file",
+        "line",
+        "depth",
+        "edge_condition",
+        "confidence",
+        "min_confidence_on_path",
+        "exception_transient",
+        "reached_change",
+        "via_containment_lift"
+      ],
+      "type": "object"
+    },
+    "ImpactedTestsOutput": {
+      "description": "`impacted_tests`. Compares two graphs, so it reports both graph keys rather\nthan a single `graph_version`.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "base_graph_key": {
+          "description": "Graph key of the base side: a tree OID or `workdir:<digest>`.",
+          "type": "string"
+        },
+        "base_ref": {
+          "description": "What the base side resolved to: a commit hex, or `workdir`.",
+          "type": "string"
+        },
+        "changed_symbols": {
+          "description": "Number of changed symbols the walk was seeded with.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degenerate": {
+          "description": "No changed symbol is in a language whose tests cgx identifies: an empty\nresult means \"not analysed\", not \"no tests affected\".",
+          "type": "boolean"
+        },
+        "degenerate_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The head side is the working directory.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Files whose content differs between the two sides.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "head_graph_key": {
+          "description": "Graph key of the head side: a tree OID or `workdir:<digest>`.",
+          "type": "string"
+        },
+        "head_ref": {
+          "description": "What the head side resolved to: a commit hex, or `workdir`.",
+          "type": "string"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/ImpactedRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "base_ref",
+        "head_ref",
+        "base_graph_key",
+        "head_graph_key",
+        "changed_symbols",
+        "dirty",
+        "dirty_files_analyzed",
+        "degenerate",
+        "degenerate_reason",
+        "freshness",
+        "approximation"
+      ],
+      "type": "object"
+    },
+    "NegativeScope": {
+      "description": "The scope of a *negative* answer (A4): what the search covered, so a consumer\ncan gate on the negative claim instead of trusting a bare \"no\". The\ninvalidators (\"what could make this negative wrong\") are the `under`-direction\nentries in the contract's `reasons`.",
+      "properties": {
+        "confidence_floor": {
+          "$ref": "#/$defs/Confidence",
+          "description": "The minimum edge confidence the search required (edges below this were not\nfollowed). `possible` means \"every edge\"."
+        },
+        "max_depth": {
+          "description": "The maximum hop depth searched; `null` = unbounded.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "searched_edge_kinds": {
+          "description": "The edge kinds the search followed. The call family is spelled out so the\nclaim is self-describing.",
+          "items": {
+            "$ref": "#/$defs/EdgeKind"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "searched_edge_kinds",
+        "confidence_floor",
+        "max_depth"
+      ],
+      "type": "object"
+    },
+    "NeighborOutput": {
+      "description": "`callers`, `callees`, `flows_to`, `flows_from`.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/NeighborRow"
+          },
+          "type": "array"
+        },
+        "symbol": {
+          "description": "The `symbol` argument as received (not the resolved FQN).",
+          "type": "string"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "symbol",
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "NeighborRow": {
+      "description": "One symbol reached by a neighbor walk (`callers`, `callees`, `reaches` without\n`to`, `flows_to`, `flows_from`).",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Confidence of the edge that reached this symbol."
+        },
+        "depth": {
+          "description": "Hop distance from the anchor symbol.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edge_condition": {
+          "$ref": "#/$defs/EdgeCondition",
+          "description": "Condition of the edge that reached this symbol."
+        },
+        "exception_transient": {
+          "description": "The discovery path crossed an exceptional-class edge.",
+          "type": "boolean"
+        },
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_confidence_on_path": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Weakest edge confidence along the discovery path."
+        },
+        "name": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "file",
+        "line",
+        "depth",
+        "edge_condition",
+        "confidence",
+        "min_confidence_on_path",
+        "exception_transient"
+      ],
+      "type": "object"
+    },
+    "PathRow": {
+      "description": "One call path.",
+      "properties": {
+        "crosses_exceptional": {
+          "description": "Some edge on the path is exceptional-class.",
+          "type": "boolean"
+        },
+        "hops": {
+          "description": "Number of edges (`steps.len() - 1`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Weakest edge confidence on the path."
+        },
+        "steps": {
+          "description": "The path's nodes, in call order.",
+          "items": {
+            "$ref": "#/$defs/PathStepRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hops",
+        "min_confidence",
+        "crosses_exceptional",
+        "steps"
+      ],
+      "type": "object"
+    },
+    "PathStepRow": {
+      "description": "One node of a call path. The first step has no incoming edge, so its\n`edge_condition` and `confidence` are `null`.",
+      "properties": {
+        "confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Confidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Confidence of the edge into this step."
+        },
+        "edge_condition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EdgeCondition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Condition of the edge into this step."
+        },
+        "exception_transient": {
+          "description": "The path up to this step has crossed an exceptional-class edge.",
+          "type": "boolean"
+        },
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "file",
+        "line",
+        "edge_condition",
+        "confidence",
+        "exception_transient"
+      ],
+      "type": "object"
+    },
+    "PathsOutput": {
+      "description": "`paths`.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "from": {
+          "description": "The `from` argument as received.",
+          "type": "string"
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/PathRow"
+          },
+          "type": "array"
+        },
+        "to": {
+          "description": "The `to` argument as received.",
+          "type": "string"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "A traversal bound cut the enumeration short.",
+          "type": "boolean"
+        },
+        "truncation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TruncationReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which bound; `null` when the enumeration was complete."
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "paths",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "truncated",
+        "truncation_reason",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "ReachesOutput": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReachesPairOutput"
+        },
+        {
+          "$ref": "#/$defs/ReachesSetOutput"
+        }
+      ],
+      "description": "`reaches`: the pair form when `to` was given (`reachable` present), the set\nform otherwise (`results` present).",
+      "type": "object"
+    },
+    "ReachesPairOutput": {
+      "description": "`reaches` with `to`: one reachability verdict and its witness.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "from": {
+          "description": "The `from` argument as received.",
+          "type": "string"
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "reachable": {
+          "type": "boolean"
+        },
+        "to": {
+          "description": "The `to` argument as received.",
+          "type": "string"
+        },
+        "witness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PathRow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A shortest witness path; `null` when not reachable."
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "reachable",
+        "witness",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "ReachesSetOutput": {
+      "description": "`reaches` without `to`: every symbol `from` reaches.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "from": {
+          "description": "The `from` argument as received.",
+          "type": "string"
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/NeighborRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "ReasonDirection": {
+      "description": "Which way a single [`ApproxReason`] pushes the answer.",
+      "enum": [
+        "over",
+        "under"
+      ],
+      "type": "string"
+    },
+    "SearchOutput": {
+      "description": "`search`. Carries no `approximation`: it is a node-table scan.",
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/SymbolHitRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "SiteRef": {
+      "description": "A source location.",
+      "properties": {
+        "file": {
+          "description": "Repo-relative file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file",
+        "line"
+      ],
+      "type": "object"
+    },
+    "SymbolHitRow": {
+      "description": "One `search` hit.",
+      "properties": {
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "fqn": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SymbolKind",
+          "description": "Symbol kind."
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fqn",
+        "file",
+        "line",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "SymbolKind": {
+      "description": "Symbol kinds (GM-1.1). Every named program entity is a symbol.",
+      "enum": [
+        "function",
+        "method",
+        "type",
+        "field",
+        "variable",
+        "module",
+        "constant",
+        "macro",
+        "lambda",
+        "entrypoint"
+      ],
+      "type": "string"
+    },
+    "SymbolRankRow": {
+      "description": "One `symbols` row: a symbol and its reference counts.",
+      "properties": {
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "fqn": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        },
+        "in_degree": {
+          "description": "Incoming edge count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inbound": {
+          "$ref": "#/$defs/EdgeBreakdown",
+          "description": "Incoming edges by family, condition and confidence."
+        },
+        "kind": {
+          "$ref": "#/$defs/SymbolKind",
+          "description": "Symbol kind."
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "out_degree": {
+          "description": "Outgoing edge count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outbound": {
+          "$ref": "#/$defs/EdgeBreakdown",
+          "description": "Outgoing edges by family, condition and confidence."
+        }
+      },
+      "required": [
+        "fqn",
+        "file",
+        "line",
+        "kind",
+        "in_degree",
+        "out_degree",
+        "inbound",
+        "outbound"
+      ],
+      "type": "object"
+    },
+    "SymbolsOutput": {
+      "description": "`symbols`. Carries no `approximation`: it is a degree aggregate.",
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/SymbolRankRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "Tier": {
+      "description": "The resolution tier that produced an edge (GM-5.2). Recorded in provenance.\n\nThe ladder is strictly narrowing; each tier emits a confidence band. Phase 1\nships tiers 0–1; tiers 2–4 are reserved so the schema does not change when\nSCIP/CHA/points-to enrichment lands.",
+      "enum": [
+        "name_syntactic",
+        "scope_graph",
+        "scip",
+        "cha_rta",
+        "points_to"
+      ],
+      "type": "string"
+    },
+    "TruncationReason": {
+      "description": "Why a `paths` enumeration stopped before exhausting the full simple-path set.\n`None` (absent) means the enumeration was complete; a value names which bound\nit hit. Mirrors the [`cgx_core::CutMarker`] honesty idiom: a budget cutoff is a\nsurfaced fact, never a silent drop and never an error.",
+      "enum": [
+        "step-budget",
+        "path-cap"
+      ],
+      "type": "string"
+    },
+    "UnusedOutput": {
+      "description": "`unused`.",
+      "properties": {
+        "approximation": {
+          "$ref": "#/$defs/ApproximationContract"
+        },
+        "cursor": {
+          "description": "Opaque cursor for the next page; `null` exactly when `has_more` is false.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "The working-tree overlay was active and changed the base graph.",
+          "type": "boolean"
+        },
+        "dirty_files_analyzed": {
+          "description": "Paths the overlay fed the indexer differently from `HEAD`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessEnvelope",
+          "description": "Which tree the answer was computed over."
+        },
+        "graph_version": {
+          "description": "Cache key of the graph the answer was computed over: a 7-character tree\nOID, or `<oid>+dirty.<digest>` when the working-tree overlay changed it.",
+          "type": "string"
+        },
+        "has_more": {
+          "description": "More results exist beyond this page.",
+          "type": "boolean"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/UnusedRow"
+          },
+          "type": "array"
+        },
+        "total_matched": {
+          "description": "Size of the full result set, across all pages.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "results",
+        "total_matched",
+        "has_more",
+        "cursor",
+        "approximation",
+        "graph_version",
+        "dirty",
+        "dirty_files_analyzed",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "UnusedRow": {
+      "description": "One symbol no entrypoint reaches.",
+      "properties": {
+        "file": {
+          "description": "Repo-relative definition file.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SymbolKind",
+          "description": "Symbol kind."
+        },
+        "line": {
+          "description": "1-based definition line.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Fully qualified symbol name (opaque).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "file",
+        "line",
+        "kind"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "structuredContent of every cgx MCP tool: property name = tool name, value = that tool's output type.",
+  "properties": {
+    "callees": {
+      "$ref": "#/$defs/NeighborOutput"
+    },
+    "callers": {
+      "$ref": "#/$defs/NeighborOutput"
+    },
+    "coupling": {
+      "$ref": "#/$defs/CouplingReport"
+    },
+    "explain": {
+      "$ref": "#/$defs/ExplainOutput"
+    },
+    "flows_from": {
+      "$ref": "#/$defs/NeighborOutput"
+    },
+    "flows_to": {
+      "$ref": "#/$defs/NeighborOutput"
+    },
+    "graph_query": {
+      "$ref": "#/$defs/GraphQueryOutput"
+    },
+    "impacted_tests": {
+      "$ref": "#/$defs/ImpactedTestsOutput"
+    },
+    "paths": {
+      "$ref": "#/$defs/PathsOutput"
+    },
+    "reaches": {
+      "$ref": "#/$defs/ReachesOutput"
+    },
+    "search": {
+      "$ref": "#/$defs/SearchOutput"
+    },
+    "symbols": {
+      "$ref": "#/$defs/SymbolsOutput"
+    },
+    "unused": {
+      "$ref": "#/$defs/UnusedOutput"
+    }
+  },
+  "title": "cgx MCP tool outputs",
+  "type": "object"
+}

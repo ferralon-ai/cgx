@@ -20,6 +20,7 @@ cgx-index = { path = "../cgx-index" }
 cgx-mcp = { path = "../cgx-mcp" }
 cgx-query = { path = "../cgx-query" }
 cgx-select = { path = "../cgx-select" }
+cgx-session = { path = "../cgx-session" }
 cgx-store = { path = "../cgx-store" }
 cgx-transport = { path = "../cgx-transport" }
 clap = { version = "4", features = ["derive"] }

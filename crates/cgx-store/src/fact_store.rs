@@ -1,7 +1,8 @@
 //! The storage contract the indexer and query layers program against
 //! ([`FactStore`]), kept apart from its backends so it is available on every
-//! target — including `wasm32`, where the SQLite and object-store backends (and
-//! their advisory file locking) are not compiled and the host owns persistence.
+//! target — including `wasm32`, where the SQLite backend and the advisory file
+//! lock are not compiled (the object-store backend is; see the crate docs,
+//! "Targets").
 
 use crate::error::Result;
 use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};

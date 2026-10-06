@@ -24,16 +24,26 @@ cgx-core                     model only: nodes, edges, conditions, confidence, c
   ├── cgx-frontend           LanguageFrontend seam + FileFacts + Tier-0 fallback
   │     └── cgx-lang-{rust,ts,go,python,java}
   ├── cgx-resolve            cross-file link + CHA/RTA/sig/IFDS/effects passes
-  ├── cgx-store              SQLite persistence, v_* views, advisory write lock
+  ├── cgx-store              object store + SQLite persistence, v_* views, write lock
   ├── cgx-query              GraphView / PathWalker / EdgeFilter + contract + freshness
   │     └── cgx-cql          Cypher subset lowered onto cgx-query primitives
   ├── cgx-scip               hand-rolled SCIP protobuf decoder
   ├── cgx-index              pipeline: enumerate → extract → link → refine → store
   ├── cgx-diff               graph diff, edge age/attribution, co-change coupling
   ├── cgx-doctor             index-quality report
-  ├── cgx-mcp                JSON-RPC 2.0 STDIO server
+  ├── cgx-mcp                JSON-RPC 2.0 STDIO server; tool handlers over a SessionProvider
+  ├── cgx-session            resident session: warm open, index-and-hold, session ops
+  ├── cgx-wasm               the engine as a wasm32-wasip1 reactor module (host-facing exports)
   └── cgx-cli                clap command surface
 ```
+
+The engine also builds for `wasm32-wasip1` (`cargo xtask wasm`, C via a pinned
+wasi-sdk): extraction, linking, the object store and query evaluation compile
+there; git access, SQLite, threads and the history-reading tools (`coupling`,
+`impacted_tests`) are native-only, and a wasm host supplies sources, schedules
+extraction across instances and holds the store's write lock. `cgx-session` is
+the single implementation of session semantics for that module and for the
+native `cgx session` verb.
 
 This document specifies:
 

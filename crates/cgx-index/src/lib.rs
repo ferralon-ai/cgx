@@ -76,8 +76,8 @@ pub use source::SourceFile;
 pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
 pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
 pub use pipeline::{
-    extract_one, link_prepared, plan, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile,
-    PreparedFile, ScipStats,
+    apply_cha, apply_effects, apply_rta, apply_scip, apply_sig, extract_one, link_prepared, plan,
+    store_graph, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile, PreparedFile, ScipStats,
 };
 pub use registry::default_registry;
 

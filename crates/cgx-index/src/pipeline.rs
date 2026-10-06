@@ -26,14 +26,14 @@ use std::path::{Path, PathBuf};
 use crate::cargo_pkg::PackageMap;
 use crate::error::{IndexError, Result};
 use crate::source::SourceFile;
-use cgx_core::codec::{decode, encode};
+use cgx_core::codec::encode;
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{
     link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
-use cgx_store::{BlobOid, FactStore, FragmentInput, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, LinkedGraph, TreeOid};
 
 pub use scip_relabel::ScipStats;
 
@@ -282,12 +282,15 @@ pub fn link_prepared<S: FactStore>(
 ///
 /// The composition of [`plan`], [`extract_one`] and [`link_prepared`] around the
 /// store's Layer-1 fragment cache.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn extract_and_link<S: FactStore>(
     sources: &[SourceFile],
     registry: &FrontendRegistry,
     store: &mut S,
     opts: &IndexOpts,
 ) -> Result<(ResolvedGraph, IndexStats)> {
+    use cgx_core::codec::decode;
+    use cgx_store::{BlobOid, FragmentInput};
     use rayon::prelude::*;
 
     let mut stats = IndexStats::default();
@@ -354,7 +357,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
 /// when `opts.scip` is set, updating `stats` with the SCIP counters and any edge
 /// count change (dependency edges). A `None` `opts.scip` is a no-op — the graph
 /// and stats are byte-identical to the Phase-1 path.
-pub(crate) fn apply_scip(
+pub fn apply_scip(
     graph: &mut ResolvedGraph,
     stats: &mut IndexStats,
     opts: &IndexOpts,
@@ -383,7 +386,7 @@ fn read_scip(path: &Path) -> Result<Vec<u8>> {
 /// input, so it always runs — per the precedence ladder (§5) it runs **after**
 /// [`apply_scip`] so SCIP-settled sites are left alone. Updates the edge count
 /// and the `cha` counters.
-pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.cha = run_cha(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -396,7 +399,7 @@ pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// ladder (§5) it runs **after** [`apply_cha`] (RTA narrows CHA's set). The
 /// cut-marker guard (design §4.3 step 3) prevents pruning a site whose
 /// construction view is incomplete. Updates the edge count and the `rta` counters.
-pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.rta = run_rta(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -409,7 +412,7 @@ pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// a disjoint set of edge kinds (`CallsClosure`/`CallsCallback`/`CallsIndirect`)
 /// from CHA/RTA's `CallsVirtual`, so ordering relative to them is immaterial; it
 /// runs last. Updates the edge count and the `sig` counters.
-pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.sig = run_sig(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -422,12 +425,12 @@ pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// rides the improved edge precision. It mutates only node effect attributes (not
 /// edges or candidate groups), so no re-canonicalization is required. Updates the
 /// `effects` counters.
-pub(crate) fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.effects = run_effect_closure(graph);
 }
 
 /// Materialize `graph` into the store under `tree_oid`.
-pub(crate) fn store_graph<S: FactStore>(
+pub fn store_graph<S: FactStore>(
     store: &mut S,
     tree_oid: &str,
     created_rev: Option<&str>,

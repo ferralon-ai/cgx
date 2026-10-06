@@ -166,9 +166,9 @@ pub fn run(store: &mut impl FactStore, req: Request<'_>) -> Result<Answer> {
         }
     }
     // A working-directory manifest counts every file under the repository root
-    // except `.git` — `Repo::enumerate_workdir` consults no gitignore and no
-    // tracked-file set. cgx's own `.cgx/` store and any untracked build output
-    // (`target/`, `node_modules/`) therefore read as changed on an unedited
+    // except `.git` and cgx's own root `.cgx/` — `Repo::enumerate_workdir`
+    // consults no gitignore and no tracked-file set. Any untracked build output
+    // (`target/`, `node_modules/`) therefore reads as changed on an unedited
     // tree, which inflates `dirty_files`, fires `impacted-changed-file-unindexed`
     // on every run, and — because the vacuity predicate is keyed on the changed
     // *path* set — reports a clean tree as degenerate.

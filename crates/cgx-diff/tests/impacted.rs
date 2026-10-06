@@ -413,8 +413,8 @@ fn a_changed_file_that_yields_no_symbols_is_carried_as_an_under_reason() {
 // --- the changed-path narrowing ----------------------------------------------
 
 /// `Repo::enumerate_workdir` walks every file under the repository root except
-/// `.git`, consulting no gitignore and no tracked-file set. cgx's own `.cgx/`
-/// store and any build output therefore land in the working-tree manifest and
+/// `.git` and the root `.cgx/`, consulting no gitignore and no tracked-file set.
+/// Build output therefore lands in the working-tree manifest and
 /// are absent from the committed tree. Left alone they read as changed files
 /// that contribute no symbols, which inflates `dirty_files`, fires
 /// `impacted-changed-file-unindexed` on every run, and — because the vacuity

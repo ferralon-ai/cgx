@@ -82,7 +82,7 @@ fn is_cargo_manifest(path: &str) -> bool {
 
 /// The `/`-separated directory portion of a repo-relative path (`""` for a
 /// root-level file).
-fn parent_dir(path: &str) -> &str {
+pub(crate) fn parent_dir(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[..i],
         None => "",
@@ -91,7 +91,7 @@ fn parent_dir(path: &str) -> &str {
 
 /// Whether `ancestor` is `descendant` or a directory prefix of it. Both are
 /// `/`-separated repo-relative dirs (`""` is the repo root, an ancestor of all).
-fn is_dir_ancestor(ancestor: &str, descendant: &str) -> bool {
+pub(crate) fn is_dir_ancestor(ancestor: &str, descendant: &str) -> bool {
     if ancestor.is_empty() {
         return true;
     }

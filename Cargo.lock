@@ -285,6 +285,7 @@ dependencies = [
  "rayon",
  "tempfile",
  "thiserror",
+ "tree-sitter",
  "tree-sitter-json",
 ]
 

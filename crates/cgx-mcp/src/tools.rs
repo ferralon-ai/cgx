@@ -11,29 +11,38 @@
 //! pure function of its arguments.
 
 use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern};
+#[cfg(not(target_family = "wasm"))]
 use cgx_diff::impacted::Sides;
 use cgx_query::{
-    callees, callers, contract, entrypoint_roots, explain, impacted::ImpactedWitness,
-    paths as query_paths, rank_symbols, reaches, reaches_all, resolve_anchor, search_symbols,
-    unused, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter, FreshnessEnvelope, GraphView,
-    NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
-    SymbolRank,
+    callees, callers, contract, entrypoint_roots, explain, paths as query_paths, rank_symbols,
+    reaches, reaches_all, resolve_anchor, search_symbols, unused, ConditionFilter, Direction,
+    EdgeBreakdown, EdgeFilter, GraphView, NeighborResult, PathResult, PathWalker, RankBy,
+    ReachResult, SearchMatch, SymbolHit, SymbolRank,
 };
+#[cfg(not(target_family = "wasm"))]
+use cgx_query::{impacted::ImpactedWitness, FreshnessEnvelope};
 use serde_json::{json, Value};
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_family = "wasm"))]
 use cgx_index::local::{ensure_indexed, open_store};
+#[cfg(not(target_family = "wasm"))]
 use cgx_store::OverlayStore;
 
 use crate::error::ToolError;
 use crate::output::{
     self, CqlCell, CqlEdge, CqlNode, EdgeDirection, ExplainEdgeRow, ExplainOutput,
-    GraphQueryOutput, GraphQueryPathsOutput, GraphQueryTableOutput, ImpactedRow,
-    ImpactedTestsOutput, NeighborOutput, NeighborRow, Page, PathRow, PathStepRow, PathsOutput,
-    ReachesOutput, ReachesPairOutput, ReachesSetOutput, SearchOutput, SessionMeta, SiteRef,
-    SymbolHitRow, SymbolRankRow, SymbolsOutput, UnusedOutput, UnusedRow,
+    GraphQueryOutput, GraphQueryPathsOutput, GraphQueryTableOutput, NeighborOutput, NeighborRow,
+    Page, PathRow, PathStepRow, PathsOutput, ReachesOutput, ReachesPairOutput, ReachesSetOutput,
+    SearchOutput, SessionMeta, SiteRef, SymbolHitRow, SymbolRankRow, SymbolsOutput, UnusedOutput,
+    UnusedRow,
 };
-use crate::session::{self, GraphSession};
+#[cfg(not(target_family = "wasm"))]
+use crate::output::{ImpactedRow, ImpactedTestsOutput};
+#[cfg(not(target_family = "wasm"))]
+use crate::session;
+use crate::session::GraphSession;
 
 /// Default page size for list-shaped tool results (docs/07 IF-18).
 const DEFAULT_MAX_RESULTS: usize = 20;
@@ -428,9 +437,18 @@ impl std::ops::Deref for SessionRef<'_> {
 pub struct AcquirePerCall;
 
 impl SessionProvider for AcquirePerCall {
+    #[cfg(not(target_family = "wasm"))]
     fn session(&self, args: &Value) -> Result<SessionRef<'_>, ToolError> {
         let root = PathBuf::from(req_str(args, "root")?);
         session::acquire(&root, include_dirty(args)?).map(|s| SessionRef::Owned(Box::new(s)))
+    }
+
+    /// Acquisition indexes from git, which the wasm build does not have.
+    #[cfg(target_family = "wasm")]
+    fn session(&self, _args: &Value) -> Result<SessionRef<'_>, ToolError> {
+        Err(ToolError::unimplemented(
+            "per-call acquisition needs git; serve the call from a resident session",
+        ))
     }
 }
 
@@ -491,6 +509,7 @@ fn opt_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolError> {
     }
 }
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -502,6 +521,7 @@ fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolError> {
 }
 
 /// `include_dirty` defaults to `true` for MCP (ADR-06). Any non-bool is rejected.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn include_dirty(args: &Value) -> Result<bool, ToolError> {
     match args.get("include_dirty") {
         None | Some(Value::Null) => Ok(true),
@@ -851,6 +871,7 @@ fn unused_call(args: &Value, provider: &dyn SessionProvider) -> Result<Value, To
 /// answer is vacuous, and the flag plus the contract's reasons say so. Marking
 /// it an error would let a client treat "not analysed" as a transport failure
 /// and retry, rather than as the finding it is.
+#[cfg(not(target_family = "wasm"))]
 fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
     let root = PathBuf::from(req_str(args, "root")?);
     let dirty = include_dirty(args)?;
@@ -951,6 +972,7 @@ fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
 /// A two-committed-ref comparison whose head ref is not `HEAD` yields
 /// `matches_head: false`. That is correct, not a surprise: the graph this answer
 /// was computed over genuinely is not the current `HEAD` tree.
+#[cfg(not(target_family = "wasm"))]
 fn impacted_freshness(root: &std::path::Path, answer: &cgx_diff::Answer) -> FreshnessEnvelope {
     let head_tree = cgx_index::Repo::discover(root)
         .ok()
@@ -972,6 +994,7 @@ fn impacted_freshness(root: &std::path::Path, answer: &cgx_diff::Answer) -> Fres
 /// facts that make the row actionable — *which* changed symbol it reaches, and
 /// whether the path crossed a closure-containment lift (containment is not
 /// invocation, so such a row is an over-approximation).
+#[cfg(not(target_family = "wasm"))]
 fn impacted_row(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) -> ImpactedRow {
     ImpactedRow {
         neighbor: neighbor_row(r),
@@ -1313,6 +1336,7 @@ fn graph_query_call(
 ///    asking a provider for a session would trigger an unnecessary — possibly
 ///    failing — index for an answer that does not use it, and `dirty: false` would
 ///    assert something about a graph this answer never consulted.
+#[cfg(not(target_family = "wasm"))]
 fn coupling_call(args: &Value) -> Result<Value, ToolError> {
     let root = req_str(args, "root")?;
     let base = req_str(args, "base")?;
@@ -1333,6 +1357,20 @@ fn coupling_call(args: &Value) -> Result<Value, ToolError> {
 
     serde_json::to_value(&report)
         .map_err(|e| ToolError::invalid_params(format!("serializing coupling report: {e}")))
+}
+
+/// `coupling` and `impacted_tests` read git history, which the wasm build does
+/// not have.
+#[cfg(target_family = "wasm")]
+fn coupling_call(_args: &Value) -> Result<Value, ToolError> {
+    Err(ToolError::unimplemented("`coupling` reads git history, which this build cannot"))
+}
+
+#[cfg(target_family = "wasm")]
+fn impacted_tests_call(_args: &Value) -> Result<Value, ToolError> {
+    Err(ToolError::unimplemented(
+        "`impacted_tests` reads git history, which this build cannot",
+    ))
 }
 
 /// Whether any bound edge cell in a CQL result was resolved over an

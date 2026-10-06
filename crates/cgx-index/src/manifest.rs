@@ -155,6 +155,14 @@ fn dir_inside_importable_package(dir: &str, all_paths: &[&str]) -> bool {
     }
 }
 
+/// Whether `path` is one of the build manifests this module resolves (at any
+/// depth): the files whose content [`ManifestMap::from_sources`] reads.
+pub(crate) fn is_resolved_manifest(path: &str) -> bool {
+    ["go.mod", "package.json", "pyproject.toml", "setup.py"]
+        .iter()
+        .any(|name| is_named(path, name))
+}
+
 /// Whether `path`'s final segment is exactly `name` (the manifest at any depth).
 fn is_named(path: &str, name: &str) -> bool {
     path == name || path.ends_with(&format!("/{name}"))

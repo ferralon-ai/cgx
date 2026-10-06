@@ -225,6 +225,79 @@ pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     out
 }
 
+/// Whether [`plan`] reads the content of the source at `path`. Every other
+/// source's `content` is ignored by planning, so a host that supplies sources
+/// itself sends content only for these paths and may leave the rest empty.
+pub fn is_manifest_path(path: &str) -> bool {
+    crate::cargo_pkg::is_cargo_manifest(path) || crate::manifest::is_resolved_manifest(path)
+}
+
+/// Pass 1 of [`extract_and_link`]: probe the store's Layer-1 fragment cache for
+/// every planned file. Hits from the current frontend version are decoded into
+/// prepared facts and counted in `stats.blobs_cached`; fragments from another
+/// frontend version are counted in `stats.blobs_stale` and returned with the
+/// misses for extraction.
+///
+/// This is the single implementation of the cache probe: every driver of the
+/// pipeline stages (the native composition and a host-driven one) calls it, so a
+/// change to what counts as a usable hit applies to all of them.
+pub fn probe_fragments<'p, S: FactStore>(
+    plan: &'p Plan,
+    registry: &FrontendRegistry,
+    store: &S,
+    stats: &mut IndexStats,
+) -> Result<(Vec<PreparedFile>, Vec<&'p PlannedFile>)> {
+    use cgx_core::codec::decode;
+
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut misses: Vec<&PlannedFile> = Vec::new();
+    for file in &plan.files {
+        let want = registry.frontend_for(&file.ctx.path).fragment_version();
+        match store.fragment(&file.key)? {
+            Some(cached) if cached.frontend_version == want => {
+                let facts: FileFacts = decode(&cached.fragment)?;
+                stats.blobs_cached += 1;
+                prepared.push(PreparedFile {
+                    blob_oid: file.ctx.blob_oid.clone(),
+                    rel_path: file.ctx.path.as_str().to_string(),
+                    lang: file.lang.clone(),
+                    facts,
+                });
+            }
+            // A fragment from another frontend version may not even decode under
+            // the current `FileFacts` schema, so it is never read: re-extract it
+            // and let the store overwrite it.
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push(file);
+            }
+            None => misses.push(file),
+        }
+    }
+    Ok((prepared, misses))
+}
+
+/// Write freshly extracted fragments to the store's Layer-1 cache in one batch.
+/// A no-op for an empty slice.
+pub fn put_extracted<S: FactStore>(store: &mut S, extracted: &[ExtractedFile]) -> Result<()> {
+    use cgx_store::FragmentInput;
+
+    if extracted.is_empty() {
+        return Ok(());
+    }
+    let batch: Vec<FragmentInput<'_>> = extracted
+        .iter()
+        .map(|e| FragmentInput {
+            key: &e.key,
+            lang: &e.prepared.lang,
+            frontend_version: e.fragment_version,
+            bytes: &e.fragment,
+        })
+        .collect();
+    store.put_fragments(&batch)?;
+    Ok(())
+}
+
 /// Stage 2 of [`extract_and_link`]: extract one file's facts and encode its
 /// Layer-1 fragment. Pure per-file work with no store or git access, so callers
 /// may run it in parallel or on another host.
@@ -336,14 +409,12 @@ pub fn link_prepared<S: FactStore>(
 /// The composition of [`plan`], [`extract_one`] and [`link_prepared`] around the
 /// store's Layer-1 fragment cache.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn extract_and_link<S: FactStore>(
+pub fn extract_and_link<S: FactStore>(
     sources: &[SourceFile],
     registry: &FrontendRegistry,
     store: &mut S,
     opts: &IndexOpts,
 ) -> Result<(ResolvedGraph, IndexStats)> {
-    use cgx_core::codec::decode;
-    use cgx_store::FragmentInput;
     use rayon::prelude::*;
 
     let mut stats = IndexStats::default();
@@ -351,34 +422,10 @@ pub(crate) fn extract_and_link<S: FactStore>(
     let plan = plan(sources, registry);
     stats.blobs_unsupported = plan.unsupported;
 
-    // Pass 1 (sequential, cheap store reads): partition into cache hits (decode
-    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
+    // Pass 1 (sequential, cheap store reads): partition into cache hits (decoded
+    // now) and misses (extracted in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
-    let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<&PlannedFile> = Vec::new();
-    for file in &plan.files {
-        let want = registry.frontend_for(&file.ctx.path).fragment_version();
-        match store.fragment(&file.key)? {
-            Some(cached) if cached.frontend_version == want => {
-                let facts: FileFacts = decode(&cached.fragment)?;
-                stats.blobs_cached += 1;
-                prepared.push(PreparedFile {
-                    blob_oid: file.ctx.blob_oid.clone(),
-                    rel_path: file.ctx.path.as_str().to_string(),
-                    lang: file.lang.clone(),
-                    facts,
-                });
-            }
-            // A fragment from another frontend version may not even decode under
-            // the current `FileFacts` schema, so it is never read: re-extract it
-            // and let the store overwrite it.
-            Some(_) => {
-                stats.blobs_stale += 1;
-                misses.push(file);
-            }
-            None => misses.push(file),
-        }
-    }
+    let (mut prepared, misses) = probe_fragments(&plan, registry, store, &mut stats)?;
 
     // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
     // store/git access — the (content, context) purity that makes Layer-1
@@ -391,18 +438,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
     stats.blobs_extracted = extracted.len();
 
     // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .map(|e| FragmentInput {
-                key: &e.key,
-                lang: &e.prepared.lang,
-                frontend_version: e.fragment_version,
-                bytes: &e.fragment,
-            })
-            .collect();
-        store.put_fragments(&batch)?;
-    }
+    put_extracted(store, &extracted)?;
     prepared.extend(extracted.into_iter().map(|e| e.prepared));
 
     let graph = link_prepared(prepared, store, opts, &mut stats)?;
@@ -423,9 +459,72 @@ pub fn apply_scip(
     let Some(scip_path) = opts.scip.as_ref() else {
         return Ok(());
     };
-    let bytes = read_scip(scip_path)?;
-    let resolver = ScipResolver::from_bytes(&bytes)
-        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
+    let scip = read_scip(scip_path)?;
+    let compdb = || {
+        compdb::completeness(sources, source_root, opts.compdb.as_deref(), opts.compdb_complete)
+    };
+    relabel_scip(graph, stats, &scip, compdb)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))
+}
+
+/// A SCIP overlay supplied as bytes rather than paths: the input to
+/// [`apply_scip_bytes`], for a caller with no filesystem access to the files (a
+/// wasm guest whose host read them).
+#[derive(Debug, Clone, Copy)]
+pub struct ScipOverlay<'a> {
+    /// The `.scip` index bytes.
+    pub scip: &'a [u8],
+    /// The `compile_commands.json` behind a scip-clang index, if known. Consulted
+    /// only for a scip-clang index and only when `compdb_complete` is unset.
+    pub compdb: Option<CompdbInput<'a>>,
+    /// The `--compdb-complete` assertion: trust the compdb as covering every
+    /// translation unit without checking.
+    pub compdb_complete: bool,
+}
+
+/// A `compile_commands.json` supplied as bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct CompdbInput<'a> {
+    /// The file's bytes.
+    pub bytes: &'a [u8],
+    /// The directory the file lives in: the base for an entry that omits
+    /// `directory`, as it would be when the compdb is read from disk.
+    pub dir: &'a Path,
+}
+
+/// [`apply_scip`] over bytes. `sources` and `source_root` are as for
+/// [`apply_scip`]: the indexed source set and the absolute directory its paths are
+/// relative to, which anchors the scip-clang compdb-completeness check. The path
+/// form is a thin wrapper that reads the files and calls the same code.
+pub fn apply_scip_bytes(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    sources: &[SourceFile],
+    source_root: &Path,
+    overlay: &ScipOverlay<'_>,
+) -> Result<()> {
+    let compdb = || {
+        compdb::completeness_bytes(
+            sources,
+            source_root,
+            overlay.compdb.map(|c| (c.bytes, c.dir)),
+            overlay.compdb_complete,
+        )
+    };
+    relabel_scip(graph, stats, overlay.scip, compdb)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index: {e}")))
+}
+
+/// The SCIP pass shared by [`apply_scip`] and [`apply_scip_bytes`]. `compdb`
+/// computes the compdb-completeness report and is called only for a scip-clang
+/// index. The error is the SCIP parse failure, which each caller labels.
+fn relabel_scip(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    scip: &[u8],
+    compdb: impl FnOnce() -> compdb::CompdbReport,
+) -> std::result::Result<(), String> {
+    let resolver = ScipResolver::from_bytes(scip).map_err(|e| e.to_string())?;
     // FAIL-CLOSED compdb policy (ADR B2 Decision 3 / Phase F2): rust-analyzer
     // indices have no compile_commands.json, so the gate does not apply. A
     // scip-clang index's completeness is verified against the discovered C++ TU
@@ -435,12 +534,7 @@ pub fn apply_scip(
     let compdb = match resolver.scheme() {
         cgx_scip::SymbolScheme::RustAnalyzer => scip_relabel::CompdbCompleteness::NotApplicable,
         cgx_scip::SymbolScheme::ScipClang => {
-            let report = compdb::completeness(
-                sources,
-                source_root,
-                opts.compdb.as_deref(),
-                opts.compdb_complete,
-            );
+            let report = compdb();
             let completeness = report.completeness;
             stats.compdb = Some(report);
             completeness

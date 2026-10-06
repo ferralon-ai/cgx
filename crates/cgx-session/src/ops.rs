@@ -7,13 +7,17 @@
 //!   the edges it covers rather than a full query evaluation, so a host streams
 //!   the whole graph in `O(E)` by following `next_cursor`.
 //! - **`resolve`** — a batch of node selectors (the `cgx-select` grammar), each
-//!   answered with every node it matches, edges or not.
+//!   answered with every node it matches, edges or not. A selector whose last
+//!   segment is literal (`a::b::name`, `**::name`, `**::(x|y)`) is evaluated only
+//!   against the nodes ending in that segment, through an index built once per
+//!   resident graph; one ending in a wildcard, negation or globstar scans every
+//!   node. Each result reports how many nodes it evaluated.
 //!
 //! Node and edge ids are the resident graph's ids: stable for one `graph_version`,
 //! meaningless across graphs. FQNs are passed through verbatim.
 
-use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeRecord, SymbolKind};
-use cgx_query::GraphView;
+use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, NodeRecord, SymbolKind};
+use cgx_query::{GraphView, SelectResolution};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -98,16 +102,21 @@ fn field<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<Opti
     }
 }
 
-/// `export_edges {min_confidence?, kinds?, max_edges?, cursor?}`.
+/// `export_edges {confidence?, kind?, max_edges?, cursor?}`.
 ///
-/// `min_confidence` (`possible` | `probable` | `certain`, default `possible`) is
-/// the floor; `kinds` lists edge kinds as they appear in the output (`calls`,
-/// `calls-virtual`, …), defaulting to the call family; `max_edges` (default
-/// 50 000, at most 1 000 000) bounds one chunk.
+/// `confidence` (`possible` | `probable` | `certain`, default `possible`) is the
+/// floor and `kind` restricts to call-family edge kinds — both exactly as on the
+/// MCP `callers`/`callees` tools (`kind` tokens `calls`, `calls_virtual`, …;
+/// default the whole call family). Edges come out with their `kind` in the
+/// serialized form `explain` and `graph_query` use (`calls-virtual`).
+/// `max_edges` (default 50 000, at most 1 000 000) bounds one chunk.
 fn export_edges(resident: &Resident, args: &Value) -> Result<Value> {
     let view: &GraphView = &resident.session.view;
-    let floor: Confidence = field(args, "min_confidence")?.unwrap_or(Confidence::Possible);
-    let kinds: Option<Vec<EdgeKind>> = field(args, "kinds")?;
+    let floor = match field::<String>(args, "confidence")? {
+        Some(c) => cgx_mcp::tools::parse_confidence(&c)?,
+        None => Confidence::Possible,
+    };
+    let kinds: Option<Vec<EdgeKind>> = cgx_mcp::tools::parse_edge_kinds(args)?;
     let max_edges: usize = field(args, "max_edges")?.unwrap_or(DEFAULT_MAX_EDGES);
     if max_edges == 0 || max_edges > MAX_MAX_EDGES {
         return Err(SessionError::invalid_params(format!(
@@ -183,6 +192,10 @@ struct ResolveResult<'a> {
     cross_language: Vec<u32>,
     /// Parse-time diagnostics (for example a `!*` rewrite).
     diagnostics: &'a [cgx_select::Diagnostic],
+    /// How many nodes were evaluated: the candidates sharing the selector's
+    /// literal final segment, or every node when it has none (a wildcard,
+    /// negation or globstar last segment).
+    evaluated: usize,
     /// Why the selector was rejected; `null` when it compiled.
     error: Option<SessionError>,
 }
@@ -224,12 +237,13 @@ fn resolve(resident: &Resident, args: &Value) -> Result<Value> {
                     limited: false,
                     cross_language: Vec::new(),
                     diagnostics: &[],
+                    evaluated: 0,
                     error: Some(SessionError::invalid_params(message.clone())),
                 });
                 continue;
             }
         };
-        let res = view.resolve_select(sel, &opts);
+        let (res, evaluated) = select(resident, sel, &opts);
         let limit = max_nodes.unwrap_or(usize::MAX);
         results.push(ResolveResult {
             selector: text,
@@ -238,6 +252,7 @@ fn resolve(resident: &Resident, args: &Value) -> Result<Value> {
             limited: res.ids.len() > limit,
             cross_language: res.agnostic_cross_language.iter().map(|id| id.0).collect(),
             diagnostics: sel.diagnostics(),
+            evaluated,
             error: None,
         });
     }
@@ -246,4 +261,107 @@ fn resolve(resident: &Resident, args: &Value) -> Result<Value> {
         results,
     })
     .expect("resolve output serializes"))
+}
+
+/// Match `sel` against the resident graph: through the final-segment index when
+/// the selector ends in literal segments, else by scanning every node. Returns
+/// the resolution (ids ascending) and how many nodes were evaluated. A node
+/// outside the candidates cannot match, so skipping it changes no answer; the
+/// truncation flag then covers the nodes that could.
+fn select(
+    resident: &Resident,
+    sel: &cgx_select::Selector,
+    opts: &cgx_select::MatchOptions,
+) -> (SelectResolution, usize) {
+    let view = &resident.session.view;
+    let Some(finals) = sel.final_segments() else {
+        return (view.resolve_select(sel, opts), view.node_count());
+    };
+    let mut candidates: Vec<NodeId> = finals
+        .into_iter()
+        .flat_map(|f| resident.nodes_ending_in(f).iter().copied())
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut res = SelectResolution::default();
+    for &id in &candidates {
+        let m = sel.evaluate(view.node(id), opts);
+        res.truncated |= m.truncated;
+        if m.matched {
+            res.ids.push(id);
+            if m.agnostic_cross_language {
+                res.agnostic_cross_language.push(id);
+            }
+        }
+    }
+    (res, candidates.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Mode;
+    use cgx_core::node::Visibility;
+    use cgx_mcp::GraphSession;
+    use serde_json::json;
+
+    fn node(id: u32, fqn: String) -> NodeRecord {
+        NodeRecord {
+            id: NodeId(id),
+            kind: SymbolKind::Function,
+            fqn,
+            file: format!("f{}.rs", id % 97),
+            line_start: id,
+            line_end: id,
+            lang: "rust".into(),
+            visibility: Visibility::Public,
+            is_abstract: false,
+            entrypoint_kind: None,
+            signature: None,
+            own_effects: Default::default(),
+            transitive_effects: Default::default(),
+            unresolved_calls: 0,
+        }
+    }
+
+    /// A batch of literal selectors over a large graph evaluates only the nodes
+    /// sharing each selector's final segment — not selectors × nodes — and answers
+    /// exactly what the full scan answers.
+    #[test]
+    fn literal_selectors_evaluate_candidates_not_the_graph() {
+        let n = 100_000u32;
+        let nodes: Vec<NodeRecord> = (0..n)
+            .map(|i| node(i, format!("pkg{}::mod{}::fn{}", i % 50, i % 1000, i)))
+            .collect();
+        let view = GraphView::new(nodes, vec![], vec![]);
+        let resident = Resident::new(
+            "t".into(),
+            Mode::Head,
+            GraphSession::committed(view, "t".into(), None),
+        );
+        let selectors: Vec<String> = (0..20_000u32)
+            .map(|i| format!("pkg{}::mod{}::fn{}", (i * 5) % 50, (i * 5) % 1000, i * 5))
+            .collect();
+
+        let out = resolve(&resident, &json!({"selectors": selectors})).unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 20_000);
+        let evaluated: u64 = results.iter().map(|r| r["evaluated"].as_u64().unwrap()).sum();
+        assert_eq!(evaluated, 20_000, "one candidate per exact selector");
+        for (i, r) in results.iter().enumerate().step_by(997) {
+            assert_eq!(r["nodes"][0]["id"], json!(i * 5));
+        }
+
+        // Same answers as the full scan, on literal and non-literal selectors.
+        for s in ["**::fn42", "pkg3::**::(fn3|fn53)", "pkg1::mod1::*1", "pkg2::**"] {
+            let sel = cgx_select::compile(s).unwrap();
+            let opts = cgx_select::MatchOptions::native();
+            let (fast, _) = select(&resident, &sel, &opts);
+            let slow = resident.session.view.resolve_select(&sel, &opts);
+            assert_eq!(fast.ids, slow.ids, "{s}");
+            assert_eq!(fast.truncated, slow.truncated, "{s}");
+        }
+        let wild = resolve(&resident, &json!({"selectors": ["pkg2::**"]})).unwrap();
+        assert_eq!(wild["results"][0]["evaluated"], json!(n));
+    }
 }

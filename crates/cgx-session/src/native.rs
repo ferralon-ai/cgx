@@ -71,27 +71,31 @@ impl<S: FactStore> Session<S> {
         scip: Option<&Path>,
         force: bool,
     ) -> Result<IndexReport> {
+        self.discard();
         let repo = Repo::discover(self.root()).map_err(git_err)?;
         let head = repo.head_tree_oid().map_err(git_err)?;
         let toml = self.cgx_toml();
-        let dataflow = dataflow.unwrap_or_else(|| dataflow_default(toml.as_deref()));
 
-        if mode == Mode::Head && !force {
+        // The pointer does not record how its graph was built, so a fresh pointer
+        // answers only a request that asks for nothing in particular: an explicit
+        // `dataflow` or a `scip` index always rebuilds, as `cgx index` does.
+        if mode == Mode::Head && !force && dataflow.is_none() && scip.is_none() {
             let opened = self.open(OpenRequest {
                 head_tree: Some(head.clone()),
-                cgx_toml: toml,
-                dataflow: Some(dataflow),
+                cgx_toml: toml.clone(),
+                dataflow: None,
             })?;
             if opened.state == OpenState::Fresh {
                 return Ok(IndexReport {
                     graph_key: head,
                     mode,
                     up_to_date: true,
-                    dataflow,
+                    dataflow: None,
                     stats: None,
                 });
             }
         }
+        let dataflow = dataflow.unwrap_or_else(|| dataflow_default(toml.as_deref()));
 
         let scip = match scip {
             Some(path) => Some(std::fs::read(path).map_err(|e| {
@@ -143,8 +147,6 @@ impl<S: FactStore> Session<S> {
 
 #[derive(Debug, Deserialize)]
 struct Request {
-    #[serde(default)]
-    id: Value,
     op: String,
     #[serde(default)]
     tool: Option<String>,
@@ -161,10 +163,12 @@ struct Request {
 }
 
 /// Serve the `cgx session` protocol (module docs) over `input`/`output` until
-/// `close` or end of input. Only I/O errors on the streams end it early.
+/// `close` or end of input. Only I/O errors on the streams end it early; a
+/// line that is not a valid request (not JSON, not UTF-8, wrong shape) gets an
+/// `invalid_params` answer.
 pub fn serve<S: FactStore>(
     session: &mut Session<S>,
-    input: impl BufRead,
+    mut input: impl BufRead,
     mut output: impl Write,
 ) -> std::io::Result<()> {
     let handshake = json!({
@@ -176,19 +180,29 @@ pub fn serve<S: FactStore>(
     writeln!(output, "{handshake}")?;
     output.flush()?;
 
-    for line in input.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let (id, close, outcome) = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => {
-                let close = req.op == "close";
-                let id = req.id.clone();
-                (id, close, handle(session, req))
-            }
+        // Parse leniently first so a request of the wrong shape still gets its
+        // `id` echoed; a line that is not JSON at all answers with `id: null`.
+        let value = serde_json::from_slice::<Value>(&line);
+        let id = value
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(Value::Null);
+        let request = value
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::from_value::<Request>(v).map_err(|e| e.to_string()));
+        let (close, outcome) = match request {
+            Ok(req) => (req.op == "close", handle(session, req)),
             Err(e) => (
-                Value::Null,
                 false,
                 Err(SessionError::invalid_params(format!("malformed request: {e}"))),
             ),

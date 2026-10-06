@@ -14,10 +14,11 @@
 //! store's canonical order — never read back from the store.
 
 use std::cell::{Cell, OnceCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use cgx_core::codec::{decode, encode};
+use cgx_core::NodeId;
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry};
 use cgx_index::{
     apply_cha, apply_effects, apply_rta, apply_scip_bytes, apply_sig, default_registry,
@@ -156,8 +157,9 @@ pub struct IndexReport {
     pub mode: Mode,
     /// The persisted graph already matched `HEAD`; nothing was rebuilt.
     pub up_to_date: bool,
-    /// Whether the dataflow layer was built.
-    pub dataflow: bool,
+    /// Whether the dataflow layer was built; `null` when `up_to_date` (the
+    /// pointer does not record it).
+    pub dataflow: Option<bool>,
     /// Pipeline counters; `null` when `up_to_date`.
     pub stats: Option<ReportStats>,
 }
@@ -195,11 +197,44 @@ impl From<&IndexStats> for ReportStats {
 }
 
 /// The graph a session holds and answers from.
+///
+/// Its session metadata — `graph_version`, `dirty` and the freshness envelope —
+/// is established when the graph becomes resident (at `open` or `index`) and is
+/// not re-checked per call: if the repository's `HEAD` moves while a session
+/// holds a graph, answers keep describing the graph as of that moment until the
+/// next `open` or `index`.
 #[derive(Debug)]
 pub struct Resident {
     pub graph_key: String,
     pub mode: Mode,
     pub session: GraphSession,
+    /// Node ids by final FQN segment, built on the first `resolve` that can use it.
+    by_final_segment: OnceCell<HashMap<String, Vec<NodeId>>>,
+}
+
+impl Resident {
+    pub(crate) fn new(graph_key: String, mode: Mode, session: GraphSession) -> Self {
+        Resident {
+            graph_key,
+            mode,
+            session,
+            by_final_segment: OnceCell::new(),
+        }
+    }
+
+    /// The nodes whose FQN ends in the segment `last` (text after the final
+    /// `::`), in ascending id order.
+    pub(crate) fn nodes_ending_in(&self, last: &str) -> &[NodeId] {
+        let index = self.by_final_segment.get_or_init(|| {
+            let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
+            for n in self.session.view.nodes() {
+                let seg = n.fqn.rsplit("::").next().unwrap_or(&n.fqn);
+                index.entry(seg.to_string()).or_default().push(n.id);
+            }
+            index
+        });
+        index.get(last).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Where an index's graph goes once linked.
@@ -290,6 +325,13 @@ impl<S: FactStore> Session<S> {
         (self.open_store)(&self.root).map_err(|e| SessionError::index(format!("opening the store: {e}")))
     }
 
+    /// Drop the resident graph and any index in progress.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn discard(&mut self) {
+        self.pending = None;
+        self.resident = None;
+    }
+
     pub(crate) fn effective_dataflow(&self, explicit: Option<bool>, cgx_toml: Option<&str>) -> bool {
         explicit
             .or_else(|| cgx_toml.map(|t| dataflow_default(Some(t))))
@@ -330,11 +372,11 @@ impl<S: FactStore> Session<S> {
         }
         let g = store.read_graph(&key)?;
         let view = GraphView::new(g.nodes, g.edges, g.candidates);
-        self.resident = Some(Resident {
-            graph_key: ptr.graph_key.clone(),
-            mode: Mode::Head,
-            session: GraphSession::committed(view, ptr.graph_key.clone(), req.head_tree),
-        });
+        self.resident = Some(Resident::new(
+            ptr.graph_key.clone(),
+            Mode::Head,
+            GraphSession::committed(view, ptr.graph_key.clone(), req.head_tree),
+        ));
         Ok(OpenResponse {
             state: OpenState::Fresh,
             graph_key: Some(ptr.graph_key.clone()),
@@ -381,6 +423,7 @@ impl<S: FactStore> Session<S> {
                 let key = opts.graph_key.ok_or_else(|| {
                     SessionError::invalid_params("head mode requires graph_key (HEAD's tree OID)")
                 })?;
+                let key = host_oid(key.as_bytes())?;
                 Target {
                     mode: Mode::Head,
                     graph_key: key.clone(),
@@ -393,6 +436,7 @@ impl<S: FactStore> Session<S> {
                 let head = opts.head_tree.ok_or_else(|| {
                     SessionError::invalid_params("worktree mode requires head_tree")
                 })?;
+                let head = host_oid(head.as_bytes())?;
                 let mut base = BTreeMap::new();
                 for (path, oid) in committed {
                     base.insert(String::from_utf8_lossy(path).into_owned(), host_oid(oid)?);
@@ -480,8 +524,19 @@ impl<S: FactStore> Session<S> {
 
     /// Hand extracted files to the index in progress. Each must be a miss the
     /// plan returned and not yet submitted, with the fragment version its
-    /// frontend reports.
+    /// frontend reports and facts in canonical encoding (the bytes are stored as
+    /// the file's Layer-1 fragment). Any rejected file aborts the whole index:
+    /// the pending state is dropped, so no graph missing that file can be
+    /// finished.
     pub fn index_submit(&mut self, files: Vec<Submitted>) -> Result<()> {
+        let result = self.submit_all(files);
+        if result.is_err() {
+            self.pending = None;
+        }
+        result
+    }
+
+    fn submit_all(&mut self, files: Vec<Submitted>) -> Result<()> {
         let registry = self.registry.get_or_init(default_registry);
         let planned = self
             .pending
@@ -489,7 +544,7 @@ impl<S: FactStore> Session<S> {
             .and_then(|p| p.planned.as_mut())
             .ok_or_else(|| SessionError::invalid_params("index_submit without index_plan"))?;
         for f in files {
-            let file = planned.awaiting.remove(&f.index).ok_or_else(|| {
+            let file = planned.awaiting.get(&f.index).ok_or_else(|| {
                 SessionError::invalid_params(format!(
                     "file {} was not asked for by the plan or was already submitted",
                     f.index
@@ -505,11 +560,21 @@ impl<S: FactStore> Session<S> {
             let facts: FileFacts = decode(&f.facts).map_err(|e| {
                 SessionError::invalid_params(format!("file {}: facts do not decode: {e}", f.index))
             })?;
+            // Fragments are write-once per blob, so non-canonical bytes would
+            // persist and break store byte identity for every later reader.
+            let canonical = encode(&facts).map_err(|e| SessionError::internal(e.to_string()))?;
+            if canonical != f.facts {
+                return Err(SessionError::invalid_params(format!(
+                    "file {}: facts are not in canonical encoding",
+                    f.index
+                )));
+            }
+            let file = planned.awaiting.remove(&f.index).expect("present: checked above");
             planned.extracted.push(ExtractedFile {
                 prepared: PreparedFile {
-                    blob_oid: file.ctx.blob_oid.clone(),
+                    blob_oid: file.ctx.blob_oid,
                     rel_path: file.ctx.path.as_str().to_string(),
-                    lang: file.lang.clone(),
+                    lang: file.lang,
                     facts,
                 },
                 fragment_version: f.fragment_version,
@@ -600,16 +665,12 @@ impl<S: FactStore> Session<S> {
                 target.graph_key.clone(),
             ),
         };
-        self.resident = Some(Resident {
-            graph_key: target.graph_key.clone(),
-            mode: target.mode,
-            session,
-        });
+        self.resident = Some(Resident::new(target.graph_key.clone(), target.mode, session));
         Ok(IndexReport {
             graph_key: target.graph_key,
             mode: target.mode,
             up_to_date: false,
-            dataflow: target.dataflow,
+            dataflow: Some(target.dataflow),
             stats: Some(ReportStats::from(&stats)),
         })
     }
@@ -653,11 +714,16 @@ impl SessionProvider for Held<'_> {
     }
 }
 
-/// A blob OID as the host sent it: hex, so ASCII.
+/// An object id (blob or tree OID) as the host sent it: exactly 40 (SHA-1) or 64
+/// (SHA-256) lowercase hex digits, the only spellings git and the native walk
+/// produce. Anything else would address store paths native never writes, or
+/// none at all.
 fn host_oid(bytes: &[u8]) -> Result<String> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_hexdigit) {
+    let well_formed = matches!(bytes.len(), 40 | 64)
+        && bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !well_formed {
         return Err(SessionError::invalid_params(format!(
-            "blob OID {:?} is not hex",
+            "object id {:?} is not 40 or 64 lowercase hex digits",
             String::from_utf8_lossy(bytes)
         )));
     }

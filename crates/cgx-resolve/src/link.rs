@@ -1445,6 +1445,22 @@ fn finalize(
     graph
 }
 
+/// Remove the edges at the positions in `drop`, keeping the survivors in their
+/// original relative order. Filters in place: the post-passes run on the
+/// full-size edge list, and a filtered copy would hold two edge buffers at once.
+pub(crate) fn remove_edges_at(
+    edges: &mut Vec<EdgeWithProvenance>,
+    drop: &std::collections::BTreeSet<usize>,
+) {
+    let mut drop = drop.iter().copied().peekable();
+    let mut i = 0usize;
+    edges.retain(|_| {
+        let keep = drop.next_if_eq(&i).is_none();
+        i += 1;
+        keep
+    });
+}
+
 /// Re-establish the canonical edge order, dense [`EdgeId`] assignment, and
 /// candidate-set order on an already-built [`ResolvedGraph`].
 ///

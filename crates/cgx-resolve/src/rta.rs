@@ -203,13 +203,7 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
         m
     };
 
-    let mut kept: Vec<_> = Vec::with_capacity(graph.edges.len());
-    for (i, e) in graph.edges.drain(..).enumerate() {
-        if !drop_edge_idx.contains(&i) {
-            kept.push(e);
-        }
-    }
-    graph.edges = kept;
+    crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
 
     // Remove the dropped candidate rows.
     graph.candidates.retain(|c| {

@@ -456,6 +456,14 @@ enum Command {
         #[arg(long, conflicts_with = "root")]
         print_schemas: bool,
     },
+    /// Serve a resident session over stdin/stdout (NDJSON): open or index the
+    /// repository once and answer tool calls from the graph held in memory. The
+    /// embedding protocol behind the Go SDK's native transport.
+    Session {
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Test entrypoints whose call graph reaches a symbol changed between two git
     /// refs, or in the uncommitted working tree.
     ///
@@ -887,6 +895,12 @@ fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Mcp { root, .. } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
+        }
+        Command::Session { repo } => {
+            let repo_root = resolve_repo(repo)?;
+            let mut session = cgx_session::Session::new(&repo_root, Box::new(ShadowStore::open));
+            cgx_session::native::serve(&mut session, std::io::stdin().lock(), std::io::stdout().lock())
+                .map_err(|e| CliError::graph(format!("session stdio: {e}")))
         }
         Command::ImpactedTests {
             base,

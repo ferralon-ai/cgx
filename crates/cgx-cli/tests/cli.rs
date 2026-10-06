@@ -970,6 +970,77 @@ fn mcp_initialize_responds_and_exits_on_eof() {
     );
 }
 
+/// The `.cgx` files that must not depend on which writer indexed: objects,
+/// fragments, refs and the pointer.
+fn store_files(repo: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                walk(root, &e.path(), out);
+            } else {
+                let rel = e.path().strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(e.path()).unwrap());
+            }
+        }
+    }
+    let cgx = repo.join(".cgx");
+    let mut out = std::collections::BTreeMap::new();
+    for sub in ["objects", "fragments", "refs"] {
+        walk(&cgx, &cgx.join(sub), &mut out);
+    }
+    out.insert("HEAD.json".into(), std::fs::read(cgx.join("HEAD.json")).unwrap());
+    out
+}
+
+#[test]
+fn session_indexes_once_and_writes_what_index_writes() {
+    let (_ta, a) = fixture_repo();
+    let (_tb, b) = fixture_repo();
+    index(&a);
+
+    let requests = [
+        json!({"id": 1, "op": "open"}),
+        json!({"id": 2, "op": "index", "mode": "head", "force": false}),
+        json!({"id": 3, "op": "call", "tool": "callers", "args": {"symbol": "beta"}}),
+        json!({"id": 4, "op": "close"}),
+    ];
+    let out = Command::new(cargo_bin("cgx"))
+        .args(["session", "--repo"])
+        .arg(&b)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            for r in &requests {
+                writeln!(stdin, "{r}").unwrap();
+            }
+            drop(stdin);
+            child.wait_with_output()
+        })
+        .expect("run cgx session");
+    assert!(out.status.success());
+    let lines: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5, "handshake + one line per request");
+    assert_eq!(lines[0]["cgx_session"], 1);
+    assert_eq!(lines[1]["result"]["state"], "missing");
+    assert_eq!(lines[2]["ok"], true, "{}", lines[2]);
+    assert!(!lines[3]["result"]["results"].as_array().unwrap().is_empty(), "{}", lines[3]);
+    assert_eq!(store_files(&a), store_files(&b));
+
+    // The CLI reads what the session wrote without re-indexing.
+    let (callers, code) = run_cgx(&b, &["callers", "beta", "--no-auto-index"]);
+    assert_eq!(code, 0);
+    assert!(callers.contains("alpha"), "{callers}");
+}
+
 #[test]
 fn mcp_tools_list_returns_tools() {
     let list_msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;

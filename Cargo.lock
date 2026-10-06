@@ -480,10 +480,13 @@ dependencies = [
 name = "cgx-wasm"
 version = "0.3.0"
 dependencies = [
- "cgx-core",
  "cgx-index",
- "cgx-query",
+ "cgx-mcp",
+ "cgx-session",
  "cgx-store",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

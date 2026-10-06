@@ -311,6 +311,7 @@ dependencies = [
  "cgx-store",
  "gix",
  "rayon",
+ "sha1",
  "tempfile",
  "thiserror",
  "tree-sitter-json",

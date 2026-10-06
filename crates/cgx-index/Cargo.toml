@@ -18,6 +18,7 @@ cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }
 cgx-scip.workspace = true
 cgx-store = { path = "../cgx-store" }
+sha1 = "0.10"
 thiserror.workspace = true
 tree-sitter-json.workspace = true
 

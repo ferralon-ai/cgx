@@ -18,10 +18,14 @@ cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }
 cgx-scip.workspace = true
 cgx-store = { path = "../cgx-store" }
-gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
 rayon = "1"
 thiserror.workspace = true
 tree-sitter-json.workspace = true
+
+# Git enumeration is native-only: gix-fs does not build for wasm32-wasip1, and a
+# wasm embedding's host supplies sources itself.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
 
 [dev-dependencies]
 cgx-scip = { workspace = true, features = ["test-support"] }

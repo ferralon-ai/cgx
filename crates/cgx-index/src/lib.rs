@@ -52,24 +52,37 @@
 //! // Obtain the graph to query (keyed by the tree OID the graph was stored under):
 //! let graph = store.read_graph(&TreeOid::new(outcome.graph_key))?;
 //! ```
+//!
+//! ## Targets
+//!
+//! On `wasm32` the git layer ([`Repo`], `index_path`, `index_workdir`) is not
+//! built and extraction runs serially: the host supplies each [`SourceFile`]
+//! (path, blob OID, bytes) and drives the pipeline stages directly.
 
 #![forbid(unsafe_code)]
 
 mod cargo_pkg;
 mod error;
+#[cfg(not(target_family = "wasm"))]
 mod git;
 mod pipeline;
 mod registry;
+mod source;
 
 pub use error::{IndexError, Result};
-pub use git::{compute_blob_oid, Repo, SourceFile};
+#[cfg(not(target_family = "wasm"))]
+pub use git::{compute_blob_oid, Repo};
+pub use source::SourceFile;
 pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
 pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
 pub use pipeline::{IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 
+#[cfg(not(target_family = "wasm"))]
 use cgx_frontend::FrontendRegistry;
+#[cfg(not(target_family = "wasm"))]
 use cgx_store::FactStore;
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 
 /// The result of an index run: what was indexed, and how to reach the graph.
@@ -89,6 +102,7 @@ pub struct IndexOutcome {
 /// for files a registered adapter claims, links them, and stores the linked graph
 /// keyed by the tree OID. Re-running on an unchanged tree performs no extraction
 /// (IX-1).
+#[cfg(not(target_family = "wasm"))]
 pub fn index_path(
     repo_path: impl AsRef<Path>,
     registry: &FrontendRegistry,
@@ -120,6 +134,7 @@ pub fn index_path(
 /// blob is a cache hit. The graph is stored under a synthetic `"workdir:<digest>"`
 /// key derived from the sorted blob OIDs (a stable, content-addressed Layer-2 key
 /// distinct from any committed tree OID).
+#[cfg(not(target_family = "wasm"))]
 pub fn index_workdir(
     repo_path: impl AsRef<Path>,
     dir: impl AsRef<Path>,
@@ -146,6 +161,7 @@ pub fn index_workdir(
 /// A deterministic content-addressed Layer-2 key for a set of working-directory
 /// sources: `"workdir:"` followed by the [`manifest_digest`] of the sorted
 /// `<blob_oid> <path>` lines. Stable across runs, distinct per content.
+#[cfg(not(target_family = "wasm"))]
 fn workdir_key(sources: &[SourceFile]) -> String {
     let mut lines: Vec<String> = sources
         .iter()
@@ -171,11 +187,12 @@ fn workdir_key(sources: &[SourceFile]) -> String {
 /// from a sorted manifest — the `workdir:` graph key here and the MCP overlay
 /// digest that keys `graph_version` — must go through it: the lines are only ever
 /// hashed, never parsed back, so nothing else about them constrains the separator.
+#[cfg(not(target_family = "wasm"))]
 pub fn manifest_digest(lines: &[String]) -> String {
     compute_blob_oid(lines.join("\0").as_bytes())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
 

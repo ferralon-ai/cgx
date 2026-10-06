@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cargo_pkg::PackageMap;
 use crate::error::{IndexError, Result};
-use crate::git::SourceFile;
+use crate::source::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{

@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::git::SourceFile;
+use crate::source::SourceFile;
 
 /// Maps each crate-source file to the Rust crate identifier of its owning
 /// package, resolved workspace-aware from the set of `Cargo.toml` manifests in

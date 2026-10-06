@@ -82,6 +82,8 @@ pub use pipeline::{
     CompdbInput, CompdbReport, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile,
     PreparedFile, ScipOverlay, ScipStats,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use pipeline::extract_and_link;
 pub use registry::default_registry;
 
 #[cfg(not(target_family = "wasm"))]
@@ -175,8 +177,7 @@ pub fn index_workdir(
 /// A deterministic content-addressed Layer-2 key for a set of working-directory
 /// sources: `"workdir:"` followed by the [`manifest_digest`] of the sorted
 /// `<blob_oid> <path>` lines. Stable across runs, distinct per content.
-#[cfg(not(target_family = "wasm"))]
-fn workdir_key(sources: &[SourceFile]) -> String {
+pub fn workdir_key(sources: &[SourceFile]) -> String {
     let mut lines: Vec<String> = sources
         .iter()
         .map(|s| format!("{} {}", s.blob_oid, s.rel_path))
@@ -201,9 +202,21 @@ fn workdir_key(sources: &[SourceFile]) -> String {
 /// from a sorted manifest — the `workdir:` graph key here and the MCP overlay
 /// digest that keys `graph_version` — must go through it: the lines are only ever
 /// hashed, never parsed back, so nothing else about them constrains the separator.
-#[cfg(not(target_family = "wasm"))]
+///
+/// The hash is the SHA-1 git blob OID of the joined bytes, computed without git
+/// so the digest is available where the git layer is not built (`wasm32`).
 pub fn manifest_digest(lines: &[String]) -> String {
-    compute_blob_oid(lines.join("\0").as_bytes())
+    sha1_blob_oid(lines.join("\0").as_bytes())
+}
+
+/// The SHA-1 git blob OID (hex) of `content`: the SHA-1 of `blob <len>\0` followed
+/// by the bytes, exactly as `git hash-object` computes it.
+fn sha1_blob_oid(content: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(format!("blob {}\0", content.len()).as_bytes());
+    h.update(content);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -240,6 +253,15 @@ mod tests {
             workdir_key(&one_weird_file),
             "two distinct working sets must not share a workdir key"
         );
+    }
+
+    /// The git-free digest is git's blob OID, so keys computed on a target without
+    /// the git layer equal the native ones.
+    #[test]
+    fn sha1_blob_oid_matches_git() {
+        for content in [&b""[..], b"hello\n", "caf\u{e9}\0\n".as_bytes()] {
+            assert_eq!(sha1_blob_oid(content), compute_blob_oid(content));
+        }
     }
 
     /// The digest is a function of the line list, not of the joined bytes: any two

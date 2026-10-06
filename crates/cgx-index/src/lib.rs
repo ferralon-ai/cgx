@@ -77,9 +77,10 @@ pub use source::SourceFile;
 pub use pipeline::scip_relabel::{relabel as scip_relabel, CompdbCompleteness, ScipRelabelOpts};
 pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
 pub use pipeline::{
-    apply_cha, apply_effects, apply_rta, apply_scip, apply_sig, extract_one, link_prepared, plan,
-    store_graph, CompdbReport, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile,
-    PreparedFile, ScipStats,
+    apply_cha, apply_effects, apply_rta, apply_scip, apply_scip_bytes, apply_sig, extract_one,
+    is_manifest_path, link_prepared, plan, probe_fragments, put_extracted, store_graph,
+    CompdbInput, CompdbReport, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile,
+    PreparedFile, ScipOverlay, ScipStats,
 };
 pub use registry::default_registry;
 

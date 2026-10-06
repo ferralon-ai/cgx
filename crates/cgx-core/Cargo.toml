@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "cgx graph data model: node/edge kinds, edge conditions, confidence ladder, deterministic IDs, signatures. No I/O."
 
 [dependencies]
+schemars.workspace = true
 serde.workspace = true
 postcard.workspace = true
 smallvec.workspace = true

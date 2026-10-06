@@ -31,6 +31,7 @@ use cgx_frontend::{ManifestInfo, ManifestKind};
 use tree_sitter::{Node, Parser};
 
 use crate::cargo_pkg::{is_dir_ancestor, parent_dir};
+use crate::pipeline::manifest_kind;
 use crate::source::SourceFile;
 
 /// Maps each source file to the nearest-ancestor non-Cargo manifest's resolved
@@ -95,7 +96,8 @@ impl ManifestMap {
 /// parent dir; `all_paths` is the full source set (needed for the Python
 /// src-layout probe).
 fn resolve(path: &str, content: &[u8], dir: &str, all_paths: &[&str]) -> Option<ManifestInfo> {
-    if is_named(path, "go.mod") {
+    let kind = manifest_kind(path)?;
+    if kind == ManifestKind::GoMod {
         let text = std::str::from_utf8(content).ok()?;
         let identity = parse_go_module(text)?;
         return Some(ManifestInfo {
@@ -104,7 +106,7 @@ fn resolve(path: &str, content: &[u8], dir: &str, all_paths: &[&str]) -> Option<
             root_dir: dir.to_string(),
         });
     }
-    if is_named(path, "package.json") {
+    if kind == ManifestKind::PackageJson {
         let identity = parse_package_json_name(content)?;
         return Some(ManifestInfo {
             kind: ManifestKind::PackageJson,
@@ -112,7 +114,7 @@ fn resolve(path: &str, content: &[u8], dir: &str, all_paths: &[&str]) -> Option<
             root_dir: dir.to_string(),
         });
     }
-    if is_named(path, "pyproject.toml") || is_named(path, "setup.py") {
+    if kind == ManifestKind::PyProject {
         // A manifest *inside* an importable package is never an import root. A
         // legacy per-subpackage `setup.py`/`pyproject.toml` (scipy's
         // `scipy/sparse/setup.py`, Red-DiscordBot's `redbot/setup.py`) would
@@ -153,19 +155,6 @@ fn dir_inside_importable_package(dir: &str, all_paths: &[&str]) -> bool {
         }
         cur = parent_dir(cur);
     }
-}
-
-/// Whether `path` is one of the build manifests this module resolves (at any
-/// depth): the files whose content [`ManifestMap::from_sources`] reads.
-pub(crate) fn is_resolved_manifest(path: &str) -> bool {
-    ["go.mod", "package.json", "pyproject.toml", "setup.py"]
-        .iter()
-        .any(|name| is_named(path, name))
-}
-
-/// Whether `path`'s final segment is exactly `name` (the manifest at any depth).
-fn is_named(path: &str, name: &str) -> bool {
-    path == name || path.ends_with(&format!("/{name}"))
 }
 
 /// The src-aware Python import root: the pyproject/setup.py dir plus `/src` when

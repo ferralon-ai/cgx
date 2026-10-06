@@ -58,6 +58,7 @@
 
 pub mod confine;
 pub mod error;
+pub mod output;
 pub mod protocol;
 pub mod server;
 pub mod session;
@@ -68,4 +69,5 @@ pub use error::{ServeError, ToolError};
 pub use protocol::{Request, Response, RpcError};
 pub use server::{dispatch, serve, serve_io, ServerConfig, PROTOCOL_VERSION};
 pub use session::{acquire, GraphSession};
+pub use output::{output_schema, schema_document};
 pub use tools::{call as call_tool, tool_list};

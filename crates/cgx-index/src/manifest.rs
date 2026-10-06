@@ -31,7 +31,7 @@ use cgx_frontend::{ManifestInfo, ManifestKind};
 use tree_sitter::{Node, Parser};
 
 use crate::cargo_pkg::{is_dir_ancestor, parent_dir};
-use crate::git::SourceFile;
+use crate::source::SourceFile;
 
 /// Maps each source file to the nearest-ancestor non-Cargo manifest's resolved
 /// facts. Built once per index run.

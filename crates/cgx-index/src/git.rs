@@ -16,21 +16,10 @@
 //! results are sorted by path.
 
 use crate::error::{IndexError, Result};
+use crate::source::SourceFile;
 use gix::bstr::ByteSlice;
 use std::collections::BTreeMap;
 use std::path::Path;
-
-/// One source file to index: its content-addressed identity plus its bytes.
-#[derive(Debug, Clone)]
-pub struct SourceFile {
-    /// Git blob OID (hex). For working-dir files this is the synthetic OID git
-    /// *would* assign — identical to the committed OID when content matches.
-    pub blob_oid: String,
-    /// Repo-relative, `/`-separated path.
-    pub rel_path: String,
-    /// Raw file bytes.
-    pub content: Vec<u8>,
-}
 
 /// A repository handle plus the means to enumerate sources from it.
 #[derive(Debug)]

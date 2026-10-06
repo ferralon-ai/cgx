@@ -20,7 +20,7 @@ fn lang_tag_is_java() {
 
 #[test]
 fn fragment_version_is_stable() {
-    assert_eq!(JavaFrontend::new().fragment_version(), 1);
+    assert_eq!(JavaFrontend::new().fragment_version(), 2);
 }
 
 #[test]

@@ -50,7 +50,8 @@ impl PythonFrontend {
 /// v3: FQN root is now the importable dotted module path below a src/pyproject-aware
 /// import root instead of the literal first path segment, so v2 fragments may carry
 /// stale roots (notably the former `src`-as-root collision).
-const PYTHON_FRAGMENT_VERSION: u32 = 3;
+/// v4: `FileFacts` gained `module` and `type_facts`; v3 fragments no longer decode.
+const PYTHON_FRAGMENT_VERSION: u32 = 4;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {

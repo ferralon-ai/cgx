@@ -860,9 +860,10 @@ deliberately distinguishable.
 **`matches_head` is three-valued, and `null` is the common case over MCP.** It
 has a third null case: both trees are known, but the surface holds two views of
 the working tree that disagree about whether the graph it answered over *is*
-HEAD's tree. With MCP's default `include_dirty: true`, any indexed repository
-reaches it — `cgx index` writes `.cgx/`, after which working-tree enumeration
-(no ignore rules) and the dirty-file count (ignore rules applied) disagree. The
+HEAD's tree. With MCP's default `include_dirty: true`, any checkout holding an
+ignored or untracked file (build output such as `target/`) reaches it:
+working-tree enumeration skips only `.git` and cgx's own root `.cgx/` (no ignore
+rules), while the dirty-file count applies ignore rules, so the two disagree. The
 verdict is then `unknown`, and the human line says `unknown` rather than
 `current`: a null must not render as the reassuring word. Treating
 `matches_head` as a boolean is wrong in the ordinary case, not the edge case.

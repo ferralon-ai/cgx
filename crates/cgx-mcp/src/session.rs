@@ -21,9 +21,9 @@
 //!   no such difference reports the committed `graph_version` (no spurious
 //!   `+dirty`). That is **not** the same as "a tree git calls clean": the
 //!   difference is computed from [`cgx_index::Repo::enumerate_workdir`], which
-//!   applies no ignore rules, so an untracked or ignored file — cgx's own `.cgx/`
-//!   on any repo that has been indexed, most commonly — makes the overlay
-//!   non-empty and the `graph_version` `+dirty` on a `git status`-clean checkout.
+//!   applies no ignore rules (it skips only `.git` and cgx's own root `.cgx/`),
+//!   so an untracked or ignored file — build output such as `target/`, most
+//!   commonly — makes the overlay non-empty and the `graph_version` `+dirty` on a `git status`-clean checkout.
 //!   That is honest: the ignored file *is* part of what the answer was computed
 //!   over. It is also why `freshness.matches_head` is three-valued (see
 //!   [`acquire`]).

@@ -5,14 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "cgx engine as a wasm32-wasip1 reactor module. Currently a link stub proving the full engine (extraction for every language, link, post-link passes, query) builds and links for wasm; the host-facing exports come later."
+description = "cgx engine as a wasm32-wasip1 reactor module: the host-facing exports (index stages, extraction, queries) over a cgx-session resident session."
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-cgx-core.workspace = true
-cgx-index = { path = "../cgx-index" }
-cgx-query = { path = "../cgx-query" }
+cgx-mcp = { path = "../cgx-mcp" }
+cgx-session = { path = "../cgx-session" }
 cgx-store = { path = "../cgx-store" }
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+cgx-index = { path = "../cgx-index" }
+tempfile = "3"

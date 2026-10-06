@@ -350,13 +350,17 @@ impl FactStore for SqliteStore {
     fn put_fragments(&mut self, batch: &[FragmentInput<'_>]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            // INSERT-or-ignore makes an unchanged blob a true no-op (IX-1): the
-            // existing row and its bytes are left untouched. A blob OID is
-            // content-addressed, so a present key already holds the right bytes.
+            // Write-once per (blob OID, frontend version): a blob OID is content
+            // addressed, so an unchanged blob re-puts to a true no-op (IX-1). A
+            // row written by a different frontend version is replaced.
             let mut stmt = tx.prepare(
                 "INSERT INTO blob_facts(blob_oid, lang, frontend_version, fragment)
                  VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(blob_oid) DO NOTHING",
+                 ON CONFLICT(blob_oid) DO UPDATE SET
+                     lang = excluded.lang,
+                     frontend_version = excluded.frontend_version,
+                     fragment = excluded.fragment
+                 WHERE blob_facts.frontend_version <> excluded.frontend_version",
             )?;
             for f in batch {
                 stmt.execute(params![

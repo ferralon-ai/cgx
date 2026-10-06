@@ -162,6 +162,26 @@ fn re_put_does_not_overwrite_existing_bytes_for_same_oid() {
     );
 }
 
+#[test]
+fn put_with_a_different_frontend_version_replaces_the_fragment() {
+    let mut store = open();
+    let blob = BlobOid::new("blob-versioned");
+    let v1 = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { blob: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+
+    store.put_fragments(&[v1]).unwrap();
+    store.put_fragments(&[v2]).unwrap();
+    let got = store.fragment(&blob).unwrap().unwrap();
+    assert_eq!(got.frontend_version, 2);
+    assert_eq!(got.lang, "go");
+    assert_eq!(got.fragment, b"new");
+
+    // Re-putting the same version is still a no-op: the stored bytes win.
+    let v2_other = FragmentInput { bytes: b"ignored", ..v2 };
+    store.put_fragments(&[v2_other]).unwrap();
+    assert_eq!(store.fragment(&blob).unwrap().unwrap().fragment, b"new");
+}
+
 // ---- View-schema-version present + views queryable --------------------------
 
 #[test]

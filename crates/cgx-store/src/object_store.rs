@@ -210,11 +210,13 @@ impl FactStore for ObjectStore {
         let _lock = WriteLock::acquire(&self.lock_path)?;
         for f in batch {
             let path = ObjectOid(f.blob.0.clone()).object_path(&self.fragments_dir);
-            // Write-once by blob OID: an unchanged blob re-puts to a true no-op
-            // (IX-1). A present key already holds the right bytes (blob OID is a
-            // content hash), so no decode/compare is needed.
-            if path.exists() {
-                continue;
+            // Write-once per (blob OID, frontend version): an unchanged blob
+            // re-puts to a true no-op (IX-1). An object written by a different
+            // frontend version is replaced, so only the header is compared.
+            if let Some(existing) = read_bytes_if_exists(&path)? {
+                if decode::<StoredFragment>(&existing)?.frontend_version == f.frontend_version {
+                    continue;
+                }
             }
             let stored = StoredFragment {
                 lang: f.lang.to_owned(),

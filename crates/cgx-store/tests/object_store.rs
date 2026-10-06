@@ -479,6 +479,28 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
 }
 
 #[test]
+fn put_with_a_different_frontend_version_replaces_the_fragment() {
+    use cgx_store::{BlobOid, FragmentInput};
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let blob = BlobOid::new("blob-versioned");
+    let v1 = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { blob: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+
+    s.put_fragments(&[v1]).unwrap();
+    s.put_fragments(&[v2]).unwrap();
+    let got = s.fragment(&blob).unwrap().unwrap();
+    assert_eq!(got.frontend_version, 2);
+    assert_eq!(got.lang, "go");
+    assert_eq!(got.fragment, b"new");
+
+    // Re-putting the same version is still a no-op: the stored bytes win.
+    let v2_other = FragmentInput { bytes: b"ignored", ..v2 };
+    s.put_fragments(&[v2_other]).unwrap();
+    assert_eq!(s.fragment(&blob).unwrap().unwrap().fragment, b"new");
+}
+
+#[test]
 fn prune_drops_only_fragments_absent_from_the_live_set() {
     use cgx_store::{BlobOid, FragmentInput};
     let root = TempDir::new().unwrap();

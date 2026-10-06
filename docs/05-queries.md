@@ -147,7 +147,7 @@ fn orphan() -> u32 { 42 }
 $ git init -q . && git add -A && git commit -qm initial
 $ cgx index .
 Indexed /tmp/fixture (7380e245ab98db2dfed12ed3ee3b005f0fbf7036)
-  blobs: 1 indexed, 1 extracted, 0 cached, 0 unsupported
+  blobs: 1 indexed, 1 extracted, 0 cached, 0 stale, 0 unsupported
   graph: 22 nodes, 14 edges, 0 unresolved
   dataflow: 5 fns recomputed, 0 fns reused; ifds: 4 summaries, 3 interproc edges, 0 budget-exceeded SCCs
 ```

@@ -640,12 +640,12 @@ fn peer_matches(view: &GraphView, plan: &PatternPlan, peer: NodeId) -> bool {
 }
 
 /// Build a [`SymbolPattern`] from a `name`/`fqn` constraint string, applying the
-/// design §3.1 heuristics (glob if `*`/`?`, FQN if it contains `::`, else
-/// short-name).
+/// design §3.1 heuristics (glob if `*`/`?`, FQN if it contains a segment
+/// separator `::` or `/`, else short-name).
 pub(crate) fn name_pattern(s: &str) -> SymbolPattern {
     if s.contains('*') || s.contains('?') {
         SymbolPattern::glob(s.to_string())
-    } else if s.contains("::") {
+    } else if cgx_core::pattern::contains_segment_separator(s) {
         SymbolPattern::fqn(s.to_string())
     } else {
         SymbolPattern::short_name(s.to_string())
@@ -1734,5 +1734,25 @@ pub fn parse_confidence(value: &Value, span: Range<usize>) -> Result<Confidence,
             span,
             format!("unknown edge confidence `{other}`"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod name_pattern_tests {
+    use super::name_pattern;
+    use cgx_core::PatternKind;
+
+    #[test]
+    fn slash_bearing_string_classifies_as_fqn_not_short_name() {
+        // `/` present, no `*`/`?` → FQN (the new behavior).
+        assert_eq!(name_pattern("example.com/app/store").kind, PatternKind::Fqn);
+        assert_eq!(name_pattern("@acme/utils").kind, PatternKind::Fqn);
+        // Unchanged: `::` → FQN, bare name → short-name, glob metachars → glob.
+        assert_eq!(name_pattern("a::b").kind, PatternKind::Fqn);
+        assert_eq!(name_pattern("Open").kind, PatternKind::ShortName);
+        assert_eq!(name_pattern("a*").kind, PatternKind::Glob);
+        assert_eq!(name_pattern("a?").kind, PatternKind::Glob);
+        // `.` alone is not a separator → still short-name.
+        assert_eq!(name_pattern("example.com").kind, PatternKind::ShortName);
     }
 }

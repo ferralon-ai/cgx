@@ -51,7 +51,7 @@ Each tool call returns a JSON result envelope containing session metadata alongs
 | Flag | Value | Default | Meaning |
 |------|-------|---------|---------|
 | `--root` | path | — | Default repository root injected into tool calls that omit the `root` property. When set, agents may omit `root` from individual tool call arguments. When unset, `root` is required in every tool call. |
-| `--print-schemas` | flag | off | Print the JSON Schema document for every tool's `structuredContent` to stdout and exit without serving. The bytes match the checked-in `schemas/mcp-tool-outputs.schema.json`. Conflicts with `--root`. |
+| `--print-schemas` | flag | off | Print the JSON Schema document for every tool's arguments (`inputSchema`) and `structuredContent` (`outputSchema`) to stdout and exit without serving. Shape: `properties.<tool> = {input, output}`, types under `$defs` (see [MCP tools reference](../mcp-tools/README.md#outputschema--the-declared-shape)). The bytes match the checked-in `schemas/mcp-tools.schema.json`. Conflicts with `--root`. |
 
 ## Tools
 

@@ -360,6 +360,264 @@ pub struct CutHint {
     pub macro_origin: Option<String>,
 }
 
+/// A receiver-typing fact: the syntactic input the resolver uses to infer which
+/// classes a method-call receiver can hold. Frontends normalize language syntax
+/// into the structured [`TypeExpr`] / [`ValueSource`] payloads, so the resolver
+/// stays language-generic.
+///
+/// `func` is the owning callable's local FQN and `class` a class's local FQN;
+/// both match a [`SymbolDef::fqn`] in the same file.
+///
+/// **Binding completeness (the channel's contract).** For every callable
+/// `func` the frontend emits a [`TypeFact::Param`] per declared parameter or
+/// receiver, and **one [`TypeFact::Bind`] per binding site of every local
+/// name**. That covers assignments, augmented assignments, walrus, tuple and
+/// star targets, `for`/`with`/`except`/`match` captures, comprehension
+/// variables, `global`/`nonlocal`, function-local `import`/`def`/`class`, and
+/// `del`. It also covers names bound in code that is attributed to `func` but
+/// scoped more tightly (lambda and func-literal parameters), names rebound
+/// from a nested callable (`nonlocal`), and locals whose address is taken
+/// (Go `&x`). A form the frontend does not type emits `Bind { src: Opaque }`.
+///
+/// The contract holds only for frontends that emit this channel (Python and
+/// Go); a file without `type_facts` makes no claim about its names. Within such
+/// a file, a name with no `Param` and no `Bind` in `func` is not local to
+/// `func`: a consumer looks it up in the facts of the enclosing callables
+/// (`func`'s FQN prefixes) before treating it as module-level, imported or
+/// builtin.
+///
+/// **ABI.** Fragments are postcard-encoded, which writes the variant index.
+/// Variants are append-only: never reorder them or change a variant's fields.
+/// The same holds for every enum and struct in a variant's payload; a pinned
+/// encoding test guards it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TypeFact {
+    /// A declared parameter or method receiver of `func`.
+    Param {
+        /// Owning callable.
+        func: String,
+        /// Parameter name as written (`self`, `ctx`, the Go receiver name).
+        name: Name,
+        /// Position among the callable's parameters (0-based, saturating at
+        /// `u8::MAX`); `None` for a [`ParamKind::Receiver`].
+        index: Option<u8>,
+        /// How the parameter binds arguments.
+        kind: ParamKind,
+        /// The declared type, normalized; `None` when unannotated.
+        ty: Option<TypeExpr>,
+    },
+    /// One binding site of local `var` inside `func`.
+    Bind {
+        /// Owning callable.
+        func: String,
+        /// The bound local name.
+        var: Name,
+        /// Where the bound value comes from.
+        src: ValueSource,
+    },
+    /// An instance-field assignment on the receiver (`self.f = …`,
+    /// `this.f = …`) inside method `func`.
+    FieldBind {
+        /// Owning method.
+        func: String,
+        /// The field name (`f`).
+        field: Name,
+        /// Where the stored value comes from.
+        src: ValueSource,
+    },
+    /// The declared base classes of `class`, in source order. A class with no
+    /// explicit base gets an empty `bases` (still a fact: its lookup reaches
+    /// the language root only). Bases the frontend cannot name are kept as
+    /// [`BaseExpr::Unknown`] / [`BaseExpr::Call`], never dropped.
+    ClassBases {
+        /// The class's local FQN.
+        class: String,
+        /// Bases in declaration order (keyword arguments such as
+        /// `metaclass=` are excluded).
+        bases: Vec<BaseExpr>,
+    },
+    /// A method call whose receiver chain is rooted at a non-name expression
+    /// (`"".join(x)`, `super().m()`, `Foo().m()`, `xs[0].m()`).
+    AnonReceiver {
+        /// Owning callable.
+        func: String,
+        /// Line of the call; equals the matching [`RawRef::span`] line.
+        line: u32,
+        /// Column of the call; equals the matching [`RawRef::span`] column.
+        col: u32,
+        /// The called method's name (the call ref's last name-path segment).
+        method: Name,
+        /// Number of attribute segments after the root (the call ref's
+        /// name-path length).
+        depth: u8,
+        /// What the chain is rooted at.
+        root: AnonRoot,
+    },
+    /// The arguments at one call site inside `func`.
+    CallArgs {
+        /// Owning callable.
+        func: String,
+        /// Line of the call; equals the matching [`RawRef::span`] line.
+        line: u32,
+        /// Column of the call; equals the matching [`RawRef::span`] column.
+        col: u32,
+        /// The syntactic callee name path (`f`, `pkg.F` as `["pkg","F"]`).
+        callee: SmallVec<[Name; 2]>,
+        /// Arguments in source order. A `Vec` rather than an inline small
+        /// vector keeps every `TypeFact` small; the encoding is the same.
+        args: Vec<CallArg>,
+    },
+    /// The declared return type of `func`.
+    Return {
+        /// The callable.
+        func: String,
+        /// Its declared return type, normalized.
+        ty: TypeExpr,
+    },
+    /// The declared type of field `field` of `class`.
+    FieldType {
+        /// The class's local FQN.
+        class: String,
+        /// The field name.
+        field: Name,
+        /// Its declared type, normalized.
+        ty: TypeExpr,
+    },
+}
+
+/// How a [`TypeFact::Param`] binds call arguments. Variant order is ABI
+/// (append-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ParamKind {
+    /// A method receiver declared outside the parameter list (Go `func (r *T)`).
+    Receiver,
+    /// A positional (or positional-or-keyword) parameter. Python `self`/`cls`
+    /// are ordinary positional parameters at index 0.
+    Positional,
+    /// A keyword-only parameter (Python, after `*` or `*args`).
+    KeywordOnly,
+    /// A variadic positional parameter (Python `*args`, Go `...T`).
+    VarArgs,
+    /// A variadic keyword parameter (Python `**kwargs`).
+    VarKeywords,
+}
+
+/// One argument of a [`TypeFact::CallArgs`] site. Its fields are ABI like a
+/// variant's: never reorder or change them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CallArg {
+    /// The keyword, for a keyword argument (`f(x=1)`); `None` for positional.
+    pub keyword: Option<Name>,
+    /// Where the argument's value comes from.
+    pub value: ValueSource,
+}
+
+/// Where a bound value comes from, as far as one file can see. Variant order
+/// is ABI (append-only).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ValueSource {
+    /// A copy of a local or parameter of the same callable.
+    Var(Name),
+    /// A syntactic allocation of exactly this type (`T{}`, `&T{}`, `new T()`).
+    New(TypeExpr),
+    /// The result of calling a name path (`Foo()`, `pkg.make()`). Whether that
+    /// is a constructor or a function is for the resolver to decide.
+    Call(SmallVec<[Name; 2]>),
+    /// A declared bound: an annotation, Go `var v T`, Python `except E as e`.
+    Declared(TypeExpr),
+    /// The value a context manager yields: `with <src> as v`.
+    Enter(Box<ValueSource>),
+    /// An element of an iterable: `for v in <src>`.
+    Element(Box<ValueSource>),
+    /// A builtin literal of this kind.
+    Literal(LiteralKind),
+    /// `None` / `nil` / `null`: contributes no type.
+    Null,
+    /// Any other value. A binding from `Opaque` poisons the name: no type can
+    /// be inferred for it in this callable.
+    Opaque,
+}
+
+/// The kind of a builtin literal. Variant order is ABI (append-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum LiteralKind {
+    /// A text string.
+    Str,
+    /// A byte string.
+    Bytes,
+    /// An integer or floating-point number.
+    Num,
+    /// A boolean.
+    Bool,
+    /// A list (or list comprehension).
+    List,
+    /// A dictionary (or dict comprehension).
+    Dict,
+    /// A set (or set comprehension).
+    Set,
+    /// A tuple.
+    Tuple,
+}
+
+/// The root of an [`TypeFact::AnonReceiver`] chain. Variant order is ABI
+/// (append-only).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AnonRoot {
+    /// A builtin literal (`"".join`, `[].append`).
+    Literal(LiteralKind),
+    /// A `super()` call.
+    Super,
+    /// The result of calling a name path (`Foo().m()`).
+    Call(SmallVec<[Name; 2]>),
+    /// A subscript (`xs[0].m()`).
+    Subscript,
+    /// Any other expression.
+    Other,
+}
+
+/// One declared base of a [`TypeFact::ClassBases`]. Variant order is ABI
+/// (append-only).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BaseExpr {
+    /// A nameable base type (`Base`, `pkg.Base`, `Generic[T]`).
+    Type(TypeExpr),
+    /// A base produced by calling a name path (`declarative_base()`,
+    /// `namedtuple(...)`).
+    Call(SmallVec<[Name; 2]>),
+    /// A base expression the frontend cannot name.
+    Unknown,
+}
+
+/// A normalized type expression. Language syntax (`Optional[X]`, `X | None`,
+/// string annotations, Go `*T`) is resolved by the frontend. Variant order is
+/// ABI (append-only).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TypeExpr {
+    /// A named type as written (`Foo`, `pkg.Foo` as `["pkg","Foo"]`).
+    Named {
+        /// The name path, unresolved.
+        path: SmallVec<[Name; 2]>,
+        /// Whether the value is held through a pointer or reference (Go `*T`).
+        indirect: bool,
+    },
+    /// A generic instantiation (`List[Foo]`, `Box[T]`, Go `List[T]`).
+    Generic {
+        /// The generic type's name path.
+        head: SmallVec<[Name; 2]>,
+        /// Type arguments in source order.
+        args: Vec<TypeExpr>,
+        /// Whether the value is held through a pointer or reference (Go
+        /// `*G[A]`).
+        indirect: bool,
+    },
+    /// One of several types. `None`/`nil`/`null` members are dropped by the
+    /// frontend, and a one-member union is collapsed to its member.
+    Union(Vec<TypeExpr>),
+    /// A type the frontend does not model (callables, literal types, `Any`,
+    /// structural types).
+    Unknown,
+}
+
 /// The complete set of facts extracted from one source file (architecture §5).
 ///
 /// Canonical form (every `Vec` sorted) is what gets `postcard`-encoded into a
@@ -390,6 +648,14 @@ pub struct FileFacts {
     /// that emit no dataflow (TS in the MVP) and for the base index path.
     #[serde(default)]
     pub data_flows: Vec<DataFlowFact>,
+    /// Canonical module path this file's defs are rooted at — exactly the
+    /// prefix the frontend joined every def FQN under (`django::db::models`,
+    /// `example.com/app/svc`). `None` for frontends without a module identity.
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Receiver-typing facts (see [`TypeFact`]). Binding-complete per callable.
+    #[serde(default)]
+    pub type_facts: Vec<TypeFact>,
 }
 
 impl FileFacts {
@@ -419,6 +685,8 @@ impl FileFacts {
         self.cut_hints.sort();
         self.effects.sort();
         self.data_flows.sort();
+        self.type_facts.sort();
+        self.type_facts.dedup();
         for r in &mut self.refs {
             r.cut_markers.sort_unstable();
             r.cut_markers.dedup();
@@ -442,5 +710,6 @@ impl FileFacts {
             && self.cut_hints.is_empty()
             && self.effects.is_empty()
             && self.data_flows.is_empty()
+            && self.type_facts.is_empty()
     }
 }

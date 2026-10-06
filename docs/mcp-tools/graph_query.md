@@ -56,7 +56,7 @@ omits `paths`.
 
 ### Cell shapes in the table channel
 
-`cql_cell_json` (`tools.rs:1089`) renders each cell by its CQL value type:
+`cql_cell` (`crates/cgx-mcp/src/tools.rs`) renders each cell by its CQL value type, as the untagged `CqlCell` union (`crates/cgx-mcp/src/output.rs`):
 
 | CQL value | JSON |
 |-----------|------|

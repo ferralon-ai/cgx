@@ -47,7 +47,7 @@ not a fallback to the default (`crates/cgx-mcp/src/tools.rs:864-868`).
 There is **no `approximation` key** on this tool, in any response — see
 [Why there is no `approximation` field](#why-there-is-no-approximation-field).
 
-Each record in `results` (`symbol_rank_json`, `crates/cgx-mcp/src/tools.rs:946`):
+Each record in `results` (`SymbolRankRow`, `crates/cgx-mcp/src/output.rs`):
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -60,7 +60,7 @@ Each record in `results` (`symbol_rank_json`, `crates/cgx-mcp/src/tools.rs:946`)
 | `inbound` | object | Breakdown of the inbound edges. |
 | `outbound` | object | Breakdown of the outbound edges. |
 
-Each breakdown (`breakdown_json`, `crates/cgx-mcp/src/tools.rs:959`):
+Each breakdown (`EdgeBreakdown`, `crates/cgx-mcp/src/output.rs`):
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -200,7 +200,7 @@ so they do not all occur on every execution.
 ### Why there is no `approximation` field
 
 `symbols`, [search](search.md) and [explain](explain.md) are the three tools that
-do not pass through `with_contract` (`crates/cgx-mcp/src/tools.rs:549-577`). The
+have no `approximation` field in their output types (`crates/cgx-mcp/src/output.rs`). The
 approximation contract describes how a **traversal** can be wrong — an
 over-approximated candidate set on a walked edge, or a frontier the walk could not
 follow. `symbols` performs no traversal: it tallies edges that are already in the

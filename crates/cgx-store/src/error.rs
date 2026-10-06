@@ -6,6 +6,7 @@ use cgx_core::codec::CodecError;
 #[derive(Debug)]
 pub enum StoreError {
     /// An underlying SQLite error.
+    #[cfg(not(target_family = "wasm"))]
     Sqlite(rusqlite::Error),
     /// A fragment or graph blob failed to encode/decode (corruption or a codec
     /// mismatch).
@@ -26,6 +27,7 @@ pub enum StoreError {
 impl core::fmt::Display for StoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            #[cfg(not(target_family = "wasm"))]
             StoreError::Sqlite(e) => write!(f, "sqlite error: {e}"),
             StoreError::Codec(e) => write!(f, "codec error: {e}"),
             StoreError::SchemaVersion { found, expected } => write!(
@@ -45,6 +47,7 @@ impl core::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+#[cfg(not(target_family = "wasm"))]
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         StoreError::Sqlite(e)

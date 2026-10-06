@@ -31,21 +31,37 @@
 //! WAL gives readers MVCC snapshots; writers take an advisory [`lock::WriteLock`]
 //! (IX-7) and use the check → lock → re-check pattern.
 
+//!
+//! ## Targets
+//!
+//! On `wasm32` only the [`FactStore`] contract and the storage types are built:
+//! the SQLite and object-store backends depend on advisory file locking, which
+//! WASI does not provide, and a wasm embedding's host owns persistence.
+
 pub mod error;
+pub mod fact_store;
+#[cfg(not(target_family = "wasm"))]
 pub mod lock;
 pub mod manifest;
+#[cfg(not(target_family = "wasm"))]
 pub mod object_store;
 pub mod oid;
 pub mod schema;
+#[cfg(not(target_family = "wasm"))]
 pub mod store;
 pub mod types;
 
+#[cfg(not(target_family = "wasm"))]
 mod token;
 
 pub use error::{Result, StoreError};
+pub use fact_store::{FactStore, FragmentInput};
+#[cfg(not(target_family = "wasm"))]
 pub use lock::WriteLock;
+#[cfg(not(target_family = "wasm"))]
 pub use object_store::ObjectStore;
 pub use oid::ObjectOid;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};
-pub use store::{FactStore, FragmentInput, SqliteStore};
+#[cfg(not(target_family = "wasm"))]
+pub use store::SqliteStore;
 pub use types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};

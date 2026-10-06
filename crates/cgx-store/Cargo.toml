@@ -11,9 +11,13 @@ description = "cgx persistence layer: SQLite (rusqlite, bundled, WAL) store for 
 cgx-core = { path = "../cgx-core" }
 serde.workspace = true
 postcard.workspace = true
+sha1 = "0.10"
+
+# The SQLite and object-store backends and their advisory locking are native-only;
+# see the crate docs ("Targets").
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 fd-lock = "4"
-sha1 = "0.10"
 
 [dev-dependencies]
 proptest.workspace = true

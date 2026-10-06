@@ -7,6 +7,7 @@
 //! (WP-06) consumes the fragments. No frontend ever sees the store or git.
 
 use crate::facts::FileFacts;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A source-language tag.
@@ -54,7 +55,7 @@ impl fmt::Display for Lang {
 /// A repo-relative source path. A thin newtype over a `String` so the trait
 /// surface is explicit about *which* path flavour `handles` inspects (always
 /// repo-relative, `/`-separated, never absolute).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RelPath(String);
 
 impl RelPath {
@@ -86,7 +87,7 @@ impl fmt::Display for RelPath {
 }
 
 /// The kind of build manifest a [`ManifestInfo`] was resolved from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ManifestKind {
     /// Rust `Cargo.toml`.
     Cargo,
@@ -105,7 +106,7 @@ pub enum ManifestKind {
 ///
 /// Behaviour-neutral until an adapter reads it: carried alongside the legacy
 /// [`FileCtx::package`] field, which Rust keeps consuming unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestInfo {
     /// Which manifest kind this came from.
     pub kind: ManifestKind,
@@ -129,7 +130,10 @@ pub struct ManifestInfo {
 /// off the path — e.g. a `src/`-at-root single-crate layout), and the resolved
 /// manifest facts ([`ManifestInfo`]) for adapters whose canonical root is a
 /// manifest-declared identity.
-#[derive(Debug, Clone)]
+///
+/// Serializable so a planner and an extractor in different processes or wasm
+/// instances can hand it across (postcard, opaque to the carrier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCtx {
     /// Repo-relative path of the file being extracted.
     pub path: RelPath,

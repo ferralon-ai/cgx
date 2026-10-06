@@ -1,0 +1,18 @@
+[package]
+name = "cgx-wasm"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "cgx engine as a wasm32-wasip1 reactor module. Currently a link stub proving the full engine (extraction for every language, link, post-link passes, query) builds and links for wasm; the host-facing exports come later."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cgx-core.workspace = true
+cgx-index = { path = "../cgx-index" }
+cgx-query = { path = "../cgx-query" }
+cgx-store = { path = "../cgx-store" }

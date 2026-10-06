@@ -105,4 +105,16 @@ impl LinkedGraph {
             candidates,
         }
     }
+
+    /// Put the graph in the order [`ObjectStore`](crate::ObjectStore) reads it
+    /// back: nodes by id, edges by id, candidates by `(group, rank, dst)`. Ids are
+    /// dense and unique, so this is a total order. A caller holding a freshly
+    /// linked graph uses it to get the same in-memory graph a later read of the
+    /// store returns.
+    pub fn canonical_order(&mut self) {
+        self.nodes.sort_by_key(|n| n.id.0);
+        self.edges.sort_by_key(|e| e.id.0);
+        self.candidates
+            .sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+    }
 }

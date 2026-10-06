@@ -349,28 +349,25 @@ impl FactStore for ObjectStore {
             nodes.extend(shard.nodes);
             edges.extend(shard.edges);
         }
-        // Reconstruct the exact flat order SQLite returns: nodes by node_id, edges
-        // by edge_id (dense + unique, so a sort is a total reconstruction).
-        nodes.sort_by_key(|n| n.id.0);
-        edges.sort_by_key(|e| e.id.0);
 
         let candidates = match &manifest.candidates {
             None => Vec::new(),
             Some(oid) => {
-                let mut cands =
-                    decode::<Vec<Candidate>>(&fs::read(oid.object_path(&self.objects_dir))?)?;
-                // Defensive re-sort on read (D2 / recon §F.12.5): match SQLite's
-                // `ORDER BY candidate_group, rank, dst` byte-for-byte.
-                cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
-                cands
+                decode::<Vec<Candidate>>(&fs::read(oid.object_path(&self.objects_dir))?)?
             }
         };
 
-        Ok(LinkedGraph {
+        // Reconstruct the exact flat order SQLite returns: nodes by node_id, edges
+        // by edge_id (dense + unique, so a sort is a total reconstruction), and a
+        // defensive re-sort of candidates (D2 / recon §F.12.5) to match SQLite's
+        // `ORDER BY candidate_group, rank, dst` byte-for-byte.
+        let mut graph = LinkedGraph {
             nodes,
             edges,
             candidates,
-        })
+        };
+        graph.canonical_order();
+        Ok(graph)
     }
 
     fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats> {

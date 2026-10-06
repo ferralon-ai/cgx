@@ -54,7 +54,7 @@ There is no `kind` or `edge_condition` filter: the edge scope is fixed to
 | `dirty_files_analyzed` | integer | How many paths the overlay fed the indexer differently from `HEAD`. |
 | `freshness` | object | Index-freshness envelope: `indexed_tree`, `head_tree`, `matches_head`, `dirty_files`, `dirty_files_base`, `stale`. |
 
-Each record in `results` (`neighbor_json`, `crates/cgx-mcp/src/tools.rs:499`) is
+Each record in `results` (`NeighborRow`, `crates/cgx-mcp/src/output.rs`) is
 the same shape `callers`/`callees` return:
 
 | Field | Type | Meaning |

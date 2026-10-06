@@ -65,6 +65,150 @@
       ],
       "type": "object"
     },
+    "CalleesInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "default": 1,
+          "type": "integer"
+        },
+        "edge_condition": {
+          "enum": [
+            "always",
+            "conditional",
+            "exception",
+            "loop",
+            "panic"
+          ],
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Restrict traversal to these call-family edge kinds (default: all call edges)",
+          "items": {
+            "enum": [
+              "calls",
+              "calls_virtual",
+              "calls_closure",
+              "calls_callback",
+              "calls_async",
+              "calls_indirect",
+              "spawns"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_candidates": {
+          "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
+    "CallersInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "default": 1,
+          "type": "integer"
+        },
+        "edge_condition": {
+          "enum": [
+            "always",
+            "conditional",
+            "exception",
+            "loop",
+            "panic"
+          ],
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Restrict traversal to these call-family edge kinds (default: all call edges)",
+          "items": {
+            "enum": [
+              "calls",
+              "calls_virtual",
+              "calls_closure",
+              "calls_callback",
+              "calls_async",
+              "calls_indirect",
+              "spawns"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_candidates": {
+          "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
     "Confidence": {
       "description": "How sure `cgx` is of an edge's target (GM-5.1).\n\nDiscriminants ascend with certainty so the derived `Ord` answers \"is this at\nleast `probable`?\" via `>=`, and so that \"the weakest confidence of any\ncontributing fact\" (GM-1.3 node confidence) is a plain `min`.",
       "enum": [
@@ -73,6 +217,40 @@
         "certain"
       ],
       "type": "string"
+    },
+    "CouplingInput": {
+      "properties": {
+        "base": {
+          "description": "Range start, exclusive (rev/ref/SHA)",
+          "type": "string"
+        },
+        "head": {
+          "description": "Range end, inclusive (rev/ref/SHA)",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "type": "integer"
+        },
+        "max_files_per_commit": {
+          "default": 50,
+          "type": "integer"
+        },
+        "min_cochanges": {
+          "default": 2,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root",
+        "base",
+        "head"
+      ],
+      "type": "object"
     },
     "CouplingPair": {
       "description": "One co-changed file pair. Every number here is a raw count of commits; the\nanswer contains no derived, weighted, or fused quantity. `support` is\n`cochanges / commits_considered` and `confidence` is `cochanges / changes_a` —\nboth inputs of both are emitted, so a caller that wants a ratio computes it\nand owns its definition.",
@@ -252,7 +430,7 @@
           "type": "array"
         }
       ],
-      "description": "One cell of a `graph_query` table row. Untagged: the JSON type selects the\nvariant, and a bound path renders as an array of FQN strings."
+      "description": "One cell of a `graph_query` table row, untagged. The JSON value alone does\nnot always identify the variant: `Int` and `Float` are both JSON numbers\n(every integer also matches `Float`), and a bound path renders as an array\nof FQN strings, the same JSON as a `List` of `Str`. Decode cells lazily (Go:\n`json.RawMessage`, numbers via `json.Number`) and use the query's own\n`RETURN` clause to know which column is a path."
     },
     "CqlEdge": {
       "description": "A bound relationship in a `graph_query` cell.",
@@ -466,6 +644,26 @@
       ],
       "type": "object"
     },
+    "ExplainInput": {
+      "properties": {
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "root": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
     "ExplainOutput": {
       "description": "`explain`. Carries no `approximation`: it performs no traversal.",
       "properties": {
@@ -537,6 +735,88 @@
       ],
       "type": "object"
     },
+    "FlowsFromInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "default": 2,
+          "type": "integer"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
+    "FlowsToInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "default": 2,
+          "type": "integer"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
     "FreshnessEnvelope": {
       "description": "How far the indexed state is from the working state (no wall-clock: this is\ndivergence, not age).\n\nConstruct with [`FreshnessEnvelope::new`] — [`stale`](Self::stale) and\n[`matches_head`](Self::matches_head) are *derived* there and are never sourced\nindependently, so the one-glance boolean cannot drift from the facts under it.",
       "properties": {
@@ -592,8 +872,37 @@
       ],
       "type": "object"
     },
+    "GraphQueryInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Cypher-subset query expression",
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "root"
+      ],
+      "type": "object"
+    },
     "GraphQueryOutput": {
-      "anyOf": [
+      "description": "`graph_query`: the paths channel (`paths` present) or the table channel\n(`rows` present).",
+      "oneOf": [
         {
           "$ref": "#/$defs/GraphQueryPathsOutput"
         },
@@ -601,11 +910,10 @@
           "$ref": "#/$defs/GraphQueryTableOutput"
         }
       ],
-      "description": "`graph_query`: the paths channel (`paths` present) or the table channel\n(`rows` present).",
       "type": "object"
     },
     "GraphQueryPathsOutput": {
-      "description": "`graph_query` whose `RETURN` binds a path: the `paths`-tool row shape.",
+      "description": "`graph_query` whose `RETURN` binds a path: the `paths`-tool row shape. Told\napart from [`GraphQueryTableOutput`] by the `paths` key.",
       "properties": {
         "approximation": {
           "$ref": "#/$defs/ApproximationContract"
@@ -688,7 +996,7 @@
       "type": "object"
     },
     "GraphQueryTableOutput": {
-      "description": "`graph_query` with a tabular `RETURN`.",
+      "description": "`graph_query` with a tabular `RETURN`. Told apart from\n[`GraphQueryPathsOutput`] by the `rows` key.",
       "properties": {
         "approximation": {
           "$ref": "#/$defs/ApproximationContract"
@@ -836,6 +1144,55 @@
         "exception_transient",
         "reached_change",
         "via_containment_lift"
+      ],
+      "type": "object"
+    },
+    "ImpactedTestsInput": {
+      "properties": {
+        "base": {
+          "description": "Base git ref. Omit to compare the working tree against HEAD.",
+          "type": "string"
+        },
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "description": "Max traversal depth from each changed symbol; omit for unbounded",
+          "type": "integer"
+        },
+        "head": {
+          "description": "Head git ref (default: HEAD). Used only when `base` is given and `include_dirty` is false.",
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "merge_base": {
+          "default": true,
+          "description": "Compare against the merge-base of base and head rather than the base ref's tip",
+          "type": "boolean"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
       ],
       "type": "object"
     },
@@ -1169,6 +1526,74 @@
       ],
       "type": "object"
     },
+    "PathsInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "exclude_edge_condition": {
+          "enum": [
+            "always",
+            "conditional",
+            "exception",
+            "loop",
+            "panic"
+          ],
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_candidates": {
+          "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_depth": {
+          "default": 10,
+          "type": "integer"
+        },
+        "max_results": {
+          "default": 10,
+          "type": "integer"
+        },
+        "only_edge_condition": {
+          "enum": [
+            "always",
+            "conditional",
+            "exception",
+            "loop",
+            "panic"
+          ],
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "root"
+      ],
+      "type": "object"
+    },
     "PathsOutput": {
       "description": "`paths`.",
       "properties": {
@@ -1257,8 +1682,60 @@
       ],
       "type": "object"
     },
+    "ReachesInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "depth": {
+          "default": 2,
+          "description": "Max traversal depth (from→* form)",
+          "type": "integer"
+        },
+        "from": {
+          "description": "Source symbol (qualified name)",
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "max_candidates": {
+          "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        },
+        "to": {
+          "description": "Optional target symbol; omit for the from→* reachable set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "root"
+      ],
+      "type": "object"
+    },
     "ReachesOutput": {
-      "anyOf": [
+      "description": "`reaches`: the pair form when `to` was given (`reachable` present), the set\nform otherwise (`results` present).",
+      "oneOf": [
         {
           "$ref": "#/$defs/ReachesPairOutput"
         },
@@ -1266,11 +1743,10 @@
           "$ref": "#/$defs/ReachesSetOutput"
         }
       ],
-      "description": "`reaches`: the pair form when `to` was given (`reachable` present), the set\nform otherwise (`results` present).",
       "type": "object"
     },
     "ReachesPairOutput": {
-      "description": "`reaches` with `to`: one reachability verdict and its witness.",
+      "description": "`reaches` with `to`: one reachability verdict and its witness. Told apart\nfrom [`ReachesSetOutput`] by the `reachable` key.",
       "properties": {
         "approximation": {
           "$ref": "#/$defs/ApproximationContract"
@@ -1330,7 +1806,7 @@
       "type": "object"
     },
     "ReachesSetOutput": {
-      "description": "`reaches` without `to`: every symbol `from` reaches.",
+      "description": "`reaches` without `to`: every symbol `from` reaches. Told apart from\n[`ReachesPairOutput`] by the `results` key.",
       "properties": {
         "approximation": {
           "$ref": "#/$defs/ApproximationContract"
@@ -1402,6 +1878,56 @@
         "under"
       ],
       "type": "string"
+    },
+    "SearchInput": {
+      "properties": {
+        "all": {
+          "default": false,
+          "description": "List every symbol (mutually exclusive with `pattern`)",
+          "type": "boolean"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "kind": {
+          "default": "all",
+          "enum": [
+            "function",
+            "method",
+            "field",
+            "type",
+            "module",
+            "all"
+          ],
+          "type": "string"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "pattern": {
+          "description": "Name predicate over the whole FQN (case-insensitive substring, or regex when `regex` is true)",
+          "type": "string"
+        },
+        "regex": {
+          "default": false,
+          "description": "Treat `pattern` as an unanchored regex",
+          "type": "boolean"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
     },
     "SearchOutput": {
       "description": "`search`. Carries no `approximation`: it is a node-table scan.",
@@ -1580,6 +2106,51 @@
       ],
       "type": "object"
     },
+    "SymbolsInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "kind": {
+          "default": "all",
+          "enum": [
+            "function",
+            "method",
+            "field",
+            "type",
+            "module",
+            "all"
+          ],
+          "type": "string"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "rank": {
+          "default": "total",
+          "enum": [
+            "total",
+            "inbound",
+            "outbound"
+          ],
+          "type": "string"
+        },
+        "root": {
+          "description": "Repository root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
     "SymbolsOutput": {
       "description": "`symbols`. Carries no `approximation`: it is a degree aggregate.",
       "properties": {
@@ -1655,6 +2226,42 @@
         "path-cap"
       ],
       "type": "string"
+    },
+    "UnusedInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "entrypoint": {
+          "type": "string"
+        },
+        "include_dirty": {
+          "default": true,
+          "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted",
+          "type": "boolean"
+        },
+        "kind": {
+          "default": "all",
+          "enum": [
+            "function",
+            "method",
+            "field",
+            "all"
+          ],
+          "type": "string"
+        },
+        "max_results": {
+          "default": 20,
+          "type": "integer"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
     },
     "UnusedOutput": {
       "description": "`unused`.",
@@ -1749,48 +2356,204 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "structuredContent of every cgx MCP tool: property name = tool name, value = that tool's output type.",
+  "description": "Request arguments and structuredContent of every cgx MCP tool: property name = tool name, value = { input: that tool's inputSchema, output: its outputSchema }.",
   "properties": {
     "callees": {
-      "$ref": "#/$defs/NeighborOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CalleesInput"
+        },
+        "output": {
+          "$ref": "#/$defs/NeighborOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "callers": {
-      "$ref": "#/$defs/NeighborOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CallersInput"
+        },
+        "output": {
+          "$ref": "#/$defs/NeighborOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "coupling": {
-      "$ref": "#/$defs/CouplingReport"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CouplingInput"
+        },
+        "output": {
+          "$ref": "#/$defs/CouplingReport"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "explain": {
-      "$ref": "#/$defs/ExplainOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ExplainInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ExplainOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "flows_from": {
-      "$ref": "#/$defs/NeighborOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FlowsFromInput"
+        },
+        "output": {
+          "$ref": "#/$defs/NeighborOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "flows_to": {
-      "$ref": "#/$defs/NeighborOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FlowsToInput"
+        },
+        "output": {
+          "$ref": "#/$defs/NeighborOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "graph_query": {
-      "$ref": "#/$defs/GraphQueryOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/GraphQueryInput"
+        },
+        "output": {
+          "$ref": "#/$defs/GraphQueryOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "impacted_tests": {
-      "$ref": "#/$defs/ImpactedTestsOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ImpactedTestsInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ImpactedTestsOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "paths": {
-      "$ref": "#/$defs/PathsOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/PathsInput"
+        },
+        "output": {
+          "$ref": "#/$defs/PathsOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "reaches": {
-      "$ref": "#/$defs/ReachesOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ReachesInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ReachesOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "search": {
-      "$ref": "#/$defs/SearchOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/SearchInput"
+        },
+        "output": {
+          "$ref": "#/$defs/SearchOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "symbols": {
-      "$ref": "#/$defs/SymbolsOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/SymbolsInput"
+        },
+        "output": {
+          "$ref": "#/$defs/SymbolsOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     },
     "unused": {
-      "$ref": "#/$defs/UnusedOutput"
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/UnusedInput"
+        },
+        "output": {
+          "$ref": "#/$defs/UnusedOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
     }
   },
-  "title": "cgx MCP tool outputs",
+  "title": "cgx MCP tools",
   "type": "object"
 }

@@ -482,8 +482,9 @@ enum Command {
         /// server imposes no boundary.
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Print the JSON Schema of every tool's `structuredContent` (one
-        /// document, `$defs` keyed by type name) and exit instead of serving.
+        /// Print the JSON Schema of every tool's arguments and
+        /// `structuredContent` (one document, `$defs` keyed by type name) and
+        /// exit instead of serving.
         #[arg(long, conflicts_with = "root")]
         print_schemas: bool,
     },

@@ -384,7 +384,7 @@ Neither is universal, which is itself part of the contract: see the coverage tab
 [14 — Implementation Status Matrix](14-implementation-status-matrix.md) for exactly which
 surfaces carry which, and [09 — Architecture](09-architecture.md) AR-13 for the mechanism.
 
-**Not shipped:** `resource_link` responses for large result sets; `outputSchema` declarations;
+**Not shipped:** `resource_link` responses for large result sets;
 MCP prompts (`prompts/list` returns `method not found`); resource subscriptions and
 `notifications/resources/updated`; a `max_tokens` bound on `graph_query`. The `max_results`
 cap of 200 is not enforced — only the default of 20 exists.

@@ -137,10 +137,9 @@ Every MCP answer carries session metadata beside the result. Two fields decide w
 is safe to act on, and both are easy to parse past.
 
 **`approximation` — which direction this answer can be wrong in.** Present on 9 of the 12 tools;
-`explain`, `search` and `symbols` skip it by design (`with_contract` vs `with_session_meta`,
-`with_contract` at `tools.rs:553`, `with_session_meta` at `tools.rs:575` — `with_session_meta` is
-the one function every graph-backed tool's response passes through, which is why `freshness` has the
-wider coverage of the two). Shape:
+`explain`, `search` and `symbols` omit it by design (their output types in
+`crates/cgx-mcp/src/output.rs` have no `approximation` field, while every graph-backed output type
+flattens in `SessionMeta`, which is why `freshness` has the wider coverage of the two). Shape:
 
 ```json
 "approximation": {

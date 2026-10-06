@@ -176,6 +176,75 @@ pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     out
 }
 
+/// Whether [`plan`] reads the content of the source at `path`. Every other
+/// source's `content` is ignored by planning, so a host that supplies sources
+/// itself sends content only for these paths and may leave the rest empty.
+pub fn is_manifest_path(path: &str) -> bool {
+    crate::cargo_pkg::is_cargo_manifest(path)
+}
+
+/// Pass 1 of [`extract_and_link`]: probe the store's Layer-1 fragment cache for
+/// every planned file. Hits are decoded into prepared facts and counted in
+/// `stats.blobs_cached`; misses are returned for extraction.
+///
+/// This is the single implementation of the cache probe: every driver of the
+/// pipeline stages (the native composition and a host-driven one) calls it, so a
+/// change to what counts as a usable hit applies to all of them.
+pub fn probe_fragments<'p, S: FactStore>(
+    plan: &'p Plan,
+    store: &S,
+    stats: &mut IndexStats,
+) -> Result<(Vec<PreparedFile>, Vec<&'p PlannedFile>)> {
+    use cgx_core::codec::decode;
+    use cgx_store::BlobOid;
+
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut misses: Vec<&PlannedFile> = Vec::new();
+    for file in &plan.files {
+        let blob = BlobOid::new(file.ctx.blob_oid.clone());
+        match store.fragment(&blob)? {
+            Some(cached) => {
+                let facts: FileFacts = decode(&cached.fragment)?;
+                stats.blobs_cached += 1;
+                prepared.push(PreparedFile {
+                    blob_oid: file.ctx.blob_oid.clone(),
+                    rel_path: file.ctx.path.as_str().to_string(),
+                    lang: file.lang.clone(),
+                    facts,
+                });
+            }
+            None => misses.push(file),
+        }
+    }
+    Ok((prepared, misses))
+}
+
+/// Write freshly extracted fragments to the store's Layer-1 cache in one batch.
+/// A no-op for an empty slice.
+pub fn put_extracted<S: FactStore>(store: &mut S, extracted: &[ExtractedFile]) -> Result<()> {
+    use cgx_store::{BlobOid, FragmentInput};
+
+    if extracted.is_empty() {
+        return Ok(());
+    }
+    let blob_oids: Vec<BlobOid> = extracted
+        .iter()
+        .map(|e| BlobOid::new(e.prepared.blob_oid.clone()))
+        .collect();
+    let batch: Vec<FragmentInput<'_>> = extracted
+        .iter()
+        .zip(&blob_oids)
+        .map(|(e, blob)| FragmentInput {
+            blob,
+            lang: &e.prepared.lang,
+            frontend_version: e.fragment_version,
+            bytes: &e.fragment,
+        })
+        .collect();
+    store.put_fragments(&batch)?;
+    Ok(())
+}
+
 /// Stage 2 of [`extract_and_link`]: extract one file's facts and encode its
 /// Layer-1 fragment. Pure per-file work with no store or git access, so callers
 /// may run it in parallel or on another host.
@@ -283,14 +352,12 @@ pub fn link_prepared<S: FactStore>(
 /// The composition of [`plan`], [`extract_one`] and [`link_prepared`] around the
 /// store's Layer-1 fragment cache.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn extract_and_link<S: FactStore>(
+pub fn extract_and_link<S: FactStore>(
     sources: &[SourceFile],
     registry: &FrontendRegistry,
     store: &mut S,
     opts: &IndexOpts,
 ) -> Result<(ResolvedGraph, IndexStats)> {
-    use cgx_core::codec::decode;
-    use cgx_store::{BlobOid, FragmentInput};
     use rayon::prelude::*;
 
     let mut stats = IndexStats::default();
@@ -298,27 +365,10 @@ pub(crate) fn extract_and_link<S: FactStore>(
     let plan = plan(sources, registry);
     stats.blobs_unsupported = plan.unsupported;
 
-    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
-    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
+    // Pass 1 (sequential, cheap store reads): partition into cache hits (decoded
+    // now) and misses (extracted in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
-    let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<&PlannedFile> = Vec::new();
-    for file in &plan.files {
-        let blob = BlobOid::new(file.ctx.blob_oid.clone());
-        match store.fragment(&blob)? {
-            Some(cached) => {
-                let facts: FileFacts = decode(&cached.fragment)?;
-                stats.blobs_cached += 1;
-                prepared.push(PreparedFile {
-                    blob_oid: file.ctx.blob_oid.clone(),
-                    rel_path: file.ctx.path.as_str().to_string(),
-                    lang: file.lang.clone(),
-                    facts,
-                });
-            }
-            None => misses.push(file),
-        }
-    }
+    let (mut prepared, misses) = probe_fragments(&plan, store, &mut stats)?;
 
     // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
     // store/git access — the blob-OID independence that makes Layer-1 cacheable
@@ -330,23 +380,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
     stats.blobs_extracted = extracted.len();
 
     // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let blob_oids: Vec<BlobOid> = extracted
-            .iter()
-            .map(|e| BlobOid::new(e.prepared.blob_oid.clone()))
-            .collect();
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .zip(&blob_oids)
-            .map(|(e, blob)| FragmentInput {
-                blob,
-                lang: &e.prepared.lang,
-                frontend_version: e.fragment_version,
-                bytes: &e.fragment,
-            })
-            .collect();
-        store.put_fragments(&batch)?;
-    }
+    put_extracted(store, &extracted)?;
     prepared.extend(extracted.into_iter().map(|e| e.prepared));
 
     let graph = link_prepared(prepared, store, opts, &mut stats)?;
@@ -368,11 +402,28 @@ pub fn apply_scip(
     let bytes = read_scip(scip_path)?;
     let resolver = ScipResolver::from_bytes(&bytes)
         .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
-    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    relabel_scip(graph, stats, &resolver);
+    Ok(())
+}
+
+/// [`apply_scip`] over the bytes of a `.scip` index rather than a path, for a
+/// caller with no filesystem access to it (a wasm guest whose host read the file).
+pub fn apply_scip_bytes(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    bytes: &[u8],
+) -> Result<()> {
+    let resolver = ScipResolver::from_bytes(bytes)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index: {e}")))?;
+    relabel_scip(graph, stats, &resolver);
+    Ok(())
+}
+
+fn relabel_scip(graph: &mut ResolvedGraph, stats: &mut IndexStats, resolver: &ScipResolver) {
+    let scip_stats = scip_relabel::relabel(graph, resolver, &scip_relabel::ScipRelabelOpts::default());
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
     stats.scip = Some(scip_stats);
-    Ok(())
 }
 
 fn read_scip(path: &Path) -> Result<Vec<u8>> {

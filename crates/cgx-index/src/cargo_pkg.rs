@@ -76,7 +76,7 @@ impl PackageMap {
 }
 
 /// Whether `path` is a Cargo manifest (`Cargo.toml`, at any depth).
-fn is_cargo_manifest(path: &str) -> bool {
+pub(crate) fn is_cargo_manifest(path: &str) -> bool {
     path == "Cargo.toml" || path.ends_with("/Cargo.toml")
 }
 

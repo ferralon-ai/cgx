@@ -12,6 +12,7 @@
 //! This is ADR-03: most-semantically-significant wins, so that exceptional-class
 //! membership (GM-4) survives whenever *any* enclosing construct is exceptional.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The runtime condition under which a call edge is taken (GM-3).
@@ -19,7 +20,9 @@ use serde::{Deserialize, Serialize};
 /// The five-value set is frozen. The discriminant values are assigned in
 /// ascending precedence order so that [`EdgeCondition::max`] is a plain integer
 /// comparison and the derived `Ord` matches the ADR-03 precedence total order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum EdgeCondition {

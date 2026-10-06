@@ -4,6 +4,7 @@
 //! probabilistic score. It correlates with the resolution [`Tier`] that produced
 //! the edge.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// How sure `cgx` is of an edge's target (GM-5.1).
@@ -11,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// Discriminants ascend with certainty so the derived `Ord` answers "is this at
 /// least `probable`?" via `>=`, and so that "the weakest confidence of any
 /// contributing fact" (GM-1.3 node confidence) is a plain `min`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Confidence {
@@ -47,7 +50,9 @@ impl Confidence {
 /// The ladder is strictly narrowing; each tier emits a confidence band. Phase 1
 /// ships tiers 0–1; tiers 2–4 are reserved so the schema does not change when
 /// SCIP/CHA/points-to enrichment lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Tier {

@@ -34,6 +34,7 @@
 use std::collections::BTreeMap;
 
 use cgx_core::{Confidence, CutMarker, EdgeKind};
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::filter::{ConditionFilter, Direction, EdgeFilter};
@@ -44,7 +45,7 @@ use cgx_core::NodeId;
 
 /// The direction an answer can be wrong (GM-5 assertion-honesty). The fold of the
 /// per-reason directions: no reasons ⇒ [`Exact`](ApproxDirection::Exact).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApproxDirection {
     /// The traversed subgraph is fully `certain` and cut-marker-free and no
@@ -61,7 +62,7 @@ pub enum ApproxDirection {
 }
 
 /// Which way a single [`ApproxReason`] pushes the answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonDirection {
     Over,
@@ -71,7 +72,7 @@ pub enum ReasonDirection {
 /// One machine-readable reason contributing to the [`ApproxDirection`]. `code` is
 /// a stable kebab-case token a CI consumer can match on; `detail` is a compact
 /// human phrase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ApproxReason {
     pub direction: ReasonDirection,
     pub code: &'static str,
@@ -82,7 +83,7 @@ pub struct ApproxReason {
 /// can gate on the negative claim instead of trusting a bare "no". The
 /// invalidators ("what could make this negative wrong") are the `under`-direction
 /// entries in the contract's `reasons`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct NegativeScope {
     /// The edge kinds the search followed. The call family is spelled out so the
     /// claim is self-describing.
@@ -108,7 +109,7 @@ external/unindexed callees, undescended closure bodies, and unexpanded macros ar
 outside the modeled graph";
 
 /// The per-answer approximation contract attached to every query answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ApproximationContract {
     pub direction: ApproxDirection,
     pub reasons: Vec<ApproxReason>,

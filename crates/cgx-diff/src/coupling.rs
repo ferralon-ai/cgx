@@ -81,7 +81,7 @@ impl Default for CouplingOptions {
 /// `cochanges / commits_considered` and `confidence` is `cochanges / changes_a` —
 /// both inputs of both are emitted, so a caller that wants a ratio computes it
 /// and owns its definition.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CouplingPair {
     /// The smaller of the pair's two paths ordered on **path bytes**, rendered
     /// lossily as UTF-8.
@@ -106,7 +106,7 @@ pub struct CouplingPair {
 
 /// The answer envelope: what was asked, what was walked, the knobs, the pairs,
 /// and the approximation contract.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CouplingReport {
     /// The base revspec as the caller typed it.
     pub base_rev: String,

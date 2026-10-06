@@ -40,7 +40,9 @@ use tree_sitter::{Language, Node, Parser};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 2;
+/// v3: FQN root is now the verbatim `package.json` `name` (plus subpath) instead
+/// of the mangled dir-before-`src/`, so v2 fragments may carry stale roots.
+const TS_FRAGMENT_VERSION: u32 = 3;
 
 /// The TypeScript/JavaScript language frontend.
 ///

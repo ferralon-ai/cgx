@@ -22,6 +22,8 @@
 use std::collections::VecDeque;
 
 use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeRecord, NodeId};
+use schemars::JsonSchema;
+use serde::Serialize;
 
 use crate::filter::{Direction, EdgeFilter};
 use crate::view::GraphView;
@@ -44,7 +46,8 @@ pub const DEFAULT_MAX_STEPS: u64 = 2_000_000;
 /// `None` (absent) means the enumeration was complete; a value names which bound
 /// it hit. Mirrors the [`cgx_core::CutMarker`] honesty idiom: a budget cutoff is a
 /// surfaced fact, never a silent drop and never an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub enum TruncationReason {
     /// The work budget ([`PathWalker::max_steps`]) was exhausted before the search
     /// tree was fully explored — there may be paths the walk never reached.
@@ -529,4 +532,17 @@ fn reconstruct(
     debug_assert_eq!(rev.last().map(|(n, _)| *n), Some(start));
     rev.reverse();
     rev
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TruncationReason;
+
+    /// The CLI renders `token()`; MCP serializes the enum. Both must spell it the same.
+    #[test]
+    fn truncation_token_matches_its_serialized_form() {
+        for r in [TruncationReason::StepBudget, TruncationReason::PathCap] {
+            assert_eq!(serde_json::to_value(r).unwrap(), r.token());
+        }
+    }
 }

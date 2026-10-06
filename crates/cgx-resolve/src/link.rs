@@ -258,6 +258,40 @@ fn resolve_ref(
     };
     let virtual_receiver = matches!(raw.kind, RefKind::CallVirtualReceiver);
 
+    // --- Step 0a: pinned closure call. The frontend proved the callee binding
+    // is immutable, unshadowed, and in scope, so the single closure definition
+    // it names is the only value that can reach the call: bind it lexically,
+    // like Step 1. If the definition cannot be found, or its FQN is shared with
+    // another node (two `const f` in sibling anonymous scopes both get the
+    // owner's FQN), fall through to the indirect placeholder rather than guess.
+    if raw.kind == RefKind::CallPinnedClosure && raw.name_path.len() == 1 {
+        if let Some(local) = resolve_pinned_closure(scopes, defs, raw.scope, last) {
+            let mut same_fqn = table
+                .defs_by_short(last)
+                .iter()
+                .filter(|d| d.fqn == local.fqn);
+            if let (Some(target), None) = (same_fqn.next(), same_fqn.next()) {
+                let id = target.node_id;
+                push_edge(
+                    edges,
+                    EdgeBuild {
+                        src: caller_id,
+                        dst: id,
+                        kind: edge_kind(raw.kind, false),
+                        confidence: Confidence::Certain,
+                        tier: Tier::ScopeGraph,
+                        rule: "scope-ref",
+                        raw,
+                        caller_fqn: &caller.fqn,
+                        span: &span,
+                        candidate_group: None,
+                    },
+                );
+                return;
+            }
+        }
+    }
+
     // --- Step 0: indirect call through a function value (closure / fn-pointer /
     // callback). These cannot be bound to a single target by name: the value that
     // flows to the call site is not named at the call (`f(x)` where `f` is a
@@ -270,7 +304,10 @@ fn resolve_ref(
     // candidate set over `Lambda` + free `Function` nodes. Arity-less sites encode
     // `indirect:?`. (DF-18 value-flow narrowing — which closure actually flows here
     // — is Phase 3 and explicitly out of scope.)
-    if matches!(raw.kind, RefKind::CallClosure | RefKind::CallCallback) {
+    if matches!(
+        raw.kind,
+        RefKind::CallClosure | RefKind::CallPinnedClosure | RefKind::CallCallback
+    ) {
         let arity_tag = raw.arity.map(|a| a.to_string()).unwrap_or_else(|| "?".to_owned());
         push_edge(
             edges,
@@ -1133,6 +1170,29 @@ fn resolve_local<'a>(
     None
 }
 
+/// Resolve a pinned closure call to its `Lambda` definition: the nearest
+/// enclosing scope that defines a `Lambda` named `name` must define exactly
+/// one. Unlike [`resolve_local`], non-`Lambda` defs of the same short name are
+/// passed over (a class member `C::f` is not a lexical binding of `f`), and two
+/// same-named lambdas in one scope (sibling blocks share a scope here) are
+/// ambiguous, so the call is left to the indirect fallback.
+fn resolve_pinned_closure<'a>(
+    scopes: &ScopeTree,
+    defs: &'a [SymbolDef],
+    scope: ScopeId,
+    name: &str,
+) -> Option<&'a SymbolDef> {
+    for sid in scopes.ancestors(scope) {
+        let mut hits = defs.iter().filter(|d| {
+            d.scope == sid && d.kind == SymbolKind::Lambda && short_name(&d.fqn) == name
+        });
+        if let Some(first) = hits.next() {
+            return if hits.next().is_none() { Some(first) } else { None };
+        }
+    }
+    None
+}
+
 /// Find the import binding for a head name visible at `scope` (the binding's
 /// scope must be an ancestor of, or equal to, the ref's scope), or a glob import.
 fn lookup_binding<'a>(
@@ -1201,7 +1261,7 @@ fn edge_kind(kind: RefKind, virtual_dispatch: bool) -> EdgeKind {
                 EdgeKind::Calls
             }
         }
-        RefKind::CallClosure => EdgeKind::CallsClosure,
+        RefKind::CallClosure | RefKind::CallPinnedClosure => EdgeKind::CallsClosure,
         RefKind::CallCallback => EdgeKind::CallsCallback,
         RefKind::CallAsync => EdgeKind::CallsAsync,
         RefKind::Spawn => EdgeKind::Spawns,

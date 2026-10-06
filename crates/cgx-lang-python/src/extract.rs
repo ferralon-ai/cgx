@@ -47,7 +47,10 @@ impl PythonFrontend {
 }
 
 /// Version of the Python extraction rules; bumping invalidates cached fragments.
-const PYTHON_FRAGMENT_VERSION: u32 = 2;
+/// v3: FQN root is now the importable dotted module path below a src/pyproject-aware
+/// import root instead of the literal first path segment, so v2 fragments may carry
+/// stale roots (notably the former `src`-as-root collision).
+const PYTHON_FRAGMENT_VERSION: u32 = 3;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {

@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::pipeline::manifest_kind;
 use crate::source::SourceFile;
 
 /// Maps each crate-source file to the Rust crate identifier of its owning
@@ -43,7 +44,7 @@ impl PackageMap {
     pub(crate) fn from_sources(sources: &[SourceFile]) -> PackageMap {
         let mut by_dir = BTreeMap::new();
         for src in sources {
-            if !is_cargo_manifest(&src.rel_path) {
+            if manifest_kind(&src.rel_path) != Some(CARGO_KIND) {
                 continue;
             }
             let dir = parent_dir(&src.rel_path);
@@ -75,10 +76,10 @@ impl PackageMap {
     }
 }
 
-/// Whether `path` is a Cargo manifest (`Cargo.toml`, at any depth).
-pub(crate) fn is_cargo_manifest(path: &str) -> bool {
-    path == "Cargo.toml" || path.ends_with("/Cargo.toml")
-}
+/// The Cargo manifest's entry in the manifest table
+/// ([`is_manifest_path`](crate::is_manifest_path)): its file name and kind.
+pub(crate) const CARGO_MANIFEST: &str = "Cargo.toml";
+pub(crate) const CARGO_KIND: &str = "cargo";
 
 /// The `/`-separated directory portion of a repo-relative path (`""` for a
 /// root-level file).

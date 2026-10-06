@@ -176,11 +176,34 @@ pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     out
 }
 
-/// Whether [`plan`] reads the content of the source at `path`. Every other
-/// source's `content` is ignored by planning, so a host that supplies sources
-/// itself sends content only for these paths and may leave the rest empty.
+/// The manifest table: each manifest file name (matched against a path's final
+/// segment, at any depth) and the kind of manifest it is, which selects the
+/// resolver that reads it. Extend this table — and only this table — when
+/// planning starts reading another manifest kind.
+const MANIFEST_FILES: &[(&str, &str)] = &[(
+    crate::cargo_pkg::CARGO_MANIFEST,
+    crate::cargo_pkg::CARGO_KIND,
+)];
+
+/// The kind of manifest `path` is (see [`is_manifest_path`]), or `None`.
+pub(crate) fn manifest_kind(path: &str) -> Option<&'static str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    MANIFEST_FILES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .map(|(_, kind)| *kind)
+}
+
+/// Whether `path` is a manifest: **the single manifest-filename predicate in
+/// cgx-index.** Every manifest resolver (today the Cargo package map) selects
+/// its files through it, dispatching on the matched kind, and [`plan`] reads the
+/// content of these sources and of no others, so a host that supplies sources
+/// itself sends content only for these paths and may leave the rest empty. A
+/// resolver that reads a file this predicate rejects would see empty content on
+/// such a host and silently diverge; `tests/manifest_predicate.rs` guards that
+/// over the fixtures.
 pub fn is_manifest_path(path: &str) -> bool {
-    crate::cargo_pkg::is_cargo_manifest(path)
+    manifest_kind(path).is_some()
 }
 
 /// Pass 1 of [`extract_and_link`]: probe the store's Layer-1 fragment cache for

@@ -557,7 +557,8 @@ fn parse_condition(s: &str) -> Result<EdgeCondition, ToolError> {
     }
 }
 
-fn parse_confidence(s: &str) -> Result<Confidence, ToolError> {
+/// Parse a `confidence` floor token (`possible` | `probable` | `certain`).
+pub fn parse_confidence(s: &str) -> Result<Confidence, ToolError> {
     match s {
         "possible" => Ok(Confidence::Possible),
         "probable" => Ok(Confidence::Probable),
@@ -589,7 +590,7 @@ fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
 
 /// Parse the optional `kind` array into a set of call-family [`EdgeKind`]s. `None`
 /// (absent) leaves the default call-family scope; an empty array is also `None`.
-fn parse_edge_kinds(args: &Value) -> Result<Option<Vec<EdgeKind>>, ToolError> {
+pub fn parse_edge_kinds(args: &Value) -> Result<Option<Vec<EdgeKind>>, ToolError> {
     let arr = match args.get("kind") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Array(a)) => a,

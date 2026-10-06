@@ -1478,28 +1478,26 @@ pub(crate) fn remove_edges_at(
 pub fn canonicalize(graph: &mut ResolvedGraph) {
     // Edges: canonical order is (src, dst, kind, stmt_index, candidate_group),
     // matching cgx_core::sort::edge_sort_key. Assign dense ids by position.
-    graph.edges.sort_by(|a, b| {
-        let ka = (
-            a.edge.src.0,
-            a.edge.dst.0,
-            a.edge.kind as u8,
-            a.edge.stmt_index.unwrap_or(u32::MAX),
-            a.edge.candidate_group.unwrap_or(u32::MAX),
-        );
-        let kb = (
-            b.edge.src.0,
-            b.edge.dst.0,
-            b.edge.kind as u8,
-            b.edge.stmt_index.unwrap_or(u32::MAX),
-            b.edge.candidate_group.unwrap_or(u32::MAX),
-        );
-        ka.cmp(&kb)
+    // The key is not total, so the sort must be stable: ties keep their input
+    // order, which is part of the byte-identity contract. `sort_by_cached_key`
+    // is stable and sorts (key, u32 index) pairs, then permutes the edges in
+    // place, instead of a merge sort whose scratch buffer holds half the edges.
+    graph.edges.sort_by_cached_key(|e| {
+        (
+            e.edge.src.0,
+            e.edge.dst.0,
+            e.edge.kind as u8,
+            e.edge.stmt_index.unwrap_or(u32::MAX),
+            e.edge.candidate_group.unwrap_or(u32::MAX),
+        )
     });
     for (i, e) in graph.edges.iter_mut().enumerate() {
         e.edge.id = EdgeId(i as u32);
     }
 
-    graph.candidates.sort_by(|a, b| {
-        (a.candidate_group, a.rank, a.dst.0).cmp(&(b.candidate_group, b.rank, b.dst.0))
-    });
+    // The key covers every field of a candidate, so equal keys are equal rows and
+    // an unstable (allocation-free) sort yields the same sequence.
+    graph
+        .candidates
+        .sort_unstable_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
 }

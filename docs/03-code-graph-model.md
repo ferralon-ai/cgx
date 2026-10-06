@@ -342,9 +342,15 @@ does not silently drop these edges; it emits a cut-marker edge instead:
 | `opaque-call` | The callee's body is not available to the analysis, so its effects and flows are unknown |
 | `truncated-access-path` | A field-access path was cut at the modelled depth (field sensitivity is depth-1) |
 | `summary-budget-exceeded` | An IFDS summary computation hit its budget and stopped short |
+| `external` | The call's receiver is an out-of-repo type or module; no in-repo target exists |
+| `untyped-receiver` | Receiver type unknown; the import-visibility rule found no visible target |
 
-**Nine markers, not six.** The last three landed with the v0.3 dataflow/IFDS work and are
-emitted by it. Note also that the serialised forms are kebab-case and lowercase throughout —
+**Eleven markers, not six.** `opaque-call`, `truncated-access-path` and
+`summary-budget-exceeded` landed with the v0.3 dataflow/IFDS work and are emitted by it.
+`external` and `untyped-receiver` belong to receiver narrowing. They are recorded on the
+dangling reference, which leaves no edge, so no edge carries them. The walk sees them through
+per-symbol counters instead, reported as `external-receiver-calls` and
+`residual-import-visible`. Note also that the serialised forms are kebab-case and lowercase throughout —
 `via-di` and `via-ffi`, not `via-DI`/`via-FFI` — so a query or a `jq` filter must match the
 lowercase token. `via-di` in particular is **never emitted today**: it is a real marker, but
 nothing detects DI containers, so no edge carries it (see GM-17).

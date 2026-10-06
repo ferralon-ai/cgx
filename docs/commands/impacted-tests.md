@@ -128,7 +128,7 @@ When the result set is empty, the contract also carries a `scope` object — the
 
 | Code | Meaning |
 |------|---------|
-| `impacted-unresolved-external-calls` | N calls in symbols on the searched frontier resolved to no in-repo target. The callee may be external or unindexed (no SCIP data), **or** the call site may be one the frontend does not model as an edge — a call inside an unexpanded macro is the common Rust case, and its callee can be in-repo and one hop away. A test that reaches the change only through such a call is not in this answer. |
+| `impacted-unresolved-external-calls` | N calls in symbols on the searched frontier resolved to no in-repo target. The callee may be external or unindexed (no SCIP data), **or** the call site may be one the frontend does not model as an edge — a call inside an unexpanded macro is the common Rust case, and its callee can be in-repo and one hop away. A test that reaches the change only through such a call is not in this answer. When receiver narrowing is enabled, N also counts calls on receivers of out-of-repo types. |
 | `impacted-test-recognition-incomplete-rust` | The Rust gaps in the table above. |
 | `impacted-test-recognition-incomplete-go` | The Go gaps in the table above. |
 | `impacted-test-recognition-incomplete-java` | The Java gaps in the table above. |
@@ -138,7 +138,10 @@ When the result set is empty, the contract also carries a `scope` object — the
 | `impacted-removed-symbols-not-walked` | N symbols were deleted at head. Tests that exercised them are not in this answer, because there is no head-side node to walk back from. |
 | `below-confidence-floor` | N edges below the `--confidence` floor were excluded from the search. |
 | `depth-limit` | The search stopped at the `--depth` bound; deeper edges were not explored. |
-| `unresolved-call`, `dynamic-dispatch`, `reflective-dispatch`, `foreign-function`, `dependency-injection`, `unexpanded-macro`, `opaque-dataflow`, `truncated-access-path`, `summary-budget` | A modeling cut on the searched frontier, each with a site count. These are the standard cut markers shared with the other traversal commands. |
+| `impacted-untyped-receiver-dropped` | N untyped-receiver call sites in symbols outside the walked region were left with no target by the import-visibility rule, which is not sound for duck typing; an in-repo target may exist. A test reaching the change only through such a site is not in this answer. Emitted when receiver narrowing is enabled. |
+| `impacted-receiver-narrowed-away` | N same-name virtual call sites were bound by receiver typing (or by argument/return/fixture typing) to targets other than the walked symbols. A test reaching the change only through such a site is not in this answer. Emitted when receiver narrowing is enabled. |
+| `impacted-residual-narrowed-away` | N same-name untyped-receiver call sites excluded the walked symbols because their classes are not import-visible to the caller; not sound for duck typing. Emitted when receiver narrowing is enabled. |
+| `unresolved-call`, `dynamic-dispatch`, `reflective-dispatch`, `foreign-function`, `dependency-injection`, `unexpanded-macro`, `opaque-dataflow`, `truncated-access-path`, `summary-budget`, `external-receiver`, `untyped-receiver` | A modeling cut on the searched frontier, each with a site count. These are the standard cut markers shared with the other traversal commands; the last two are emitted when receiver narrowing is enabled. |
 
 **Over-approximation** — a reported test may not exercise the change:
 

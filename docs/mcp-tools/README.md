@@ -118,7 +118,21 @@ Codes come from two disjoint families, matching the two kinds of answer this sur
 
 Everything else is `under`. The call-graph family covers the nine resolver cut markers (`unresolved-call`, `dynamic-dispatch`, `reflective-dispatch`, `foreign-function`, `dependency-injection`, `unexpanded-macro`, `opaque-dataflow`, `truncated-access-path`, `summary-budget`) plus `below-confidence-floor`, `depth-limit`, `unresolved-external-calls`, `truncated-step-budget` and `truncated-path-cap`. The history family covers the commits and pairs a coupling walk deliberately did not count — among them `bounded-rev-range`, `merge-commits-excluded`, `root-commits-excluded`, `large-commit-excluded`, `cochange-threshold`, `result-limit`, `shallow-repository` and `history-boundary`.
 
-Two call-graph codes are routinely conflated and are not the same fact: `unresolved-call` is a cut-marked edge on the frontier, while `unresolved-external-calls` is a Step-5 dangling reference that left **no edge at all**.
+Receiver narrowing adds nine more call-graph `under` codes, emitted when receiver narrowing is enabled. Two are cut-marker codes: `external-receiver` (a call on an out-of-repo receiver type) and `untyped-receiver` (a call on a receiver of unknown type). The other seven are counts over the symbols the walk touched, each in one walk direction only:
+
+| code | walk | meaning |
+|---|---|---|
+| `external-receiver-calls` | forward (`callees`, `reaches`, `paths`, `unused`) | N calls on receivers of out-of-repo types (builtin, stdlib or library) have no in-repo target and were not followed |
+| `receiver-narrowed` | forward | N virtual call sites were bound by receiver typing; targets outside the inferred type are excluded, reachable only if a typing assumption fails (the detail lists the assumptions) |
+| `receiver-narrowed-interproc` | forward | N sites were bound using argument/return/fixture typing, which assumes every caller of the typed function is in the indexed repo |
+| `residual-import-visible` | forward | N untyped-receiver call sites were limited to methods of classes the caller's file defines or imports, plus their subclasses (some left with no target); not sound for duck typing |
+| `receiver-narrowed-away` | backward (`callers`) | N same-name virtual call sites were bound by receiver typing to other targets; they could reach the searched symbols only if a typing assumption fails |
+| `receiver-narrowed-away-interproc` | backward | as above, for interprocedural typing, which also assumes every caller of the typed function is in the indexed repo |
+| `residual-narrowed-away` | backward | N same-name untyped-receiver call sites excluded the searched symbols because their classes are not import-visible to the caller; not sound for duck typing |
+
+The backward codes are what keep a `callers` answer honest: a caller lost to narrowing has no edge into the searched symbol, so without them "no callers" would read as a clean negative. The narrowing counts skip symbols at the depth bound: a site there could only lose a neighbor beyond the bound.
+
+Two call-graph codes are routinely conflated and are not the same fact: `unresolved-call` is a cut-marked edge on the frontier, while `unresolved-external-calls` is a Step-5 dangling reference that left **no edge at all**. The same split holds for `external-receiver` (a cut-marked edge) versus `external-receiver-calls` (calls on out-of-repo receivers that left no edge).
 
 ### Which tools carry what
 

@@ -27,15 +27,15 @@ use cgx_core::provenance::Span;
 use cgx_core::transform::Transform;
 use cgx_frontend::{
     CutHint, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts, FrontendError,
-    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, RawRef, RefKind, RelPath,
-    RelationKind, ScopeId, SymbolDef,
+    ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, ManifestKind, RawRef, RefKind,
+    RelPath, RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 use crate::effects::effects_of_call;
-use crate::module::module_path_for_pkg;
+use crate::module::{import_path_root, module_path_for_pkg};
 
 /// The Go language adapter. Stateless; one instance handles every `.go` file.
 #[derive(Debug, Default, Clone)]
@@ -77,7 +77,16 @@ impl LanguageFrontend for GoFrontend {
             None => return Ok(FileFacts::empty()),
         };
 
-        let module_prefix = module_path_for_pkg(ctx.path.as_str(), ctx.package.as_deref());
+        // Canonical root = the go.mod import path (module path + package
+        // subdir) when a GoMod manifest is resolved; otherwise the
+        // non-canonical leaf-dir fallback (no module path to be canonical to).
+        let module_prefix = match ctx.manifest.as_ref() {
+            Some(m) if m.kind == ManifestKind::GoMod => match m.identity.as_deref() {
+                Some(module_path) => import_path_root(ctx.path.as_str(), module_path, &m.root_dir),
+                None => module_path_for_pkg(ctx.path.as_str(), ctx.package.as_deref()),
+            },
+            _ => module_path_for_pkg(ctx.path.as_str(), ctx.package.as_deref()),
+        };
         let mut builder = Builder::new(src, ctx.path.as_str());
         builder.package_name = builder.read_package_name(tree.root_node());
 
@@ -1458,4 +1467,85 @@ fn string_literal_value(literal: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgx_frontend::ManifestInfo;
+
+    fn go_mod(identity: &str, root_dir: &str) -> ManifestInfo {
+        ManifestInfo {
+            kind: ManifestKind::GoMod,
+            identity: Some(identity.to_string()),
+            root_dir: root_dir.to_string(),
+        }
+    }
+
+    fn fqns(facts: &FileFacts) -> Vec<String> {
+        facts.defs.iter().map(|d| d.fqn.clone()).collect()
+    }
+
+    const SRC: &str = "package store\n\nfunc Open() {}\n";
+
+    #[test]
+    fn fqn_root_is_import_path_when_go_mod_resolved() {
+        let fe = GoFrontend::new();
+        let ctx = FileCtx::new("internal/store/db.go", "oid")
+            .with_manifest(Some(go_mod("example.com/app", "")));
+        let facts = fe.extract(SRC.as_bytes(), &ctx).unwrap();
+        assert!(
+            fqns(&facts).contains(&"example.com/app/internal/store::Open".to_string()),
+            "have {:?}",
+            fqns(&facts)
+        );
+    }
+
+    #[test]
+    fn colliding_dirs_get_distinct_roots_through_extract() {
+        let fe = GoFrontend::new();
+        let a = fe
+            .extract(
+                SRC.as_bytes(),
+                &FileCtx::new("internal/store/db.go", "oid")
+                    .with_manifest(Some(go_mod("example.com/app", ""))),
+            )
+            .unwrap();
+        let b = fe
+            .extract(
+                SRC.as_bytes(),
+                &FileCtx::new("pkg/store/db.go", "oid")
+                    .with_manifest(Some(go_mod("example.com/app", ""))),
+            )
+            .unwrap();
+        assert!(fqns(&a).contains(&"example.com/app/internal/store::Open".to_string()));
+        assert!(fqns(&b).contains(&"example.com/app/pkg/store::Open".to_string()));
+    }
+
+    #[test]
+    fn nested_go_mod_roots_from_subdir_boundary() {
+        let fe = GoFrontend::new();
+        let ctx = FileCtx::new("svc/store/db.go", "oid")
+            .with_manifest(Some(go_mod("example.com/svc", "svc")));
+        let facts = fe.extract(SRC.as_bytes(), &ctx).unwrap();
+        assert!(
+            fqns(&facts).contains(&"example.com/svc/store::Open".to_string()),
+            "have {:?}",
+            fqns(&facts)
+        );
+    }
+
+    #[test]
+    fn no_go_mod_falls_back_to_leaf_dir() {
+        // Regression: with no manifest, the root stays the leaf-dir basename.
+        let fe = GoFrontend::new();
+        let facts = fe
+            .extract(SRC.as_bytes(), &FileCtx::new("internal/store/db.go", "oid"))
+            .unwrap();
+        assert!(
+            fqns(&facts).contains(&"store::Open".to_string()),
+            "have {:?}",
+            fqns(&facts)
+        );
+    }
 }

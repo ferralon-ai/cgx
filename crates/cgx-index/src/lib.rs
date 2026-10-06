@@ -75,7 +75,10 @@ pub use git::{compute_blob_oid, Repo};
 pub use source::SourceFile;
 pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
 pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
-pub use pipeline::{IndexOpts, IndexStats, ScipStats};
+pub use pipeline::{
+    extract_one, link_prepared, plan, ExtractedFile, IndexOpts, IndexStats, Plan, PlannedFile,
+    PreparedFile, ScipStats,
+};
 pub use registry::default_registry;
 
 #[cfg(not(target_family = "wasm"))]

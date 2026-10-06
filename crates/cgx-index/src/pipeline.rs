@@ -96,107 +96,125 @@ pub struct IndexStats {
 
 /// One file's resolved contribution, carrying owned facts so the link step can
 /// borrow them uniformly whether they came from cache or fresh extraction.
-struct PreparedFile {
-    blob_oid: String,
-    rel_path: String,
-    lang: String,
-    facts: FileFacts,
+#[derive(Debug, Clone)]
+pub struct PreparedFile {
+    /// Git blob OID (hex) of the file's content.
+    pub blob_oid: String,
+    /// Repo-relative, `/`-separated path.
+    pub rel_path: String,
+    /// The language tag of the adapter that claims the file.
+    pub lang: String,
+    /// The file's extracted facts — fresh from [`extract_one`], or decoded from a
+    /// cached Layer-1 fragment.
+    pub facts: FileFacts,
 }
 
-/// Run the extract → cache → link stages over `sources`, writing newly extracted
-/// fragments to the store and returning the resolved graph plus stats. Does *not*
-/// store the graph — the caller decides the Layer-2 key (a real tree OID, or a
-/// synthetic key for a dirty overlay).
-pub(crate) fn extract_and_link<S: FactStore>(
-    sources: &[SourceFile],
-    registry: &FrontendRegistry,
-    store: &mut S,
-    opts: &IndexOpts,
-) -> Result<(ResolvedGraph, IndexStats)> {
-    use rayon::prelude::*;
+/// One source an adapter claims, with the context its extraction runs under.
+#[derive(Debug, Clone)]
+pub struct PlannedFile {
+    /// Index of the file in the `sources` slice given to [`plan`].
+    pub source: usize,
+    /// The extraction context: path, blob OID, and owning package.
+    pub ctx: FileCtx,
+    /// The language tag of the claiming adapter.
+    pub lang: String,
+}
 
-    let mut stats = IndexStats::default();
+/// The output of [`plan`]: the claimed files in source order, and how many
+/// sources no adapter claims.
+#[derive(Debug, Clone, Default)]
+pub struct Plan {
+    /// Files a registered adapter claims, in `sources` order.
+    pub files: Vec<PlannedFile>,
+    /// Sources skipped because no registered adapter claims them.
+    pub unsupported: usize,
+}
 
+/// A freshly extracted file: its prepared facts plus the Layer-1 fragment to
+/// cache under its blob OID.
+#[derive(Debug, Clone)]
+pub struct ExtractedFile {
+    /// The file's identity and extracted facts.
+    pub prepared: PreparedFile,
+    /// The claiming frontend's `fragment_version()`; a cached fragment is valid
+    /// only for the version that wrote it.
+    pub fragment_version: u32,
+    /// The canonical postcard encoding of `prepared.facts`
+    /// (`cgx_core::codec::encode`) — the bytes stored as the Layer-1 fragment.
+    pub fragment: Vec<u8>,
+}
+
+/// Stage 1 of [`extract_and_link`]: decide which sources are extracted and under
+/// what [`FileCtx`].
+///
+/// Resolves each file's owning package from the `Cargo.toml` manifests in
+/// `sources` and drops files no registered adapter claims. Pure: no store, no
+/// git. Only manifest contents are read; other files' `content` is not consulted.
+pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     // Resolve each file's owning package from the Cargo manifests in the source
     // set (workspace-aware), so FQNs root at the real crate name even for the
     // `src/`-at-root / no-`src` layouts the path alone can't disambiguate. This
     // is what lets the `--scip` join match real rust-analyzer symbols.
     let pkg_map = PackageMap::from_sources(sources);
 
-    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
-    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
-    // this stays single-threaded; only the CPU-bound extraction is parallelized.
-    let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<&SourceFile> = Vec::new();
-    for src in sources {
+    let mut out = Plan::default();
+    for (i, src) in sources.iter().enumerate() {
         let rel = RelPath::new(src.rel_path.clone());
         if !registry.has_adapter_for(&rel) {
-            stats.blobs_unsupported += 1;
+            out.unsupported += 1;
             continue;
         }
-        let blob = BlobOid::new(src.blob_oid.clone());
-        match store.fragment(&blob)? {
-            Some(cached) => {
-                let facts: FileFacts = decode(&cached.fragment)?;
-                stats.blobs_cached += 1;
-                prepared.push(PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                });
-            }
-            None => misses.push(src),
-        }
+        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+            .with_package(package);
+        out.files.push(PlannedFile {
+            source: i,
+            ctx,
+            lang: registry.lang_for(&rel).tag().to_string(),
+        });
     }
+    out
+}
 
-    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the blob-OID independence that makes Layer-1 cacheable
-    // (IX-1) is exactly what makes it embarrassingly parallel (IX-2 step 3).
-    let extracted: Vec<(PreparedFile, u32, Vec<u8>)> = misses
-        .par_iter()
-        .map(|src| {
-            let rel = RelPath::new(src.rel_path.clone());
-            let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
-            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
-                .with_package(package);
-            let facts = registry.extract(&src.content, &ctx)?;
-            let bytes = encode(&facts)?;
-            let version = registry.frontend_for(&rel).fragment_version();
-            Ok((
-                PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                },
-                version,
-                bytes,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    stats.blobs_extracted = extracted.len();
+/// Stage 2 of [`extract_and_link`]: extract one file's facts and encode its
+/// Layer-1 fragment. Pure per-file work with no store or git access, so callers
+/// may run it in parallel or on another host.
+pub fn extract_one(
+    registry: &FrontendRegistry,
+    ctx: &FileCtx,
+    content: &[u8],
+) -> Result<ExtractedFile> {
+    let rel = &ctx.path;
+    let facts = registry.extract(content, ctx)?;
+    let bytes = encode(&facts)?;
+    let version = registry.frontend_for(rel).fragment_version();
+    Ok(ExtractedFile {
+        prepared: PreparedFile {
+            blob_oid: ctx.blob_oid.clone(),
+            rel_path: rel.as_str().to_string(),
+            lang: registry.lang_for(rel).tag().to_string(),
+            facts,
+        },
+        fragment_version: version,
+        fragment: bytes,
+    })
+}
 
-    // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let blob_oids: Vec<BlobOid> = extracted
-            .iter()
-            .map(|(p, ..)| BlobOid::new(p.blob_oid.clone()))
-            .collect();
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .zip(&blob_oids)
-            .map(|((p, version, bytes), blob)| FragmentInput {
-                blob,
-                lang: &p.lang,
-                frontend_version: *version,
-                bytes,
-            })
-            .collect();
-        store.put_fragments(&batch)?;
-    }
-    prepared.extend(extracted.into_iter().map(|(p, ..)| p));
-
+/// Stage 3 of [`extract_and_link`]: link the prepared files into a
+/// [`ResolvedGraph`].
+///
+/// Sorts `prepared` by path (link input must be order-stable), builds the
+/// [`LinkOpts`] from `opts`, and runs [`link`]. Under `opts.dataflow` it also
+/// loads the per-function intraproc cache from `store` beforehand and persists
+/// the new cache, `summary_deps`, and IFDS summaries afterwards. Fills the
+/// `blobs_indexed`, `nodes`, `edges`, `unresolved`, `dataflow` and `ifds`
+/// counters in `stats`.
+pub fn link_prepared<S: FactStore>(
+    mut prepared: Vec<PreparedFile>,
+    store: &mut S,
+    opts: &IndexOpts,
+    stats: &mut IndexStats,
+) -> Result<ResolvedGraph> {
     // Restore deterministic order (cache hits + parallel misses interleave):
     // sort by path so the link input set is order-stable.
     prepared.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -254,6 +272,81 @@ pub(crate) fn extract_and_link<S: FactStore>(
         stats.ifds = df.ifds_stats;
     }
 
+    Ok(graph)
+}
+
+/// Run the extract → cache → link stages over `sources`, writing newly extracted
+/// fragments to the store and returning the resolved graph plus stats. Does *not*
+/// store the graph — the caller decides the Layer-2 key (a real tree OID, or a
+/// synthetic key for a dirty overlay).
+///
+/// The composition of [`plan`], [`extract_one`] and [`link_prepared`] around the
+/// store's Layer-1 fragment cache.
+pub(crate) fn extract_and_link<S: FactStore>(
+    sources: &[SourceFile],
+    registry: &FrontendRegistry,
+    store: &mut S,
+    opts: &IndexOpts,
+) -> Result<(ResolvedGraph, IndexStats)> {
+    use rayon::prelude::*;
+
+    let mut stats = IndexStats::default();
+
+    let plan = plan(sources, registry);
+    stats.blobs_unsupported = plan.unsupported;
+
+    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
+    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
+    // this stays single-threaded; only the CPU-bound extraction is parallelized.
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut misses: Vec<&PlannedFile> = Vec::new();
+    for file in &plan.files {
+        let blob = BlobOid::new(file.ctx.blob_oid.clone());
+        match store.fragment(&blob)? {
+            Some(cached) => {
+                let facts: FileFacts = decode(&cached.fragment)?;
+                stats.blobs_cached += 1;
+                prepared.push(PreparedFile {
+                    blob_oid: file.ctx.blob_oid.clone(),
+                    rel_path: file.ctx.path.as_str().to_string(),
+                    lang: file.lang.clone(),
+                    facts,
+                });
+            }
+            None => misses.push(file),
+        }
+    }
+
+    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
+    // store/git access — the blob-OID independence that makes Layer-1 cacheable
+    // (IX-1) is exactly what makes it embarrassingly parallel (IX-2 step 3).
+    let extracted: Vec<ExtractedFile> = misses
+        .par_iter()
+        .map(|file| extract_one(registry, &file.ctx, &sources[file.source].content))
+        .collect::<Result<Vec<_>>>()?;
+    stats.blobs_extracted = extracted.len();
+
+    // Batch-write the freshly extracted fragments in one transaction.
+    if !extracted.is_empty() {
+        let blob_oids: Vec<BlobOid> = extracted
+            .iter()
+            .map(|e| BlobOid::new(e.prepared.blob_oid.clone()))
+            .collect();
+        let batch: Vec<FragmentInput<'_>> = extracted
+            .iter()
+            .zip(&blob_oids)
+            .map(|(e, blob)| FragmentInput {
+                blob,
+                lang: &e.prepared.lang,
+                frontend_version: e.fragment_version,
+                bytes: &e.fragment,
+            })
+            .collect();
+        store.put_fragments(&batch)?;
+    }
+    prepared.extend(extracted.into_iter().map(|e| e.prepared));
+
+    let graph = link_prepared(prepared, store, opts, &mut stats)?;
     Ok((graph, stats))
 }
 

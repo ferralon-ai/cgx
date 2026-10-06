@@ -1412,6 +1412,22 @@ fn two_disagreeing_views_of_the_working_tree_yield_an_unestablished_matches_head
     }
 }
 
+/// cgx's own `.cgx/` at the repository root is not part of the working set, so an
+/// indexed repository that git calls clean is HEAD's tree: no overlay, and
+/// `matches_head` established `true` rather than left unknown.
+#[test]
+fn an_indexed_repo_whose_only_extra_files_are_cgx_is_clean() {
+    let (_t, repo) = init_repo();
+    std::fs::create_dir_all(repo.join(".cgx")).unwrap();
+    std::fs::write(repo.join(".cgx/.gitignore"), "*\n").unwrap();
+    std::fs::write(repo.join(".cgx/HEAD.json"), "{}\n").unwrap();
+
+    let s = call_tool(&repo, "search", json!({ "all": true, "include_dirty": true }));
+    assert_eq!(s["dirty"], json!(false), "{s}");
+    assert_eq!(s["dirty_files_analyzed"], json!(0), "{s}");
+    assert_eq!(s["freshness"]["matches_head"], json!(true), "{}", s["freshness"]);
+}
+
 /// Cross-surface parity: the same working-tree state under the same
 /// `freshness.dirty_files` key must mean the same thing on the CLI and on MCP.
 /// Their absence is what let the two surfaces disagree by three independent

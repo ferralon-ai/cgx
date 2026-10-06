@@ -179,7 +179,19 @@ pub fn is_changed_symbol_marker(edge: &EdgeRecord) -> bool {
 /// The incompleteness facts on the frontier of the reverse walk.
 #[derive(Debug, Default)]
 struct FrontierFacts {
+    /// Calls left with no edge because no in-repo target exists
+    /// (`unresolved_calls`, `external_calls`) on unreached nodes.
     dangling_refs: u64,
+    /// `narrowing.visible_dropped_out` on unreached nodes: untyped-receiver sites
+    /// the import-visibility rule left with no target. Kept apart from
+    /// `dangling_refs` because an in-repo target may well exist.
+    untyped_dropped: u64,
+    /// `narrowing.typed_away_in + interproc_away_in` on reached nodes: same-name
+    /// sites elsewhere that receiver typing bound to other targets.
+    narrowed_away_in: u64,
+    /// `narrowing.visible_away_in` on reached nodes: same-name untyped-receiver
+    /// sites elsewhere whose import-visibility bound excluded a reached node.
+    visible_away_in: u64,
     cut_counts: BTreeMap<CutMarker, usize>,
     below_floor: usize,
     /// Edges the walk's `--max-candidates` fan-out cap excluded. Counted only for
@@ -231,9 +243,20 @@ fn scan_frontier(view: &GraphView, walker: &PathWalker, reached: &[bool]) -> Fro
             continue;
         }
         if !reached[i] {
-            facts.dangling_refs += u64::from(node.unresolved_calls);
+            // Every way a call can leave no edge severs the same way; the
+            // import-visibility drops are reported separately because their
+            // cause is a heuristic, not a missing target.
+            facts.dangling_refs +=
+                u64::from(node.unresolved_calls) + u64::from(node.external_calls);
+            facts.untyped_dropped += u64::from(node.narrowing.visible_dropped_out);
             continue;
         }
+        // The away-in counts are sites *elsewhere* whose narrowed target set
+        // excluded this reached node: a test calling through one of them could
+        // reach the change, but the walk has no edge to find it by.
+        facts.narrowed_away_in +=
+            u64::from(node.narrowing.typed_away_in) + u64::from(node.narrowing.interproc_away_in);
+        facts.visible_away_in += u64::from(node.narrowing.visible_away_in);
         for er in view.neighbors(node.id, Direction::Backward, &scan_filter) {
             for marker in er.edge.cut_markers.iter() {
                 *facts.cut_counts.entry(marker).or_default() += 1;
@@ -260,7 +283,7 @@ fn scan_frontier(view: &GraphView, walker: &PathWalker, reached: &[bool]) -> Fro
 /// The per-answer approximation contract for an `impacted-tests` answer.
 ///
 /// Reason emission order is fixed (AR-10): the frontier-derived reasons first
-/// (dangling → cut markers → below-floor → depth-limit), then the remaining
+/// (dangling → untyped-dropped → narrowed-away → cut markers → below-floor → depth-limit), then the remaining
 /// `under` reasons in vocabulary order with the four per-language reasons sorted
 /// by lang token, then the `over` reasons in vocabulary order. `cut_counts` comes
 /// out of a `BTreeMap` and `langs_in_play` out of a `BTreeSet`, so no hash
@@ -293,6 +316,40 @@ pub fn contract_for(
                  model as an edge, such as one written inside an unexpanded macro. A test \
                  reaching your change only through such a call is not in this answer.",
                 frontier.dangling_refs
+            ),
+        ));
+    }
+    if frontier.untyped_dropped > 0 {
+        reasons.push(under(
+            "impacted-untyped-receiver-dropped",
+            format!(
+                "{} untyped-receiver call site(s) outside the walked region were left with no \
+                 target by the import-visibility rule; not sound for duck typing. A test reaching \
+                 your change only through such a site is not in this answer.",
+                frontier.untyped_dropped
+            ),
+        ));
+    }
+    if frontier.narrowed_away_in > 0 {
+        reasons.push(under(
+            "impacted-receiver-narrowed-away",
+            format!(
+                "{} same-name virtual call site(s) were bound by receiver typing to targets other \
+                 than the walked symbols; they could reach your change only if a typing \
+                 assumption fails or a caller of the typed function is outside the indexed repo. \
+                 A test reaching your change only through such a site is not in this answer.",
+                frontier.narrowed_away_in
+            ),
+        ));
+    }
+    if frontier.visible_away_in > 0 {
+        reasons.push(under(
+            "impacted-residual-narrowed-away",
+            format!(
+                "{} same-name untyped-receiver call site(s) excluded the walked symbols because \
+                 their classes are not import-visible to the caller; not sound for duck typing. \
+                 A test reaching your change only through such a site is not in this answer.",
+                frontier.visible_away_in
             ),
         ));
     }

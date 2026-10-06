@@ -589,6 +589,103 @@ fn reached_nodes_dangling_calls_do_not_fire_it() {
 }
 
 #[test]
+fn calls_on_out_of_repo_receivers_add_to_the_unreached_dangling_count() {
+    // `t` has 1 unresolved call and 2 calls on an out-of-repo receiver: no
+    // in-repo target exists for any of them, and all three sever `t` from the
+    // change the same way.
+    let mut g = G::new();
+    let t = g.test("t");
+    let target = g.func("target");
+    g.dangling(t, 1);
+    g.nodes[t.index()].external_calls = 2;
+    let v = g.view();
+
+    let (_, c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    let r = c
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-unresolved-external-calls")
+        .expect("dangling reason fires");
+    assert!(r.detail.starts_with("3 call(s)"), "{}", r.detail);
+    assert!(!codes(&c).contains(&"impacted-untyped-receiver-dropped"));
+}
+
+#[test]
+fn import_visibility_drops_get_their_own_reason_not_the_dangling_one() {
+    // An untyped-receiver site the import-visibility rule left with no target
+    // may well have an in-repo target, so it must not be reported as "resolved
+    // to no in-repo target", and it must carry the duck-typing caveat.
+    let mut g = G::new();
+    let t = g.test("t");
+    let target = g.func("target");
+    g.nodes[t.index()].narrowing.visible_dropped_out = 2;
+    let v = g.view();
+
+    let (_, c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    assert!(!codes(&c).contains(&"impacted-unresolved-external-calls"));
+    let r = c
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-untyped-receiver-dropped")
+        .expect("own reason fires");
+    assert!(r.detail.starts_with("2 untyped-receiver"), "{}", r.detail);
+    assert!(r.detail.contains("not sound for duck typing"));
+}
+
+#[test]
+fn narrowed_away_sites_on_reached_nodes_fire_their_under_reasons() {
+    // `target` is reached (it is the change). Same-name sites elsewhere were
+    // narrowed away from it: a test calling through one of them is invisible.
+    let mut g = G::new();
+    let target = g.func("target");
+    g.nodes[target.index()].narrowing.typed_away_in = 1;
+    g.nodes[target.index()].narrowing.interproc_away_in = 1;
+    g.nodes[target.index()].narrowing.visible_away_in = 2;
+    let v = g.view();
+
+    let (_, c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    assert_eq!(c.direction, ApproxDirection::Under);
+    let typed = c
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-receiver-narrowed-away")
+        .expect("typed reason fires");
+    assert!(typed.detail.starts_with("2 same-name"), "{}", typed.detail);
+    assert!(
+        typed.detail.contains("outside the indexed repo"),
+        "{}",
+        typed.detail
+    );
+    let visible = c
+        .reasons
+        .iter()
+        .find(|r| r.code == "impacted-residual-narrowed-away")
+        .expect("residual reason fires");
+    assert!(
+        visible.detail.starts_with("2 same-name"),
+        "{}",
+        visible.detail
+    );
+    assert!(visible.detail.contains("not sound for duck typing"));
+}
+
+#[test]
+fn narrowed_away_sites_on_unreached_nodes_do_not_fire_them() {
+    // A site narrowed away from a symbol the walk never reached cannot bear on
+    // whether a test reaches the change.
+    let mut g = G::new();
+    let other = g.func("other");
+    let target = g.func("target");
+    g.nodes[other.index()].narrowing.typed_away_in = 4;
+    g.nodes[other.index()].narrowing.visible_away_in = 4;
+    let v = g.view();
+
+    let (_, c) = contract_of(&v, &[target], &unbounded(), DiffFacts::default());
+    assert!(!codes(&c).contains(&"impacted-receiver-narrowed-away"));
+    assert!(!codes(&c).contains(&"impacted-residual-narrowed-away"));
+}
+
+#[test]
 fn each_language_in_play_carries_its_recognition_gap() {
     for (lang, code) in [
         ("rust", "impacted-test-recognition-incomplete-rust"),

@@ -5,9 +5,10 @@
 //! serializes it, so the schema a tool declares in `tools/list` and the bytes it
 //! emits come from one definition: the schema is generated from the type, never
 //! maintained beside it. `tests/output_schema.rs` validates real tool output
-//! against the declared schema, and pins the full schema document to
-//! `schemas/mcp-tool-outputs.schema.json` so any change to the wire shape shows up
-//! as a reviewed diff.
+//! against the declared schema, pins the bytes of that output to a golden
+//! snapshot, and pins the full schema document (inputs and outputs) to
+//! `schemas/mcp-tools.schema.json`, so any change to the wire shape or the
+//! wire values shows up as a reviewed diff.
 //!
 //! Schemas are generated for the **serialize** contract: a field that is always
 //! emitted is `required` even when it can be `null`, and only a field that is
@@ -223,8 +224,12 @@ pub struct ImpactedRow {
     pub via_containment_lift: bool,
 }
 
-/// One cell of a `graph_query` table row. Untagged: the JSON type selects the
-/// variant, and a bound path renders as an array of FQN strings.
+/// One cell of a `graph_query` table row, untagged. The JSON value alone does
+/// not always identify the variant: `Int` and `Float` are both JSON numbers
+/// (every integer also matches `Float`), and a bound path renders as an array
+/// of FQN strings, the same JSON as a `List` of `Str`. Decode cells lazily (Go:
+/// `json.RawMessage`, numbers via `json.Number`) and use the query's own
+/// `RETURN` clause to know which column is a path.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum CqlCell {
@@ -277,7 +282,8 @@ pub struct NeighborOutput {
     pub session: SessionMeta,
 }
 
-/// `reaches` with `to`: one reachability verdict and its witness.
+/// `reaches` with `to`: one reachability verdict and its witness. Told apart
+/// from [`ReachesSetOutput`] by the `reachable` key.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReachesPairOutput {
     /// The `from` argument as received.
@@ -292,7 +298,8 @@ pub struct ReachesPairOutput {
     pub session: SessionMeta,
 }
 
-/// `reaches` without `to`: every symbol `from` reaches.
+/// `reaches` without `to`: every symbol `from` reaches. Told apart from
+/// [`ReachesPairOutput`] by the `results` key.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReachesSetOutput {
     /// The `from` argument as received.
@@ -382,7 +389,8 @@ pub struct SymbolsOutput {
     pub session: SessionMeta,
 }
 
-/// `graph_query` whose `RETURN` binds a path: the `paths`-tool row shape.
+/// `graph_query` whose `RETURN` binds a path: the `paths`-tool row shape. Told
+/// apart from [`GraphQueryTableOutput`] by the `paths` key.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GraphQueryPathsOutput {
     pub columns: Vec<String>,
@@ -396,7 +404,8 @@ pub struct GraphQueryPathsOutput {
     pub session: SessionMeta,
 }
 
-/// `graph_query` with a tabular `RETURN`.
+/// `graph_query` with a tabular `RETURN`. Told apart from
+/// [`GraphQueryPathsOutput`] by the `rows` key.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GraphQueryTableOutput {
     pub columns: Vec<String>,
@@ -520,13 +529,21 @@ fn collapse_const_one_of(schema: &mut Schema) {
     obj.insert("enum".into(), Value::Array(values));
 }
 
-/// MCP requires an `outputSchema` whose root is `type: object`. An untagged
-/// union of object types (`reaches`, `graph_query`) is `anyOf` at the root, so
-/// state the shared `type` there.
-fn ensure_object_root(schema: &mut Map<String, Value>) {
+/// Shape a tool output's root schema. MCP requires an `outputSchema` whose root
+/// is `type: object`; an untagged union of object types (`reaches`,
+/// `graph_query`) comes out of schemars as `anyOf` with no `type`, so state the
+/// shared `type`. Its branches are mutually exclusive (disjoint `required`
+/// keys, named in each branch's description), so the union is declared as
+/// `oneOf`, which says so; `anyOf` would let a generator merge the branches
+/// into one all-optional type. `CqlCell` is not a root and keeps `anyOf`: an
+/// integer validates against both its `Int` and `Float` branches.
+fn shape_output_root(schema: &mut Map<String, Value>) {
     schema
         .entry("type")
         .or_insert_with(|| Value::String("object".into()));
+    if let Some(branches) = schema.remove("anyOf") {
+        schema.insert("oneOf".into(), branches);
+    }
 }
 
 /// Resolve a `{"$ref": "#/$defs/Name"}` returned by `subschema_for`, to `Name`.
@@ -545,11 +562,11 @@ pub fn output_schema(tool: &str) -> Option<Value> {
     let mut g = generator();
     let reference = subschema(&mut g);
     let mut defs = g.take_definitions(true);
-    let name = ref_name(&reference).expect("tool outputs are named types");
+    let name = ref_name(&reference)?;
     let Some(Value::Object(mut root)) = defs.remove(name) else {
-        unreachable!("subschema_for registered `{name}`");
+        return None;
     };
-    ensure_object_root(&mut root);
+    shape_output_root(&mut root);
     let mut out = Map::new();
     out.insert("$schema".into(), json!(SCHEMA_DIALECT));
     out.insert("title".into(), json!(name));
@@ -560,17 +577,22 @@ pub fn output_schema(tool: &str) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-/// `schema` with every `description` annotation removed: the form `tools/list`
-/// declares. Validation is unaffected; the prose (about two thirds of the bytes)
-/// stays in [`schema_document`], where code generators read it, and out of every
-/// agent's `tools/list`.
-pub fn without_descriptions(schema: Value) -> Value {
+/// The form of an output schema `tools/list` declares: `schema` without its
+/// `description` and `format` annotations. Neither affects validation. The
+/// prose is about two thirds of the bytes and stays in [`schema_document`],
+/// where code generators read it, out of every agent's `tools/list`. The
+/// integer formats (`uint`, `uint32`, `int64`, `double`) are schemars' own
+/// vocabulary, which a validator with a fixed format registry warns about on
+/// every compile; `minimum: 0` still carries the unsigned constraint.
+pub fn for_tools_list(schema: Value) -> Value {
     fn strip(v: Value, in_properties: bool) -> Value {
         match v {
             Value::Object(map) => Value::Object(
                 map.into_iter()
                     // Inside `properties` the keys are field names, not keywords.
-                    .filter(|(k, _)| in_properties || k != "description")
+                    .filter(|(k, _)| {
+                        in_properties || !matches!(k.as_str(), "description" | "format")
+                    })
                     .map(|(k, v)| {
                         let props = !in_properties && k == "properties";
                         (k, strip(v, props))
@@ -586,32 +608,69 @@ pub fn without_descriptions(schema: Value) -> Value {
     strip(schema, false)
 }
 
-/// Every tool's output schema as one document, for code generators: `$defs`
-/// holds each type once under its Rust name, and `properties` maps each tool
-/// name to its output type. `cgx mcp --print-schemas` prints this.
+/// Every tool's request and response schema as one document, for code
+/// generators. `cgx mcp --print-schemas` prints this.
+///
+/// It is itself a JSON Schema, describing `{ <tool>: { "input": <arguments>,
+/// "output": <structuredContent> } }`. `$defs` holds each output type once under
+/// its Rust type name, and each tool's `inputSchema` (exactly as `tools/list`
+/// declares it) under `<Tool>Input`, the tool name in PascalCase — so
+/// `graph_query` takes `GraphQueryInput` and returns `GraphQueryOutput`.
 pub fn schema_document() -> Value {
     let mut g = generator();
-    let mut tools = Map::new();
+    let mut outputs = Vec::new();
     let mut roots = Vec::new();
     for (name, subschema) in TOOL_OUTPUTS {
         let reference = subschema(&mut g);
         roots.extend(ref_name(&reference).map(str::to_string));
-        tools.insert((*name).to_string(), reference.to_value());
+        outputs.push((*name, reference.to_value()));
     }
     let mut defs = g.take_definitions(true);
     for root in &roots {
         if let Some(Value::Object(obj)) = defs.get_mut(root) {
-            ensure_object_root(obj);
+            shape_output_root(obj);
         }
     }
+
+    let inputs: BTreeMap<String, Value> = crate::tools::input_schemas().into_iter().collect();
+    let mut tools = Map::new();
+    for (name, output_ref) in outputs {
+        let mut tool = json!({
+            "type": "object",
+            "properties": { "output": output_ref },
+            "required": ["output"],
+        });
+        if let Some(input) = inputs.get(name) {
+            let def = input_def_name(name);
+            defs.insert(def.clone(), input.clone());
+            tool["properties"]["input"] = json!({ "$ref": format!("#/$defs/{def}") });
+            tool["required"] = json!(["input", "output"]);
+        }
+        tools.insert(name.to_string(), tool);
+    }
+
     canonical(json!({
         "$schema": SCHEMA_DIALECT,
-        "title": "cgx MCP tool outputs",
-        "description": "structuredContent of every cgx MCP tool: property name = tool name, value = that tool's output type.",
+        "title": "cgx MCP tools",
+        "description": "Request arguments and structuredContent of every cgx MCP tool: property name = tool name, value = { input: that tool's inputSchema, output: its outputSchema }.",
         "type": "object",
         "properties": tools,
         "$defs": defs,
     }))
+}
+
+/// `graph_query` → `GraphQueryInput`.
+fn input_def_name(tool: &str) -> String {
+    let mut out = String::with_capacity(tool.len() + 5);
+    for part in tool.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out.push_str("Input");
+    out
 }
 
 /// The registered tool names that declare an output schema, in `tools/list` order.

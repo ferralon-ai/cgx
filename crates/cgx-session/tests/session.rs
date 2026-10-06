@@ -137,13 +137,18 @@ fn export_edges_streams_the_filtered_graph_in_order() {
     assert_eq!(streamed, all);
 
     let certain = s
-        .call("export_edges", &json!({"min_confidence": "certain", "kinds": ["calls"]}))
+        .call("export_edges", &json!({"confidence": "certain", "kind": ["calls"]}))
         .unwrap();
     for e in certain["edges"].as_array().unwrap() {
         assert_eq!(e["confidence"], "certain");
         assert_eq!(e["kind"], "calls");
     }
-    for bad in [json!({"min_confidence": "sure"}), json!({"cursor": "x"}), json!({"max_edges": 0})] {
+    for bad in [
+        json!({"confidence": "sure"}),
+        json!({"kind": ["contains"]}),
+        json!({"cursor": "x"}),
+        json!({"max_edges": 0}),
+    ] {
         assert_eq!(s.call("export_edges", &bad).unwrap_err().kind, ErrorKind::InvalidParams);
     }
 }
@@ -162,7 +167,7 @@ fn resolve_answers_a_batch_of_selectors() {
     let rows = ranked["results"].as_array().unwrap();
     let called = rows.iter().find(|r| r["in_degree"].as_u64() > Some(0)).unwrap()["fqn"].clone();
     let callers: Vec<&str> = rows.iter().map(|r| r["fqn"].as_str().unwrap()).collect();
-    let all = s.call("export_edges", &json!({"max_edges": 1_000_000, "kinds": null})).unwrap();
+    let all = s.call("export_edges", &json!({"max_edges": 1_000_000})).unwrap();
     let edged: std::collections::BTreeSet<u64> = all["edges"]
         .as_array()
         .unwrap()
@@ -217,6 +222,39 @@ fn worktree_index_is_held_not_persisted() {
     assert_eq!(std::fs::read(repo.join(".cgx/HEAD.json")).unwrap(), pointer);
 }
 
+/// cgx's own `.cgx/` is not part of the working set: a worktree index after a
+/// HEAD index, on an unmodified checkout, is HEAD's tree.
+#[test]
+fn worktree_index_after_head_index_is_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(tmp.path(), "go");
+    let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let mut s = indexed(&repo);
+    assert!(repo.join(".cgx/HEAD.json").exists());
+
+    s.index_native(Mode::Worktree, None, None, false).unwrap();
+    let answer = s.call("symbols", &json!({"max_results": 1})).unwrap();
+    assert_eq!(answer["dirty"], json!(false));
+    assert_eq!(answer["dirty_files_analyzed"], json!(0));
+    assert_eq!(answer["graph_version"], json!(&tree[..7]));
+    assert_eq!(answer["freshness"]["matches_head"], json!(true));
+}
+
+/// Without `force`, `index` answers `up_to_date` only for a request that asks
+/// for nothing the pointer cannot vouch for.
+#[test]
+fn up_to_date_only_when_nothing_specific_is_requested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(tmp.path(), "go");
+    let mut s = indexed(&repo);
+    let plain = s.index_native(Mode::Head, None, None, false).unwrap();
+    assert!(plain.up_to_date);
+    assert_eq!(plain.dataflow, None);
+    let explicit = s.index_native(Mode::Head, Some(false), None, false).unwrap();
+    assert!(!explicit.up_to_date);
+    assert_eq!(explicit.dataflow, Some(false));
+}
+
 #[test]
 fn native_server_speaks_the_session_protocol() {
     let tmp = tempfile::tempdir().unwrap();
@@ -229,6 +267,7 @@ fn native_server_speaks_the_session_protocol() {
         json!({"id": 3, "op": "call", "tool": "symbols", "args": {"max_results": 1}}),
         json!({"id": 4, "op": "call", "tool": "callers", "args": {"symbol": "no::such"}}),
         json!({"id": 5, "op": "bogus"}),
+        json!({"id": 51, "op": 7}),
         json!({"id": 6, "op": "close"}),
         json!({"id": 7, "op": "open"}),
     ]
@@ -243,7 +282,7 @@ fn native_server_speaks_the_session_protocol() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 7, "handshake + six answers; nothing after close");
+    assert_eq!(lines.len(), 8, "handshake + seven answers; nothing after close");
     assert_eq!(
         lines[0],
         json!({"cgx_session": 1, "abi": 1, "version": env!("CARGO_PKG_VERSION"), "schema_hash": cgx_session::schema_hash()})
@@ -254,7 +293,9 @@ fn native_server_speaks_the_session_protocol() {
     assert_eq!(lines[3]["ok"], true);
     assert_eq!(lines[4]["error"]["kind"], "resolve");
     assert_eq!(lines[5]["error"]["kind"], "invalid_params");
-    assert_eq!(lines[6], json!({"id": 6, "ok": true, "result": {}}));
+    assert_eq!(lines[6]["id"], 51, "a request of the wrong shape keeps its id");
+    assert_eq!(lines[6]["error"]["kind"], "invalid_params");
+    assert_eq!(lines[7], json!({"id": 6, "ok": true, "result": {}}));
 }
 
 /// The embedded schema document is what `cgx mcp --print-schemas` prints, so

@@ -63,8 +63,7 @@ use serde_json::{json, Value};
 #[allow(unsafe_code)]
 #[no_mangle]
 pub extern "C" fn _initialize() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
     extern "C" {
         fn __wasm_call_ctors();
     }
@@ -74,6 +73,12 @@ pub extern "C" fn _initialize() {
     // SAFETY: provided by wasm-ld; runs each constructor once, guarded above.
     unsafe { __wasm_call_ctors() }
 }
+
+/// Set once `_initialize` has run the module's constructors. Ops refuse to run
+/// before that: without the constructors, registrations made at load time (the
+/// selector engine's tokenizers) are missing and answers would be silently wrong.
+#[cfg(target_family = "wasm")]
+static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Status byte of a successful response.
 const STATUS_OK: u8 = 0;
@@ -116,12 +121,14 @@ pub fn handle(state: &mut State, op: Op, req: &[u8]) -> Vec<u8> {
             body.insert(0, STATUS_OK);
             body
         }
-        Err(e) => {
-            let mut out = vec![STATUS_ERR];
-            serde_json::to_writer(&mut out, &e).expect("error envelope serializes");
-            out
-        }
+        Err(e) => error_response(&e),
     }
+}
+
+fn error_response(e: &SessionError) -> Vec<u8> {
+    let mut out = vec![STATUS_ERR];
+    serde_json::to_writer(&mut out, e).expect("error envelope serializes");
+    out
 }
 
 fn json_body<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -335,7 +342,17 @@ fn call(op: Op, ptr: i32, len: i32) -> i64 {
         Some(_) => unsafe { Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize) },
         None => Vec::new(),
     };
-    let resp = STATE.with(|s| handle(&mut s.borrow_mut(), op, &req));
+    #[cfg(target_family = "wasm")]
+    let initialized = INITIALIZED.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(target_family = "wasm"))]
+    let initialized = true;
+    let resp = if initialized {
+        STATE.with(|s| handle(&mut s.borrow_mut(), op, &req))
+    } else {
+        error_response(&SessionError::internal(
+            "the host must call _initialize once before any other export",
+        ))
+    };
     drop(req);
     let resp = resp.into_boxed_slice();
     let len = resp.len();
@@ -461,14 +478,38 @@ mod tests {
     fn index_through_exports(session: &mut State, repo: &Path) -> Value {
         let git = Repo::discover(repo).unwrap();
         let tree = git.head_tree_oid().unwrap();
-        let mut files = git.enumerate_tree().unwrap();
-        files.reverse(); // the host's order is irrelevant
-
+        let files = git.enumerate_tree().unwrap();
         let opts = json!({"mode": "head", "graph_key": tree, "dataflow": null});
+        drive_index(session, opts, files, Vec::new())
+    }
+
+    /// `mode: "worktree"` through the exports, with the walk and committed list
+    /// a host would send (here from the native git layer, so both sides of a
+    /// comparison see the same working set).
+    fn worktree_through_exports(session: &mut State, repo: &Path) -> Value {
+        let git = Repo::discover(repo).unwrap();
+        let tree = git.head_tree_oid().unwrap();
+        let working = git.enumerate_workdir(repo).unwrap();
+        let committed: Vec<(String, String)> = git.tree_blob_oids(&tree).unwrap().into_iter().collect();
+        let opts = json!({"mode": "worktree", "head_tree": tree, "committed": committed.len()});
+        drive_index(session, opts, working, committed)
+    }
+
+    fn drive_index(
+        session: &mut State,
+        opts: Value,
+        mut files: Vec<cgx_index::SourceFile>,
+        committed: Vec<(String, String)>,
+    ) -> Value {
+        files.reverse(); // the host's order is irrelevant
         let mut begin = vec![serde_json::to_vec(&opts).unwrap()];
         for f in &files {
             begin.push(f.rel_path.as_bytes().to_vec());
             begin.push(f.blob_oid.as_bytes().to_vec());
+        }
+        for (path, oid) in &committed {
+            begin.push(path.as_bytes().to_vec());
+            begin.push(oid.as_bytes().to_vec());
         }
         let r = ok_json(handle(session, Op::IndexBegin, &encode_frame(&begin)));
         let manifests: Vec<usize> = serde_json::from_value(r["manifest_indices"].clone()).unwrap();
@@ -506,7 +547,7 @@ mod tests {
         ok_json(handle(state, Op::Query, &req))
     }
 
-    /// G5 on the composition: the host-driven index through the export dispatch
+    /// Store byte identity on the composition: the host-driven index through the export dispatch
     /// writes the same `.cgx/{objects,fragments,refs}` and `HEAD.json` bytes as
     /// the native in-process index, answers the same, and warm-opens.
     #[test]
@@ -562,6 +603,71 @@ mod tests {
         let again = index_through_exports(&mut warm, &b);
         assert_eq!(again["stats"]["blobs_extracted"], json!(0));
         assert_eq!(store_files(&b), sb, "a re-index of the same tree rewrites nothing");
+
+        // Worktree mode after a HEAD index, on unmodified checkouts: the store
+        // under `.cgx/` is not part of the working set, so the tree is clean and
+        // both drivers key it identically.
+        let native_wt = native.index_native(cgx_session::Mode::Worktree, None, None, false).unwrap();
+        let host_wt = worktree_through_exports(&mut host, &b);
+        assert_eq!(host_wt["graph_key"], json!(native_wt.graph_key));
+        let answer = query(&mut host, "symbols", json!({"max_results": 3}));
+        assert_eq!(answer, native.call("symbols", &json!({"max_results": 3})).unwrap());
+        assert_eq!(answer["dirty"], json!(false));
+        assert_eq!(answer["graph_version"], json!(&tree[..7]));
+    }
+
+    /// A rejected submit aborts the index: nothing can be finished without the
+    /// file, and nothing is written.
+    #[test]
+    fn a_rejected_submit_fails_the_index_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = mixed_repo(tmp.path());
+        let git = Repo::discover(&repo).unwrap();
+        let tree = git.head_tree_oid().unwrap();
+        let files = git.enumerate_tree().unwrap();
+        let mut s = State::new(&repo);
+
+        let mut begin = vec![serde_json::to_vec(&json!({"mode": "head", "graph_key": tree})).unwrap()];
+        for f in &files {
+            begin.push(f.rel_path.as_bytes().to_vec());
+            begin.push(f.blob_oid.as_bytes().to_vec());
+        }
+        let r = ok_json(handle(&mut s, Op::IndexBegin, &encode_frame(&begin)));
+        let manifests: Vec<usize> = serde_json::from_value(r["manifest_indices"].clone()).unwrap();
+        let contents: Vec<Vec<u8>> = manifests.iter().map(|&i| files[i].content.clone()).collect();
+        let plan = ok(handle(&mut s, Op::IndexPlan, &encode_frame(&contents)));
+        let plan = decode_frame(&plan).unwrap();
+        let mut extractor = State::new("/nonexistent");
+        let submit = |index: u32, version: u32, facts: &[u8]| {
+            let mut e = index.to_le_bytes().to_vec();
+            e.extend_from_slice(&version.to_le_bytes());
+            e.extend_from_slice(facts);
+            encode_frame(&[e])
+        };
+        let entry = plan[1];
+        let index = u32::from_le_bytes(entry[..4].try_into().unwrap());
+        let out = ok(handle(
+            &mut extractor,
+            Op::Extract,
+            &encode_frame(&[entry[4..].to_vec(), files[index as usize].content.clone()]),
+        ));
+        let out = decode_frame(&out).unwrap();
+        let meta: Value = serde_json::from_slice(out[0]).unwrap();
+        let version = meta["fragment_version"].as_u64().unwrap() as u32;
+
+        // A wrong fragment version, and (on a fresh plan) non-canonical bytes.
+        assert_eq!(err_kind(handle(&mut s, Op::IndexSubmit, &submit(index, version + 1, out[1]))), "invalid_params");
+        let finish = encode_frame(&[b"{}".to_vec()]);
+        assert_eq!(err_kind(handle(&mut s, Op::IndexFinish, &finish)), "invalid_params");
+        assert!(!repo.join(".cgx/HEAD.json").exists());
+
+        ok_json(handle(&mut s, Op::IndexBegin, &encode_frame(&begin)));
+        ok(handle(&mut s, Op::IndexPlan, &encode_frame(&contents)));
+        let mut padded = out[1].to_vec();
+        padded.push(0);
+        assert_eq!(err_kind(handle(&mut s, Op::IndexSubmit, &submit(index, version, &padded))), "invalid_params");
+        assert_eq!(err_kind(handle(&mut s, Op::IndexFinish, &finish)), "invalid_params");
+        assert!(!repo.join(".cgx/HEAD.json").exists());
     }
 
     #[test]
@@ -577,8 +683,17 @@ mod tests {
         assert_eq!(err_kind(handle(&mut s, Op::Query, br#"{"tool":"export_edges"}"#)), "stale");
         let finish = encode_frame(&[br#"{"surprise":1}"#.to_vec()]);
         assert_eq!(err_kind(handle(&mut s, Op::IndexFinish, &finish)), "invalid_params");
-        let bad_oid = encode_frame(&[br#"{"mode":"head","graph_key":"t"}"#.to_vec(), b"a.rs".to_vec(), b"zz".to_vec()]);
-        assert_eq!(err_kind(handle(&mut s, Op::IndexBegin, &bad_oid)), "invalid_params");
+        let key = "0".repeat(40);
+        for (graph_key, oid) in [
+            (key.as_str(), "a"),                          // too short to name a store path
+            (key.as_str(), &*"A".repeat(40)),             // uppercase
+            (key.as_str(), &*"0".repeat(41)),             // wrong length
+            ("t", &*"0".repeat(40)),                      // graph key is not an OID
+        ] {
+            let opts = serde_json::to_vec(&json!({"mode": "head", "graph_key": graph_key})).unwrap();
+            let frame = encode_frame(&[opts, b"a.rs".to_vec(), oid.as_bytes().to_vec()]);
+            assert_eq!(err_kind(handle(&mut s, Op::IndexBegin, &frame)), "invalid_params", "{oid}");
+        }
     }
 
     #[test]

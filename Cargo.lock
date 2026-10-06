@@ -433,6 +433,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-session"
+version = "0.3.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "cgx-index",
+ "cgx-mcp",
+ "cgx-query",
+ "cgx-resolve",
+ "cgx-select",
+ "cgx-store",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+]
+
+[[package]]
 name = "cgx-store"
 version = "0.3.0"
 dependencies = [

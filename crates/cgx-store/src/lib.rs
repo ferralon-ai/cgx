@@ -34,16 +34,20 @@
 //!
 //! ## Targets
 //!
-//! On `wasm32` only the [`FactStore`] contract and the storage types are built:
-//! the SQLite and object-store backends depend on advisory file locking, which
-//! WASI does not provide, and a wasm embedding's host owns persistence.
+//! On `wasm32` the SQLite backend (rusqlite) and its `fd-lock` advisory locking
+//! are not built. [`ObjectStore`] is: its [`WriteLock`] is a no-op there (the host
+//! holds the exclusive lock on `.cgx/objects.lock`), and its three dataflow caches,
+//! which natively live in a scoped SQLite DB, are not persisted (every
+//! `--dataflow` link is a cold build; the graph is unaffected).
 
 pub mod error;
 pub mod fact_store;
 #[cfg(not(target_family = "wasm"))]
 pub mod lock;
+#[cfg(target_family = "wasm")]
+#[path = "lock_wasm.rs"]
+pub mod lock;
 pub mod manifest;
-#[cfg(not(target_family = "wasm"))]
 pub mod object_store;
 pub mod oid;
 pub mod schema;
@@ -56,9 +60,7 @@ mod token;
 
 pub use error::{Result, StoreError};
 pub use fact_store::{FactStore, FragmentInput};
-#[cfg(not(target_family = "wasm"))]
 pub use lock::WriteLock;
-#[cfg(not(target_family = "wasm"))]
 pub use object_store::ObjectStore;
 pub use oid::ObjectOid;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};

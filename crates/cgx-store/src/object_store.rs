@@ -13,9 +13,11 @@
 //!
 //! The three dataflow caches (`fn_intraproc_cache`, `summary_deps`, `fn_summaries`)
 //! are **not** content-addressed — they want keyed upsert/delete — so they are
-//! delegated to an internally-owned, scoped, gitignored [`SqliteStore`] at
+//! delegated to an internally-owned, scoped, gitignored `SqliteStore` at
 //! `.cgx/cache.db`. That DB is index-time scratch and lives under the `.cgx`
 //! `.gitignore`'s `*`; it is never part of the committed/transported object set.
+//! On `wasm32`, where SQLite is not built, they are not persisted at all (see
+//! [`NoopDataflowCache`]).
 //!
 //! ## Write discipline (atomic-replace + CAS)
 //!
@@ -31,7 +33,7 @@ use crate::error::{Result, StoreError};
 use crate::lock::WriteLock;
 use crate::manifest::{Manifest, ShardEntry, CURRENT_STORE_FORMAT};
 use crate::oid::ObjectOid;
-use crate::store::{FactStore, FnSummaryRow, FragmentInput, SqliteStore};
+use crate::fact_store::{FactStore, FnSummaryRow, FragmentInput};
 use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
 use cgx_core::codec::{decode, encode};
 use cgx_core::{Candidate, EdgeRecord, NodeRecord};
@@ -59,6 +61,42 @@ struct StoredFragment {
     bytes: Vec<u8>,
 }
 
+/// The backend for the three dataflow caches.
+#[cfg(not(target_family = "wasm"))]
+type DataflowCache = crate::store::SqliteStore;
+#[cfg(target_family = "wasm")]
+type DataflowCache = NoopDataflowCache;
+
+/// The `wasm32` dataflow-cache backend: stores nothing and loads empty. The
+/// caches only let a `--dataflow` re-link classify functions as reused vs.
+/// recomputed and skip re-summarizing; an empty prior cache is a cold build, so
+/// the linked graph is identical and only the incremental telemetry differs.
+#[cfg(target_family = "wasm")]
+#[derive(Debug)]
+pub struct NoopDataflowCache;
+
+#[cfg(target_family = "wasm")]
+impl NoopDataflowCache {
+    fn open(_path: impl AsRef<Path>) -> Result<Self> {
+        Ok(NoopDataflowCache)
+    }
+    fn load_fn_intraproc_cache(&self) -> Result<Vec<((String, String), String)>> {
+        Ok(Vec::new())
+    }
+    fn put_fn_intraproc_cache(&mut self, _rows: &[((String, String), String)]) -> Result<()> {
+        Ok(())
+    }
+    fn put_summary_deps(&mut self, _rows: &[(String, String)]) -> Result<()> {
+        Ok(())
+    }
+    fn load_fn_summaries(&self) -> Result<Vec<FnSummaryRow>> {
+        Ok(Vec::new())
+    }
+    fn put_fn_summaries(&mut self, _rows: &[FnSummaryRow]) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A content-addressed loose-object [`FactStore`].
 #[derive(Debug)]
 pub struct ObjectStore {
@@ -67,7 +105,7 @@ pub struct ObjectStore {
     refs_dir: PathBuf,
     lock_path: PathBuf,
     /// Scoped, gitignored SQLite backing **only** the three dataflow caches.
-    cache: SqliteStore,
+    cache: DataflowCache,
 }
 
 impl ObjectStore {
@@ -83,7 +121,7 @@ impl ObjectStore {
         fs::create_dir_all(&objects_dir)?;
         fs::create_dir_all(&fragments_dir)?;
         fs::create_dir_all(&refs_dir)?;
-        let cache = SqliteStore::open(root.join("cache.db"))?;
+        let cache = DataflowCache::open(root.join("cache.db"))?;
         Ok(ObjectStore {
             objects_dir,
             fragments_dir,

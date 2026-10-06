@@ -58,6 +58,7 @@
 mod cargo_pkg;
 mod error;
 mod git;
+mod manifest;
 mod pipeline;
 mod registry;
 

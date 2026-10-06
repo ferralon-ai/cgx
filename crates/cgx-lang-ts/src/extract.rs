@@ -20,7 +20,7 @@
 //! stack is popped.
 
 use crate::effects::{effects_of_call, is_spawn_launcher};
-use crate::module::module_path_for;
+use crate::module::{module_path_for, module_path_from_manifest};
 use crate::query;
 use cgx_core::condition::EdgeCondition;
 use cgx_core::cut::CutMarker;
@@ -33,14 +33,16 @@ use cgx_frontend::facts::{
     CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileFacts, ImportFact,
     ImportedName, RawRef, RefKind, ScopeId, ScopeTree, SymbolDef,
 };
-use cgx_frontend::frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
+use cgx_frontend::frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, ManifestKind, RelPath};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashSet};
 use tree_sitter::{Language, Node, Parser};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 2;
+/// v3: FQN root is now the verbatim `package.json` `name` (plus subpath) instead
+/// of the mangled dir-before-`src/`, so v2 fragments may carry stale roots.
+const TS_FRAGMENT_VERSION: u32 = 3;
 
 /// The TypeScript/JavaScript language frontend.
 ///
@@ -106,7 +108,19 @@ impl LanguageFrontend for TypeScriptFrontend {
             None => return Ok(FileFacts::empty()),
         };
 
-        let module_prefix = module_path_for(ctx.path.as_str());
+        // Canonical root = the nearest-ancestor package.json `name` (verbatim),
+        // resolved pipeline-side into `ctx.manifest`. Fall back to the
+        // non-canonical dir-before-`src/` derivation when no package.json is
+        // resolved (or it declares no `name`). tsconfig path aliases are
+        // deliberately not consulted: identity is the package name plus the real
+        // on-disk subpath, independent of build config.
+        let module_prefix = match &ctx.manifest {
+            Some(m) if m.kind == ManifestKind::PackageJson => match &m.identity {
+                Some(name) => module_path_from_manifest(ctx.path.as_str(), name, &m.root_dir),
+                None => module_path_for(ctx.path.as_str()),
+            },
+            _ => module_path_for(ctx.path.as_str()),
+        };
 
         let mut builder = Builder::new(src, ctx.path.as_str(), &module_prefix);
         builder.walk_program(tree.root_node());

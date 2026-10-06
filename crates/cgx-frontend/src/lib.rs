@@ -63,7 +63,9 @@ pub use facts::{
     SymbolDef,
 };
 pub use fallback::FallbackFrontend;
-pub use frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
+pub use frontend::{
+    FileCtx, FrontendError, Lang, LanguageFrontend, ManifestInfo, ManifestKind, RelPath,
+};
 pub use registry::FrontendRegistry;
 
 // --- Re-exported cgx-core model types frontends emit (reuse, never duplicate) ---

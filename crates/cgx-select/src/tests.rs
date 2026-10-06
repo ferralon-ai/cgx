@@ -24,6 +24,8 @@ fn node(fqn: &str, lang: &str) -> NodeRecord {
         own_effects: EffectSet::default(),
         transitive_effects: EffectSet::default(),
         unresolved_calls: 0,
+        external_calls: 0,
+        narrowing: Default::default(),
     }
 }
 

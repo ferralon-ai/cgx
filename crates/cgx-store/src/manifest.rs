@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 /// Unlike `created_rev` (git provenance), this is the compatibility gate: a reader
 /// rejects a manifest whose `store_format` exceeds this value rather than
 /// mis-decoding non-self-describing postcard bytes (recon §4 / D-3).
-pub const CURRENT_STORE_FORMAT: u32 = 1;
+///
+/// 2: `NodeRecord` gains `external_calls` and `narrowing`. Format-1 shards are
+/// not readable by this binary; rebuild the index.
+pub const CURRENT_STORE_FORMAT: u32 = 2;
 
 /// One shard entry: the owning-function key and the OID of the object holding that
 /// function's nodes + edges. The list is sorted by `fn_key` so the manifest bytes

@@ -268,6 +268,14 @@ fn cut_reason(marker: CutMarker, count: usize) -> ApproxReason {
             "summary-budget",
             "interprocedural dataflow summary budget exhausted",
         ),
+        CutMarker::External => (
+            "external-receiver",
+            "call on an out-of-repo receiver type not modeled",
+        ),
+        CutMarker::UntypedReceiver => (
+            "untyped-receiver",
+            "call on a receiver of unknown type not modeled",
+        ),
     };
     ApproxReason {
         direction: ReasonDirection::Under,
@@ -722,6 +730,8 @@ mod tests {
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 

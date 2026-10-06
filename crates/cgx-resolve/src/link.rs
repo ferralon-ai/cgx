@@ -151,6 +151,8 @@ fn build_nodes(
                 // P8b populates this via the transitive closure pass; empty here.
                 transitive_effects: cgx_core::EffectSet::new(),
                 unresolved_calls: 0,
+                external_calls: 0,
+                narrowing: Default::default(),
             };
             let prov = Provenance::new(
                 def.span.clone(),
@@ -909,6 +911,8 @@ impl ValueNodeStage {
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         };
         let prov = Provenance::new(self.span, "ssa-value", Tier::ScopeGraph, self.blob_oid);
         NodeWithProvenance {

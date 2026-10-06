@@ -568,6 +568,14 @@ fn cut_phrase(marker: CutMarker) -> (&'static str, &'static str) {
             "summary-budget",
             "interprocedural dataflow summary budget exhausted",
         ),
+        CutMarker::External => (
+            "external-receiver",
+            "call on an out-of-repo receiver type not modeled",
+        ),
+        CutMarker::UntypedReceiver => (
+            "untyped-receiver",
+            "call on a receiver of unknown type not modeled",
+        ),
     }
 }
 

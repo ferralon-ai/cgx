@@ -13,9 +13,10 @@ pub enum StoreError {
     /// The on-disk `schema_version` is newer than this binary understands, or the
     /// `view_schema_version` does not match. Carries `(found, expected)`.
     SchemaVersion { found: i64, expected: i64 },
-    /// A committed manifest carries a `store_format` newer than this binary
-    /// understands. Rejected rather than mis-decoded (the postcard wire format is
-    /// not self-describing). Carries `(found, expected)`.
+    /// A committed manifest carries a `store_format` other than the one this
+    /// binary reads (newer, or an older one with no reader). Rejected rather than
+    /// mis-decoded (the postcard wire format is not self-describing). Carries
+    /// `(found, expected)`.
     StoreFormat { found: u32, expected: u32 },
     /// The advisory write lock could not be acquired within the timeout (IX-7).
     LockTimeout,
@@ -32,10 +33,15 @@ impl core::fmt::Display for StoreError {
                 f,
                 "index schema version {found} is incompatible with this binary (expected {expected})"
             ),
-            StoreError::StoreFormat { found, expected } => write!(
+            StoreError::StoreFormat { found, expected } if found > expected => write!(
                 f,
                 "committed store_format {found} is newer than this cgx understands \
                  (supports up to {expected}); upgrade cgx to read this graph"
+            ),
+            StoreError::StoreFormat { found, expected } => write!(
+                f,
+                "committed store_format {found} is older than this cgx reads \
+                 (expects {expected}); rebuild the index"
             ),
             StoreError::LockTimeout => write!(f, "could not acquire index write lock within timeout"),
             StoreError::Io(e) => write!(f, "io error: {e}"),

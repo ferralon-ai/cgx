@@ -66,6 +66,14 @@ pub struct CutMarkerCount {
     pub reflective: usize,
     /// [`CutMarker::ViaDi`]: dependency-injection container dispatch.
     pub via_di: usize,
+    /// [`CutMarker::External`]: calls on an out-of-repo receiver. The resolver
+    /// leaves these as dangling refs, not edges, so this is normally 0; the
+    /// per-node count is `DanglingCounts::external`.
+    pub external: usize,
+    /// [`CutMarker::UntypedReceiver`]: untyped-receiver calls with no
+    /// import-visible target. Normally 0 for the same reason; see
+    /// `DanglingCounts::untyped_dropped`.
+    pub untyped_receiver: usize,
 }
 
 impl CutMarkerCount {
@@ -80,6 +88,8 @@ impl CutMarkerCount {
             + self.dynamic
             + self.reflective
             + self.via_di
+            + self.external
+            + self.untyped_receiver
     }
 }
 
@@ -208,6 +218,8 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
                 CutMarker::Dynamic => cut_markers.dynamic += 1,
                 CutMarker::Reflective => cut_markers.reflective += 1,
                 CutMarker::ViaDi => cut_markers.via_di += 1,
+                CutMarker::External => cut_markers.external += 1,
+                CutMarker::UntypedReceiver => cut_markers.untyped_receiver += 1,
                 // Dataflow-only cut markers (v0.3 DATA_FLOW): not part of the
                 // call-resolution quality breakdown this report summarizes.
                 CutMarker::OpaqueCall

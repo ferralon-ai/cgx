@@ -150,6 +150,8 @@ impl GraphBuilder {
                     own_effects: cgx_core::EffectSet::new(),
                     transitive_effects: cgx_core::EffectSet::new(),
                     unresolved_calls: 0,
+                    external_calls: 0,
+                    narrowing: Default::default(),
                 }
             })
             .collect();

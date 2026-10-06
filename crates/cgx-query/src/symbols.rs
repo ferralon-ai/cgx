@@ -244,6 +244,8 @@ mod tests {
             own_effects: Default::default(),
             transitive_effects: Default::default(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 

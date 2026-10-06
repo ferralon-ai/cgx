@@ -403,7 +403,9 @@ pub enum TypeFact {
         index: Option<u8>,
         /// How the parameter binds arguments.
         kind: ParamKind,
-        /// The declared type, normalized; `None` when unannotated.
+        /// The declared type, normalized; `None` when unannotated. For
+        /// `VarArgs`/`VarKeywords` it is the declared element type (`*args: T`,
+        /// Go `...T`).
         ty: Option<TypeExpr>,
     },
     /// One binding site of local `var` inside `func`.

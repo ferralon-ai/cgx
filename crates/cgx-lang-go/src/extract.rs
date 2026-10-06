@@ -91,6 +91,7 @@ impl LanguageFrontend for GoFrontend {
         };
         let mut builder = Builder::new(src, ctx.path.as_str());
         builder.package_name = builder.read_package_name(tree.root_node());
+        builder.facts.module = Some(module_prefix.clone());
 
         let root_ctx = Ctx::root(module_prefix);
         let mut stmt_index = 0u32;
@@ -328,6 +329,9 @@ impl<'a> Builder<'a> {
         });
         self.maybe_export(&name, node);
         self.record_fn_entrypoints(&name, &fqn);
+        self.facts
+            .type_facts
+            .extend(crate::typefacts::collect(self.src, node, &fqn));
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope);
@@ -362,6 +366,9 @@ impl<'a> Builder<'a> {
             is_abstract: false,
             signature: None,
         });
+        self.facts
+            .type_facts
+            .extend(crate::typefacts::collect(self.src, node, &fqn));
 
         // The receiver type's method set drives same-file `Implements` detection.
         self.type_methods

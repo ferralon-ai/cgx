@@ -6,7 +6,9 @@ use cgx_core::cut::{CutMarker, CutMarkers};
 use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
 use cgx_core::locality::{locality_tier, LocalityTier};
-use cgx_core::node::{EntrypointKind, NodeRecord, NodeWithProvenance, SymbolKind, Visibility};
+use cgx_core::node::{
+    EntrypointKind, NarrowingCounts, NodeRecord, NodeWithProvenance, SymbolKind, Visibility,
+};
 use cgx_core::provenance::{Provenance, Span};
 use cgx_core::transform::Transform;
 use cgx_frontend::facts::{
@@ -101,7 +103,8 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
         DataflowOutput::default()
     };
 
-    let mut graph = finalize(nodes, edges, candidates, unresolved);
+    let narrowing = std::collections::BTreeMap::new();
+    let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
     graph.dataflow = dataflow;
     graph
 }
@@ -1408,33 +1411,57 @@ fn emit_candidate_set(
 }
 
 /// Sort nodes/edges into canonical order, assign dense edge ids, sort candidates.
+///
+/// `narrowing` carries the receiver-narrowing counters per caller node; its
+/// `visible_dropped_out` is ignored because that count is derived here from the
+/// dangling refs themselves.
 fn finalize(
     mut nodes: Vec<NodeWithProvenance>,
     edges: Vec<EdgeWithProvenance>,
     candidates: Vec<Candidate>,
     mut unresolved: Vec<UnresolvedRef>,
+    narrowing: &std::collections::BTreeMap<NodeId, NarrowingCounts>,
 ) -> ResolvedGraph {
     unresolved.sort();
 
-    // Stamp each caller's Step-5 dangling-ref count onto its node record
-    // (`NodeRecord.unresolved_calls`). Dangling refs leave *no edge*, so this
-    // count is the only trace of the blind spot a graph walk can see — the
-    // approximation contract (A3/A4) reads it so a negative answer whose
-    // frontier crosses an external/unindexed call is never claimed `exact`.
-    // Keyed by `(caller fqn, file)`: the ref's span lies inside the caller's
-    // body, so its file matches the caller node's file.
-    let mut dangling: std::collections::BTreeMap<(&str, &str), u32> =
+    // Stamp each caller's dangling-ref counts onto its node record, one field per
+    // marker. Dangling refs leave *no edge*, so these counts are the only trace
+    // of the blind spot a graph walk can see — the approximation contract
+    // (A3/A4) reads them so a negative answer whose frontier crosses a call that
+    // was not followed is never claimed `exact`. Keyed by `(caller fqn, file)`:
+    // the ref's span lies inside the caller's body, so its file matches the
+    // caller node's file.
+    #[derive(Default)]
+    struct Dangling {
+        unresolved: u32,
+        external: u32,
+        untyped: u32,
+    }
+    let mut dangling: std::collections::BTreeMap<(&str, &str), Dangling> =
         std::collections::BTreeMap::new();
     for r in &unresolved {
-        *dangling
+        let d = dangling
             .entry((r.caller_fqn.as_str(), r.span.file.as_str()))
-            .or_default() += 1;
+            .or_default();
+        match r.marker {
+            CutMarker::External => d.external += 1,
+            CutMarker::UntypedReceiver => d.untyped += 1,
+            // `Unresolved`, and any other marker a dangling ref might carry: the
+            // call was still not followed, so it must be counted somewhere.
+            _ => d.unresolved += 1,
+        }
     }
-    if !dangling.is_empty() {
+    if !dangling.is_empty() || !narrowing.is_empty() {
         for n in &mut nodes {
-            if let Some(count) = dangling.get(&(n.node.fqn.as_str(), n.node.file.as_str())) {
-                n.node.unresolved_calls = *count;
+            let d = dangling.get(&(n.node.fqn.as_str(), n.node.file.as_str()));
+            if let Some(d) = d {
+                n.node.unresolved_calls = d.unresolved;
+                n.node.external_calls = d.external;
             }
+            if let Some(counts) = narrowing.get(&n.node.id) {
+                n.node.narrowing = *counts;
+            }
+            n.node.narrowing.visible_dropped_out = d.map_or(0, |d| d.untyped);
         }
     }
 
@@ -1490,4 +1517,129 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     graph.candidates.sort_by(|a, b| {
         (a.candidate_group, a.rank, a.dst.0).cmp(&(b.candidate_group, b.rank, b.dst.0))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn node(id: u32, fqn: &str, file: &str) -> NodeWithProvenance {
+        NodeWithProvenance {
+            node: NodeRecord {
+                id: NodeId(id),
+                kind: SymbolKind::Function,
+                fqn: fqn.into(),
+                file: file.into(),
+                line_start: 1,
+                line_end: 10,
+                lang: "python".into(),
+                visibility: Visibility::Public,
+                is_abstract: false,
+                entrypoint_kind: None,
+                signature: None,
+                own_effects: Default::default(),
+                transitive_effects: Default::default(),
+                unresolved_calls: 0,
+                external_calls: 0,
+                narrowing: Default::default(),
+            },
+            provenance: Provenance {
+                span: Span::new(file, 1, None),
+                rule: "def".into(),
+                tier: Tier::NameSyntactic,
+                index_id: "blob".into(),
+            },
+        }
+    }
+
+    fn dangle(caller: &str, file: &str, line: u32, marker: CutMarker) -> UnresolvedRef {
+        UnresolvedRef {
+            caller_fqn: caller.into(),
+            name_path: vec!["x".into(), "m".into()],
+            span: Span::new(file, line, None),
+            marker,
+        }
+    }
+
+    fn counts(g: &ResolvedGraph, fqn: &str) -> (u32, u32, NarrowingCounts) {
+        let n = &g.nodes.iter().find(|n| n.node.fqn == fqn).unwrap().node;
+        (n.unresolved_calls, n.external_calls, n.narrowing)
+    }
+
+    #[test]
+    fn finalize_counts_each_dangling_marker_into_its_own_field() {
+        let nodes = vec![node(0, "m::a", "m.py"), node(1, "m::b", "m.py")];
+        let unresolved = vec![
+            dangle("m::a", "m.py", 2, CutMarker::Unresolved),
+            dangle("m::a", "m.py", 3, CutMarker::External),
+            dangle("m::a", "m.py", 4, CutMarker::External),
+            dangle("m::a", "m.py", 5, CutMarker::UntypedReceiver),
+            dangle("m::b", "m.py", 12, CutMarker::UntypedReceiver),
+        ];
+        let total = unresolved.len() as u32;
+        let g = finalize(nodes, vec![], vec![], unresolved, &BTreeMap::new());
+
+        let (u, e, n) = counts(&g, "m::a");
+        assert_eq!((u, e, n.visible_dropped_out), (1, 2, 1));
+        let (u, e, n) = counts(&g, "m::b");
+        assert_eq!((u, e, n.visible_dropped_out), (0, 0, 1));
+
+        let sum: u32 = g
+            .nodes
+            .iter()
+            .map(|n| {
+                n.node.unresolved_calls
+                    + n.node.external_calls
+                    + n.node.narrowing.visible_dropped_out
+            })
+            .sum();
+        assert_eq!(sum, total, "every dangling ref is counted exactly once");
+        assert_eq!(g.unresolved.len() as u32, total);
+    }
+
+    #[test]
+    fn finalize_merges_narrowing_counts_but_derives_dropped_sites_from_dangles() {
+        let nodes = vec![node(0, "m::a", "m.py"), node(1, "m::b", "m.py")];
+        let unresolved = vec![dangle("m::a", "m.py", 2, CutMarker::UntypedReceiver)];
+        let mut narrowing = BTreeMap::new();
+        narrowing.insert(
+            NodeId(0),
+            NarrowingCounts {
+                typed_out: 3,
+                visible_out: 1,
+                visible_dropped_out: 99,
+                ..Default::default()
+            },
+        );
+        narrowing.insert(
+            NodeId(1),
+            NarrowingCounts {
+                typed_away_in: 4,
+                visible_away_in: 2,
+                ..Default::default()
+            },
+        );
+        let g = finalize(nodes, vec![], vec![], unresolved, &narrowing);
+
+        let (_, _, a) = counts(&g, "m::a");
+        assert_eq!(
+            a,
+            NarrowingCounts {
+                typed_out: 3,
+                visible_out: 1,
+                visible_dropped_out: 1,
+                ..Default::default()
+            }
+        );
+        let (_, _, b) = counts(&g, "m::b");
+        assert_eq!(
+            b,
+            NarrowingCounts {
+                typed_away_in: 4,
+                visible_away_in: 2,
+                ..Default::default()
+            }
+        );
+    }
 }

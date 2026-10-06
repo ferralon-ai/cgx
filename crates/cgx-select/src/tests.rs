@@ -365,3 +365,47 @@ fn family_order_is_deterministic() {
     let b = compile("Foo").unwrap();
     assert_eq!(a.families(), b.families());
 }
+
+/// `final_segments` names the literal final segments a match must end in, and
+/// only when every parse ends in one.
+#[test]
+fn final_segments_are_the_literal_last_segment() {
+    let fin = |s: &str| {
+        compile(s)
+            .unwrap()
+            .final_segments()
+            .map(|set| set.into_iter().map(str::to_string).collect::<Vec<_>>())
+    };
+    assert_eq!(fin("a::b"), Some(vec!["b".to_string()]));
+    assert_eq!(fin("**::b"), Some(vec!["b".to_string()]));
+    assert_eq!(fin("a::(x|y)"), Some(vec!["x".to_string(), "y".to_string()]));
+    assert_eq!(fin("a::*B"), None);
+    assert_eq!(fin("a::**"), None);
+    assert_eq!(fin("a::!b"), None);
+    assert_eq!(fin("a::*"), None);
+}
+
+/// Soundness: whenever `final_segments` is `Some`, every node the selector
+/// matches (natively or agnostically) ends in one of those segments.
+#[test]
+fn final_segments_never_exclude_a_match() {
+    let selectors = [
+        "com::foo::Bar", "**::Bar", "(com|org)::**::(Bar|Baz)", "com.foo.Bar", "foo.bar",
+        "github.com/x/y::Bar", "**::*Bar", "com::!foo::Bar",
+    ];
+    let fqns = [
+        ("com::foo::Bar", "rust"), ("org::x::Baz", "java"), ("com::foo::Barn", "rust"),
+        ("foo::bar", "python"), ("github.com/x/y::Bar", "go"), ("com::other::Bar", "rust"),
+    ];
+    for s in selectors {
+        let Ok(sel) = compile(s) else { continue };
+        let Some(fin) = sel.final_segments() else { continue };
+        for (fqn, lang) in fqns {
+            let n = node(fqn, lang);
+            if sel.matches(&n, &MatchOptions::agnostic()) {
+                let last = fqn.rsplit("::").next().unwrap();
+                assert!(fin.contains(last), "{s} matched {fqn} outside {fin:?}");
+            }
+        }
+    }
+}

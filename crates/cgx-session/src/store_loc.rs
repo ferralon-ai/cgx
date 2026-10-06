@@ -1,9 +1,11 @@
 //! Store location (IX-8), the current-index pointer, and the `cgx.toml` dataflow
 //! switch: the parts of the on-disk index layout every writer of `.cgx/` shares.
 //!
-//! The index lives under a `.cgx/` directory at the repository root, and
-//! `.cgx/HEAD.json` records the graph the last index produced so a later query
-//! knows which Layer-2 graph to load without re-indexing. The CLI and a resident
+//! The index lives under a `.cgx/` directory at the repository root: the
+//! content-addressed object store (`objects/`, `refs/`, `fragments/`, and the
+//! dataflow-cache `cache.db`), and `.cgx/HEAD.json`, which records the graph the
+//! last index produced so a later query knows which Layer-2 graph to load without
+//! re-indexing. The CLI and a resident
 //! session (native or wasm) write the pointer through this one implementation, so
 //! its bytes do not depend on which of them indexed.
 //!
@@ -27,7 +29,7 @@ pub const GITIGNORE_FILE: &str = ".gitignore";
 ///
 /// Forward-compat (sparse-storage RFC §7, option c): when a user opts into the
 /// in-tree committable loose store, cgx will *rewrite* this file selectively
-/// (keep ignoring the rebuildable cache `index.db*`/`*.lock`, but un-ignore the
+/// (keep ignoring the rebuildable cache `cache.db*`/`*.lock`, but un-ignore the
 /// committable `objects/` + manifest via `!objects/` then `!objects/**`). Do not
 /// build that mode now — `*` is correct for the default posture.
 const GITIGNORE_BODY: &str = "*\n";
@@ -94,13 +96,16 @@ pub fn ensure_cgx_dir(repo_root: &Path) -> Result<(), String> {
 }
 
 /// Persist the current-index pointer (deterministic: stable field order, trailing
-/// newline). Called after a successful store of a committed-tree graph.
+/// newline). Called after a successful store of a committed-tree graph. Written
+/// temp → flush → rename, so a crash leaves either the previous pointer or the
+/// new one.
 pub fn write_pointer(repo_root: &Path, ptr: &IndexPointer) -> Result<(), String> {
     ensure_cgx_dir(repo_root)?;
     let mut json = serde_json::to_string_pretty(ptr).expect("IndexPointer serializes");
     json.push('\n');
     let path = head_path(repo_root);
-    std::fs::write(&path, json).map_err(|e| format!("writing {path:?}: {e}"))?;
+    cgx_store::durable::write_durable(&path, json.as_bytes())
+        .map_err(|e| format!("writing {path:?}: {e}"))?;
     Ok(())
 }
 
@@ -176,7 +181,7 @@ mod tests {
         ensure_cgx_dir(root).unwrap();
         // Simulate a future selective (in-tree-committable) form the user/cgx put there.
         let gi = gitignore_path(root);
-        let selective = "index.db\nindex.db-wal\n!objects/\n!objects/**\n";
+        let selective = "cache.db\ncache.db-wal\n!objects/\n!objects/**\n";
         std::fs::write(&gi, selective).unwrap();
 
         // A subsequent index must not clobber an existing .gitignore.

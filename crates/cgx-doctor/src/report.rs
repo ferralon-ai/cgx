@@ -68,11 +68,11 @@ pub struct CutMarkerCount {
     pub via_di: usize,
     /// [`CutMarker::External`]: calls on an out-of-repo receiver. The resolver
     /// leaves these as dangling refs, not edges, so this is normally 0; the
-    /// per-node count is `DanglingCounts::external`.
+    /// per-node count is [`DanglingCounts::external`].
     pub external: usize,
     /// [`CutMarker::UntypedReceiver`]: untyped-receiver calls with no
     /// import-visible target. Normally 0 for the same reason; see
-    /// `DanglingCounts::untyped_dropped`.
+    /// [`DanglingCounts::untyped_dropped`].
     pub untyped_receiver: usize,
 }
 
@@ -91,6 +91,41 @@ impl CutMarkerCount {
             + self.external
             + self.untyped_receiver
     }
+}
+
+/// Call sites that left **no edge**, summed from the per-node counters the
+/// resolver stamps (`NodeRecord.unresolved_calls`, `external_calls`,
+/// `narrowing.visible_dropped_out`). Edges never carry these, so the edge-based
+/// [`CutMarkerCount`] cannot see them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct DanglingCounts {
+    /// No definition found for the callee.
+    pub unresolved: usize,
+    /// The receiver was proven to be of an out-of-repo type or module.
+    pub external: usize,
+    /// The receiver type was unknown and the import-visibility rule found no
+    /// visible target.
+    pub untyped_dropped: usize,
+}
+
+impl DanglingCounts {
+    /// All call sites that left no edge.
+    pub fn total(&self) -> usize {
+        self.unresolved + self.external + self.untyped_dropped
+    }
+}
+
+/// Call sites whose targets receiver narrowing restricted, summed from
+/// `NodeRecord.narrowing`. Zero unless receiver narrowing ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct NarrowingTotals {
+    /// Sites bound by receiver typing (`typed_out`).
+    pub typed_sites: usize,
+    /// Sites bound by interprocedural receiver typing (`interproc_out`).
+    pub interproc_sites: usize,
+    /// Untyped-receiver sites bounded by the import-visibility rule
+    /// (`visible_out`); the rule is not sound for duck typing.
+    pub visible_sites: usize,
 }
 
 /// An anomaly flag: a condition that suggests the index may be incomplete or
@@ -159,6 +194,16 @@ pub struct DoctorReport {
     /// Unresolved refs as a fraction of total refs (0.0 = perfect, 1.0 = all
     /// unresolved). `None` if `total_refs == 0`.
     pub unresolved_rate: Option<f64>,
+    /// Call sites that left no edge, by cause (from node counters).
+    pub dangling: DanglingCounts,
+    /// `dangling.total() / (call_edge_count + dangling.total())`: unfollowed
+    /// sites as a share of call edges plus unfollowed sites. Call edges are not
+    /// call sites (a site with a k-candidate set contributes k edges), so this
+    /// understates the share of sites. `None` if the denominator is 0. Unlike
+    /// `unresolved_rate` this sees dangling refs, which leave no edge.
+    pub dangling_rate: Option<f64>,
+    /// Call sites whose targets receiver narrowing restricted.
+    pub narrowing: NarrowingTotals,
 
     // --- Unsupported files ----------------------------------------------
     /// Files that were skipped because no registered adapter claimed them.
@@ -250,6 +295,25 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
         None
     };
 
+    // --- Dangling call sites and receiver narrowing (node counters) ---
+    // Pure sums over `graph.nodes`, so deterministic.
+    let mut dangling = DanglingCounts::default();
+    let mut narrowing = NarrowingTotals::default();
+    for node in &graph.nodes {
+        dangling.unresolved += node.unresolved_calls as usize;
+        dangling.external += node.external_calls as usize;
+        dangling.untyped_dropped += node.narrowing.visible_dropped_out as usize;
+        narrowing.typed_sites += node.narrowing.typed_out as usize;
+        narrowing.interproc_sites += node.narrowing.interproc_out as usize;
+        narrowing.visible_sites += node.narrowing.visible_out as usize;
+    }
+    let dangling_sites = call_edge_count + dangling.total();
+    let dangling_rate = if dangling_sites > 0 {
+        Some(dangling.total() as f64 / dangling_sites as f64)
+    } else {
+        None
+    };
+
     // --- Unsupported files (not tracked in LinkedGraph; set to 0/None) ---
     // The LinkedGraph does not carry pipeline counters (those live in IndexStats).
     // The doctor report can be computed from just the stored graph; callers who
@@ -310,6 +374,9 @@ pub fn compute(graph: &LinkedGraph) -> DoctorReport {
         total_refs,
         unresolved_count,
         unresolved_rate,
+        dangling,
+        dangling_rate,
+        narrowing,
         unsupported_files,
         total_files,
         unsupported_share,

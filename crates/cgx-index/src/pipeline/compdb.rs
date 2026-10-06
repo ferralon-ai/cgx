@@ -30,7 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use super::scip_relabel::CompdbCompleteness;
-use crate::git::SourceFile;
+use crate::source::SourceFile;
 
 /// C++ translation-unit extensions (NOT headers). The TU subset of the extensions
 /// `cgx_lang_cpp::CppFrontend::handles` claims (`cpp/cc/cxx` are compiled units;

@@ -33,6 +33,7 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | IF-7 | `--at <ref>` flag: query against a specific commit | Shipped |
 | IF-8 | `--order` flag: stable result ordering | **Planned (not yet shipped in v0.3.0)** — engine already returns rows in a fixed deterministic order; no CLI flag exists |
 | IF-9 | MCP STDIO server mode: `cgx mcp` | Shipped |
+| IF-9a | Resident session: `cgx session` (NDJSON over stdio) and the `cgx.wasm` module exports; index or warm-open once, answer the MCP tools plus `export_edges`/`resolve` from the graph held in memory — see [commands/session.md](commands/session.md) | **Shipped** — the embedding surface of the Go SDK's native and wasm transports |
 | IF-10 | MCP tool: `graph_query` | **Shipped** — routes to the same CQL engine as `cgx query`; it is not a stub and does not error |
 | IF-11 | MCP tool: `callers` | Shipped |
 | IF-12 | MCP tool: `callees` | Shipped |

@@ -13,8 +13,8 @@ serde.workspace = true
 postcard.workspace = true
 sha1 = "0.10"
 
-# The SQLite and object-store backends and their advisory locking are native-only;
-# see the crate docs ("Targets").
+# The SQLite backend and the advisory file lock are native-only; the object store
+# builds everywhere (see the crate docs, "Targets").
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 fd-lock = "4"

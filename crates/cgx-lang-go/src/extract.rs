@@ -48,7 +48,9 @@ impl GoFrontend {
 }
 
 /// Version of the Go extraction rules; bumping invalidates cached fragments.
-const GO_FRAGMENT_VERSION: u32 = 1;
+/// v2: FQN root is now the go.mod import path (module path + package subdir)
+/// instead of the leaf directory name, so v1 fragments may carry stale roots.
+const GO_FRAGMENT_VERSION: u32 = 2;
 
 impl LanguageFrontend for GoFrontend {
     fn lang(&self) -> Lang {

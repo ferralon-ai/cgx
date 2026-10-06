@@ -63,17 +63,39 @@ const CALL_EDGE_KINDS: &[(&str, EdgeKind)] = &[
 /// determinism. Each declares its `inputSchema` per docs/07 and the
 /// `outputSchema` of its `structuredContent` (IF-17); the agent-facing
 /// `include_dirty` default is `true` on every graph-reading tool (ADR-06).
+///
+/// A tool with no output type in [`crate::output`] is listed without an
+/// `outputSchema` rather than failing `tools/list`; `tests/output_schema.rs`
+/// fails the build instead.
 pub fn tool_list() -> Value {
     let mut list = registrations();
-    for tool in list["tools"].as_array_mut().expect("tools array") {
-        let name = tool["name"].as_str().expect("tool name").to_string();
-        let schema = output::output_schema(&name)
-            .unwrap_or_else(|| panic!("tool `{name}` has no output type in output.rs"));
-        tool.as_object_mut()
-            .expect("tool registration is an object")
-            .insert("outputSchema".into(), output::without_descriptions(schema));
+    if let Some(tools) = list.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let schema = output::output_schema(name);
+            debug_assert!(schema.is_some(), "tool `{name}` has no output type");
+            if let (Some(schema), Some(obj)) = (schema, tool.as_object_mut()) {
+                obj.insert("outputSchema".into(), output::for_tools_list(schema));
+            }
+        }
     }
     list
+}
+
+/// Each registered tool's `(name, inputSchema)`, in `tools/list` order.
+pub(crate) fn input_schemas() -> Vec<(String, Value)> {
+    let list = registrations();
+    list.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?.to_string();
+            Some((name, t.get("inputSchema")?.clone()))
+        })
+        .collect()
 }
 
 fn registrations() -> Value {

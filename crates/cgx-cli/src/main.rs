@@ -117,6 +117,21 @@ enum Command {
         /// ⇒ the Phase-1 syntactic graph, unchanged.
         #[arg(long, value_name = "SCIP_INDEX")]
         scip: Option<PathBuf>,
+        /// Path to the `compile_commands.json` backing a scip-clang (C++) index.
+        /// cgx verifies it covers every C++ translation unit (`.cpp/.cc/.cxx`, not
+        /// headers) discovered in the source tree; only a fully-covering compdb
+        /// lets C++ promotions reach `certain`. Any discovered TU missing ⇒
+        /// fail-closed to `probable`, with the missing-TU diagnostic. Ignored for a
+        /// rust-analyzer index.
+        #[arg(long, value_name = "COMPILE_COMMANDS")]
+        compdb: Option<PathBuf>,
+        /// Assert (for CI) that the compdb is complete for every discovered C++ TU,
+        /// skipping the coverage self-check. Use when the build system guarantees a
+        /// full compile_commands.json. Without it, completeness is verified from
+        /// `--compdb`; absent both, a scip-clang index stays fail-closed at
+        /// `probable`.
+        #[arg(long = "compdb-complete")]
+        compdb_complete: bool,
         /// Skip the v0.3 DATA_FLOW layer (SSA value nodes + `derives-from` edges,
         /// intraprocedural, Rust-only). Dataflow is built BY DEFAULT (v0.3 SC6);
         /// pass `--no-dataflow` (or set `[index] data_flow = false` in `cgx.toml`)
@@ -778,7 +793,9 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path, scip, no_dataflow } => run_index(path, scip, no_dataflow),
+        Command::Index { path, scip, compdb, compdb_complete, no_dataflow } => {
+            run_index(path, scip, compdb, compdb_complete, no_dataflow)
+        }
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::FlowsTo { symbol, query } => run_flow(&symbol, query, FlowDir::Forward),
@@ -917,6 +934,8 @@ fn run(command: Command) -> Result<(), CliError> {
 fn run_index(
     path: Option<PathBuf>,
     scip: Option<PathBuf>,
+    compdb: Option<PathBuf>,
+    compdb_complete: bool,
     no_dataflow: bool,
 ) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
@@ -925,7 +944,15 @@ fn run_index(
     // disables it. The library `IndexOpts::default()` stays base (dataflow off) —
     // the on-by-default decision lives here at the application boundary.
     let dataflow = resolve_dataflow_default(&repo_root) && !no_dataflow;
-    let outcome = index_repo(&repo_root, &IndexOpts { scip, dataflow })?;
+    let outcome = index_repo(
+        &repo_root,
+        &IndexOpts {
+            scip,
+            dataflow,
+            compdb,
+            compdb_complete,
+        },
+    )?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
@@ -946,6 +973,25 @@ fn run_index(
             scip.collisions,
             scip.capped_partial_compdb
         );
+    }
+    if let Some(c) = &s.compdb {
+        match c.completeness {
+            cgx_index::CompdbCompleteness::Complete => println!(
+                "  compdb: COMPLETE — {}/{} C++ TUs covered; C++ promotions may reach certain",
+                c.covered_tus, c.discovered_tus
+            ),
+            _ => {
+                println!(
+                    "  compdb: PARTIAL — {}/{} C++ TUs covered, {} missing; C++ capped at probable (fail-closed)",
+                    c.covered_tus, c.discovered_tus, c.missing_tus
+                );
+                if !c.missing_sample.is_empty() {
+                    let more = c.missing_tus.saturating_sub(c.missing_sample.len());
+                    let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                    println!("    missing TUs: {}{}", c.missing_sample.join(", "), suffix);
+                }
+            }
+        }
     }
     if s.cha.sites_rescoped > 0 {
         println!(

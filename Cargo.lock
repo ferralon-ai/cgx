@@ -285,6 +285,8 @@ dependencies = [
  "cgx-store",
  "gix",
  "rayon",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tree-sitter-json",

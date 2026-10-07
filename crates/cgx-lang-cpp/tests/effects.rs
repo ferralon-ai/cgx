@@ -8,7 +8,7 @@ use cgx_core::effect::Effect;
 use cgx_frontend::FileFacts;
 use common::extract;
 
-fn effects_of<'a>(f: &'a FileFacts, fqn: &str) -> cgx_core::effect::EffectSet {
+fn effects_of(f: &FileFacts, fqn: &str) -> cgx_core::effect::EffectSet {
     f.effects
         .iter()
         .find(|e| e.fqn == fqn)

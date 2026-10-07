@@ -124,14 +124,14 @@ fn write_compdb(path: &std::path::Path, repo: &std::path::Path, tus: &[&str]) {
 /// NodeId of the `pick(int)` overload.
 fn index_pick_edges(
     repo: &std::path::Path,
-    scip_path: &std::path::PathBuf,
+    scip_path: &std::path::Path,
     compdb: Option<std::path::PathBuf>,
     compdb_complete: bool,
 ) -> (Vec<cgx_core::EdgeRecord>, cgx_index::IndexStats, cgx_core::NodeId) {
     let registry = cgx_index::default_registry();
     let mut store = mem_store();
     let opts = IndexOpts {
-        scip: Some(scip_path.clone()),
+        scip: Some(scip_path.to_path_buf()),
         dataflow: false,
         compdb,
         compdb_complete,

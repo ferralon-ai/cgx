@@ -21,7 +21,7 @@ pub fn extract(rel_path: &str, src: &str) -> FileFacts {
 pub fn link_files<'a>(files: &'a [(&str, &'a FileFacts)]) -> ResolvedGraph {
     let inputs: Vec<FileInput<'a>> = files
         .iter()
-        .map(|(path, facts)| FileInput::new(format!("blob-{path}"), *path, "c", *facts))
+        .map(|(path, facts)| FileInput::new(format!("blob-{path}"), *path, "c", facts))
         .collect();
     link(&inputs, &LinkOpts::default())
 }
@@ -58,6 +58,6 @@ pub fn has_ref(facts: &FileFacts, callee_last: &str, kind: RefKind, cond: EdgeCo
     })
 }
 
-pub fn cut_hints<'a>(facts: &'a FileFacts) -> &'a [CutHint] {
+pub fn cut_hints(facts: &FileFacts) -> &[CutHint] {
     &facts.cut_hints
 }

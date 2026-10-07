@@ -23,7 +23,7 @@ pub fn extract(rel_path: &str, src: &str) -> FileFacts {
 pub fn link_files<'a>(files: &'a [(&str, &'a FileFacts)]) -> ResolvedGraph {
     let inputs: Vec<FileInput<'a>> = files
         .iter()
-        .map(|(path, facts)| FileInput::new(format!("blob-{path}"), *path, "cpp", *facts))
+        .map(|(path, facts)| FileInput::new(format!("blob-{path}"), *path, "cpp", facts))
         .collect();
     link(&inputs, &LinkOpts::default())
 }

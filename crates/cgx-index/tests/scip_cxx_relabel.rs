@@ -90,18 +90,20 @@ fn call_edge(
 /// (node 2, `app::f(double)`); scip-clang resolves the call to the OTHER overload
 /// (node 1, `app::f(int)`), so a correct redirect must be span-precise.
 fn overload_graph() -> ResolvedGraph {
-    let mut g = ResolvedGraph::default();
-    g.nodes = vec![
-        node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
-        node(1, "app::f", "src/f.cpp", 3, SymbolKind::Function), // f(int)
-        node(2, "app::f", "src/f.cpp", 7, SymbolKind::Function), // f(double)
-    ];
-    // Lexical default dst = node 2; both overloads are candidates (group 7).
-    g.edges = vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 7)];
-    g.candidates = vec![
-        Candidate { candidate_group: 7, dst: NodeId(2), rank: 0 },
-        Candidate { candidate_group: 7, dst: NodeId(1), rank: 1 },
-    ];
+    let mut g = ResolvedGraph {
+        nodes: vec![
+            node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
+            node(1, "app::f", "src/f.cpp", 3, SymbolKind::Function), // f(int)
+            node(2, "app::f", "src/f.cpp", 7, SymbolKind::Function), // f(double)
+        ],
+        // Lexical default dst = node 2; both overloads are candidates (group 7).
+        edges: vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 7)],
+        candidates: vec![
+            Candidate { candidate_group: 7, dst: NodeId(2), rank: 0 },
+            Candidate { candidate_group: 7, dst: NodeId(1), rank: 1 },
+        ],
+        ..Default::default()
+    };
     cgx_resolve::canonicalize(&mut g);
     g
 }
@@ -212,13 +214,15 @@ fn virtual_dispatch_caps_at_probable_even_under_complete_compdb() {
     let circle = "cxx . . . shape/Circle#area().";
     let shape = "cxx . . . shape/Shape#area().";
 
-    let mut g = ResolvedGraph::default();
-    g.nodes = vec![
-        node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
-        node(1, "shape::Circle::area", "src/shape.cpp", 5, SymbolKind::Method),
-    ];
-    g.edges = vec![call_edge(0, 1, EdgeKind::CallsVirtual, "src/main.cpp", 10, 5, 3)];
-    g.candidates = vec![Candidate { candidate_group: 3, dst: NodeId(1), rank: 0 }];
+    let mut g = ResolvedGraph {
+        nodes: vec![
+            node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
+            node(1, "shape::Circle::area", "src/shape.cpp", 5, SymbolKind::Method),
+        ],
+        edges: vec![call_edge(0, 1, EdgeKind::CallsVirtual, "src/main.cpp", 10, 5, 3)],
+        candidates: vec![Candidate { candidate_group: 3, dst: NodeId(1), rank: 0 }],
+        ..Default::default()
+    };
     cgx_resolve::canonicalize(&mut g);
 
     let bytes = index(

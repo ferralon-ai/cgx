@@ -196,13 +196,13 @@ impl<'a> Builder<'a> {
                         self.fn_like_macros.insert(name);
                     }
                 }
-                "type_definition" => {
-                    if is_fn_pointer_declarator(child.child_by_field_name("declarator")) {
-                        if let Some(name) =
-                            base_declarator_name(self, child.child_by_field_name("declarator"))
-                        {
-                            self.fn_ptr_typedefs.insert(name);
-                        }
+                "type_definition"
+                    if is_fn_pointer_declarator(child.child_by_field_name("declarator")) =>
+                {
+                    if let Some(name) =
+                        base_declarator_name(self, child.child_by_field_name("declarator"))
+                    {
+                        self.fn_ptr_typedefs.insert(name);
                     }
                 }
                 _ => {}

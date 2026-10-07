@@ -443,7 +443,7 @@ impl<'a> Builder<'a> {
             };
             let mut cursor = body.walk();
             for child in body.children(&mut cursor) {
-                self.walk_member(child, &body_ctx, &name, &mut access);
+                self.walk_member(child, &body_ctx, &mut access);
             }
         }
     }
@@ -484,13 +484,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Walk one member of a class body, threading the current access specifier.
-    fn walk_member(
-        &mut self,
-        node: Node<'_>,
-        ctx: &Ctx,
-        class_simple: &str,
-        access: &mut Visibility,
-    ) {
+    fn walk_member(&mut self, node: Node<'_>, ctx: &Ctx, access: &mut Visibility) {
         match node.kind() {
             "access_specifier" => {
                 if let Some(kw) = node.child(0) {
@@ -525,7 +519,7 @@ impl<'a> Builder<'a> {
                     if matches!(child.kind(), "template_parameter_list" | "template" | "<" | ">") {
                         continue;
                     }
-                    self.walk_member(child, &inner_ctx, class_simple, access);
+                    self.walk_member(child, &inner_ctx, access);
                 }
             }
             "class_specifier" | "struct_specifier" | "union_specifier" => {

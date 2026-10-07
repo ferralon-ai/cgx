@@ -25,6 +25,9 @@ pub struct UnresolvedRef {
     /// policy found no import-visible target). `finalize` counts each marker into
     /// its own field on the caller's node record.
     pub marker: CutMarker,
+    /// The calling symbol's node: the node whose dangling counters count this
+    /// reference.
+    pub caller: cgx_core::NodeId,
 }
 
 /// The linked graph the resolver produces (architecture §3 Layer 2).
@@ -47,6 +50,9 @@ pub struct ResolvedGraph {
     /// v0.3 SC3 incremental-dataflow products. Empty/zeroed unless the link ran
     /// with `dataflow` enabled and a prior cache was supplied.
     pub dataflow: DataflowOutput,
+    /// Receiver-narrowing counters; zero unless the link ran with
+    /// `receiver_narrowing`.
+    pub precision: crate::PrecisionStats,
 }
 
 /// The v0.3 SC3 incremental-dataflow products of a link: per-function cache rows

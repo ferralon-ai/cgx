@@ -51,7 +51,9 @@ impl PythonFrontend {
 /// import root instead of the literal first path segment, so v2 fragments may carry
 /// stale roots (notably the former `src`-as-root collision).
 /// v4: `FileFacts` gained `module` and `type_facts`; v3 fragments no longer decode.
-const PYTHON_FRAGMENT_VERSION: u32 = 4;
+/// v5: module-level `Bind` facts; `super(X, self)` naming another class and
+/// class-factory bases with non-literal arguments are no longer `Super` / `Call`.
+const PYTHON_FRAGMENT_VERSION: u32 = 5;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {
@@ -103,6 +105,10 @@ impl LanguageFrontend for PythonFrontend {
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             builder.walk(child, &root_ctx, &mut stmt_index);
+        }
+        if let Some(module) = builder.facts.module.clone() {
+            let binds = crate::typefacts::collect_module(src, root, &module);
+            builder.facts.type_facts.extend(binds);
         }
         builder.emit_module_exports();
         Ok(builder.finish())
@@ -629,15 +635,32 @@ impl<'a> Builder<'a> {
 
     // --- references (calls) ---
 
+    /// The short name of the innermost class def whose FQN is a prefix of
+    /// `fqn` (the class a method, or a function nested in one, belongs to).
+    fn enclosing_class_name(&self, fqn: &str) -> Option<String> {
+        let mut cur = fqn;
+        loop {
+            if self
+                .facts
+                .defs
+                .iter()
+                .any(|d| d.kind == SymbolKind::Type && d.fqn == cur)
+            {
+                return cur.rsplit("::").next().map(str::to_owned);
+            }
+            cur = cur.rsplit_once("::")?.0;
+        }
+    }
+
     fn walk_call(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
         if let Some(func) = node.child_by_field_name("function") {
             self.emit_call_cut_hints(func, node);
             let (name_path, kind) = self.classify_callee(func);
             if kind == RefKind::CallVirtualReceiver {
-                if let (Some((root, depth)), Some(method)) = (
-                    crate::typefacts::anon_root(self.src, func),
-                    name_path.last(),
-                ) {
+                let anon = crate::typefacts::anon_root(self.src, func, &|| {
+                    self.enclosing_class_name(&ctx.fqn_prefix)
+                });
+                if let (Some((root, depth)), Some(method)) = (anon, name_path.last()) {
                     self.facts.type_facts.push(TypeFact::AnonReceiver {
                         func: ctx.fqn_prefix.clone(),
                         line: self.line(node),

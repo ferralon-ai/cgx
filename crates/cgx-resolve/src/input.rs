@@ -69,6 +69,17 @@ pub struct LinkOpts {
     /// `cgx-query`'s `max_steps`/`DEFAULT_MAX_STEPS`). Tests set a small value to
     /// exercise the backstop on a bounded input. Ignored when `dataflow` is off.
     pub max_summary_edges: Option<u64>,
+    /// Narrow virtual call sites by receiver kind before falling back to the
+    /// global same-name method set: `self`/`cls` receivers to the enclosing
+    /// class's cone, class-headed calls to the class's method lookup,
+    /// `super()` to the next classes in the MRO, and literal or out-of-repo
+    /// module receivers to a dangling ref marked `CutMarker::External`.
+    /// Applies to languages whose frontend emits receiver-typing facts and a
+    /// module identity (Python). Off by default.
+    pub receiver_narrowing: bool,
+    /// Print one stderr line per narrowed, dangled or fallen-back virtual site
+    /// (diagnostics). Ignored unless `receiver_narrowing` is on.
+    pub narrowing_trace: bool,
 }
 
 impl Default for LinkOpts {
@@ -79,6 +90,8 @@ impl Default for LinkOpts {
             dataflow: false,
             prior_fn_cache: std::collections::HashMap::new(),
             max_summary_edges: None,
+            receiver_narrowing: false,
+            narrowing_trace: false,
         }
     }
 }

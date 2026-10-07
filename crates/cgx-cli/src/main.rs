@@ -118,6 +118,15 @@ enum Command {
         /// for the leaner base index — byte-identical to the pre-dataflow graph.
         #[arg(long = "no-dataflow")]
         no_dataflow: bool,
+        /// Narrow virtual call sites by receiver kind (Python): `self`/`cls` to
+        /// the enclosing class's cone, class-headed calls and `super()` to the
+        /// class lookup, literal and out-of-repo module receivers to no edge,
+        /// instead of every same-name method. Answers that lost candidates this
+        /// way say so in their approximation contract. Also enabled by
+        /// `CGX_RECEIVER_NARROWING=1`; `CGX_PRECISION_TRACE=1` prints one stderr
+        /// line per narrowed site.
+        #[arg(long = "receiver-narrowing")]
+        receiver_narrowing: bool,
     },
     /// Symbols that (transitively) call `symbol`.
     Callers {
@@ -773,7 +782,12 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path, scip, no_dataflow } => run_index(path, scip, no_dataflow),
+        Command::Index {
+            path,
+            scip,
+            no_dataflow,
+            receiver_narrowing,
+        } => run_index(path, scip, no_dataflow, receiver_narrowing),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::FlowsTo { symbol, query } => run_flow(&symbol, query, FlowDir::Forward),
@@ -913,6 +927,7 @@ fn run_index(
     path: Option<PathBuf>,
     scip: Option<PathBuf>,
     no_dataflow: bool,
+    receiver_narrowing: bool,
 ) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
     // v0.3 SC6: dataflow is ON by default. The CLI flag `--no-dataflow` and the
@@ -920,7 +935,17 @@ fn run_index(
     // disables it. The library `IndexOpts::default()` stays base (dataflow off) —
     // the on-by-default decision lives here at the application boundary.
     let dataflow = resolve_dataflow_default(&repo_root) && !no_dataflow;
-    let outcome = index_repo(&repo_root, &IndexOpts { scip, dataflow })?;
+    let env_on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+    let receiver_narrowing = receiver_narrowing || env_on("CGX_RECEIVER_NARROWING");
+    let outcome = index_repo(
+        &repo_root,
+        &IndexOpts {
+            scip,
+            dataflow,
+            receiver_narrowing,
+            narrowing_trace: env_on("CGX_PRECISION_TRACE"),
+        },
+    )?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
@@ -955,6 +980,25 @@ fn run_index(
             "  sig: {} indirect sites resolved, {} unmatched, {} supernode (cut-marked)",
             s.sig.sites_resolved, s.sig.sites_unmatched, s.sig.supernode_sites
         );
+    }
+    if receiver_narrowing {
+        for (name, c) in s.precision.rows() {
+            if c.sites + c.dangling + c.fallback == 0 {
+                continue;
+            }
+            println!(
+                "  receiver {name}: {} sites ({} -> {} edges), {} dangling ({} edges dropped), {} fallback ({} edges kept)",
+                c.sites, c.edges_before, c.edges_after, c.dangling, c.dangling_edges_before,
+                c.fallback, c.fallback_edges
+            );
+        }
+        let counts: Vec<String> = s
+            .precision
+            .counts()
+            .iter()
+            .map(|(name, n)| format!("{n} {name}"))
+            .collect();
+        println!("  receiver lattice: {}", counts.join(", "));
     }
     // v0.3 SC6 perf-gate telemetry: surface the per-function recompute/reuse
     // split (SC3) and the IFDS summary counters (SC4) so the perf gate can

@@ -17,6 +17,7 @@ use cgx_frontend::facts::{
 
 use crate::graph::{DataflowOutput, ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
+use crate::receiver::{Ledger, Narrowed, ReceiverIndex, Site};
 use crate::symtab::{
     collect_import_bindings, short_name, DefEntry, ImportBinding, ResolveOutcome, SymbolTable,
 };
@@ -41,8 +42,12 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut unresolved: Vec<UnresolvedRef> = Vec::new();
     let mut next_group: u32 = 0;
+    let mut ledger = Ledger::new(opts.narrowing_trace);
+    let receivers = opts
+        .receiver_narrowing
+        .then(|| ReceiverIndex::build(inputs, &table, &mut ledger));
 
-    for file in inputs {
+    for (file_idx, file) in inputs.iter().enumerate() {
         let facts = file.facts;
         let bindings = collect_import_bindings(&facts.imports);
         for raw in &facts.refs {
@@ -56,6 +61,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
             };
             resolve_ref(
                 file,
+                file_idx,
                 raw,
                 caller,
                 caller_id,
@@ -68,6 +74,8 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
                 &mut candidates,
                 &mut unresolved,
                 &mut next_group,
+                receivers.as_ref(),
+                &mut ledger,
             );
         }
     }
@@ -103,9 +111,10 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
         DataflowOutput::default()
     };
 
-    let narrowing = std::collections::BTreeMap::new();
+    let (precision, narrowing) = ledger.finish(&table);
     let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
     graph.dataflow = dataflow;
+    graph.precision = precision;
     graph
 }
 
@@ -243,6 +252,7 @@ fn enclosing_def<'a>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     file: &FileInput<'_>,
+    file_idx: usize,
     raw: &RawRef,
     caller: &SymbolDef,
     caller_id: NodeId,
@@ -255,6 +265,8 @@ fn resolve_ref(
     candidates: &mut Vec<Candidate>,
     unresolved: &mut Vec<UnresolvedRef>,
     next_group: &mut u32,
+    receivers: Option<&ReceiverIndex<'_>>,
+    ledger: &mut Ledger,
 ) {
     let span = Span::new(file.path.clone(), raw.span.line, raw.span.col);
     let last = match raw.name_path.last() {
@@ -332,6 +344,57 @@ fn resolve_ref(
         }
     }
 
+    // --- Step 1b (opt-in): receiver-kind narrowing of virtual sites. Runs
+    // before import resolution so a `self`/`cls` head is never bound through a
+    // glob import and a class-headed call is looked up on the class, not as a
+    // module member. See `crate::receiver`. ---
+    let narrowing = receivers.filter(|_| virtual_receiver).map(|rx| {
+        let site = Site {
+            file,
+            file_idx,
+            raw,
+            caller,
+            caller_id,
+            local_def: resolve_local(scopes, defs, raw.scope, &raw.name_path[0]),
+        };
+        (rx, site)
+    });
+    if let Some((rx, site)) = &narrowing {
+        match rx.narrow(site, ledger) {
+            Narrowed::Typed {
+                hits,
+                rule,
+                virtual_dispatch,
+                ..
+            } => {
+                emit_candidate_set(
+                    edges,
+                    candidates,
+                    next_group,
+                    &hits,
+                    caller_id,
+                    raw,
+                    virtual_dispatch,
+                    rule,
+                    &caller.fqn,
+                    &span,
+                );
+                return;
+            }
+            Narrowed::External => {
+                unresolved.push(UnresolvedRef {
+                    caller_fqn: caller.fqn.clone(),
+                    name_path: raw.name_path.iter().cloned().collect(),
+                    span,
+                    marker: CutMarker::External,
+                    caller: caller_id,
+                });
+                return;
+            }
+            Narrowed::Legacy(_) => {}
+        }
+    }
+
     // --- Step 2: import-binding resolution (Pass B tier 1). ---
     let head = raw.name_path[0].as_str();
     if let Some(binding) = lookup_binding(bindings, scopes, raw.scope, head) {
@@ -376,6 +439,9 @@ fn resolve_ref(
     // --- Step 3: virtual / duck-typed dispatch — same-name method candidate set. ---
     if virtual_receiver {
         let hits = method_candidates(table, last, &file.lang);
+        if let Some((rx, site)) = &narrowing {
+            rx.record_legacy(site, hits.len(), ledger);
+        }
         if !hits.is_empty() {
             emit_candidate_set(
                 edges,
@@ -444,6 +510,7 @@ fn resolve_ref(
         name_path: raw.name_path.iter().cloned().collect(),
         span,
         marker: CutMarker::Unresolved,
+        caller: caller_id,
     });
 }
 
@@ -1428,21 +1495,19 @@ fn finalize(
     // marker. Dangling refs leave *no edge*, so these counts are the only trace
     // of the blind spot a graph walk can see — the approximation contract
     // (A3/A4) reads them so a negative answer whose frontier crosses a call that
-    // was not followed is never claimed `exact`. Keyed by `(caller fqn, file)`:
-    // the ref's span lies inside the caller's body, so its file matches the
-    // caller node's file.
+    // was not followed is never claimed `exact`. Keyed by the caller's node id,
+    // so every dangling ref lands on exactly one node even when two defs share
+    // an FQN.
     #[derive(Default)]
     struct Dangling {
         unresolved: u32,
         external: u32,
         untyped: u32,
     }
-    let mut dangling: std::collections::BTreeMap<(&str, &str), Dangling> =
+    let mut dangling: std::collections::BTreeMap<NodeId, Dangling> =
         std::collections::BTreeMap::new();
     for r in &unresolved {
-        let d = dangling
-            .entry((r.caller_fqn.as_str(), r.span.file.as_str()))
-            .or_default();
+        let d = dangling.entry(r.caller).or_default();
         match r.marker {
             CutMarker::External => d.external += 1,
             CutMarker::UntypedReceiver => d.untyped += 1,
@@ -1453,7 +1518,7 @@ fn finalize(
     }
     if !dangling.is_empty() || !narrowing.is_empty() {
         for n in &mut nodes {
-            let d = dangling.get(&(n.node.fqn.as_str(), n.node.file.as_str()));
+            let d = dangling.get(&n.node.id);
             if let Some(d) = d {
                 n.node.unresolved_calls = d.unresolved;
                 n.node.external_calls = d.external;
@@ -1471,6 +1536,7 @@ fn finalize(
         candidates,
         unresolved,
         dataflow: DataflowOutput::default(),
+        precision: Default::default(),
     };
     canonicalize(&mut graph);
     graph
@@ -1554,11 +1620,13 @@ mod tests {
     }
 
     fn dangle(caller: &str, file: &str, line: u32, marker: CutMarker) -> UnresolvedRef {
+        let id = if caller == "m::a" { 0 } else { 1 };
         UnresolvedRef {
             caller_fqn: caller.into(),
             name_path: vec!["x".into(), "m".into()],
             span: Span::new(file, line, None),
             marker,
+            caller: NodeId(id),
         }
     }
 
@@ -1596,6 +1664,20 @@ mod tests {
             .sum();
         assert_eq!(sum, total, "every dangling ref is counted exactly once");
         assert_eq!(g.unresolved.len() as u32, total);
+    }
+
+    #[test]
+    fn finalize_counts_a_dangle_once_when_two_defs_share_an_fqn() {
+        let nodes = vec![node(0, "m::dup", "m.py"), node(1, "m::dup", "m.py")];
+        let unresolved: Vec<UnresolvedRef> = (2..4)
+            .map(|line| UnresolvedRef {
+                caller: NodeId(1),
+                ..dangle("m::dup", "m.py", line, CutMarker::Unresolved)
+            })
+            .collect();
+        let g = finalize(nodes, vec![], vec![], unresolved, &BTreeMap::new());
+        let per_node: Vec<u32> = g.nodes.iter().map(|n| n.node.unresolved_calls).collect();
+        assert_eq!(per_node, vec![0, 2]);
     }
 
     #[test]

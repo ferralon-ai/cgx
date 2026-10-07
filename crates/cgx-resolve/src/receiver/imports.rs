@@ -24,6 +24,14 @@ pub(crate) enum Target {
     ModuleOrMember(Spec, String),
 }
 
+impl Target {
+    pub(super) fn spec(&self) -> &Spec {
+        match self {
+            Target::Module(s) | Target::Member(s, _) | Target::ModuleOrMember(s, _) => s,
+        }
+    }
+}
+
 /// One file's module-level import bindings.
 #[derive(Debug, Default)]
 pub(super) struct FileScope {

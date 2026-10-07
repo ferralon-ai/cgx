@@ -183,7 +183,7 @@ read a clean exit as confirmation that the flag did anything.
 | 0 | Success (including empty results) |
 | 1 | A CI gate fired — `--assert-empty` found results, **or** `diff --path-added` found a new path (no assertion flag involved) |
 | 2 | Bad symbol / CQL parse or plan error / bad flag value / a `--format` the command does not implement / an unresolvable git revspec |
-| 3 | Index missing, corrupt, or unbuildable (most commonly `--no-auto-index` against a repo with no `.cgx/`, but a corrupt `.cgx/index.db` also exits 3 regardless of that flag). **`doctor` hits it without any flag** — see below. Also the "not a git repository" case: `index` and `coupling` both exit 3 when the target is not inside a git working tree |
+| 3 | Index missing, corrupt, or unbuildable (most commonly `--no-auto-index` against a repo with no `.cgx/`, but a corrupt `.cgx/` store also exits 3 regardless of that flag). **`doctor` hits it without any flag** — see below. Also the "not a git repository" case: `index` and `coupling` both exit 3 when the target is not inside a git working tree |
 | 4 | `--assert-empty` vacuous: confidence filter excluded all results (suppress with `--allow-vacuous`) |
 
 **`doctor` is the one read command that never auto-indexes.** Every other read command builds the

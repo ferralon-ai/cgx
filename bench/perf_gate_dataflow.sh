@@ -198,29 +198,22 @@ echo ""
 echo "[G4] Per-function summary distribution + 2M cap headroom"
 git -c user.email=bench@cgx -c user.name=bench reset --hard HEAD >/dev/null 2>&1
 "$CGX" index "$CORPUS" >/dev/null 2>&1
-python3 - "$CORPUS/.cgx/index.db" <<'PY'
-import sqlite3, sys, statistics
-db=sys.argv[1]
-c=sqlite3.connect(db)
-# summary rows per function (fn_summaries keyed by (blob_oid, fn_fqn)).
+python3 - "$CORPUS/.cgx/cache.db" <<'PY'
+import sqlite3, sys
+c=sqlite3.connect(sys.argv[1])
+# summary rows per function (fn_summaries keyed by (blob_oid, fn_fqn)). Schema
+# stores a serialized summary blob per fn; we report the per-fn ROW count as the
+# observable proxy.
 try:
-    cols=[d[1] for d in c.execute("pragma table_info(fn_summaries)")]
-    rows=list(c.execute("select * from fn_summaries"))
-    # Count facts per function. Schema stores a serialized summary blob per fn; we
-    # report the per-fn ROW count distribution as the observable proxy and note the
-    # interproc-edge total as the materialized-summary-edge count.
-    n_fn=len(rows)
+    n_fn=c.execute("select count(*) from fn_summaries").fetchone()[0]
     print(f"  fn_summaries rows (functions with a stored summary): {n_fn}")
 except Exception as e:
     print("  fn_summaries inspect error:", e)
-# interproc summary edges materialized = derives-from edges that cross functions.
-# Filter to the CURRENT graph (the db may retain prior graph_ids across re-index).
-gid=c.execute("select graph_id from edges order by graph_id desc limit 1").fetchone()
-gid=gid[0] if gid else None
-total_df=c.execute("select count(*) from edges where edge_kind='derives-from' and graph_id=?", (gid,)).fetchone()[0]
-print(f"  total DerivesFrom edges (current graph): {total_df}")
 c.close()
 PY
+# interproc summary edges materialized = derives-from edges in the current graph.
+TOTAL_DF=$("$CGX" dump --repo "$CORPUS" | grep -c $'\tDerivesFrom\t' || true)
+echo "  total DerivesFrom edges (current graph): $TOTAL_DF"
 echo "  DEFAULT_MAX_SUMMARY_EDGES = 2,000,000 (cgx-resolve/src/ifds.rs:45)"
 echo "  interproc summary edges materialized this run: $INTERPROC"
 CAP_HEADROOM=$(awk -v ip="$INTERPROC" 'BEGIN{printf "%.0fx", 2000000/(ip+1)}')

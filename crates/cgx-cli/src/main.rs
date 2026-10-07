@@ -24,7 +24,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, StoreError, TreeOid};
+use cgx_store::{FactStore, ObjectStore, StoreError, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -36,8 +36,9 @@ use cgx_cli::output::{
 };
 use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::shadow_store::ShadowStore;
-use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{
+    cgx_dir, ensure_cgx_dir, read_pointer, remove_retired_files, write_pointer, IndexPointer,
+};
 use cgx_cli::CliError;
 
 /// The full LICENSE text, embedded at build time. At release-build time
@@ -988,11 +989,12 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
     // Blast-radius fix (sparse-storage RFC P1): GC every superseded Layer-2 graph,
     // keeping only the one we just wrote. No read path needs historical graphs on
     // the normal index path; the `diff` path uses its own session and never lands
-    // here. Bounded (retain exactly 1) and deterministic (delete-by-key, no VACUUM).
+    // here. Bounded (retain exactly 1) and deterministic (delete-by-key).
     let keep = cgx_store::TreeOid::new(outcome.graph_key.clone());
     store
         .prune_graphs_except(&[&keep])
         .map_err(|e| CliError::graph(format!("pruning stale graphs: {e}")))?;
+    remove_retired_files(repo_root)?;
     write_pointer(
         repo_root,
         &IndexPointer {
@@ -1484,7 +1486,7 @@ fn run_impacted_tests(
     // unchanged file re-extracts nothing. `index_repo` is deliberately not used —
     // it prunes the store to a single graph and would delete the other side.
     ensure_cgx_dir(&repo_root)?;
-    let mut store = ShadowStore::open(&repo_root)
+    let mut store = ObjectStore::open(cgx_dir(&repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     // Unbounded by default: a test three hops from the change is still impacted,
@@ -2383,7 +2385,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
 fn index_ref(
     repo_root: &Path,
     commit_hex: &str,
-    store: &mut ShadowStore,
+    store: &mut ObjectStore,
 ) -> Result<TreeOid, CliError> {
     let tmp = tempfile::Builder::new()
         .prefix("cgx-diff-")
@@ -2514,7 +2516,7 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
 
     // Open (or create) the shared on-disk store for this diff session.
     ensure_cgx_dir(&repo_root)?;
-    let mut store = ShadowStore::open(&repo_root)
+    let mut store = ObjectStore::open(cgx_dir(&repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(&repo_root)
@@ -2620,7 +2622,7 @@ fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
 /// usage error (exit 2), never an unanchored walk (the dense-graph blowup risk).
 fn run_path_added(
     args: &DiffArgs,
-    store: &ShadowStore,
+    store: &ObjectStore,
     base_tree: &TreeOid,
     head_tree: &TreeOid,
     blame: &BlameRepo,
@@ -2978,8 +2980,8 @@ fn resolve_repo(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .map_err(|e| CliError::usage(format!("path {raw:?} is not accessible: {e}")))
 }
 
-fn open_store(repo_root: &Path) -> Result<ShadowStore, CliError> {
-    ShadowStore::open(repo_root)
+fn open_store(repo_root: &Path) -> Result<ObjectStore, CliError> {
+    ObjectStore::open(cgx_dir(repo_root))
         .map_err(|e| CliError::graph(format!("opening store at {repo_root:?}: {e}")))
 }
 
@@ -3008,7 +3010,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
 /// the store by id (no pointer involved).
 fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
     ensure_cgx_dir(repo_root)?;
-    let mut store = ShadowStore::open(repo_root)
+    let mut store = ObjectStore::open(cgx_dir(repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(repo_root)

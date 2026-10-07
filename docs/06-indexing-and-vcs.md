@@ -466,11 +466,10 @@ into the repository root, and `~/.cache/cgx/` is never created:
 ```console
 $ cgx index .
 $ ls -a .cgx/
-.gitignore  HEAD.json  index.db
+.gitignore  HEAD.json  cache.db  fragments  objects  objects.lock  refs
 $ cat .cgx/HEAD.json
 {
   "graph_key": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
-  "graph_id": 1,
   "total_files": 1,
   "unsupported_files": 0
 }
@@ -479,8 +478,10 @@ $ cat .cgx/.gitignore
 $ git status --porcelain      # empty — the self-ignoring .gitignore keeps the tree clean
 ```
 
-Three files: `index.db` (the SQLite store — `rusqlite`, bundled, WAL), `HEAD.json` (the
-pointer naming the indexed tree OID and graph id), and a `.gitignore` containing `*`, which
+The content-addressed object store (`objects/` for per-function graph shards and
+manifests, `refs/` for the per-tree pointers, `fragments/` for per-blob extraction caches,
+`cache.db` for the dataflow caches, and `objects.lock`), `HEAD.json` (the pointer naming the
+indexed tree OID), and a `.gitignore` containing `*`, which
 is how `.cgx/` avoids the "polluted by `git status`" objection the table below raises against
 this very location. `cgx index` also garbage-collects superseded graphs, keeping exactly one.
 

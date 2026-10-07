@@ -72,7 +72,7 @@ func Open(ctx context.Context, repo string, opts ...Option) (*Graph, error) {
 
 	var t transport.Transport
 	if c.transport.native {
-		t, err = native.New(ctx, c.transport.bin, tc, c.stderr)
+		t, err = native.New(ctx, c.transport.bin, c.env, tc, c.stderr)
 	} else {
 		module := c.module
 		if module == nil {

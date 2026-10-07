@@ -13,7 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +60,7 @@ type response struct {
 // Client is a transport.Transport over a `cgx session` subprocess.
 type Client struct {
 	bin    string
+	env    []string
 	cfg    transport.Config
 	stderr *transport.Ring
 
@@ -84,8 +89,9 @@ type proc struct {
 // New checks the repository as the wasm transport does (a git work tree with
 // a committed HEAD, and a .cgx that is a real directory if present) and
 // returns a client; the process starts on first use. bin "" means `cgx` on
-// PATH.
-func New(ctx context.Context, bin string, cfg transport.Config, stderr io.Writer) (*Client, error) {
+// PATH. The process gets Env(os.Environ(), extraEnv), never the whole parent
+// environment.
+func New(ctx context.Context, bin string, extraEnv []string, cfg transport.Config, stderr io.Writer) (*Client, error) {
 	repo, err := gitsrc.Open(ctx, cfg.Repo)
 	if err != nil {
 		return nil, err
@@ -103,7 +109,41 @@ func New(ctx context.Context, bin string, cfg transport.Config, stderr io.Writer
 		}
 		bin = p
 	}
-	return &Client{bin: bin, cfg: cfg, stderr: transport.NewRing(stderr), stats: transport.Stats{Transport: name}}, nil
+	return &Client{bin: bin, env: Env(os.Environ(), extraEnv), cfg: cfg,
+		stderr: transport.NewRing(stderr), stats: transport.Stats{Transport: name}}, nil
+}
+
+// inheritedVars are the only parent variables the engine process receives.
+// cgx reads no variables of its own. Its git-history tools run `git` (found
+// on PATH) and stage a temporary worktree (TMPDIR, or TMP/TEMP on Windows,
+// where os/exec also supplies SYSTEMROOT). Everything else stays behind:
+// HOME and XDG_CONFIG_HOME, so user-global git configuration does not reach
+// the engine, and git's repository-location variables (GIT_DIR and the like),
+// which the SDK's own git calls also drop.
+var inheritedVars = []string{"PATH", "TMPDIR", "TMP", "TEMP"}
+
+// Env returns the engine process's environment: the inheritedVars present in
+// base, the variables every git invocation needs (lazy fetch and credential
+// prompts off, as gitsrc.Env sets), then extra, whose entries win.
+func Env(base, extra []string) []string {
+	out := make([]string, 0, len(inheritedVars)+2+len(extra))
+	for _, kv := range base {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.ContainsFunc(inheritedVars, func(v string) bool { return sameVar(v, name) }) {
+			out = append(out, kv)
+		}
+	}
+	out = append(out, "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0")
+	return append(out, extra...)
+}
+
+// sameVar compares variable names as the OS does: case-insensitively on
+// Windows ("Path"), exactly elsewhere.
+func sameVar(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func (c *Client) addStats(f func(*transport.Stats)) {
@@ -118,6 +158,7 @@ func (c *Client) Name() string { return name }
 // binary that never writes its first line is killed when ctx is done.
 func (c *Client) start(ctx context.Context) error {
 	cmd := exec.Command(c.bin, "session", "--repo", c.cfg.Repo)
+	cmd.Env = c.env
 	cmd.Stderr = c.stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -32,6 +32,7 @@ type config struct {
 	module           []byte
 	stderr           io.Writer
 	allowSchemaSkew  bool
+	env              []string
 }
 
 // WithTransport selects the engine. There is no fallback between transports.
@@ -81,6 +82,13 @@ func WithModule(wasm []byte) Option { return func(c *config) { c.module = wasm }
 // WithStderr receives the engine's diagnostics. The last 64 KiB are kept
 // regardless and attached to EngineErrors.
 func WithStderr(w io.Writer) Option { return func(c *config) { c.stderr = w } }
+
+// WithEnv adds "KEY=value" entries to the native engine's environment. The
+// `cgx session` process does not inherit the caller's environment: it gets
+// PATH, TMPDIR (TMP and TEMP on Windows) and the settings that keep git from
+// fetching or prompting, then env, whose entries win. The wasm engine gets no
+// environment and ignores this.
+func WithEnv(env []string) Option { return func(c *config) { c.env = append(c.env, env...) } }
 
 // WithAllowSchemaSkew accepts an engine whose tool schema differs from the
 // one the Go types were generated from. Decoding may then fail or drop fields.

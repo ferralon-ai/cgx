@@ -43,6 +43,16 @@ repository-location variables (`GIT_DIR`, `GIT_WORK_TREE` and the like, set
 inside git hooks) are ignored, so the SDK always reads the repository it was
 given, as the native engine does.
 
+The `cgx session` process does not inherit the caller's environment. It gets
+PATH (its git-history tools run `git`), TMPDIR (TMP and TEMP on Windows), and
+`GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`; nothing else, so tokens and
+other secrets in the caller's environment stay out of a process that parses
+untrusted source. Without HOME, user-global git configuration (such as
+`core.excludesFile`) does not apply to it. Add variables with `WithEnv`. The
+SDK's own `git` calls keep the caller's environment, minus the
+repository-location variables: git reads its configuration through HOME
+(`safe.directory`, for one), and it parses no source.
+
 The index lives in `<repo>/.cgx`, shared with the `cgx` CLI; the SDK refuses a
 `.cgx` that is a symlink (`ErrUnsafeIndexDir`). `Open` on an indexed repository
 loads the persisted graph without re-indexing. A query on a repository whose

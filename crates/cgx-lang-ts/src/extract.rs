@@ -41,7 +41,7 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 3;
+const TS_FRAGMENT_VERSION: u32 = 4;
 
 /// The TypeScript/JavaScript language frontend.
 ///

@@ -396,6 +396,126 @@ fn field_binds_through_cls_and_any_first_parameter_name() {
     );
 }
 
+fn attr_stores_in(src: &str, func: &str) -> Vec<(ValueSource, String, ValueSource)> {
+    let facts = extract("m.py", src);
+    let module = facts.module.clone().unwrap();
+    let func = if func.is_empty() {
+        module
+    } else {
+        format!("{module}::{func}")
+    };
+    facts
+        .type_facts
+        .into_iter()
+        .filter_map(|t| match t {
+            TypeFact::AttrStore {
+                func: f,
+                base,
+                field,
+                src,
+            } if f == func => Some((base, field, src)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn non_receiver_attribute_stores_are_attr_stores() {
+    let src = "def f(self, other):\n    other.h = B()\n    self.a.b = 1\n    other.n += 1\n\n\nobj.g = A()\n";
+    let var = |n: &str| ValueSource::Var(n.into());
+    assert_eq!(
+        attr_stores_in(src, "f"),
+        vec![
+            (var("other"), "h".into(), ValueSource::Call(segs("B"))),
+            (var("other"), "n".into(), ValueSource::Opaque),
+            (
+                ValueSource::Opaque,
+                "b".into(),
+                ValueSource::Literal(LiteralKind::Num)
+            ),
+        ]
+    );
+    assert_eq!(
+        attr_stores_in(src, ""),
+        vec![(var("obj"), "g".into(), ValueSource::Call(segs("A")))]
+    );
+    // A store through the receiver stays a field bind.
+    assert!(attr_stores_in("class C:\n    def m(self):\n        self.h = 1\n", "C::m").is_empty());
+}
+
+#[test]
+fn nested_callables_store_through_the_enclosing_receiver() {
+    let src = "class C:\n    def __init__(this):\n        def later():\n            this.h = B()\n        def shadow(this):\n            this.g = B()\n        def rebinds():\n            this = other()\n            this.k = B()\n";
+    assert_eq!(
+        field_binds_in(src, "C::__init__::later"),
+        vec![("h".into(), ValueSource::Call(segs("B")))]
+    );
+    assert!(field_binds_in(src, "C::__init__::shadow").is_empty());
+    assert_eq!(attr_stores_in(src, "C::__init__::shadow").len(), 1);
+    assert!(field_binds_in(src, "C::__init__::rebinds").is_empty());
+    assert_eq!(
+        attr_stores_in(src, "C::__init__::rebinds"),
+        vec![(
+            ValueSource::Var("this".into()),
+            "k".into(),
+            ValueSource::Call(segs("B"))
+        )]
+    );
+}
+
+#[test]
+fn pep695_type_parameters_are_unknown() {
+    let src = "class A:\n    pass\n\n\ndef f[A, *Ts, **P](x: A, y: list[A]):\n    z: A = x\n\n\nclass G[T]:\n    def m(self, x: T, y: A):\n        pass\n";
+    let facts = extract("m.py", src);
+    let module = facts.module.clone().unwrap();
+    let ty = |func: &str, name: &str| {
+        facts.type_facts.iter().find_map(|t| match t {
+            TypeFact::Param {
+                func: f,
+                name: n,
+                ty,
+                ..
+            } if *f == format!("{module}::{func}") && n == name => ty.clone(),
+            _ => None,
+        })
+    };
+    assert_eq!(ty("f", "x"), Some(TypeExpr::Unknown));
+    assert_eq!(
+        ty("f", "y"),
+        Some(TypeExpr::Generic {
+            head: segs("list"),
+            args: vec![TypeExpr::Unknown],
+            indirect: false,
+        })
+    );
+    assert_eq!(ty("G::m", "x"), Some(TypeExpr::Unknown));
+    assert_eq!(ty("G::m", "y"), Some(named("A")));
+    let z = facts.type_facts.iter().find_map(|t| match t {
+        TypeFact::Bind { var, src, .. } if var == "z" => Some(src.clone()),
+        _ => None,
+    });
+    assert_eq!(z, Some(ValueSource::Declared(TypeExpr::Unknown)));
+}
+
+#[test]
+fn calling_a_type_parameter_is_opaque() {
+    let src = "class A:\n    def m(self):\n        pass\n\n\ndef g[A]():\n    x = A()\n    A().m()\n    return x\n\n\ndef h():\n    y = A()\n    return y\n";
+    let facts = extract("m.py", src);
+    let bind = |var: &str| {
+        facts.type_facts.iter().find_map(|t| match t {
+            TypeFact::Bind { var: v, src, .. } if v == var => Some(src.clone()),
+            _ => None,
+        })
+    };
+    assert_eq!(bind("x"), Some(ValueSource::Opaque));
+    assert_eq!(bind("y"), Some(ValueSource::Call(segs("A"))));
+    let root = facts.type_facts.iter().find_map(|t| match t {
+        TypeFact::AnonReceiver { method, root, .. } if method == "m" => Some(root.clone()),
+        _ => None,
+    });
+    assert_eq!(root, Some(AnonRoot::Other));
+}
+
 #[test]
 fn first_parameter_of_a_module_function_is_not_a_receiver() {
     let src = "def f(o):\n    o.z = 1\n";

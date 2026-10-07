@@ -56,6 +56,18 @@ pub(crate) struct Lattice {
     /// The floating closure: classes with an unresolvable base, and their
     /// in-repo subclasses.
     pub(super) floating: BTreeSet<u32>,
+    /// The def is abstract (a Go interface).
+    is_abstract: Vec<bool>,
+    /// The class declares `Protocol` as a base: values match it structurally.
+    structural: Vec<bool>,
+    /// In-repo classes with an out-of-repo base: the in-repo classes a value
+    /// of any out-of-repo class can be (through any out-of-repo hierarchy).
+    pub(super) ext_any: BTreeSet<u32>,
+    pub(super) ext_memo: RefCell<HashMap<u32, Rc<Lookup>>>,
+    /// Attribute names stored through a base of unknown type: possibly an
+    /// instance attribute of any class, so a lookup that misses them is
+    /// unknown.
+    pub(super) foreign_attrs: BTreeSet<String>,
     pub(crate) fqn_collisions: usize,
     pub(crate) open_nonclass_bases: usize,
     pub(crate) unknown_bases: usize,
@@ -84,6 +96,7 @@ impl Lattice {
                 l.ids.insert(d.fqn.clone(), l.names.len() as u32);
                 l.names.push(d.fqn.clone());
                 l.rules.push(rules);
+                l.is_abstract.push(d.is_abstract);
             }
         }
         let n = l.names.len();
@@ -93,6 +106,7 @@ impl Lattice {
         l.rootless = vec![false; n];
         l.meta = vec![false; n];
         l.subclasses = vec![BTreeSet::new(); n];
+        l.structural = vec![false; n];
         for f in inputs.iter().filter(|f| lang::rules(&f.lang).is_some()) {
             for d in &f.facts.defs {
                 let Some((parent, m)) = d.fqn.rsplit_once("::") else {
@@ -129,6 +143,25 @@ impl Lattice {
         }
     }
 
+    /// Record attribute stores seen outside the receiver: `typed` through a
+    /// name typed as that class, `untyped` through anything else. Drops every
+    /// memoized lookup, since stores turn misses into unknowns.
+    pub(crate) fn add_attr_stores<'s>(
+        &mut self,
+        typed: impl IntoIterator<Item = (u32, &'s str)>,
+        untyped: impl IntoIterator<Item = &'s str>,
+    ) {
+        for (c, f) in typed {
+            self.attrs[c as usize].insert(f.to_owned());
+        }
+        self.foreign_attrs
+            .extend(untyped.into_iter().map(str::to_owned));
+        self.memo.borrow_mut().clear();
+        self.cone_memo.borrow_mut().clear();
+        self.super_memo.borrow_mut().clear();
+        self.ext_memo.borrow_mut().clear();
+    }
+
     pub(crate) fn ids(&self) -> &BTreeMap<String, u32> {
         &self.ids
     }
@@ -139,6 +172,21 @@ impl Lattice {
 
     pub(crate) fn is_meta(&self, c: u32) -> bool {
         self.meta[c as usize]
+    }
+
+    pub(crate) fn bases(&self, c: u32) -> &[Base] {
+        &self.bases[c as usize]
+    }
+
+    pub(crate) fn rules(&self, c: u32) -> &'static LangRules {
+        self.rules[c as usize]
+    }
+
+    /// Whether a value declared as `c` may be of a class outside `c`'s cone:
+    /// a Go interface or a Python protocol.
+    pub(crate) fn is_structural(&self, c: u32) -> bool {
+        (self.is_abstract[c as usize] && !self.rules[c as usize].class_lattice)
+            || self.structural[c as usize]
     }
 
     /// Resolve every class's declared bases (`ClassBases` facts), then derive
@@ -205,6 +253,12 @@ impl Lattice {
                 if r.meta {
                     meta_roots.push(c);
                 }
+                if r.ext.as_deref() == Some("Protocol") {
+                    self.structural[c as usize] = true;
+                }
+                if matches!(r.base, Base::Open) {
+                    self.ext_any.insert(c);
+                }
                 match &r.base {
                     Base::Classes(cs) => {
                         for &s in cs {
@@ -221,7 +275,7 @@ impl Lattice {
             }
         }
         for (c, s) in seen.iter().enumerate() {
-            if !s {
+            if !s && self.rules[c].class_lattice {
                 self.bases[c].push(Base::Unknown);
                 floating.insert(c as u32);
             }
@@ -261,6 +315,8 @@ struct Resolution {
     dynamic: bool,
     /// A named out-of-repo metaclass root (`type`, `ABCMeta`).
     meta: bool,
+    /// The name of a named out-of-repo base class, as imported.
+    ext: Option<String>,
 }
 
 fn is_object(b: &BaseExpr) -> bool {
@@ -284,6 +340,7 @@ fn resolve_base(
         base,
         dynamic,
         meta,
+        ext: None,
     };
     let path = match b {
         BaseExpr::Type(TypeExpr::Named { path, .. } | TypeExpr::Generic { head: path, .. }) => path,
@@ -309,7 +366,10 @@ fn resolve_base(
         Resolved::Class(ids) => res(Base::Classes(ids.into_iter().collect()), false, false),
         Resolved::External => {
             let last = path.last().map(String::as_str).unwrap_or("");
-            res(Base::Open, false, rules.metaclass_roots.contains(&last))
+            Resolution {
+                ext: Some(modules.external_name(file, path).to_owned()),
+                ..res(Base::Open, false, rules.metaclass_roots.contains(&last))
+            }
         }
         Resolved::Dynamic => res(Base::Open, true, false),
         Resolved::NonClass | Resolved::Module(_) | Resolved::NotFound => {

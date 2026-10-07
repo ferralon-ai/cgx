@@ -5,7 +5,9 @@
 //! of the MRO answer. A branch that ends at an out-of-repo base marks the
 //! lookup `open`. It is `unknown` when a branch reaches a base nobody can
 //! resolve, a class holds a non-method attribute of that name (an instance
-//! field, a class-level assignment), or attribute access is customised
+//! field, a class-level assignment, a store through a name typed as the
+//! class), the lookup finds nothing and the name is stored through a base
+//! of unknown type somewhere, or attribute access is customised
 //! (`__getattribute__`, or `__getattr__` when nothing defines `m`).
 //!
 //! Cone and `super()` lookups also take the floating closure (classes with an
@@ -94,6 +96,13 @@ impl Lattice {
                 out.unknown = true;
             }
         }
+        // A name stored through a base of unknown type may be an instance
+        // attribute of this class: a miss is not proof of an out-of-repo
+        // method. (Shadowing a method that is found is excluded by the
+        // assumption that methods are not assigned from outside the family.)
+        if out.targets.is_empty() && self.foreign_attrs.contains(method) {
+            out.unknown = true;
+        }
         let out = Rc::new(out);
         self.memo.borrow_mut().insert(key, out.clone());
         out
@@ -174,6 +183,58 @@ impl Lattice {
                 }
             }
         }
+        out
+    }
+
+    /// Whether `class` or an in-repo class in its MRO defines `name` (a method
+    /// or an attribute of its family), or an ancestor is unresolvable. Names
+    /// stored on unknown objects from outside the class family do not count:
+    /// methods are assumed not to be assigned from outside the family.
+    pub(crate) fn mro_may_define(&self, class: u32, name: &str) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![class];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            let i = c as usize;
+            if self.own[i].contains(name) || self.attrs[i].contains(name) {
+                return true;
+            }
+            for b in &self.bases[i] {
+                match b {
+                    Base::Classes(cs) => stack.extend(cs.iter().copied()),
+                    Base::Unknown => return true,
+                    Base::Open => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// `m` on a value of an out-of-repo class or any of its subclasses: always
+    /// open, with every in-repo class that has an out-of-repo base (any
+    /// out-of-repo class may derive from any other), their cones, and the
+    /// floating closure as the in-repo candidates.
+    pub(crate) fn ext_cone_lookup(&self, method: &str) -> Rc<Lookup> {
+        let mid = self.mid(method);
+        if let Some(hit) = self.ext_memo.borrow().get(&mid) {
+            return hit.clone();
+        }
+        let mut out = Lookup {
+            open: true,
+            ..Lookup::default()
+        };
+        for &c in &self.ext_any {
+            let r = self.cone_lookup(c, method);
+            out.targets.extend(r.targets.iter().copied());
+            out.unknown |= r.unknown;
+        }
+        let floating = self.floating_part(mid, method, None);
+        out.targets.extend(floating.targets);
+        out.unknown |= floating.unknown;
+        let out = Rc::new(out);
+        self.ext_memo.borrow_mut().insert(mid, out.clone());
         out
     }
 

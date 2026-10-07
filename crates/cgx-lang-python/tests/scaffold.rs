@@ -17,7 +17,7 @@ fn lang_tag_is_python() {
 
 #[test]
 fn fragment_version_is_stable() {
-    assert_eq!(PythonFrontend::new().fragment_version(), 5);
+    assert_eq!(PythonFrontend::new().fragment_version(), 6);
 }
 
 #[test]

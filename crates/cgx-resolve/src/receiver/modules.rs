@@ -160,6 +160,26 @@ impl ModuleIndex {
         })
     }
 
+    pub(crate) fn lang(&self, file: usize) -> &str {
+        &self.files[file].lang
+    }
+
+    /// The out-of-repo class name a dotted name written in `file` refers to:
+    /// its last segment, or the imported member name behind an alias.
+    pub(crate) fn external_name<'p>(&'p self, file: usize, path: &'p [String]) -> &'p str {
+        let last = path.last().map_or("", String::as_str);
+        if path.len() != 1 {
+            return last;
+        }
+        let member = self.files[file].bindings.get(last).and_then(|ts| {
+            ts.iter().find_map(|t| match t {
+                Target::Member(_, n) | Target::ModuleOrMember(_, n) => Some(n.as_str()),
+                Target::Module(_) => None,
+            })
+        });
+        member.unwrap_or(last)
+    }
+
     /// Resolve a dotted name as written in `file`, inside the lexical container
     /// `scope_fqn`: same-file defs (innermost container first), then the file's
     /// import bindings, then its glob imports, then the language's builtins.

@@ -193,6 +193,42 @@ fn same_graph_into_two_fresh_stores_yields_identical_objects() {
     }
 }
 
+/// The write path encodes shards and the candidate list from borrowed records.
+/// Every stored object must still be exactly the owned encoding a reader decodes,
+/// or object OIDs would shift with no change to the graph.
+#[test]
+fn borrowed_shard_and_candidate_writes_match_owned_encoding() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OwnedShard {
+        nodes: Vec<NodeRecord>,
+        edges: Vec<EdgeRecord>,
+    }
+
+    let root = TempDir::new().unwrap();
+    let g = common::sample_graph();
+    store(&root)
+        .put_graph(&TreeOid::new("t1"), Some("rev"), &g)
+        .unwrap();
+    let manifest = read_manifest(&root, "t1");
+
+    let (mut nodes, mut edges) = (0, 0);
+    for entry in &manifest.shards {
+        let bytes = fs::read(entry.oid.object_path(&objects_dir(&root))).unwrap();
+        let shard: OwnedShard = decode(&bytes).unwrap();
+        nodes += shard.nodes.len();
+        edges += shard.edges.len();
+        assert_eq!(encode(&shard).unwrap(), bytes, "shard {}", entry.fn_key);
+        assert_eq!(ObjectOid::of_bytes(&bytes), entry.oid);
+    }
+    assert_eq!((nodes, edges), (g.nodes.len(), g.edges.len()));
+
+    let coid = manifest.candidates.expect("sample graph has candidates");
+    let bytes = fs::read(coid.object_path(&objects_dir(&root))).unwrap();
+    let mut owned = g.candidates.clone();
+    owned.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+    assert_eq!(encode(&owned).unwrap(), bytes);
+}
+
 #[test]
 fn re_put_of_same_graph_is_a_noop_at_the_object_level() {
     let root = TempDir::new().unwrap();
@@ -476,6 +512,28 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
     s.put_fragments(&[input]).unwrap();
     assert_eq!(s.fragment(&blob).unwrap().unwrap(), got);
     assert!(s.fragment(&cgx_store::BlobOid::new("absent")).unwrap().is_none());
+}
+
+#[test]
+fn put_with_a_different_frontend_version_replaces_the_fragment() {
+    use cgx_store::{BlobOid, FragmentInput};
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let blob = BlobOid::new("blob-versioned");
+    let v1 = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { blob: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+
+    s.put_fragments(&[v1]).unwrap();
+    s.put_fragments(&[v2]).unwrap();
+    let got = s.fragment(&blob).unwrap().unwrap();
+    assert_eq!(got.frontend_version, 2);
+    assert_eq!(got.lang, "go");
+    assert_eq!(got.fragment, b"new");
+
+    // Re-putting the same version is still a no-op: the stored bytes win.
+    let v2_other = FragmentInput { bytes: b"ignored", ..v2 };
+    s.put_fragments(&[v2_other]).unwrap();
+    assert_eq!(s.fragment(&blob).unwrap().unwrap().fragment, b"new");
 }
 
 #[test]

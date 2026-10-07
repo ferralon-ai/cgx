@@ -194,14 +194,9 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
         return stats;
     }
 
-    let mut kept: Vec<EdgeWithProvenance> = Vec::with_capacity(graph.edges.len());
-    for (i, e) in graph.edges.drain(..).enumerate() {
-        if !drop_edge_idx.contains(&i) {
-            kept.push(e);
-        }
-    }
-    kept.extend(new_edges);
-    graph.edges = kept;
+    crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
+    graph.edges.reserve_exact(new_edges.len());
+    graph.edges.extend(new_edges);
     graph.candidates.extend(new_candidates);
 
     crate::canonicalize(graph);

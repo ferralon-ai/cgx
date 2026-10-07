@@ -2,7 +2,7 @@
 //!
 //! Heuristic (deterministic, no flags needed for the common case):
 //! - contains a glob metacharacter (`*`, `?`) → [`PatternKind::Glob`];
-//! - contains `::` → exact [`PatternKind::Fqn`];
+//! - contains a segment separator (`::` or `/`) → exact [`PatternKind::Fqn`];
 //! - otherwise → [`PatternKind::ShortName`] (a bare `foo` matches any symbol
 //!   whose last path segment is `foo`).
 //!
@@ -26,7 +26,7 @@ use cgx_core::SymbolPattern;
 pub fn parse_symbol(text: &str) -> SymbolPattern {
     if text.contains('*') || text.contains('?') {
         SymbolPattern::glob(text)
-    } else if text.contains("::") {
+    } else if cgx_core::pattern::contains_segment_separator(text) {
         SymbolPattern::fqn(text)
     } else {
         SymbolPattern::short_name(text)
@@ -76,6 +76,17 @@ mod tests {
     #[test]
     fn path_separated_is_fqn() {
         assert_eq!(parse_symbol("auth::validate").kind, PatternKind::Fqn);
+    }
+
+    #[test]
+    fn slash_bearing_root_is_fqn_not_short_name() {
+        // A `/`-bearing root (Go import path, TS scoped name) is an FQN, not a
+        // short-name — the bug this surface previously fell through on.
+        assert_eq!(parse_symbol("example.com/app/store").kind, PatternKind::Fqn);
+        assert_eq!(parse_symbol("@acme/utils").kind, PatternKind::Fqn);
+        // Regression: `::` → FQN, bare name → short-name (both unchanged).
+        assert_eq!(parse_symbol("a::b").kind, PatternKind::Fqn);
+        assert_eq!(parse_symbol("Open").kind, PatternKind::ShortName);
     }
 
     #[test]

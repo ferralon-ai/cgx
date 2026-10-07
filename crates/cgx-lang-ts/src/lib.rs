@@ -63,6 +63,7 @@
 mod effects;
 mod extract;
 mod module;
+mod pin;
 mod query;
 
 pub use extract::{FallbackStats, TypeScriptFrontend};

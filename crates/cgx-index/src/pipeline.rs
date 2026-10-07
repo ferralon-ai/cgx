@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cargo_pkg::PackageMap;
 use crate::error::{IndexError, Result};
+use crate::manifest::ManifestMap;
 use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
@@ -62,6 +63,10 @@ pub struct IndexStats {
     pub blobs_extracted: usize,
     /// Files whose facts came from the Layer-1 cache (no extraction).
     pub blobs_cached: usize,
+    /// Files whose cached fragment was written by a different frontend
+    /// version than the current one, so it was discarded and re-extracted. A
+    /// subset of `blobs_extracted`.
+    pub blobs_stale: usize,
     /// Files skipped because no registered adapter claims them.
     pub blobs_unsupported: usize,
     /// Nodes in the linked graph.
@@ -123,6 +128,12 @@ pub(crate) fn extract_and_link<S: FactStore>(
     // is what lets the `--scip` join match real rust-analyzer symbols.
     let pkg_map = PackageMap::from_sources(sources);
 
+    // Resolve the non-Cargo build manifests (go.mod / package.json / pyproject)
+    // the same way, so the Go/Python/TS adapters can receive manifest-declared
+    // identity their per-file extract cannot read. Behaviour-neutral: no adapter
+    // reads `FileCtx::manifest` yet.
+    let manifest_map = ManifestMap::from_sources(sources);
+
     // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
     // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
@@ -135,8 +146,9 @@ pub(crate) fn extract_and_link<S: FactStore>(
             continue;
         }
         let blob = BlobOid::new(src.blob_oid.clone());
+        let want = registry.frontend_for(&rel).fragment_version();
         match store.fragment(&blob)? {
-            Some(cached) => {
+            Some(cached) if cached.frontend_version == want => {
                 let facts: FileFacts = decode(&cached.fragment)?;
                 stats.blobs_cached += 1;
                 prepared.push(PreparedFile {
@@ -145,6 +157,13 @@ pub(crate) fn extract_and_link<S: FactStore>(
                     lang: registry.lang_for(&rel).tag().to_string(),
                     facts,
                 });
+            }
+            // A fragment from another frontend version may not even decode under
+            // the current `FileFacts` schema, so it is never read: re-extract it
+            // and let the store overwrite it.
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push(src);
             }
             None => misses.push(src),
         }
@@ -158,8 +177,10 @@ pub(crate) fn extract_and_link<S: FactStore>(
         .map(|src| {
             let rel = RelPath::new(src.rel_path.clone());
             let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+            let manifest = manifest_map.manifest_for(&src.rel_path);
             let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
-                .with_package(package);
+                .with_package(package)
+                .with_manifest(manifest);
             let facts = registry.extract(&src.content, &ctx)?;
             let bytes = encode(&facts)?;
             let version = registry.frontend_for(&rel).fragment_version();

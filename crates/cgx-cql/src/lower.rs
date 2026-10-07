@@ -341,8 +341,8 @@ fn node_constraints(
 }
 
 /// Build a [`SymbolPattern`] from a node's `name`/`fqn` property, applying the
-/// heuristics in design §3.1 (glob if `*`/`?`, FQN if it contains `::`, else
-/// short-name).
+/// heuristics in design §3.1 (glob if `*`/`?`, FQN if it contains a segment
+/// separator `::` or `/`, else short-name).
 fn symbol_pattern_from(value: &Value) -> Option<SymbolPattern> {
     let s = match value {
         Value::Str(s) => s,
@@ -350,7 +350,7 @@ fn symbol_pattern_from(value: &Value) -> Option<SymbolPattern> {
     };
     if s.contains('*') || s.contains('?') {
         Some(SymbolPattern::glob(s.clone()))
-    } else if s.contains("::") {
+    } else if cgx_core::pattern::contains_segment_separator(s) {
         Some(SymbolPattern::fqn(s.clone()))
     } else {
         Some(SymbolPattern::short_name(s.clone()))

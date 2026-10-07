@@ -580,6 +580,59 @@ fn class_bases_keep_source_order_and_unnameable_bases() {
 }
 
 #[test]
+fn factory_bases_with_non_literal_arguments_are_unknown() {
+    assert_eq!(
+        class_bases(
+            "class K(declarative_base(), mk(\"x\", n=1), with_metaclass(M, Core), f(cls=B)):\n    pass\n",
+            "K"
+        ),
+        vec![vec![
+            BaseExpr::Call(segs("declarative_base")),
+            BaseExpr::Call(segs("mk")),
+            BaseExpr::Unknown,
+            BaseExpr::Unknown,
+        ]]
+    );
+}
+
+#[test]
+fn module_level_bindings_are_binds_of_the_module() {
+    let facts = extract(
+        "m.py",
+        "from x import Real, declarative_base\nCompat = Real\nBase = declarative_base()\nMixed = declarative_base(cls=Real)\n\ndef f():\n    y = 1\n",
+    );
+    let module = facts.module.clone().unwrap();
+    let mut got: Vec<(String, ValueSource)> = facts
+        .type_facts
+        .iter()
+        .filter_map(|t| match t {
+            TypeFact::Bind { func, var, src } if *func == module => {
+                Some((var.clone(), src.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    got.retain(|(v, _)| ["Compat", "Base", "Mixed", "y"].contains(&v.as_str()));
+    assert_eq!(
+        got,
+        vec![
+            (
+                "Base".to_owned(),
+                ValueSource::Call(segs("declarative_base"))
+            ),
+            ("Compat".to_owned(), ValueSource::Var("Real".into())),
+            // A module-level factory given a class may subclass it.
+            ("Mixed".to_owned(), ValueSource::Opaque),
+        ]
+    );
+    // Inside a callable a call keeps its callee whatever its arguments.
+    assert_eq!(
+        binds("    z = g(Real)", "z"),
+        vec![ValueSource::Call(segs("g"))]
+    );
+}
+
+#[test]
 fn class_without_bases_still_gets_a_fact() {
     assert_eq!(class_bases("class K:\n    pass\n", "K"), vec![vec![]]);
     assert_eq!(class_bases("class K():\n    pass\n", "K"), vec![vec![]]);
@@ -652,6 +705,23 @@ fn anon_receiver_root_kinds() {
             ("baz".into(), 2, AnonRoot::Call(segs("Foo"))),
             ("strip".into(), 1, AnonRoot::Subscript),
             ("run".into(), 1, AnonRoot::Other),
+        ]
+    );
+}
+
+#[test]
+fn super_naming_another_class_is_not_the_enclosing_super() {
+    let src = "class B:\n    pass\n\nclass C(B):\n    def m(self):\n        super(C, self).m()\n        super(B, self).m()\n        def inner():\n            super(C, self).n()\n";
+    let roots: Vec<(String, AnonRoot)> = anon(src)
+        .into_iter()
+        .map(|(_, _, m, _, r)| (m, r))
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            ("m".into(), AnonRoot::Super),
+            ("m".into(), AnonRoot::Call(segs("super"))),
+            ("n".into(), AnonRoot::Super),
         ]
     );
 }

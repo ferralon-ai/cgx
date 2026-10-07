@@ -17,14 +17,21 @@
 //!   keeps the same-name set.
 //! - A language whose frontend emits no receiver-typing facts or module
 //!   identity is never narrowed.
+//! - A name with any binding the facts do not type is never narrowed by type,
+//!   and nothing is typed across calls.
 //!
 //! Assumptions: `self`/`cls` is an instance or subclass of the enclosing
-//! class; methods are not assigned from outside the class family; a base bound
-//! to a non-class value or produced by an out-of-repo call is a dynamically
-//! created class whose methods live outside the repo.
+//! class; annotations are truthful; methods are not assigned from outside the
+//! class family, and attributes are not set dynamically (`setattr`,
+//! `__dict__`); a constructor call of a class without an in-repo `__new__`
+//! returns an instance of exactly that class (with one, it is untyped); a base
+//! bound to a non-class value or produced by an out-of-repo call is a
+//! dynamically created class whose methods live outside the repo.
 //!
 //! [`CutMarker::External`]: cgx_core::cut::CutMarker::External
 
+mod fields;
+mod go_vta;
 mod imports;
 mod lang;
 mod lattice;
@@ -34,6 +41,7 @@ mod lookup;
 mod modules;
 mod python;
 mod stats;
+mod types;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +60,7 @@ use locals::Locals;
 use lookup::Lookup;
 use modules::{Defs, ModuleIndex};
 use python::Classified;
+use types::TypeEnv;
 
 /// One virtual call site, as the link pass sees it.
 pub(crate) struct Site<'s> {
@@ -104,14 +113,15 @@ pub(crate) enum Narrowed<'t> {
     Legacy(#[allow(dead_code)] LegacyReason),
 }
 
-/// `(lang, method)` → same-language method defs named `method`, by FQN.
-type HitsMemo<'a> = HashMap<(String, String), BTreeMap<&'a str, Vec<&'a DefEntry>>>;
+/// `(lang, method)` → same-language method defs named `method`, by owner type.
+type HitsMemo<'a> = HashMap<(String, String), BTreeMap<String, Vec<&'a DefEntry>>>;
 
 pub(crate) struct ReceiverIndex<'a> {
     table: &'a SymbolTable,
     modules: ModuleIndex,
     lattice: Lattice,
     locals: Locals<'a>,
+    types: TypeEnv<'a>,
     hits_memo: RefCell<HitsMemo<'a>>,
 }
 
@@ -125,13 +135,18 @@ impl<'a> ReceiverIndex<'a> {
         let locals = Locals::build(inputs);
         let mut lattice = Lattice::intern(inputs);
         lattice.link_bases(inputs, &modules, table, &locals, ledger.tracing());
-        let ix = ReceiverIndex {
+        let mut ix = ReceiverIndex {
             table,
             modules,
             lattice,
             locals,
+            types: TypeEnv::default(),
             hits_memo: RefCell::default(),
         };
+        let types = TypeEnv::build(&ix, inputs, ledger.tracing());
+        let (typed, untyped) = types.fields.attr_stores();
+        ix.lattice.add_attr_stores(typed, untyped);
+        ix.types = types;
         let s = ledger.stats_mut();
         s.fqn_collisions = ix.lattice.fqn_collisions;
         s.open_nonclass_bases = ix.lattice.open_nonclass_bases;
@@ -162,7 +177,7 @@ impl<'a> ReceiverIndex<'a> {
     }
 
     fn supported(site: &Site<'_>) -> bool {
-        site.file.lang == "python" && site.file.facts.module.is_some()
+        matches!(site.file.lang.as_str(), "python" | "go") && site.file.facts.module.is_some()
     }
 
     /// Classify a virtual call site and narrow it when its receiver kind is
@@ -170,6 +185,21 @@ impl<'a> ReceiverIndex<'a> {
     pub(crate) fn narrow(&self, site: &Site<'_>, ledger: &mut Ledger) -> Narrowed<'a> {
         if !Self::supported(site) {
             return Narrowed::Legacy(LegacyReason::Unsupported);
+        }
+        if site.file.lang == "go" {
+            return match go_vta::classify(self, site) {
+                Some(hits) => {
+                    let virtual_dispatch = hits.len() > 1;
+                    ledger.typed(self.table, site, stats::Cat::GoVta, "recv-vta", &hits);
+                    Narrowed::Typed {
+                        hits,
+                        rule: "recv-vta",
+                        virtual_dispatch,
+                        basis: Basis::Typed,
+                    }
+                }
+                None => Narrowed::Legacy(LegacyReason::Unclassified),
+            };
         }
         match python::classify(self, site) {
             Classified::Lookup {
@@ -218,27 +248,30 @@ impl<'a> ReceiverIndex<'a> {
         Narrowed::Legacy(reason)
     }
 
-    /// Every same-language method def `C::m` for each target class `C`. Two
+    /// Every same-language method def of `m` owned by each target class `C`
+    /// (`C::m`; for Go also `C`'s pointer and generic receiver forms). Two
     /// defs can share an FQN; both are targets.
     fn hits_for(&self, classes: &BTreeSet<u32>, m: &str, lang: &str) -> Vec<&'a DefEntry> {
         let mut memo = self.hits_memo.borrow_mut();
-        let by_fqn = memo
+        let by_owner = memo
             .entry((lang.to_owned(), m.to_owned()))
             .or_insert_with(|| {
-                let mut by_fqn: BTreeMap<&'a str, Vec<&'a DefEntry>> = BTreeMap::new();
+                let mut by_owner: BTreeMap<String, Vec<&'a DefEntry>> = BTreeMap::new();
                 for d in self
                     .table
                     .defs_by_short(m)
                     .iter()
                     .filter(|d| ledger::is_method_candidate(d, lang))
                 {
-                    by_fqn.entry(d.fqn.as_str()).or_default().push(d);
+                    if let Some(owner) = method_owner(&d.fqn, lang) {
+                        by_owner.entry(owner).or_default().push(d);
+                    }
                 }
-                by_fqn
+                by_owner
             });
         classes
             .iter()
-            .flat_map(|&c| by_fqn.get(format!("{}::{m}", self.lattice.name(c)).as_str()))
+            .flat_map(|&c| by_owner.get(self.lattice.name(c)))
             .flatten()
             .copied()
             .collect()
@@ -251,4 +284,20 @@ impl<'a> ReceiverIndex<'a> {
             ledger.legacy(site, cat, label, fanout);
         }
     }
+}
+
+/// The type a method def belongs to: its FQN's parent, with a Go receiver's
+/// pointer and type-parameter forms (`pkg::(*T[K])::m`) reduced to `pkg::T`.
+fn method_owner(fqn: &str, lang: &str) -> Option<String> {
+    let (parent, _) = fqn.rsplit_once("::")?;
+    if lang != "go" {
+        return Some(parent.to_owned());
+    }
+    let (pkg, recv) = parent.rsplit_once("::")?;
+    let recv = recv
+        .strip_prefix("(*")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(recv);
+    let recv = recv.split_once('[').map_or(recv, |(t, _)| t);
+    Some(format!("{pkg}::{recv}"))
 }

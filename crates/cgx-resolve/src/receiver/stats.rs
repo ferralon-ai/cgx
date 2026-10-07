@@ -32,6 +32,14 @@ pub struct PrecisionStats {
     pub literal: CatStats,
     /// Attribute chains rooted at an out-of-repo module.
     pub external_module: CatStats,
+    /// `x.m()` on a local or parameter whose type state is known.
+    pub typed_local: CatStats,
+    /// `C(...).m()` on a constructor call.
+    pub ctor_call: CatStats,
+    /// `self.f.m()` on an instance field whose type state is known.
+    pub self_field: CatStats,
+    /// Go `v.m()` on a closed set of types that flow into `v`.
+    pub go_vta: CatStats,
     /// Sites handed back because their lookup crossed a base (or class
     /// attribute) whose methods cannot be known (`fallback` / `fallback_edges`).
     pub unknown_base: CatStats,
@@ -57,13 +65,17 @@ pub struct PrecisionStats {
 
 impl PrecisionStats {
     /// Category rows for reporting, in a fixed order.
-    pub fn rows(&self) -> [(&'static str, CatStats); 10] {
+    pub fn rows(&self) -> [(&'static str, CatStats); 14] {
         [
             ("self-cone", self.self_cone),
             ("class-head", self.class_head),
             ("super", self.super_call),
             ("literal", self.literal),
             ("external-module", self.external_module),
+            ("typed-local", self.typed_local),
+            ("ctor-call", self.ctor_call),
+            ("self-field", self.self_field),
+            ("go-vta", self.go_vta),
             ("fallback:unknown-base", self.unknown_base),
             ("legacy:local", self.legacy_local),
             ("legacy:self-chain", self.legacy_self_chain),
@@ -90,6 +102,10 @@ impl PrecisionStats {
             Cat::Super => &mut self.super_call,
             Cat::Literal => &mut self.literal,
             Cat::ExternalModule => &mut self.external_module,
+            Cat::TypedLocal => &mut self.typed_local,
+            Cat::CtorCall => &mut self.ctor_call,
+            Cat::SelfField => &mut self.self_field,
+            Cat::GoVta => &mut self.go_vta,
             Cat::LegacyLocal => &mut self.legacy_local,
             Cat::LegacySelfChain => &mut self.legacy_self_chain,
             Cat::LegacyChain => &mut self.legacy_chain,
@@ -106,6 +122,10 @@ pub(crate) enum Cat {
     Super,
     Literal,
     ExternalModule,
+    TypedLocal,
+    CtorCall,
+    SelfField,
+    GoVta,
     LegacyLocal,
     LegacySelfChain,
     LegacyChain,

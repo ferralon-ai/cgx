@@ -46,7 +46,7 @@ cgx index /tmp/cgx-index-scratch
 
 ```
 Indexed /private/tmp/cgx-index-scratch (dd3ea2bdc34ca5134ee26785a20e32f9fb72952e)
-  blobs: 17 indexed, 17 extracted, 0 cached, 1 unsupported
+  blobs: 17 indexed, 17 extracted, 0 cached, 0 stale, 1 unsupported
   graph: 485 nodes, 193 edges, 108 unresolved
   cha: 9 sites trait-scoped, 0 supernode (cut-marked)
   rta: 0 sites pruned (0 candidates dropped), 9 cut-guarded
@@ -76,7 +76,7 @@ cgx index /tmp/cgx-index-scratch --no-dataflow
 
 ```
 Indexed /private/tmp/cgx-index-scratch (dd3ea2bdc34ca5134ee26785a20e32f9fb72952e)
-  blobs: 17 indexed, 0 extracted, 17 cached, 1 unsupported
+  blobs: 17 indexed, 0 extracted, 17 cached, 0 stale, 1 unsupported
   graph: 212 nodes, 134 edges, 108 unresolved
   cha: 9 sites trait-scoped, 0 supernode (cut-marked)
   rta: 0 sites pruned (0 candidates dropped), 9 cut-guarded

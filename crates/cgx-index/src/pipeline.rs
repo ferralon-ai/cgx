@@ -62,6 +62,10 @@ pub struct IndexStats {
     pub blobs_extracted: usize,
     /// Files whose facts came from the Layer-1 cache (no extraction).
     pub blobs_cached: usize,
+    /// Files whose cached fragment was written by a different frontend
+    /// version than the current one, so it was discarded and re-extracted. A
+    /// subset of `blobs_extracted`.
+    pub blobs_stale: usize,
     /// Files skipped because no registered adapter claims them.
     pub blobs_unsupported: usize,
     /// Nodes in the linked graph.
@@ -135,8 +139,9 @@ pub(crate) fn extract_and_link<S: FactStore>(
             continue;
         }
         let blob = BlobOid::new(src.blob_oid.clone());
+        let want = registry.frontend_for(&rel).fragment_version();
         match store.fragment(&blob)? {
-            Some(cached) => {
+            Some(cached) if cached.frontend_version == want => {
                 let facts: FileFacts = decode(&cached.fragment)?;
                 stats.blobs_cached += 1;
                 prepared.push(PreparedFile {
@@ -145,6 +150,13 @@ pub(crate) fn extract_and_link<S: FactStore>(
                     lang: registry.lang_for(&rel).tag().to_string(),
                     facts,
                 });
+            }
+            // A fragment from another frontend version may not even decode under
+            // the current `FileFacts` schema, so it is never read: re-extract it
+            // and let the store overwrite it.
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push(src);
             }
             None => misses.push(src),
         }

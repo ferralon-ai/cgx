@@ -34,6 +34,8 @@ fn sample_node() -> NodeRecord {
         ]),
         transitive_effects: cgx_core::EffectSet::new(),
         unresolved_calls: 0,
+        external_calls: 0,
+        narrowing: Default::default(),
     }
 }
 
@@ -62,6 +64,25 @@ fn sample_edge() -> EdgeRecord {
 #[test]
 fn node_round_trips() {
     let n = sample_node();
+    let bytes = encode(&n).unwrap();
+    let back: NodeRecord = decode(&bytes).unwrap();
+    assert_eq!(n, back);
+}
+
+#[test]
+fn node_with_dangle_and_narrowing_counts_round_trips() {
+    let mut n = sample_node();
+    n.unresolved_calls = 1;
+    n.external_calls = 2;
+    n.narrowing = NarrowingCounts {
+        typed_out: 3,
+        interproc_out: 4,
+        visible_out: 5,
+        visible_dropped_out: 6,
+        typed_away_in: 7,
+        interproc_away_in: 8,
+        visible_away_in: 9,
+    };
     let bytes = encode(&n).unwrap();
     let back: NodeRecord = decode(&bytes).unwrap();
     assert_eq!(n, back);

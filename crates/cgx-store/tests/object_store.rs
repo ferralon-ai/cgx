@@ -91,6 +91,8 @@ fn func_node(id: u32, fqn: &str, line_end: u32) -> NodeRecord {
         own_effects: cgx_core::EffectSet::new(),
         transitive_effects: cgx_core::EffectSet::new(),
         unresolved_calls: 0,
+        external_calls: 0,
+        narrowing: Default::default(),
     }
 }
 
@@ -224,21 +226,15 @@ fn manifest_is_stamped_with_current_store_format() {
     assert_eq!(read_manifest(&root, "t1").store_format, CURRENT_STORE_FORMAT);
 }
 
-#[test]
-fn read_rejects_manifest_with_newer_store_format() {
-    let root = TempDir::new().unwrap();
-    let mut s = store(&root);
-    let tree = TreeOid::new("t1");
-    s.put_graph(&tree, Some("rev"), &common::sample_graph())
-        .unwrap();
-
-    // Forge a manifest claiming a future format, write it as a new object, and
-    // repoint the ref at it — simulating a graph committed by a newer cgx.
-    let mut forged = read_manifest(&root, "t1");
-    forged.store_format = CURRENT_STORE_FORMAT + 1;
+/// Forge a manifest for `t1` stamped with `store_format`, write it as a new
+/// object, and repoint the ref at it — simulating a graph committed by a
+/// different cgx.
+fn forge_store_format(root: &TempDir, store_format: u32) {
+    let mut forged = read_manifest(root, "t1");
+    forged.store_format = store_format;
     let bytes = encode(&forged).unwrap();
     let moid = ObjectOid::of_bytes(&bytes);
-    let opath = moid.object_path(&objects_dir(&root));
+    let opath = moid.object_path(&objects_dir(root));
     fs::create_dir_all(opath.parent().unwrap()).unwrap();
     fs::write(&opath, &bytes).unwrap();
     let ref_path = root
@@ -247,11 +243,41 @@ fn read_rejects_manifest_with_newer_store_format() {
         .join("refs")
         .join(ObjectOid::of_bytes("t1".as_bytes()).0);
     fs::write(&ref_path, format!("{}\nt1\n", moid.0)).unwrap();
+}
+
+#[test]
+fn read_rejects_manifest_with_newer_store_format() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph())
+        .unwrap();
+    forge_store_format(&root, CURRENT_STORE_FORMAT + 1);
 
     match s.read_graph(&tree) {
-        Err(StoreError::StoreFormat { found, expected }) => {
+        Err(e @ StoreError::StoreFormat { found, expected }) => {
             assert_eq!(found, CURRENT_STORE_FORMAT + 1);
             assert_eq!(expected, CURRENT_STORE_FORMAT);
+            assert!(e.to_string().contains("upgrade cgx"), "{e}");
+        }
+        other => panic!("expected StoreFormat rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn read_rejects_manifest_with_older_store_format() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph())
+        .unwrap();
+    forge_store_format(&root, CURRENT_STORE_FORMAT - 1);
+
+    match s.read_graph(&tree) {
+        Err(e @ StoreError::StoreFormat { found, expected }) => {
+            assert_eq!(found, CURRENT_STORE_FORMAT - 1);
+            assert_eq!(expected, CURRENT_STORE_FORMAT);
+            assert!(e.to_string().contains("rebuild the index"), "{e}");
         }
         other => panic!("expected StoreFormat rejection, got {other:?}"),
     }

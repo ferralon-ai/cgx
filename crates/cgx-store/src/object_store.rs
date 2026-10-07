@@ -117,10 +117,11 @@ impl ObjectStore {
         let path = ObjectOid(manifest_oid).object_path(&self.objects_dir);
         let bytes = fs::read(&path)?;
         let manifest = decode::<Manifest>(&bytes)?;
-        // Compat gate: a committed manifest from a newer cgx may carry a schema this
-        // binary cannot decode faithfully (postcard is not self-describing). Reject
-        // loudly — naming both versions — rather than silently mis-decode (D-3).
-        if manifest.store_format > CURRENT_STORE_FORMAT {
+        // Compat gate: a manifest from any other format may carry a schema this
+        // binary cannot decode faithfully (postcard is not self-describing), and
+        // there is no reader for older formats. Reject loudly — naming both
+        // versions — rather than silently mis-decode (D-3).
+        if manifest.store_format != CURRENT_STORE_FORMAT {
             return Err(StoreError::StoreFormat {
                 found: manifest.store_format,
                 expected: CURRENT_STORE_FORMAT,

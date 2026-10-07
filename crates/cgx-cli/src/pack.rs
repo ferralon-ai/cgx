@@ -491,6 +491,9 @@ mod tests {
             total_refs: 2,
             unresolved_count: 0,
             unresolved_rate: Some(0.0),
+            dangling: Default::default(),
+            dangling_rate: Some(0.0),
+            narrowing: Default::default(),
             unsupported_files: 0,
             total_files: None,
             unsupported_share: None,
@@ -537,6 +540,8 @@ mod tests {
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 

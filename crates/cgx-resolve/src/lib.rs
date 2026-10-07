@@ -93,5 +93,6 @@ pub use summary::{FormalOut, SummaryFact};
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.
 pub use cgx_core::{
-    Candidate, Confidence, EdgeRecord, EdgeWithProvenance, NodeRecord, NodeWithProvenance, Tier,
+    Candidate, Confidence, EdgeRecord, EdgeWithProvenance, NarrowingCounts, NodeRecord,
+    NodeWithProvenance, Tier,
 };

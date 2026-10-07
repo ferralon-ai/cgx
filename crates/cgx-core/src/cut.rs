@@ -40,10 +40,15 @@ pub enum CutMarker {
     /// bounded-DFS backstop in cgx-query). No further interproc edges are minted
     /// once the cap fires.
     SummaryBudgetExceeded = 8,
+    /// The call's receiver is an out-of-repo type or module; no in-repo target
+    /// exists.
+    External = 9,
+    /// Receiver type unknown; the residual policy found no import-visible target.
+    UntypedReceiver = 10,
 }
 
 impl CutMarker {
-    pub const ALL: [CutMarker; 9] = [
+    pub const ALL: [CutMarker; 11] = [
         CutMarker::Reflective,
         CutMarker::Dynamic,
         CutMarker::ViaDi,
@@ -53,6 +58,8 @@ impl CutMarker {
         CutMarker::OpaqueCall,
         CutMarker::TruncatedAccessPath,
         CutMarker::SummaryBudgetExceeded,
+        CutMarker::External,
+        CutMarker::UntypedReceiver,
     ];
 }
 

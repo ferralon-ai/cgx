@@ -395,9 +395,10 @@ fn generic_types_keep_their_indirection() {
             _ => None,
         })
         .collect();
+    // `T` is the receiver's type parameter, so it is `Unknown`.
     let list = |indirect| TypeExpr::Generic {
         head: segs("List"),
-        args: vec![named("T", false)],
+        args: vec![TypeExpr::Unknown],
         indirect,
     };
     assert!(tys.contains(&("l".into(), Some(list(true)))), "{tys:?}");
@@ -426,4 +427,39 @@ fn address_taken_locals_are_opaque() {
         ]
     );
     assert!(binds(body, "s").is_empty());
+}
+
+#[test]
+fn type_parameters_are_unknown() {
+    let src = "package p\n\ntype File struct{}\n\ntype Box[K any] struct{}\n\nfunc G[File any, V any](x File, y *V, z Box[File]) {\n\tvar w File\n\t_ = w\n}\n\nfunc (b *Box[K]) M(k K, f File) {}\n";
+    let facts = extract("p/f.go", src);
+    let module = facts.module.clone().unwrap();
+    let ty = |func: &str, name: &str| {
+        facts.type_facts.iter().find_map(|t| match t {
+            TypeFact::Param {
+                func: f,
+                name: n,
+                ty,
+                ..
+            } if *f == format!("{module}::{func}") && n == name => ty.clone(),
+            _ => None,
+        })
+    };
+    assert_eq!(ty("G", "x"), Some(TypeExpr::Unknown));
+    assert_eq!(ty("G", "y"), Some(TypeExpr::Unknown));
+    assert_eq!(
+        ty("G", "z"),
+        Some(TypeExpr::Generic {
+            head: segs("Box"),
+            args: vec![TypeExpr::Unknown],
+            indirect: false,
+        })
+    );
+    assert_eq!(ty("(*Box[K])::M", "k"), Some(TypeExpr::Unknown));
+    assert_eq!(ty("(*Box[K])::M", "f"), Some(named("File", false)));
+    let w = facts.type_facts.iter().find_map(|t| match t {
+        TypeFact::Bind { var, src, .. } if var == "w" => Some(src.clone()),
+        _ => None,
+    });
+    assert_eq!(w, Some(ValueSource::Declared(TypeExpr::Unknown)));
 }

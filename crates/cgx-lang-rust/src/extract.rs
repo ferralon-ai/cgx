@@ -46,7 +46,10 @@ impl RustFrontend {
 /// (architecture §3 `frontend_version`). v3: FQN crate root now derives from the
 /// owning `Cargo.toml` package for `src/`-at-root / no-`src` layouts (previously
 /// the hardcoded `rust_sample` default), so v2 fragments may carry stale roots.
-const RUST_FRAGMENT_VERSION: u32 = 3;
+/// v4: the resolved `Cargo.toml` package name now wins over the dir-before-`src/`
+/// name unconditionally (canonical crate root for all layouts), so v3 fragments
+/// may carry stale roots.
+const RUST_FRAGMENT_VERSION: u32 = 4;
 
 impl LanguageFrontend for RustFrontend {
     fn lang(&self) -> Lang {

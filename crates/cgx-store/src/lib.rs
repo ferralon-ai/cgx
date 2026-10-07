@@ -31,6 +31,7 @@
 //! WAL gives readers MVCC snapshots; writers take an advisory [`lock::WriteLock`]
 //! (IX-7) and use the check → lock → re-check pattern.
 
+pub mod durable;
 pub mod error;
 pub mod lock;
 pub mod manifest;

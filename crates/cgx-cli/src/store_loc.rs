@@ -92,13 +92,15 @@ pub fn head_path(repo_root: &Path) -> PathBuf {
 }
 
 /// Persist the current-index pointer (deterministic: stable field order, trailing
-/// newline). Called by `cgx index` after a successful store.
+/// newline). Called by `cgx index` after a successful store. Written temp → flush
+/// → rename, so a crash leaves either the previous pointer or the new one.
 pub fn write_pointer(repo_root: &Path, ptr: &IndexPointer) -> Result<(), CliError> {
     ensure_cgx_dir(repo_root)?;
     let mut json = serde_json::to_string_pretty(ptr).expect("IndexPointer serializes");
     json.push('\n');
     let path = head_path(repo_root);
-    std::fs::write(&path, json).map_err(|e| CliError::graph(format!("writing {path:?}: {e}")))?;
+    cgx_store::durable::write_durable(&path, json.as_bytes())
+        .map_err(|e| CliError::graph(format!("writing {path:?}: {e}")))?;
     Ok(())
 }
 

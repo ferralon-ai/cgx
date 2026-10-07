@@ -487,6 +487,71 @@ fn a_normal_put_leaves_no_tmp_sidecars() {
     assert_eq!(tmp_count, 0, "no partial object left under a final name");
 }
 
+#[test]
+fn torn_object_reads_as_corrupt_and_the_next_put_heals_it() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    let g = common::sample_graph();
+    s.put_graph(&tree, Some("rev"), &g).unwrap();
+
+    // Simulate a write torn by power loss: the shard's final name exists but its
+    // bytes are truncated.
+    let manifest = read_manifest(&root, "t1");
+    let torn = manifest.shards[0].oid.clone();
+    let path = torn.object_path(&objects_dir(&root));
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, torn.0),
+        other => panic!("a torn object must read as Corrupt, got {other:?}"),
+    }
+
+    // Re-putting the same graph must not trust the torn file at its OID path.
+    s.put_graph(&tree, Some("rev"), &g).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes, "torn object rewritten");
+    assert_eq!(s.read_graph(&tree).unwrap(), g);
+}
+
+#[test]
+fn missing_object_behind_a_live_ref_reads_as_corrupt() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, None, &common::sample_graph()).unwrap();
+
+    let manifest = read_manifest(&root, "t1");
+    let gone = manifest.shards.last().unwrap().oid.clone();
+    fs::remove_file(gone.object_path(&objects_dir(&root))).unwrap();
+
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, gone.0),
+        other => panic!("a missing object must read as Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn prune_graphs_except_sweeps_stale_tmp_files() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, None, &common::sample_graph()).unwrap();
+    plant_tmp_object(&root, b"partial-bytes");
+    let refs_tmp = root.path().join(".cgx").join("refs").join("abc.tmp");
+    fs::write(&refs_tmp, b"partial-ref").unwrap();
+    let frag_tmp = root.path().join(".cgx").join("fragments").join("zz");
+    fs::create_dir_all(&frag_tmp).unwrap();
+    fs::write(frag_tmp.join("beef.tmp"), b"partial-fragment").unwrap();
+
+    s.prune_graphs_except(&[&tree]).unwrap();
+
+    assert!(!objects_dir(&root).join("zz").join("deadbeef.tmp").exists());
+    assert!(!refs_tmp.exists());
+    assert!(!frag_tmp.join("beef.tmp").exists());
+    assert_eq!(s.read_graph(&tree).unwrap(), common::sample_graph());
+}
+
 // --- Layer-1 fragments --------------------------------------------------------
 
 #[test]
@@ -557,6 +622,27 @@ fn prune_drops_only_fragments_absent_from_the_live_set() {
     assert_eq!(stats.graphs_removed, 0, "prune never GCs graphs (recon §A.1)");
     assert!(s.fragment(&live_blob).unwrap().is_some());
     assert!(s.fragment(&dead_blob).unwrap().is_none());
+}
+
+#[test]
+fn a_fragment_failing_its_checksum_is_a_miss_and_is_rewritten() {
+    use cgx_store::{BlobOid, FragmentInput};
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let blob = BlobOid::new("blob-torn");
+    let input = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"facts" };
+    s.put_fragments(&[input]).unwrap();
+
+    let path = ObjectOid(blob.0.clone()).object_path(&root.path().join(".cgx").join("fragments"));
+    let sealed = fs::read(&path).unwrap();
+    let mut flipped = sealed.clone();
+    flipped[0] ^= 0xff;
+    fs::write(&path, &flipped).unwrap();
+
+    assert!(s.fragment(&blob).unwrap().is_none(), "checksum mismatch reads as a miss");
+    s.put_fragments(&[input]).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), sealed, "same-version re-put rewrites a bad fragment");
+    assert_eq!(s.fragment(&blob).unwrap().unwrap().fragment, b"facts");
 }
 
 fn plant_orphan_object(root: &TempDir, bytes: &[u8]) {

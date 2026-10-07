@@ -24,7 +24,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, TreeOid};
+use cgx_store::{FactStore, StoreError, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -1021,13 +1021,7 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         .and_then(|r| r.head_tree_oid())
         .ok();
 
-    // v0.3 SC6: an auto-built index is a STANDARD index — dataflow ON by default,
-    // so a fresh `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`.
-    // The `[index] data_flow = false` cgx.toml key opts back out.
-    let opts = IndexOpts {
-        dataflow: resolve_dataflow_default(repo_root),
-        ..IndexOpts::default()
-    };
+    let opts = auto_index_opts(repo_root);
     match read_pointer(repo_root) {
         Ok(ptr) => match &current_tree {
             // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
@@ -1037,6 +1031,17 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         },
         // No index yet: build one.
         Err(_) => index_repo(repo_root, &opts).map(|_| ()),
+    }
+}
+
+/// The options an automatic (query-triggered) index runs with. v0.3 SC6: an
+/// auto-built index is a STANDARD index — dataflow ON by default, so a fresh
+/// `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`. The
+/// `[index] data_flow = false` cgx.toml key opts back out.
+fn auto_index_opts(repo_root: &Path) -> IndexOpts {
+    IndexOpts {
+        dataflow: resolve_dataflow_default(repo_root),
+        ..IndexOpts::default()
     }
 }
 
@@ -1830,7 +1835,7 @@ fn run_explain(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let pat: SymbolPattern = parse_symbol(symbol);
     let anchor = view
@@ -1913,7 +1918,7 @@ fn run_search(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let kind_filter = kind.map(SymbolKind::from);
     let hits =
@@ -1964,7 +1969,7 @@ fn run_search_selector(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let opts = if agnostic {
         cgx_select::MatchOptions::agnostic()
@@ -2039,7 +2044,7 @@ fn run_symbols(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let kind_filter = kind.map(SymbolKind::from);
     let ranks = rank_symbols(&view, RankBy::from(rank), kind_filter);
@@ -2318,7 +2323,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !args.no_auto_index)?;
     let ptr = read_pointer(&repo_root)?;
     let store = open_store(&repo_root)?;
     let doctor = cgx_doctor::report(&store, &TreeOid::new(ptr.graph_key.clone()))
@@ -2994,7 +2999,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    load_view(&repo_root)
+    load_view(&repo_root, !args.no_auto_index)
 }
 
 /// Load the [`GraphView`] for a single git ref (the `--at <ref>` path). Reuses the
@@ -3019,13 +3024,20 @@ fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 
-/// Load the current Layer-2 graph into a queryable [`GraphView`].
-fn load_view(repo_root: &Path) -> Result<GraphView, CliError> {
+/// Load the current Layer-2 graph into a queryable [`GraphView`]. With
+/// `rebuild_if_corrupt`, a graph whose objects fail verification is treated as not
+/// indexed: it is re-indexed once and read again.
+fn load_view(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<GraphView, CliError> {
     let ptr = read_pointer(repo_root)?;
     let store = open_store(repo_root)?;
-    let graph = store
-        .read_graph(&TreeOid::new(ptr.graph_key.clone()))
-        .map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?;
+    let graph = match store.read_graph(&TreeOid::new(ptr.graph_key.clone())) {
+        Err(StoreError::Corrupt { .. }) if rebuild_if_corrupt => {
+            drop(store);
+            index_repo(repo_root, &auto_index_opts(repo_root))?;
+            return load_view(repo_root, false);
+        }
+        r => r.map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?,
+    };
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 

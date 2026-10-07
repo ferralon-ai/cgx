@@ -407,6 +407,7 @@ version = "0.3.0"
 dependencies = [
  "cgx-core",
  "fd-lock",
+ "libc",
  "postcard",
  "proptest",
  "rusqlite",

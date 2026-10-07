@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use cgx_doctor::DoctorReport;
-use cgx_store::{ObjectStore, SqliteStore};
+use cgx_store::{FactStore, ObjectStore, TreeOid};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,10 @@ pub fn run(args: DeterminismArgs) -> Result<()> {
 
     let dir = tempfile::tempdir().context("creating temp dir for determinism stores")?;
 
-    let (data_a, rep_a) = index_once(&repo_root, &dir.path().join("store_a.db"))
-        .context("run-1 (store_a.db)")?;
-    let (data_b, rep_b) = index_once(&repo_root, &dir.path().join("store_b.db"))
-        .context("run-2 (store_b.db)")?;
+    let run_a = index_once(&repo_root, &dir.path().join("objects_a")).context("run-1")?;
+    let run_b = index_once(&repo_root, &dir.path().join("objects_b")).context("run-2")?;
+    let (data_a, rep_a, objs_a) = (run_a.rows, run_a.report, run_a.objects);
+    let (data_b, rep_b, objs_b) = (run_b.rows, run_b.report, run_b.objects);
 
     if data_a.len() != data_b.len() {
         bail!(
@@ -58,16 +58,9 @@ pub fn run(args: DeterminismArgs) -> Result<()> {
         bail!("render_json output differs between run-1 and run-2");
     }
 
-    // Object-level determinism (D3 / criterion 7): the SQLite gate above is
-    // blind to the content-addressed store (`dump_node_edge_data` is a
-    // `SqliteStore` inherent method), so a net-new assertion indexes the same
-    // tree twice into fresh `ObjectStore`s and requires byte-identical object
-    // files *and* identical object OIDs. A repeat-run identity check, not a
-    // golden file.
-    let objs_a = index_once_objects(&repo_root, &dir.path().join("objects_a"))
-        .context("object run-1")?;
-    let objs_b = index_once_objects(&repo_root, &dir.path().join("objects_b"))
-        .context("object run-2")?;
+    // Object-level determinism (D3 / criterion 7): the same two runs must also
+    // leave byte-identical object files *and* identical object OIDs on disk. A
+    // repeat-run identity check, not a golden file.
     let oids_a: Vec<&String> = objs_a.keys().collect();
     let oids_b: Vec<&String> = objs_b.keys().collect();
     if oids_a != oids_b {
@@ -120,7 +113,7 @@ pub fn run(args: DeterminismArgs) -> Result<()> {
     }
 
     println!(
-        "xtask determinism: OK — {} store rows + {} content-addressed objects, byte-identical \
+        "xtask determinism: OK — {} graph records + {} content-addressed objects, byte-identical \
          across 2 independent index runs; cgx push of both runs converges on commit {commit_a} \
          (idempotent re-push confirmed)",
         data_a.len(),
@@ -203,20 +196,39 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Index `repo_root` once into a fresh [`ObjectStore`] rooted at `root`, then read
-/// every content-addressed object back as an `oid -> bytes` map. The map's keys are
-/// the object OIDs and its values the exact on-disk bytes, so comparing two maps
-/// asserts both OID stability and byte-identity of the objects themselves.
-fn index_once_objects(repo_root: &Path, root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+/// One index run's observable output.
+struct IndexRun {
+    /// The canonical encoding of every node (by `node_id`) then every edge (by
+    /// `edge_id`) of the stored graph, as read back through [`FactStore`].
+    rows: Vec<Vec<u8>>,
+    report: DoctorReport,
+    /// Every content-addressed object on disk, `oid -> bytes`, so comparing two
+    /// maps asserts both OID stability and byte-identity of the objects.
+    objects: BTreeMap<String, Vec<u8>>,
+}
+
+/// Index `repo_root` once into a fresh [`ObjectStore`] rooted at `root`.
+fn index_once(repo_root: &Path, root: &Path) -> Result<IndexRun> {
     let mut store = ObjectStore::open(root).with_context(|| format!("opening object store {root:?}"))?;
     let registry = cgx_index::default_registry();
-    cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
+    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
         .context("indexing repo into object store")?;
+    let tree = TreeOid::new(outcome.graph_key.clone());
 
-    let mut out = BTreeMap::new();
+    let graph = store.read_graph(&tree).context("reading graph back")?;
+    let mut rows = Vec::with_capacity(graph.nodes.len() + graph.edges.len());
+    for n in &graph.nodes {
+        rows.push(cgx_core::codec::encode(n).context("encoding node")?);
+    }
+    for e in &graph.edges {
+        rows.push(cgx_core::codec::encode(e).context("encoding edge")?);
+    }
+    let report = cgx_doctor::report(&store, &tree).context("computing doctor report")?;
+
+    let mut objects = BTreeMap::new();
     let objects_dir = root.join("objects");
     let Ok(shards) = std::fs::read_dir(&objects_dir) else {
-        return Ok(out);
+        return Ok(IndexRun { rows, report, objects });
     };
     for shard in shards {
         let shard = shard?;
@@ -230,24 +242,10 @@ fn index_once_objects(repo_root: &Path, root: &Path) -> Result<BTreeMap<String, 
             if rest.ends_with(".tmp") {
                 continue;
             }
-            out.insert(format!("{prefix}{rest}"), std::fs::read(f.path())?);
+            objects.insert(format!("{prefix}{rest}"), std::fs::read(f.path())?);
         }
     }
-    Ok(out)
-}
-
-fn index_once(repo_root: &Path, db_path: &Path) -> Result<(Vec<Vec<u8>>, DoctorReport)> {
-    let mut store = SqliteStore::open(db_path)
-        .with_context(|| format!("opening store {db_path:?}"))?;
-    let registry = cgx_index::default_registry();
-    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
-        .context("indexing repo")?;
-    let tree = cgx_store::TreeOid::new(outcome.graph_key.clone());
-    let data = store
-        .dump_node_edge_data(&tree)
-        .context("dumping node/edge data")?;
-    let rep = cgx_doctor::report(&store, &tree).context("computing doctor report")?;
-    Ok((data, rep))
+    Ok(IndexRun { rows, report, objects })
 }
 
 /// Resolve the repo to index: an explicit `--repo` is used as-is (any git

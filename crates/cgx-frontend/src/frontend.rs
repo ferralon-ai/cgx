@@ -7,6 +7,7 @@
 //! (WP-06) consumes the fragments. No frontend ever sees the store or git.
 
 use crate::facts::FileFacts;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A source-language tag.
@@ -54,7 +55,7 @@ impl fmt::Display for Lang {
 /// A repo-relative source path. A thin newtype over a `String` so the trait
 /// surface is explicit about *which* path flavour `handles` inspects (always
 /// repo-relative, `/`-separated, never absolute).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RelPath(String);
 
 impl RelPath {
@@ -92,7 +93,10 @@ impl fmt::Display for RelPath {
 /// construction), the blob OID (stamped into provenance as `index_id`), and the
 /// owning package name (the crate root for FQN derivation when it cannot be read
 /// off the path — e.g. a `src/`-at-root single-crate layout).
-#[derive(Debug, Clone)]
+///
+/// Serializable so a planner and an extractor in different processes or wasm
+/// instances can hand it across (postcard, opaque to the carrier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCtx {
     /// Repo-relative path of the file being extracted.
     pub path: RelPath,

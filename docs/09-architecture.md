@@ -24,16 +24,26 @@ cgx-core                     model only: nodes, edges, conditions, confidence, c
   ├── cgx-frontend           LanguageFrontend seam + FileFacts + Tier-0 fallback
   │     └── cgx-lang-{rust,ts,go,python,java}
   ├── cgx-resolve            cross-file link + CHA/RTA/sig/IFDS/effects passes
-  ├── cgx-store              SQLite persistence, v_* views, advisory write lock
+  ├── cgx-store              object store + SQLite persistence, v_* views, write lock
   ├── cgx-query              GraphView / PathWalker / EdgeFilter + contract + freshness
   │     └── cgx-cql          Cypher subset lowered onto cgx-query primitives
   ├── cgx-scip               hand-rolled SCIP protobuf decoder
   ├── cgx-index              pipeline: enumerate → extract → link → refine → store
   ├── cgx-diff               graph diff, edge age/attribution, co-change coupling
   ├── cgx-doctor             index-quality report
-  ├── cgx-mcp                JSON-RPC 2.0 STDIO server
+  ├── cgx-mcp                JSON-RPC 2.0 STDIO server; tool handlers over a SessionProvider
+  ├── cgx-session            resident session: warm open, index-and-hold, session ops
+  ├── cgx-wasm               the engine as a wasm32-wasip1 reactor module (host-facing exports)
   └── cgx-cli                clap command surface
 ```
+
+The engine also builds for `wasm32-wasip1` (`cargo xtask wasm`, C via a pinned
+wasi-sdk): extraction, linking, the object store and query evaluation compile
+there; git access, SQLite, threads and the history-reading tools (`coupling`,
+`impacted_tests`) are native-only, and a wasm host supplies sources, schedules
+extraction across instances and holds the store's write lock. `cgx-session` is
+the single implementation of session semantics for that module and for the
+native `cgx session` verb.
 
 This document specifies:
 
@@ -860,9 +870,10 @@ deliberately distinguishable.
 **`matches_head` is three-valued, and `null` is the common case over MCP.** It
 has a third null case: both trees are known, but the surface holds two views of
 the working tree that disagree about whether the graph it answered over *is*
-HEAD's tree. With MCP's default `include_dirty: true`, any indexed repository
-reaches it — `cgx index` writes `.cgx/`, after which working-tree enumeration
-(no ignore rules) and the dirty-file count (ignore rules applied) disagree. The
+HEAD's tree. With MCP's default `include_dirty: true`, any checkout holding an
+ignored or untracked file (build output such as `target/`) reaches it:
+working-tree enumeration skips only `.git` and cgx's own root `.cgx/` (no ignore
+rules), while the dirty-file count applies ignore rules, so the two disagree. The
 verdict is then `unknown`, and the human line says `unknown` rather than
 `current`: a null must not render as the reassuring word. Treating
 `matches_head` as a boolean is wrong in the ordinary case, not the edge case.

@@ -66,6 +66,8 @@ pub mod tools;
 pub use error::{ServeError, ToolError};
 pub use protocol::{Request, Response, RpcError};
 pub use server::{dispatch, serve, serve_io, ServerConfig, PROTOCOL_VERSION};
-pub use session::{acquire, GraphSession};
+#[cfg(not(target_family = "wasm"))]
+pub use session::acquire;
+pub use session::GraphSession;
 pub use output::{output_schema, schema_document};
-pub use tools::{call as call_tool, tool_list};
+pub use tools::{call as call_tool, call_with, tool_list, AcquirePerCall, SessionProvider, SessionRef};

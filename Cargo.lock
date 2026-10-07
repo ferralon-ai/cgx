@@ -220,6 +220,7 @@ dependencies = [
  "cgx-mcp",
  "cgx-query",
  "cgx-select",
+ "cgx-session",
  "cgx-store",
  "cgx-transport",
  "clap",
@@ -311,6 +312,7 @@ dependencies = [
  "cgx-store",
  "gix",
  "rayon",
+ "sha1",
  "tempfile",
  "thiserror",
  "tree-sitter-json",
@@ -432,6 +434,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgx-session"
+version = "0.3.0"
+dependencies = [
+ "cgx-core",
+ "cgx-frontend",
+ "cgx-index",
+ "cgx-mcp",
+ "cgx-query",
+ "cgx-resolve",
+ "cgx-select",
+ "cgx-store",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+]
+
+[[package]]
 name = "cgx-store"
 version = "0.3.0"
 dependencies = [
@@ -455,6 +475,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "cgx-wasm"
+version = "0.3.0"
+dependencies = [
+ "cgx-index",
+ "cgx-mcp",
+ "cgx-session",
+ "cgx-store",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

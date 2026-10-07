@@ -18,10 +18,16 @@ cgx-lang-ts = { path = "../cgx-lang-ts" }
 cgx-resolve = { path = "../cgx-resolve" }
 cgx-scip.workspace = true
 cgx-store = { path = "../cgx-store" }
-gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
-rayon = "1"
+sha1 = "0.10"
 thiserror.workspace = true
 tree-sitter-json.workspace = true
+
+# Native-only: gix-fs does not build for wasm32-wasip1 and a wasm embedding's host
+# supplies sources itself; rayon's parallel extraction lives in the native
+# composition (`extract_and_link`), while a wasm host drives the stages serially.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
+rayon = "1"
 
 [dev-dependencies]
 cgx-scip = { workspace = true, features = ["test-support"] }

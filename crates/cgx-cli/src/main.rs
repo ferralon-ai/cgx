@@ -456,6 +456,14 @@ enum Command {
         #[arg(long, conflicts_with = "root")]
         print_schemas: bool,
     },
+    /// Serve a resident session over stdin/stdout (NDJSON): open or index the
+    /// repository once and answer tool calls from the graph held in memory. The
+    /// embedding protocol behind the Go SDK's native transport.
+    Session {
+        /// Path to the repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Test entrypoints whose call graph reaches a symbol changed between two git
     /// refs, or in the uncommitted working tree.
     ///
@@ -888,6 +896,12 @@ fn run(command: Command) -> Result<(), CliError> {
         Command::Mcp { root, .. } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
         }
+        Command::Session { repo } => {
+            let repo_root = resolve_repo(repo)?;
+            let mut session = cgx_session::Session::new(&repo_root, Box::new(ShadowStore::open));
+            cgx_session::native::serve(&mut session, std::io::stdin().lock(), std::io::stdout().lock())
+                .map_err(|e| CliError::graph(format!("session stdio: {e}")))
+        }
         Command::ImpactedTests {
             base,
             head,
@@ -1043,52 +1057,19 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         ..IndexOpts::default()
     };
     match read_pointer(repo_root) {
-        Ok(ptr) => match &current_tree {
-            // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
-            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &opts).map(|_| ()),
-            // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
-            _ => Ok(()),
-        },
-        // No index yet: build one.
-        Err(_) => index_repo(repo_root, &opts).map(|_| ()),
+        // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
+        Ok(ptr) if ptr.is_fresh(current_tree.as_deref()) => Ok(()),
+        // Stale (the pointer names another tree), or no index yet: build one.
+        _ => index_repo(repo_root, &opts).map(|_| ()),
     }
 }
 
-/// The effective on-by-default dataflow setting for `repo_root` (v0.3 SC6).
-/// Dataflow ships ON; the only off-switch at config level is the
-/// `[index] data_flow = false` key in a `cgx.toml` at the repo root. Any other
-/// value (or a missing key/file) leaves dataflow enabled. Parsed with a minimal
-/// line scan — cgx carries no `toml` dependency by design (cf. `cargo_pkg.rs`).
+/// The effective on-by-default dataflow setting for `repo_root` (v0.3 SC6): on,
+/// unless a `cgx.toml` at the repo root sets `[index] data_flow = false`
+/// ([`cgx_session::store_loc::dataflow_default`]).
 fn resolve_dataflow_default(repo_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(repo_root.join("cgx.toml")) else {
-        return true;
-    };
-    !cgx_toml_data_flow_is_false(&text)
-}
-
-/// Whether a `cgx.toml`'s `[index]` table sets `data_flow = false`. A minimal
-/// scanner: find the `[index]` section header, then the first `data_flow = …`
-/// assignment within it, and test for a literal `false`. Section-scoped so a
-/// `data_flow` key under another table is ignored.
-fn cgx_toml_data_flow_is_false(text: &str) -> bool {
-    let mut in_index = false;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_index = line == "[index]";
-            continue;
-        }
-        if !in_index {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "data_flow" {
-            return value.trim() == "false";
-        }
-    }
-    false
+    let text = std::fs::read_to_string(repo_root.join("cgx.toml")).ok();
+    cgx_session::store_loc::dataflow_default(text.as_deref())
 }
 
 /// Direction selector for the shared callers/callees path.

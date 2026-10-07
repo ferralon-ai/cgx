@@ -31,21 +31,39 @@
 //! WAL gives readers MVCC snapshots; writers take an advisory [`lock::WriteLock`]
 //! (IX-7) and use the check → lock → re-check pattern.
 
+//!
+//! ## Targets
+//!
+//! On `wasm32` the SQLite backend (rusqlite) and its `fd-lock` advisory locking
+//! are not built. [`ObjectStore`] is: its [`WriteLock`] is a no-op there (the host
+//! holds the exclusive lock on `.cgx/objects.lock`), and its three dataflow caches,
+//! which natively live in a scoped SQLite DB, are not persisted (every
+//! `--dataflow` link is a cold build; the graph is unaffected).
+
 pub mod error;
+pub mod fact_store;
+#[cfg(not(target_family = "wasm"))]
+pub mod lock;
+#[cfg(target_family = "wasm")]
+#[path = "lock_wasm.rs"]
 pub mod lock;
 pub mod manifest;
 pub mod object_store;
 pub mod oid;
 pub mod schema;
+#[cfg(not(target_family = "wasm"))]
 pub mod store;
 pub mod types;
 
+#[cfg(not(target_family = "wasm"))]
 mod token;
 
 pub use error::{Result, StoreError};
+pub use fact_store::{FactStore, FragmentInput};
 pub use lock::WriteLock;
 pub use object_store::ObjectStore;
 pub use oid::ObjectOid;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};
-pub use store::{FactStore, FragmentInput, SqliteStore};
+#[cfg(not(target_family = "wasm"))]
+pub use store::SqliteStore;
 pub use types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};

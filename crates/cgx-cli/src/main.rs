@@ -957,8 +957,8 @@ fn run_index(
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
     println!(
-        "  blobs: {} indexed, {} extracted, {} cached, {} unsupported",
-        s.blobs_indexed, s.blobs_extracted, s.blobs_cached, s.blobs_unsupported
+        "  blobs: {} indexed, {} extracted, {} cached, {} stale, {} unsupported",
+        s.blobs_indexed, s.blobs_extracted, s.blobs_cached, s.blobs_stale, s.blobs_unsupported
     );
     println!(
         "  graph: {} nodes, {} edges, {} unresolved",

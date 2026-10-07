@@ -153,3 +153,53 @@ fn determinism_holds_for_typescript_too() {
     let b = read_graph(&store_b, &id_b);
     assert_eq!(a, b);
 }
+
+#[test]
+fn stale_frontend_version_fragment_is_reextracted_and_overwritten() {
+    use cgx_core::codec::encode;
+    use cgx_frontend::RelPath;
+    use cgx_store::{BlobOid, FactStore, FragmentInput};
+    use std::process::Command;
+
+    let (_tmp, repo) = init_empty_repo();
+    write_file(&repo, "src/lib.rs", "pub fn f() -> i32 { 1 }\n");
+    commit_all(&repo, "one file");
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["hash-object", "src/lib.rs"])
+        .output()
+        .unwrap();
+    let blob = BlobOid::new(String::from_utf8(out.stdout).unwrap().trim().to_string());
+
+    let registry = default_registry();
+    let current = registry
+        .frontend_for(&RelPath::new("src/lib.rs"))
+        .fragment_version();
+    let mut store = mem_store();
+    // Garbage bytes under an older version: reading them would be a decode error.
+    store
+        .put_fragments(&[FragmentInput {
+            blob: &blob,
+            lang: "rust",
+            frontend_version: current - 1,
+            bytes: &encode(&"not a FileFacts").unwrap(),
+        }])
+        .unwrap();
+
+    let first = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(first.stats.blobs_extracted, 1, "{:?}", first.stats);
+    assert_eq!(first.stats.blobs_stale, 1, "{:?}", first.stats);
+    assert_eq!(first.stats.blobs_cached, 0, "{:?}", first.stats);
+    assert_eq!(
+        store.fragment(&blob).unwrap().unwrap().frontend_version,
+        current,
+        "the stale fragment is overwritten at the current version"
+    );
+
+    let second = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(second.stats.blobs_cached, 1, "{:?}", second.stats);
+    assert_eq!(second.stats.blobs_extracted, 0, "{:?}", second.stats);
+    assert_eq!(second.stats.blobs_stale, 0, "{:?}", second.stats);
+}

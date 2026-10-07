@@ -21,6 +21,7 @@ cgx-store = { path = "../cgx-store" }
 gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
 rayon = "1"
 thiserror.workspace = true
+tree-sitter.workspace = true
 tree-sitter-json.workspace = true
 
 [dev-dependencies]

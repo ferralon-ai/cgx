@@ -61,6 +61,41 @@ enter the workflow.
 convenience pointer to the latest patch rather than a resolution target — but the
 mechanic mirrors `ferralon-assay` so the two release processes read alike.)
 
+## Go module (`sdk/go/vX.Y.Z`)
+
+The Go SDK is the module `github.com/ferralon-ai/cgx/sdk/go`. It embeds the
+engine as `cgx.wasm`, which is a build output and so is not on `main`. When the
+cleave commit contains `sdk/go/go.mod`, the workflow additionally:
+
+1. builds `cgx.wasm` from the cleave commit with `cargo xtask wasm
+   --check-reproducible` (pinned toolchain and wasi-sdk; two builds from two
+   checkout paths, and the run fails unless they are byte-identical);
+2. commits it into the stamp commit at
+   `sdk/go/internal/embedded/module/cgx.wasm`, so the stamp changes exactly
+   `LICENSE` and that file (anything else fails the run);
+3. runs `go vet` and `go test` in `sdk/go` at the stamp commit, against the
+   embedded engine, before pushing any tag;
+4. creates the annotated tag **`sdk/go/vX.Y.Z`** at the stamp commit — the same
+   commit `vX.Y.Z` names — before it moves `vX.Y.Z`;
+5. attaches `cgx-vX.Y.Z-wasm32-wasip1.wasm` (the committed bytes) and its
+   `.sha256` to the Release.
+
+Consumers depend on it as usual: `go get github.com/ferralon-ai/cgx/sdk/go@vX.Y.Z`.
+The module zip carries the stamp commit's dated `LICENSE`.
+
+**The Go tag is created once and never moved.** The Go checksum database
+records the first content it sees for a module version, so a moved tag would
+break every consumer's build. If `sdk/go/vX.Y.Z` already exists at another
+commit, the run fails before anything is published; fix forward with a new
+version. There is no `sdk/go/vX.Y` alias, and the run refuses to start if one
+exists: Go already resolves `@v0.3` to the newest `v0.3.*` by itself, and Go
+tooling must never resolve a tag that moves. The floating-alias step only ever
+touches top-level `vX.Y` tags.
+
+Each release adds one compressed wasm blob to the history reachable from tags,
+so a full clone grows by about that much per release; `main`'s history does not.
+Cleave points older than the SDK take the LICENSE-only path unchanged.
+
 ## Change Date basis
 
 The BUSL-1.1 Change Date is keyed to **publication**, not code authorship: it is

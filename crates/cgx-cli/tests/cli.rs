@@ -2270,3 +2270,67 @@ fn search_selector_negation_rewrite_warns_on_stderr() {
         "the `!*`→`*!` rewrite is disclosed on stderr: {stderr}"
     );
 }
+
+/// A `callers` answer that lost callers to receiver narrowing says so: same-name
+/// `self.validate()` sites bound to other classes are reported as an `under`
+/// reason, and without narrowing the legacy callers come back with no such
+/// reason.
+#[test]
+fn callers_of_a_method_narrowing_excluded_reports_the_narrowed_sites() {
+    let repo_of = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(
+            repo.join("pkg/base.py"),
+            "class Base:\n    def save(self):\n        return self.validate()\n\n    def validate(self):\n        return True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("pkg/widgets.py"),
+            "class Unrelated:\n    def validate(self):\n        return 1\n",
+        )
+        .unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "cgx-test"]);
+        git(&repo, &["config", "user.email", "cgx@test.invalid"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        (tmp, repo)
+    };
+    let codes = |out: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(out).expect("json");
+        v["approximation"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["code"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let query = ["callers", "pkg::widgets::Unrelated::validate", "--format", "json"];
+
+    let (_t, narrowed) = repo_of();
+    let (out, code) = run_cgx(&narrowed, &["index", "--receiver-narrowing"]);
+    assert_eq!(code, 0, "index: {out}");
+    let (out, code) = run_cgx(&narrowed, &query);
+    assert_eq!(code, 0, "callers: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["count"], serde_json::json!(0), "narrowing dropped the only caller: {out}");
+    assert_eq!(v["approximation"]["direction"], serde_json::json!("under"), "{out}");
+    assert!(
+        codes(&out).iter().any(|c| c == "receiver-narrowed-away"),
+        "the narrowed-away site is reported: {out}"
+    );
+
+    let (_t, legacy) = repo_of();
+    index(&legacy);
+    let (out, code) = run_cgx(&legacy, &query);
+    assert_eq!(code, 0, "callers: {out}");
+    assert!(out.contains("pkg::base::Base::save"), "legacy keeps the same-name caller: {out}");
+    assert!(
+        !codes(&out).iter().any(|c| c.starts_with("receiver-narrowed")),
+        "no narrowing reason without narrowing: {out}"
+    );
+}

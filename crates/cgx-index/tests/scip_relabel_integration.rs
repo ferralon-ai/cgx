@@ -119,6 +119,7 @@ fn scip_upgrades_free_fn_call_to_certain_via_index_path() {
     let opts = IndexOpts {
         scip: Some(scip_path.clone()),
         dataflow: false,
+        ..Default::default()
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
 
@@ -177,6 +178,7 @@ fn scip_joins_on_real_cargo_package_name_not_rust_sample() {
     let opts = IndexOpts {
         scip: Some(scip_path),
         dataflow: false,
+        ..Default::default()
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
 
@@ -241,6 +243,7 @@ fn re_indexing_with_scip_is_byte_identical() {
     let opts = IndexOpts {
         scip: Some(scip_path.clone()),
         dataflow: false,
+        ..Default::default()
     };
 
     let registry = cgx_index::default_registry();
@@ -282,6 +285,7 @@ fn real_scip_blob_when_present() {
     let opts = IndexOpts {
         scip: Some(blob),
         dataflow: false,
+        ..Default::default()
     };
     let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
     let g = read_graph(&store, &outcome.graph_key);

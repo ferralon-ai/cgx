@@ -50,6 +50,9 @@ pub struct ResolvedGraph {
     /// v0.3 SC3 incremental-dataflow products. Empty/zeroed unless the link ran
     /// with `dataflow` enabled and a prior cache was supplied.
     pub dataflow: DataflowOutput,
+    /// Receiver-narrowing counters; zero unless the link ran with
+    /// `receiver_narrowing`.
+    pub precision: crate::PrecisionStats,
 }
 
 /// The v0.3 SC3 incremental-dataflow products of a link: per-function cache rows

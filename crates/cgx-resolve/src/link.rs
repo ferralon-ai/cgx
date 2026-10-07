@@ -17,6 +17,7 @@ use cgx_frontend::facts::{
 
 use crate::graph::{DataflowOutput, ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
+use crate::receiver::{Ledger, Narrowed, ReceiverIndex, Site};
 use crate::symtab::{
     collect_import_bindings, short_name, DefEntry, ImportBinding, ResolveOutcome, SymbolTable,
 };
@@ -41,8 +42,12 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut unresolved: Vec<UnresolvedRef> = Vec::new();
     let mut next_group: u32 = 0;
+    let mut ledger = Ledger::new(opts.narrowing_trace);
+    let receivers = opts
+        .receiver_narrowing
+        .then(|| ReceiverIndex::build(inputs, &table, &mut ledger));
 
-    for file in inputs {
+    for (file_idx, file) in inputs.iter().enumerate() {
         let facts = file.facts;
         let bindings = collect_import_bindings(&facts.imports);
         for raw in &facts.refs {
@@ -56,6 +61,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
             };
             resolve_ref(
                 file,
+                file_idx,
                 raw,
                 caller,
                 caller_id,
@@ -68,6 +74,8 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
                 &mut candidates,
                 &mut unresolved,
                 &mut next_group,
+                receivers.as_ref(),
+                &mut ledger,
             );
         }
     }
@@ -103,9 +111,10 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
         DataflowOutput::default()
     };
 
-    let narrowing = std::collections::BTreeMap::new();
+    let (precision, narrowing) = ledger.finish(&table);
     let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
     graph.dataflow = dataflow;
+    graph.precision = precision;
     graph
 }
 
@@ -243,6 +252,7 @@ fn enclosing_def<'a>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     file: &FileInput<'_>,
+    file_idx: usize,
     raw: &RawRef,
     caller: &SymbolDef,
     caller_id: NodeId,
@@ -255,6 +265,8 @@ fn resolve_ref(
     candidates: &mut Vec<Candidate>,
     unresolved: &mut Vec<UnresolvedRef>,
     next_group: &mut u32,
+    receivers: Option<&ReceiverIndex<'_>>,
+    ledger: &mut Ledger,
 ) {
     let span = Span::new(file.path.clone(), raw.span.line, raw.span.col);
     let last = match raw.name_path.last() {
@@ -332,6 +344,57 @@ fn resolve_ref(
         }
     }
 
+    // --- Step 1b (opt-in): receiver-kind narrowing of virtual sites. Runs
+    // before import resolution so a `self`/`cls` head is never bound through a
+    // glob import and a class-headed call is looked up on the class, not as a
+    // module member. See `crate::receiver`. ---
+    let narrowing = receivers.filter(|_| virtual_receiver).map(|rx| {
+        let site = Site {
+            file,
+            file_idx,
+            raw,
+            caller,
+            caller_id,
+            local_def: resolve_local(scopes, defs, raw.scope, &raw.name_path[0]),
+        };
+        (rx, site)
+    });
+    if let Some((rx, site)) = &narrowing {
+        match rx.narrow(site, ledger) {
+            Narrowed::Typed {
+                hits,
+                rule,
+                virtual_dispatch,
+                ..
+            } => {
+                emit_candidate_set(
+                    edges,
+                    candidates,
+                    next_group,
+                    &hits,
+                    caller_id,
+                    raw,
+                    virtual_dispatch,
+                    rule,
+                    &caller.fqn,
+                    &span,
+                );
+                return;
+            }
+            Narrowed::External => {
+                unresolved.push(UnresolvedRef {
+                    caller_fqn: caller.fqn.clone(),
+                    name_path: raw.name_path.iter().cloned().collect(),
+                    span,
+                    marker: CutMarker::External,
+                    caller: caller_id,
+                });
+                return;
+            }
+            Narrowed::Legacy(_) => {}
+        }
+    }
+
     // --- Step 2: import-binding resolution (Pass B tier 1). ---
     let head = raw.name_path[0].as_str();
     if let Some(binding) = lookup_binding(bindings, scopes, raw.scope, head) {
@@ -376,6 +439,9 @@ fn resolve_ref(
     // --- Step 3: virtual / duck-typed dispatch — same-name method candidate set. ---
     if virtual_receiver {
         let hits = method_candidates(table, last, &file.lang);
+        if let Some((rx, site)) = &narrowing {
+            rx.record_legacy(site, hits.len(), ledger);
+        }
         if !hits.is_empty() {
             emit_candidate_set(
                 edges,
@@ -1470,6 +1536,7 @@ fn finalize(
         candidates,
         unresolved,
         dataflow: DataflowOutput::default(),
+        precision: Default::default(),
     };
     canonicalize(&mut graph);
     graph

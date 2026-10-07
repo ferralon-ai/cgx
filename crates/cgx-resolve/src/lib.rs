@@ -72,6 +72,7 @@ mod graph_alg;
 mod ifds;
 mod input;
 mod link;
+mod receiver;
 mod rta;
 mod sig;
 mod summary;
@@ -86,6 +87,7 @@ pub use graph::{
 pub use ifds::{IfdsStats, DEFAULT_MAX_SUMMARY_EDGES};
 pub use input::{FileInput, LinkOpts};
 pub use link::{canonicalize, link};
+pub use receiver::{CatStats, PrecisionStats};
 pub use rta::{run_rta, RtaStats};
 pub use sig::{run_sig, SigStats};
 pub use summary::{FormalOut, SummaryFact};

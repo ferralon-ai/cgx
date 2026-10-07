@@ -25,6 +25,9 @@ pub struct UnresolvedRef {
     /// policy found no import-visible target). `finalize` counts each marker into
     /// its own field on the caller's node record.
     pub marker: CutMarker,
+    /// The calling symbol's node: the node whose dangling counters count this
+    /// reference.
+    pub caller: cgx_core::NodeId,
 }
 
 /// The linked graph the resolver produces (architecture §3 Layer 2).

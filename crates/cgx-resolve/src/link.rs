@@ -444,6 +444,7 @@ fn resolve_ref(
         name_path: raw.name_path.iter().cloned().collect(),
         span,
         marker: CutMarker::Unresolved,
+        caller: caller_id,
     });
 }
 
@@ -1428,21 +1429,19 @@ fn finalize(
     // marker. Dangling refs leave *no edge*, so these counts are the only trace
     // of the blind spot a graph walk can see — the approximation contract
     // (A3/A4) reads them so a negative answer whose frontier crosses a call that
-    // was not followed is never claimed `exact`. Keyed by `(caller fqn, file)`:
-    // the ref's span lies inside the caller's body, so its file matches the
-    // caller node's file.
+    // was not followed is never claimed `exact`. Keyed by the caller's node id,
+    // so every dangling ref lands on exactly one node even when two defs share
+    // an FQN.
     #[derive(Default)]
     struct Dangling {
         unresolved: u32,
         external: u32,
         untyped: u32,
     }
-    let mut dangling: std::collections::BTreeMap<(&str, &str), Dangling> =
+    let mut dangling: std::collections::BTreeMap<NodeId, Dangling> =
         std::collections::BTreeMap::new();
     for r in &unresolved {
-        let d = dangling
-            .entry((r.caller_fqn.as_str(), r.span.file.as_str()))
-            .or_default();
+        let d = dangling.entry(r.caller).or_default();
         match r.marker {
             CutMarker::External => d.external += 1,
             CutMarker::UntypedReceiver => d.untyped += 1,
@@ -1453,7 +1452,7 @@ fn finalize(
     }
     if !dangling.is_empty() || !narrowing.is_empty() {
         for n in &mut nodes {
-            let d = dangling.get(&(n.node.fqn.as_str(), n.node.file.as_str()));
+            let d = dangling.get(&n.node.id);
             if let Some(d) = d {
                 n.node.unresolved_calls = d.unresolved;
                 n.node.external_calls = d.external;
@@ -1554,11 +1553,13 @@ mod tests {
     }
 
     fn dangle(caller: &str, file: &str, line: u32, marker: CutMarker) -> UnresolvedRef {
+        let id = if caller == "m::a" { 0 } else { 1 };
         UnresolvedRef {
             caller_fqn: caller.into(),
             name_path: vec!["x".into(), "m".into()],
             span: Span::new(file, line, None),
             marker,
+            caller: NodeId(id),
         }
     }
 
@@ -1596,6 +1597,20 @@ mod tests {
             .sum();
         assert_eq!(sum, total, "every dangling ref is counted exactly once");
         assert_eq!(g.unresolved.len() as u32, total);
+    }
+
+    #[test]
+    fn finalize_counts_a_dangle_once_when_two_defs_share_an_fqn() {
+        let nodes = vec![node(0, "m::dup", "m.py"), node(1, "m::dup", "m.py")];
+        let unresolved: Vec<UnresolvedRef> = (2..4)
+            .map(|line| UnresolvedRef {
+                caller: NodeId(1),
+                ..dangle("m::dup", "m.py", line, CutMarker::Unresolved)
+            })
+            .collect();
+        let g = finalize(nodes, vec![], vec![], unresolved, &BTreeMap::new());
+        let per_node: Vec<u32> = g.nodes.iter().map(|n| n.node.unresolved_calls).collect();
+        assert_eq!(per_node, vec![0, 2]);
     }
 
     #[test]

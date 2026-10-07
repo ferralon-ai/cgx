@@ -50,7 +50,8 @@ impl GoFrontend {
 /// Version of the Go extraction rules; bumping invalidates cached fragments.
 /// v2: FQN root is now the go.mod import path (module path + package subdir)
 /// instead of the leaf directory name, so v1 fragments may carry stale roots.
-const GO_FRAGMENT_VERSION: u32 = 2;
+/// v3: `FileFacts` gained `module` and `type_facts`; v2 fragments no longer decode.
+const GO_FRAGMENT_VERSION: u32 = 3;
 
 impl LanguageFrontend for GoFrontend {
     fn lang(&self) -> Lang {
@@ -91,6 +92,7 @@ impl LanguageFrontend for GoFrontend {
         };
         let mut builder = Builder::new(src, ctx.path.as_str());
         builder.package_name = builder.read_package_name(tree.root_node());
+        builder.facts.module = Some(module_prefix.clone());
 
         let root_ctx = Ctx::root(module_prefix);
         let mut stmt_index = 0u32;
@@ -328,6 +330,9 @@ impl<'a> Builder<'a> {
         });
         self.maybe_export(&name, node);
         self.record_fn_entrypoints(&name, &fqn);
+        self.facts
+            .type_facts
+            .extend(crate::typefacts::collect(self.src, node, &fqn));
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope);
@@ -362,6 +367,9 @@ impl<'a> Builder<'a> {
             is_abstract: false,
             signature: None,
         });
+        self.facts
+            .type_facts
+            .extend(crate::typefacts::collect(self.src, node, &fqn));
 
         // The receiver type's method set drives same-file `Implements` detection.
         self.type_methods

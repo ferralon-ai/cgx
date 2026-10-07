@@ -58,9 +58,9 @@ pub mod registry;
 // --- Primary surface ---
 
 pub use facts::{
-    CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileFacts, ImplRelation,
-    ImportFact, ImportedName, Name, RawRef, RefKind, RelationKind, Scope, ScopeId, ScopeTree,
-    SymbolDef,
+    AnonRoot, BaseExpr, CallArg, CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact,
+    FileFacts, ImplRelation, ImportFact, ImportedName, LiteralKind, Name, ParamKind, RawRef,
+    RefKind, RelationKind, Scope, ScopeId, ScopeTree, SymbolDef, TypeExpr, TypeFact, ValueSource,
 };
 pub use fallback::FallbackFrontend;
 pub use frontend::{

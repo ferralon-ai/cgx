@@ -42,7 +42,8 @@ use tree_sitter::{Language, Node, Parser};
 /// extraction logic changes in a way that invalidates cached fragments.
 /// v3: FQN root is now the verbatim `package.json` `name` (plus subpath) instead
 /// of the mangled dir-before-`src/`, so v2 fragments may carry stale roots.
-const TS_FRAGMENT_VERSION: u32 = 3;
+/// v6: `FileFacts` gained `module` and `type_facts`; older fragments no longer decode.
+const TS_FRAGMENT_VERSION: u32 = 6;
 
 /// The TypeScript/JavaScript language frontend.
 ///

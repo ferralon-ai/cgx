@@ -27,7 +27,7 @@ use cgx_core::transform::Transform;
 use cgx_frontend::{
     CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts,
     FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, ManifestKind,
-    Name, RawRef, RefKind, RelPath, RelationKind, ScopeId, SymbolDef,
+    Name, RawRef, RefKind, RelPath, RelationKind, ScopeId, SymbolDef, TypeFact,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +50,8 @@ impl PythonFrontend {
 /// v3: FQN root is now the importable dotted module path below a src/pyproject-aware
 /// import root instead of the literal first path segment, so v2 fragments may carry
 /// stale roots (notably the former `src`-as-root collision).
-const PYTHON_FRAGMENT_VERSION: u32 = 3;
+/// v4: `FileFacts` gained `module` and `type_facts`; v3 fragments no longer decode.
+const PYTHON_FRAGMENT_VERSION: u32 = 4;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {
@@ -92,6 +93,7 @@ impl LanguageFrontend for PythonFrontend {
             .map(|m| m.root_dir.as_str());
         let module_prefix = module_path_for_root(ctx.path.as_str(), import_root);
         let mut builder = Builder::new(src, ctx.path.as_str());
+        builder.facts.module = Some(module_prefix.clone());
         let root_ctx = Ctx::root(module_prefix);
 
         let root = tree.root_node();
@@ -386,6 +388,9 @@ impl<'a> Builder<'a> {
         self.note_module_def(&name, ctx, node);
         self.record_fn_entrypoints(&name, &fqn, ctx);
         self.note_class_method(&name, &fqn, ctx, node);
+        self.facts
+            .type_facts
+            .extend(crate::typefacts::collect(self.src, node, &fqn, ctx.in_class));
 
         // Recurse into the body for nested defs and call refs. The body is not a
         // class body, so nested functions are `Function`s. A body opens a fresh
@@ -421,6 +426,10 @@ impl<'a> Builder<'a> {
         self.note_module_def(&name, ctx, node);
         self.record_class_entrypoint(node, &name, &fqn, ctx);
         self.emit_inheritance(node, &name);
+        self.facts.type_facts.push(TypeFact::ClassBases {
+            class: fqn.clone(),
+            bases: crate::typefacts::class_bases(self.src, node),
+        });
 
         if let Some(body) = node.child_by_field_name("body") {
             let body_ctx = ctx.enter_body(fqn, scope, true);
@@ -624,6 +633,21 @@ impl<'a> Builder<'a> {
         if let Some(func) = node.child_by_field_name("function") {
             self.emit_call_cut_hints(func, node);
             let (name_path, kind) = self.classify_callee(func);
+            if kind == RefKind::CallVirtualReceiver {
+                if let (Some((root, depth)), Some(method)) = (
+                    crate::typefacts::anon_root(self.src, func),
+                    name_path.last(),
+                ) {
+                    self.facts.type_facts.push(TypeFact::AnonReceiver {
+                        func: ctx.fqn_prefix.clone(),
+                        line: self.line(node),
+                        col: self.col(node),
+                        method: method.clone(),
+                        depth,
+                        root,
+                    });
+                }
+            }
             if !name_path.is_empty() {
                 let joined = name_path.join("::");
                 // A concurrency spawn site (`asyncio.create_task`,

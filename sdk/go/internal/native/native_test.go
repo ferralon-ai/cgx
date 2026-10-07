@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,8 @@ func fakeServer(state string) {
 			switch req.Tool {
 			case "echo":
 				ok(map[string]any{"tool": req.Tool, "args": req.Args})
+			case "env":
+				ok(os.Environ())
 			case "callers":
 				fail(abi.KindResolve, "no symbol matched `nope`")
 			case "sleep":
@@ -107,15 +110,13 @@ func appendFile(path, s string) {
 	f.Close()
 }
 
+// newFake starts a client on the fake server. env reaches the server only
+// through New's extra environment, as a caller's WithEnv would.
 func newFake(t *testing.T, env ...string) (*Client, string) {
 	t.Helper()
 	state := t.TempDir()
-	t.Setenv("CGX_FAKE_SESSION_STATE", state)
-	for _, kv := range env {
-		k, v, _ := strings.Cut(kv, "=")
-		t.Setenv(k, v)
-	}
-	c, err := New(ctx, os.Args[0], transport.Config{Repo: gitRepo(t), SchemaHash: "h1"}, nil)
+	env = append([]string{"CGX_FAKE_SESSION_STATE=" + state}, env...)
+	c, err := New(ctx, os.Args[0], env, transport.Config{Repo: gitRepo(t), SchemaHash: "h1"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,14 +348,14 @@ func TestSCIPAndDataflowAlwaysRebuild(t *testing.T) {
 }
 
 func TestNewChecksRepository(t *testing.T) {
-	if _, err := New(ctx, os.Args[0], transport.Config{Repo: t.TempDir()}, nil); !errors.Is(err, transport.ErrNotGitRepo) {
+	if _, err := New(ctx, os.Args[0], nil, transport.Config{Repo: t.TempDir()}, nil); !errors.Is(err, transport.ErrNotGitRepo) {
 		t.Fatalf("plain dir: %v, want ErrNotGitRepo", err)
 	}
 	dir := gitRepo(t)
 	if err := os.Symlink(t.TempDir(), filepath.Join(dir, ".cgx")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(ctx, os.Args[0], transport.Config{Repo: dir}, nil); !errors.Is(err, transport.ErrUnsafeIndexDir) {
+	if _, err := New(ctx, os.Args[0], nil, transport.Config{Repo: dir}, nil); !errors.Is(err, transport.ErrUnsafeIndexDir) {
 		t.Fatalf("symlinked .cgx: %v, want ErrUnsafeIndexDir", err)
 	}
 }
@@ -380,4 +381,74 @@ func TestStatsDoesNotWaitForACall(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// The engine process sees only the allowlisted parent variables and what the
+// caller adds, never the rest of the parent environment.
+func TestChildEnvironment(t *testing.T) {
+	repo, state := gitRepo(t), t.TempDir()
+	// Set after the temporary directories and the repository exist: the
+	// parent's own git and TempDir read these too.
+	t.Setenv("CGX_TEST_PARENT_SECRET", "must-not-leak")
+	t.Setenv("GIT_DIR", "/elsewhere/.git")
+	t.Setenv("HOME", "/home/parent")
+	t.Setenv("TMPDIR", "/tmp/parent")
+	c, err := New(ctx, os.Args[0], []string{"CGX_FAKE_SESSION_STATE=" + state, "CGX_TEST_ADDED=yes", "TMPDIR=/tmp/caller"},
+		transport.Config{Repo: repo, SchemaHash: "h1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := c.Call(ctx, "env", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env []string
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	for _, k := range []string{"CGX_TEST_PARENT_SECRET", "GIT_DIR", "HOME"} {
+		if v, ok := got[k]; ok {
+			t.Errorf("parent variable %s=%q reached the engine", k, v)
+		}
+	}
+	want := map[string]string{
+		"CGX_TEST_ADDED":      "yes",
+		"TMPDIR":              "/tmp/caller",
+		"GIT_NO_LAZY_FETCH":   "1",
+		"GIT_TERMINAL_PROMPT": "0",
+		"PATH":                os.Getenv("PATH"),
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("engine %s = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestEnv(t *testing.T) {
+	base := []string{"PATH=/bin", "HOME=/h", "TMPDIR=/t", "GIT_DIR=/g", "SECRET=s", "GIT_TERMINAL_PROMPT=1"}
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  []string
+	}{
+		{"default", nil, []string{"PATH=/bin", "TMPDIR=/t", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0"}},
+		{"extra appended last", []string{"HOME=/h2", "PATH=/usr/bin"},
+			[]string{"PATH=/bin", "TMPDIR=/t", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0", "HOME=/h2", "PATH=/usr/bin"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Env(base, tc.extra); !slices.Equal(got, tc.want) {
+				t.Fatalf("Env = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

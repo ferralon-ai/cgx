@@ -485,6 +485,77 @@ pub enum TypeFact {
         /// Its declared type, normalized.
         ty: TypeExpr,
     },
+    /// An attribute store `base.field = …` inside `func` (a callable, or the
+    /// module path for module-level code) that is not a [`TypeFact::FieldBind`]:
+    /// the object stored through is not the method's receiver.
+    AttrStore {
+        /// Owning callable, or the module path.
+        func: String,
+        /// The object stored through: `Var(name)` for a plain name, `Opaque`
+        /// for any other expression.
+        base: ValueSource,
+        /// The attribute name.
+        field: Name,
+        /// Where the stored value comes from.
+        src: ValueSource,
+    },
+}
+
+impl TypeFact {
+    /// Replace every type named by a single segment in `names` (the type
+    /// parameters in scope) with [`TypeExpr::Unknown`], so a type parameter
+    /// never resolves to a same-named type.
+    pub fn erase_type_names(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        match self {
+            TypeFact::Param { ty: Some(t), .. }
+            | TypeFact::Return { ty: t, .. }
+            | TypeFact::FieldType { ty: t, .. } => t.erase_names(names),
+            TypeFact::Bind { src, .. } | TypeFact::FieldBind { src, .. } => {
+                src.erase_type_names(names)
+            }
+            TypeFact::AttrStore { base, src, .. } => {
+                base.erase_type_names(names);
+                src.erase_type_names(names);
+            }
+            TypeFact::CallArgs { args, .. } => {
+                for a in args {
+                    a.value.erase_type_names(names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ValueSource {
+    fn erase_type_names(&mut self, names: &[String]) {
+        match self {
+            ValueSource::New(t) | ValueSource::Declared(t) => t.erase_names(names),
+            ValueSource::Enter(s) | ValueSource::Element(s) => s.erase_type_names(names),
+            _ => {}
+        }
+    }
+}
+
+impl TypeExpr {
+    fn erase_names(&mut self, names: &[String]) {
+        match self {
+            TypeExpr::Named { path, .. } | TypeExpr::Generic { head: path, .. }
+                if path.len() == 1 && names.contains(&path[0]) =>
+            {
+                *self = TypeExpr::Unknown;
+            }
+            TypeExpr::Generic { args, .. } | TypeExpr::Union(args) => {
+                for a in args {
+                    a.erase_names(names);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How a [`TypeFact::Param`] binds call arguments. Variant order is ABI

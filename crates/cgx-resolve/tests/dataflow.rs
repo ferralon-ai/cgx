@@ -349,6 +349,7 @@ fn caller_callee_fixture(callee_transform: Transform) -> FileFacts {
     b.last_data_flow_cut(CutMarker::OpaqueCall);
     b.last_data_flow_callee("h");
     b.last_data_flow_args(&[&["p0"]]); // g's own param p0 is passed as h's arg 0.
+    b.call(&["h"], g_body, 2); // the call ref the frontend emits for `h(a)`.
     b.data_flow(&["b"], 1, &["r"], g_body, Transform::Copy, 3);
     b.build()
 }
@@ -409,6 +410,7 @@ fn self_recursion_reaches_fixpoint_no_hang() {
     b.last_data_flow_cut(CutMarker::OpaqueCall);
     b.last_data_flow_callee("r");
     b.last_data_flow_args(&[&["p0"]]);
+    b.call(&["r"], body, 3);
     let facts = b.build();
     let g = link(&[input(&facts)], &dataflow_opts());
     // The summary fixpoint terminates; we get a self-edge return#1 ⇝ p0#0.
@@ -437,12 +439,14 @@ fn mutual_recursion_scc_reaches_fixpoint_no_hang() {
     b.last_data_flow_cut(CutMarker::OpaqueCall);
     b.last_data_flow_callee("g");
     b.last_data_flow_args(&[&["p0"]]);
+    b.call(&["g"], f_body, 3);
     // m::g: base-case `return p0` + recursive `return f(p0)`.
     b.data_flow(&["m::g", "return"], 1, &["p0"], g_body, Transform::Copy, 11);
     b.data_flow(&["m::g", "return"], 2, &[], g_body, Transform::Copy, 12);
     b.last_data_flow_cut(CutMarker::OpaqueCall);
     b.last_data_flow_callee("f");
     b.last_data_flow_args(&[&["p0"]]);
+    b.call(&["f"], g_body, 12);
     let facts = b.build();
     let g = link(&[input(&facts)], &dataflow_opts());
     assert_eq!(g.dataflow.ifds_stats.budget_exceeded_sccs, 0, "no budget trip on f<->g");
@@ -494,10 +498,12 @@ fn work_budget_backstop_fires_on_dense_scc() {
             if i == j {
                 continue;
             }
-            b.data_flow(&["return"], 2 + j as u32, &[], *body, Transform::Copy, (i as u32) * 10 + 3 + j as u32);
+            let line = (i as u32) * 10 + 3 + j as u32;
+            b.data_flow(&["return"], 2 + j as u32, &[], *body, Transform::Copy, line);
             b.last_data_flow_cut(CutMarker::OpaqueCall);
             b.last_data_flow_callee(&format!("f{j}"));
             b.last_data_flow_args(&[&["p0"]]);
+            b.call(&[&format!("f{j}")], *body, line);
         }
     }
     let facts = b.build();
@@ -751,4 +757,131 @@ fn resolution_is_independent_of_canonical_fact_order() {
         edge_fqns(&g_b),
         "resolved DerivesFrom edge set must not depend on canonical fact order"
     );
+}
+
+// --- Summary grounding: a summary applies only through the resolved call ------
+//
+// IFDS applies a callee's summary at `r = helper(a)` only when that call itself
+// resolved to one in-repo callable by scope or import binding. A repo-wide
+// short-name match must not stand in for an out-of-repo or ambiguous callee.
+
+/// `src/util.rs`: `fn helper(p0) { return p0 }`, a summary `formal_in_0 ⇝ return`.
+fn util_helper_file() -> FileFacts {
+    let mut b = FB::new();
+    let body = b.scope(ScopeId::ROOT, Some("crate::util::helper"));
+    b.def("crate::util::helper", SymbolKind::Function, ScopeId::ROOT, 1,
+        cgx_core::node::Visibility::Public, false, Some(1));
+    b.data_flow(&["crate::util::helper", "return"], 1, &["p0"], body, Transform::Copy, 2);
+    b.build()
+}
+
+/// `src/app.rs`: `fn run(p0) { let r = helper(p0); }`, with `setup` adding
+/// imports or local defs. The caller passes its own param as the argument.
+fn app_calling_helper<F: FnOnce(&mut FB)>(setup: F) -> FileFacts {
+    let mut b = FB::new();
+    let body = b.scope(ScopeId::ROOT, Some("crate::app::run"));
+    b.def("crate::app::run", SymbolKind::Function, ScopeId::ROOT, 10,
+        cgx_core::node::Visibility::Public, false, Some(1));
+    setup(&mut b);
+    b.data_flow(&["r"], 1, &[], body, Transform::Other, 11);
+    b.last_data_flow_cut(CutMarker::OpaqueCall);
+    b.last_data_flow_callee("helper");
+    b.last_data_flow_args(&[&["p0"]]);
+    b.call(&["helper"], body, 11);
+    b.build()
+}
+
+fn interproc_edges(g: &cgx_resolve::ResolvedGraph) -> Vec<(String, String)> {
+    let fqn = |id: cgx_core::id::NodeId| {
+        g.node_records().find(|n| n.id == id).map(|n| n.fqn.clone()).unwrap_or_default()
+    };
+    g.edge_records()
+        .filter(|e| e.kind == EdgeKind::DerivesFrom && e.rule == "interprocedural")
+        .map(|e| (fqn(e.src), fqn(e.dst)))
+        .collect()
+}
+
+#[test]
+fn out_of_repo_import_takes_no_in_repo_summary() {
+    // `use ext::helper;` names an out-of-repo function. The in-repo
+    // `crate::util::helper` shares only its short name, so its summary must not
+    // be applied at `helper(p0)`.
+    let util = util_helper_file();
+    let app = app_calling_helper(|b| {
+        b.import("ext", "helper", None, false, ScopeId::ROOT);
+    });
+    let g = link(
+        &[
+            FileInput::new("blob-app", "src/app.rs", "rust", &app),
+            FileInput::new("blob-util", "src/util.rs", "rust", &util),
+        ],
+        &dataflow_opts(),
+    );
+    assert!(
+        g.edge_records().all(|e| !(e.rule == "scope-ref" || e.rule == "import-ref")),
+        "the call must not be scope- or import-resolved in this fixture"
+    );
+    assert_eq!(interproc_edges(&g), Vec::<(String, String)>::new());
+}
+
+#[test]
+fn same_file_callee_applies_its_summary() {
+    // A same-file `helper` resolves by scope (`scope-ref`), so its summary applies.
+    let app = app_calling_helper(|b| {
+        let body = b.scope(ScopeId::ROOT, Some("crate::app::helper"));
+        b.def("crate::app::helper", SymbolKind::Function, ScopeId::ROOT, 1,
+            cgx_core::node::Visibility::Public, false, Some(1));
+        b.data_flow(&["crate::app::helper", "return"], 1, &["p0"], body, Transform::Copy, 2);
+    });
+    let g = link(&[FileInput::new("blob-app", "src/app.rs", "rust", &app)], &dataflow_opts());
+    assert!(g.edge_records().any(|e| e.rule == "scope-ref"));
+    assert_eq!(
+        interproc_edges(&g),
+        vec![("crate::app::run::r#1".to_string(), "crate::app::run::p0#0".to_string())]
+    );
+}
+
+#[test]
+fn import_bound_callee_applies_its_summary() {
+    // `use crate::util::helper;` binds the call to the in-repo def (`import-ref`).
+    let util = util_helper_file();
+    let app = app_calling_helper(|b| {
+        b.import("crate::util", "helper", None, false, ScopeId::ROOT);
+    });
+    let g = link(
+        &[
+            FileInput::new("blob-app", "src/app.rs", "rust", &app),
+            FileInput::new("blob-util", "src/util.rs", "rust", &util),
+        ],
+        &dataflow_opts(),
+    );
+    assert!(g.edge_records().any(|e| e.rule == "import-ref"));
+    assert_eq!(
+        interproc_edges(&g),
+        vec![("crate::app::run::r#1".to_string(), "crate::app::run::p0#0".to_string())]
+    );
+}
+
+#[test]
+fn name_shared_by_two_callables_applies_no_summary() {
+    // With no binding, `helper` matches two in-repo functions; the call resolves
+    // only to a name-matched candidate set, so neither summary applies.
+    let util = util_helper_file();
+    let mut other = FB::new();
+    let body = other.scope(ScopeId::ROOT, Some("crate::other::helper"));
+    other.def("crate::other::helper", SymbolKind::Function, ScopeId::ROOT, 1,
+        cgx_core::node::Visibility::Public, false, Some(1));
+    other.data_flow(&["crate::other::helper", "return"], 1, &["p0"], body, Transform::Copy, 2);
+    let other = other.build();
+    let app = app_calling_helper(|_| {});
+    let g = link(
+        &[
+            FileInput::new("blob-app", "src/app.rs", "rust", &app),
+            FileInput::new("blob-util", "src/util.rs", "rust", &util),
+            FileInput::new("blob-other", "src/other.rs", "rust", &other),
+        ],
+        &dataflow_opts(),
+    );
+    assert!(g.edge_records().any(|e| e.rule.starts_with("name-arity")));
+    assert_eq!(interproc_edges(&g), Vec::<(String, String)>::new());
 }

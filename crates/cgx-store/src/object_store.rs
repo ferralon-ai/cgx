@@ -9,7 +9,9 @@
 //! (guarded by [`WriteLock`], analogous to the SQLite `tx.commit()`).
 //!
 //! Layer-1 fragments are stored as their own objects under `.cgx/fragments/`, keyed
-//! by blob OID (IX-1: a re-put of an unchanged blob is a no-op).
+//! by blob OID (IX-1: a re-put of an unchanged blob is a no-op). Because their name
+//! is not the hash of their bytes, each carries a SHA-1 trailer; a fragment whose
+//! trailer does not match reads as a cache miss.
 //!
 //! The three dataflow caches (`fn_intraproc_cache`, `summary_deps`, `fn_summaries`)
 //! are **not** content-addressed — they want keyed upsert/delete — so they are
@@ -17,16 +19,22 @@
 //! `.cgx/cache.db`. That DB is index-time scratch and lives under the `.cgx`
 //! `.gitignore`'s `*`; it is never part of the committed/transported object set.
 //!
-//! ## Write discipline (atomic-replace + CAS)
+//! ## Write discipline (atomic-replace + batched durability + verify-on-read)
 //!
-//! Every object is written temp → `fsync` → atomic `rename` to its final OID path,
-//! and is write-once (if the OID path already exists the bytes are identical by
-//! construction, so the write is skipped). A half-written object never occupies its
-//! final name, so torn *reads* are impossible. Shards and the candidates blob land
-//! first; then the manifest object; then the ref pointer advances last. A reader
-//! therefore never observes a manifest that references an object not yet fully
-//! written.
+//! Every object is written temp → writeout flush → atomic `rename` to its final
+//! OID path inside a [`Batch`], and is write-once: an existing file at the OID path
+//! is kept only if its bytes hash to that OID. Shards and the candidates blob land
+//! first, then the manifest object; the batch is then made durable with one full
+//! flush ([`Batch::commit`]), and only then does the ref pointer advance, itself
+//! written temp → full flush → `rename`. A reader therefore never observes a ref
+//! naming an object that is not durably in place.
+//!
+//! Reads re-hash every object against its OID. An object that is missing or whose
+//! bytes do not match (a write torn by power loss on a platform without the batch
+//! flush, e.g. wasm) surfaces as [`StoreError::Corrupt`] rather than being served,
+//! and the next index run rewrites it.
 
+use crate::durable::{self, Batch};
 use crate::error::{Result, StoreError};
 use crate::lock::WriteLock;
 use crate::manifest::{Manifest, ShardEntry, CURRENT_STORE_FORMAT};
@@ -36,10 +44,10 @@ use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, Tr
 use cgx_core::codec::{decode, encode};
 use cgx_core::{Candidate, EdgeRecord, NodeRecord};
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// One per-function shard: the nodes and edges attributed to a single owning
@@ -124,9 +132,7 @@ impl ObjectStore {
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let path = ObjectOid(manifest_oid).object_path(&self.objects_dir);
-        let bytes = fs::read(&path)?;
-        let manifest = decode::<Manifest>(&bytes)?;
+        let manifest = decode::<Manifest>(&self.read_object(&ObjectOid(manifest_oid))?)?;
         // Compat gate: a committed manifest from a newer cgx may carry a schema this
         // binary cannot decode faithfully (postcard is not self-describing). Reject
         // loudly — naming both versions — rather than silently mis-decode (D-3).
@@ -139,17 +145,33 @@ impl ObjectStore {
         Ok(Some(manifest))
     }
 
-    /// Write `bytes` as a content-addressed object under `dir`, returning its OID.
-    /// Write-once: if the OID path already exists the bytes are identical by
-    /// construction and the write is skipped. Otherwise temp → `fsync` → atomic
-    /// `rename` so a torn object never occupies its final name.
-    fn write_object(&self, dir: &Path, bytes: &[u8]) -> Result<ObjectOid> {
-        let oid = ObjectOid::of_bytes(bytes);
-        let path = oid.object_path(dir);
-        if path.exists() {
-            return Ok(oid);
+    /// Read the object `oid` and verify its bytes hash to it. A missing object or
+    /// a mismatch is [`StoreError::Corrupt`]. The bad file is left in place: readers
+    /// do not hold the write lock, and the next [`write_object`](Self::write_object)
+    /// of that OID verifies and replaces it.
+    fn read_object(&self, oid: &ObjectOid) -> Result<Vec<u8>> {
+        let corrupt = || StoreError::Corrupt { oid: oid.0.clone() };
+        let bytes = read_bytes_if_exists(&oid.object_path(&self.objects_dir))?.ok_or_else(corrupt)?;
+        if ObjectOid::of_bytes(&bytes) != *oid {
+            return Err(corrupt());
         }
-        atomic_write(&path, bytes)?;
+        Ok(bytes)
+    }
+
+    /// Write `bytes` as a content-addressed object, returning its OID. Write-once:
+    /// a file already at the OID path is kept only if its bytes hash to the OID, so
+    /// a torn object left at its final name by a crash is replaced rather than
+    /// trusted forever. New writes go through `batch`; the caller commits it before
+    /// advancing any ref.
+    fn write_object(&self, batch: &mut Batch, bytes: &[u8]) -> Result<ObjectOid> {
+        let oid = ObjectOid::of_bytes(bytes);
+        let path = oid.object_path(&self.objects_dir);
+        if let Some(existing) = read_bytes_if_exists(&path)? {
+            if existing.len() == bytes.len() && ObjectOid::of_bytes(&existing) == oid {
+                return Ok(oid);
+            }
+        }
+        batch.write(&path, bytes)?;
         Ok(oid)
     }
 
@@ -207,7 +229,9 @@ impl FactStore for ObjectStore {
         let Some(bytes) = read_bytes_if_exists(&path)? else {
             return Ok(None);
         };
-        let sf = decode::<StoredFragment>(&bytes)?;
+        let Some(sf) = open_fragment(&bytes) else {
+            return Ok(None);
+        };
         Ok(Some(CachedFragment {
             blob: blob.clone(),
             lang: sf.lang,
@@ -223,8 +247,11 @@ impl FactStore for ObjectStore {
             // Write-once per (blob OID, frontend version): an unchanged blob
             // re-puts to a true no-op (IX-1). An object written by a different
             // frontend version is replaced, so only the header is compared.
+            // An existing file that fails its checksum is rewritten.
             if let Some(existing) = read_bytes_if_exists(&path)? {
-                if decode::<StoredFragment>(&existing)?.frontend_version == f.frontend_version {
+                if open_fragment(&existing)
+                    .is_some_and(|sf| sf.frontend_version == f.frontend_version)
+                {
                     continue;
                 }
             }
@@ -233,7 +260,9 @@ impl FactStore for ObjectStore {
                 frontend_version: f.frontend_version,
                 bytes: f.bytes.to_vec(),
             };
-            atomic_write(&path, &encode(&stored)?)?;
+            // No flush: a fragment is a checksummed cache entry, so one torn or lost
+            // by a crash reads as a miss and is re-extracted.
+            durable::write_atomic(&path, &seal_fragment(&stored)?)?;
         }
         Ok(())
     }
@@ -274,11 +303,12 @@ impl FactStore for ObjectStore {
         // Canonicalize each shard's contents and write it. `shards` is a BTreeMap,
         // so iteration is in `fn_key` order — the manifest's shard list is thereby
         // canonical and its OID deterministic.
+        let mut batch = Batch::new();
         let mut shard_entries = Vec::with_capacity(shards.len());
         for (fn_key, mut shard) in shards {
             shard.nodes.sort_by_key(|n| n.id.0);
             shard.edges.sort_by_key(|e| e.id.0);
-            let oid = self.write_object(&self.objects_dir, &encode(&shard)?)?;
+            let oid = self.write_object(&mut batch, &encode(&shard)?)?;
             shard_entries.push(ShardEntry {
                 fn_key: fn_key.into_owned(),
                 oid,
@@ -292,7 +322,7 @@ impl FactStore for ObjectStore {
         } else {
             let mut cands: Vec<&Candidate> = g.candidates.iter().collect();
             cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
-            Some(self.write_object(&self.objects_dir, &encode(&cands)?)?)
+            Some(self.write_object(&mut batch, &encode(&cands)?)?)
         };
 
         let manifest = Manifest {
@@ -302,11 +332,12 @@ impl FactStore for ObjectStore {
             shards: shard_entries,
             candidates,
         };
-        let manifest_oid = self.write_object(&self.objects_dir, &encode(&manifest)?)?;
+        let manifest_oid = self.write_object(&mut batch, &encode(&manifest)?)?;
+        batch.commit(&self.objects_dir)?;
 
-        // Linearization point: advance the ref last, atomically. Until this rename
-        // lands, every object it names is already durably renamed into place.
-        atomic_write(
+        // Linearization point: advance the ref last, atomically. The batch commit
+        // above made every object it names durable first.
+        durable::write_durable(
             &self.ref_path(tree.as_str()),
             format!("{}\n{}\n", manifest_oid.as_str(), tree.as_str()).as_bytes(),
         )?;
@@ -321,8 +352,7 @@ impl FactStore for ObjectStore {
         let mut nodes: Vec<NodeRecord> = Vec::new();
         let mut edges: Vec<EdgeRecord> = Vec::new();
         for entry in &manifest.shards {
-            let path = entry.oid.object_path(&self.objects_dir);
-            let shard = decode::<Shard>(&fs::read(&path)?)?;
+            let shard = decode::<Shard>(&self.read_object(&entry.oid)?)?;
             nodes.extend(shard.nodes);
             edges.extend(shard.edges);
         }
@@ -334,8 +364,7 @@ impl FactStore for ObjectStore {
         let candidates = match &manifest.candidates {
             None => Vec::new(),
             Some(oid) => {
-                let mut cands =
-                    decode::<Vec<Candidate>>(&fs::read(oid.object_path(&self.objects_dir))?)?;
+                let mut cands = decode::<Vec<Candidate>>(&self.read_object(oid)?)?;
                 // Defensive re-sort on read (D2 / recon §F.12.5): match SQLite's
                 // `ORDER BY candidate_group, rank, dst` byte-for-byte.
                 cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
@@ -371,6 +400,19 @@ impl FactStore for ObjectStore {
         let _lock = WriteLock::acquire(&self.lock_path)?;
         let keep_keys: BTreeSet<&str> = keep.iter().map(|t| t.as_str()).collect();
 
+        // Under the write lock no write is in flight, so every temp file is debris
+        // from an interrupted run.
+        sweep_tmp(&self.refs_dir)?;
+        for dir in [&self.objects_dir, &self.fragments_dir] {
+            if let Some(fanout) = read_dir_if_exists(dir)? {
+                for d in fanout {
+                    if d.file_type()?.is_dir() {
+                        sweep_tmp(&d.path())?;
+                    }
+                }
+            }
+        }
+
         // Drop refs whose graph_key is not kept, counting removals.
         let mut removed = 0usize;
         let Some(refs) = read_dir_if_exists(&self.refs_dir)? else {
@@ -396,9 +438,8 @@ impl FactStore for ObjectStore {
                     continue;
                 };
                 let manifest_oid = contents.lines().next().unwrap_or_default().trim().to_owned();
-                let manifest = decode::<Manifest>(&fs::read(
-                    ObjectOid(manifest_oid.clone()).object_path(&self.objects_dir),
-                )?)?;
+                let manifest =
+                    decode::<Manifest>(&self.read_object(&ObjectOid(manifest_oid.clone()))?)?;
                 live.insert(manifest_oid);
                 for oid in manifest.referenced_oids() {
                     live.insert(oid.0.clone());
@@ -434,24 +475,40 @@ impl FactStore for ObjectStore {
     }
 }
 
-/// Write `bytes` to `path` via temp → `fsync` → atomic `rename`. The temp file is
-/// created in the destination's own directory so the rename stays on one
-/// filesystem. Overwrites an existing `path` (used for the ref pointer's CAS
-/// advance); object writes gate on non-existence before calling this.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().expect("object path has a parent");
-    fs::create_dir_all(parent)?;
-    let file_name = path.file_name().expect("object path has a file name");
-    let tmp = parent.join(format!(
-        "{}.tmp",
-        file_name.to_str().expect("object file name is utf-8")
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+const SHA1_LEN: usize = 20;
+
+/// Encode a fragment with a trailing SHA-1 of its encoding.
+fn seal_fragment(sf: &StoredFragment) -> Result<Vec<u8>> {
+    let mut bytes = encode(sf)?;
+    let digest = Sha1::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    Ok(bytes)
+}
+
+/// Decode a sealed fragment, or `None` if it is truncated, fails its checksum, or
+/// does not decode (including fragments written before the checksum existed).
+fn open_fragment(bytes: &[u8]) -> Option<StoredFragment> {
+    let body_len = bytes.len().checked_sub(SHA1_LEN)?;
+    let (body, trailer) = bytes.split_at(body_len);
+    if Sha1::digest(body).as_slice() != trailer {
+        return None;
     }
-    fs::rename(&tmp, path)?;
+    decode::<StoredFragment>(body).ok()
+}
+
+/// Remove every `*.tmp` file directly under `dir`.
+fn sweep_tmp(dir: &Path) -> Result<()> {
+    let Some(entries) = read_dir_if_exists(dir)? else {
+        return Ok(());
+    };
+    for e in entries {
+        if e.file_name().to_str().is_some_and(|n| n.ends_with(".tmp")) {
+            match fs::remove_file(e.path()) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 

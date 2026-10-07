@@ -651,3 +651,34 @@ fn sql_flag_defers_with_clear_message_exit_2() {
         "--sql deferral message says not-implemented: {stderr}"
     );
 }
+
+/// A graph object torn by a crash (here: truncated in place) must not be served:
+/// the next auto-indexing query detects it and rebuilds instead of failing.
+#[test]
+fn query_rebuilds_a_graph_with_a_torn_object() {
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let objects = repo.join(".cgx").join("objects");
+    let mut torn = 0;
+    for fanout in std::fs::read_dir(&objects).unwrap().flatten() {
+        for f in std::fs::read_dir(fanout.path()).unwrap().flatten() {
+            let bytes = std::fs::read(f.path()).unwrap();
+            std::fs::write(f.path(), &bytes[..bytes.len() / 2]).unwrap();
+            torn += 1;
+        }
+    }
+    assert!(torn > 0, "fixture index wrote objects");
+
+    let (out, stderr, code) = run_cgx_full(
+        &repo,
+        &["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
+    );
+    assert_eq!(code, 0, "query after corruption exits 0: {out} {stderr}");
+    assert!(out.contains("fixture::alpha"), "rebuilt graph answers: {out}");
+
+    let (_out, stderr, code) = run_cgx_full(
+        &repo,
+        &["query", "--no-auto-index", "MATCH (a)-[:CALLS]->(b) RETURN a.name"],
+    );
+    assert_eq!(code, 0, "healed index reads without rebuilding: {stderr}");
+}

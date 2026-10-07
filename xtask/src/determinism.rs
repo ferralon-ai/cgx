@@ -24,17 +24,24 @@ pub struct DeterminismArgs {
     /// current directory).
     #[arg(long)]
     repo: Option<PathBuf>,
+    /// Index with receiver narrowing on (`cgx index --receiver-narrowing`).
+    #[arg(long)]
+    receiver_narrowing: bool,
 }
 
 pub fn run(args: DeterminismArgs) -> Result<()> {
     let repo_root = resolve_repo_root(args.repo)?;
+    let opts = cgx_index::IndexOpts {
+        receiver_narrowing: args.receiver_narrowing,
+        ..Default::default()
+    };
     println!("xtask determinism: indexing {} twice into fresh stores", repo_root.display());
 
     let dir = tempfile::tempdir().context("creating temp dir for determinism stores")?;
 
-    let (data_a, rep_a) = index_once(&repo_root, &dir.path().join("store_a.db"))
+    let (data_a, rep_a) = index_once(&repo_root, &opts, &dir.path().join("store_a.db"))
         .context("run-1 (store_a.db)")?;
-    let (data_b, rep_b) = index_once(&repo_root, &dir.path().join("store_b.db"))
+    let (data_b, rep_b) = index_once(&repo_root, &opts, &dir.path().join("store_b.db"))
         .context("run-2 (store_b.db)")?;
 
     if data_a.len() != data_b.len() {
@@ -64,9 +71,9 @@ pub fn run(args: DeterminismArgs) -> Result<()> {
     // tree twice into fresh `ObjectStore`s and requires byte-identical object
     // files *and* identical object OIDs. A repeat-run identity check, not a
     // golden file.
-    let objs_a = index_once_objects(&repo_root, &dir.path().join("objects_a"))
+    let objs_a = index_once_objects(&repo_root, &opts, &dir.path().join("objects_a"))
         .context("object run-1")?;
-    let objs_b = index_once_objects(&repo_root, &dir.path().join("objects_b"))
+    let objs_b = index_once_objects(&repo_root, &opts, &dir.path().join("objects_b"))
         .context("object run-2")?;
     let oids_a: Vec<&String> = objs_a.keys().collect();
     let oids_b: Vec<&String> = objs_b.keys().collect();
@@ -207,10 +214,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// every content-addressed object back as an `oid -> bytes` map. The map's keys are
 /// the object OIDs and its values the exact on-disk bytes, so comparing two maps
 /// asserts both OID stability and byte-identity of the objects themselves.
-fn index_once_objects(repo_root: &Path, root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+fn index_once_objects(repo_root: &Path, opts: &cgx_index::IndexOpts, root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut store = ObjectStore::open(root).with_context(|| format!("opening object store {root:?}"))?;
     let registry = cgx_index::default_registry();
-    cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
+    cgx_index::index_path(repo_root, &registry, &mut store, opts)
         .context("indexing repo into object store")?;
 
     let mut out = BTreeMap::new();
@@ -236,11 +243,11 @@ fn index_once_objects(repo_root: &Path, root: &Path) -> Result<BTreeMap<String, 
     Ok(out)
 }
 
-fn index_once(repo_root: &Path, db_path: &Path) -> Result<(Vec<Vec<u8>>, DoctorReport)> {
+fn index_once(repo_root: &Path, opts: &cgx_index::IndexOpts, db_path: &Path) -> Result<(Vec<Vec<u8>>, DoctorReport)> {
     let mut store = SqliteStore::open(db_path)
         .with_context(|| format!("opening store {db_path:?}"))?;
     let registry = cgx_index::default_registry();
-    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
+    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, opts)
         .context("indexing repo")?;
     let tree = cgx_store::TreeOid::new(outcome.graph_key.clone());
     let data = store

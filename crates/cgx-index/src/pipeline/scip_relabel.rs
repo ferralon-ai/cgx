@@ -42,12 +42,12 @@
 use std::collections::BTreeMap;
 
 use cgx_core::confidence::{Confidence, Tier};
-use cgx_core::edge::{EdgeRecord, EdgeWithProvenance};
+use cgx_core::edge::{EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
 use cgx_core::node::{NodeRecord, NodeWithProvenance, SymbolKind, Visibility};
 use cgx_core::provenance::{Provenance, Span};
 use cgx_resolve::ResolvedGraph;
-use cgx_scip::{ScipResolver, SymClass};
+use cgx_scip::{ScipResolver, SymClass, SymbolScheme};
 
 /// Per-run SCIP counters, surfaced through [`IndexStats`](super::IndexStats) so
 /// `cgx doctor` can report what the SCIP pass did.
@@ -55,12 +55,48 @@ use cgx_scip::{ScipResolver, SymClass};
 pub struct ScipStats {
     /// Call edges upgraded to `Certain` by a unique SCIP definition.
     pub upgraded_certain: usize,
-    /// Call edges upgraded to `Probable` (trait member or #18772 collision).
+    /// Call edges upgraded to `Probable` (trait/virtual member or #18772/overload collision).
     pub upgraded_probable: usize,
     /// GM-14 cross-crate dependency edges emitted.
     pub dep_edges: usize,
     /// #18772 inherent-impl collisions observed (a matched symbol with >1 def).
     pub collisions: usize,
+    /// Promotions that resolved to a unique definition but were capped at
+    /// `Probable` by the FAIL-CLOSED partial-compdb policy — a `certain` that a
+    /// complete compile_commands.json would have allowed. `cgx doctor` surfaces
+    /// this as the honest coverage caveat (ADR B2 Decision 3 top risk).
+    pub capped_partial_compdb: usize,
+}
+
+/// How complete the `compile_commands.json` backing a scip-clang index is known
+/// to be (ADR B2 Decision 3 / Eric's binding fail-closed decision).
+///
+/// A partial compdb omits translation units, so scip-clang's merged index can
+/// see one definition where the program has several — a *false singleton* that
+/// would wrongly promote to `certain`. The policy is FAIL-CLOSED: `certain` is
+/// emitted only when completeness is affirmatively known; otherwise the
+/// promotion caps at `probable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompdbCompleteness {
+    /// No `compile_commands.json` concept (e.g. a rust-analyzer index). The
+    /// completeness gate does not apply; promotions proceed to `certain`.
+    #[default]
+    NotApplicable,
+    /// The compdb is verified complete for every indexed TU. `certain`
+    /// promotions are allowed.
+    Complete,
+    /// The compdb is known partial, or its completeness is unverified.
+    /// FAIL-CLOSED: SCIP promotions are capped at `probable` and no candidate
+    /// group is collapsed on a possibly-false singleton.
+    Partial,
+}
+
+impl CompdbCompleteness {
+    /// Whether the fail-closed cap is in force (completeness not affirmatively
+    /// established).
+    fn is_fail_closed(self) -> bool {
+        matches!(self, CompdbCompleteness::Partial)
+    }
 }
 
 /// The local package name SCIP resolution treats as "in-tree". A reference whose
@@ -74,6 +110,11 @@ pub struct ScipRelabelOpts {
     /// The package name(s) considered local (in-tree). A ref resolving to any
     /// other package is a dependency edge. Empty ⇒ infer from def-site packages.
     pub local_packages: Vec<String>,
+    /// The completeness of the `compile_commands.json` behind a scip-clang
+    /// index. Gates the `certain` promotion FAIL-CLOSED (ADR B2 Decision 3).
+    /// Defaults to [`CompdbCompleteness::NotApplicable`] so the rust-analyzer
+    /// path is unchanged.
+    pub compdb: CompdbCompleteness,
 }
 
 /// Apply the SCIP upgrade-only re-label pass to `graph` in place, returning the
@@ -93,6 +134,13 @@ struct ScipRelabel<'g, 's> {
     scip: &'s ScipResolver,
     /// `qname → NodeId` for every existing node (for dst-redirect lookups).
     node_by_fqn: BTreeMap<String, NodeId>,
+    /// `(file, 1-based line_start) → NodeId` for span-precise dst redirect. Used
+    /// by the scip-clang path to redirect an overloaded call to the exact
+    /// resolved overload's node, which the signature-free qname cannot pick.
+    node_by_loc: BTreeMap<(String, u32), NodeId>,
+    /// FAIL-CLOSED: when the backing compdb is not known-complete, cap SCIP
+    /// promotions at `probable` and leave candidate groups intact.
+    fail_closed: bool,
     /// The set of packages owning an in-tree definition site, plus any caller
     /// override. A resolved package outside this set is a dependency.
     local_packages: std::collections::BTreeSet<String>,
@@ -117,6 +165,15 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             .map(|n| (n.node.fqn.clone(), n.node.id))
             .collect();
 
+        // (file, 1-based line) → node, for span-precise overload redirect. On a
+        // span collision (two nodes starting on one line) the last wins; the
+        // redirect only consults this for a SCIP-confirmed unique def site.
+        let node_by_loc: BTreeMap<(String, u32), NodeId> = graph
+            .nodes
+            .iter()
+            .map(|n| ((n.node.file.clone(), n.node.line_start), n.node.id))
+            .collect();
+
         // Local packages: caller override ∪ packages that own a def site whose
         // qname is also an in-tree node. Falls back to all def-site packages.
         let mut local_packages: std::collections::BTreeSet<String> =
@@ -139,6 +196,8 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             graph,
             scip,
             node_by_fqn,
+            node_by_loc,
+            fail_closed: opts.compdb.is_fail_closed(),
             local_packages,
             external_nodes: BTreeMap::new(),
             new_nodes: Vec::new(),
@@ -190,16 +249,36 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             None => return,
         };
         let sym_class = self.scip.classify(&occ_symbol);
-        let def_count = self.scip.def_sites(&mapped.qname).len();
+        // Overload-precise multiplicity: keyed on (qname, overload_key), so two
+        // resolved C++ overloads of one qname are NOT a false collision.
+        let def_count = self.scip.def_count(&mapped);
         if def_count > 1 {
             self.stats.collisions += 1;
         }
 
-        let target_conf = match sym_class {
-            SymClass::TraitMember => Confidence::Probable,
+        let edge_kind = self.graph.edges[i].edge.kind;
+
+        let mut target_conf = match sym_class {
+            // Trait member (Rust) / virtual-overridable member (C++): the SCIP
+            // occurrence binds the declaration, not the concrete impl/override.
+            SymClass::TraitMember | SymClass::VirtualMember => Confidence::Probable,
             SymClass::FreeOrInherent if def_count == 1 => Confidence::Certain,
-            SymClass::FreeOrInherent => Confidence::Probable, // #18772 collision
+            SymClass::FreeOrInherent => Confidence::Probable, // #18772 / overload collision
         };
+
+        // A virtual-dispatch call site is resolved by scip-clang to the static
+        // declared target, which is not a devirtualization → never certain.
+        if edge_kind == EdgeKind::CallsVirtual {
+            target_conf = target_conf.min(Confidence::Probable);
+        }
+
+        // --- FAIL-CLOSED partial-compdb policy (ADR B2 Decision 3). ---
+        // A unique-looking resolution from an incomplete compdb may be a false
+        // singleton; never let it reach `certain`.
+        if self.fail_closed && target_conf == Confidence::Certain {
+            target_conf = Confidence::Probable;
+            self.stats.capped_partial_compdb += 1;
+        }
 
         // --- GM-14: cross-crate dependency edge (design §3.6). ---
         if !self.local_packages.contains(&mapped.package) {
@@ -224,11 +303,23 @@ impl<'g, 's> ScipRelabel<'g, 's> {
         }
 
         // --- Optional dst-redirect / candidate-group collapse (design §3.5). ---
-        // Only when SCIP resolved a single in-tree definition and the edge points
-        // elsewhere: redirect to the unique target and collapse any candidate
-        // group. Marks the graph dirty (sort key + group membership change).
-        if def_count == 1 && self.local_packages.contains(&mapped.package) {
-            if let Some(&target) = self.node_by_fqn.get(&mapped.qname) {
+        // Only when SCIP resolved a single in-tree definition the policy trusts:
+        // redirect to the unique target and collapse any candidate group. Under
+        // the fail-closed cap the singleton may be false, so the group is left
+        // intact (the ambiguity stays visible). Marks the graph dirty.
+        if def_count == 1 && !self.fail_closed && self.local_packages.contains(&mapped.package) {
+            let target = match self.scip.scheme() {
+                // C++: rewrite the target only on a genuinely `certain` promotion
+                // (a virtual/capped edge keeps its candidate set — honest), and
+                // pick the exact resolved overload by its def-site span, since the
+                // signature-free qname maps to an arbitrary overload node.
+                SymbolScheme::ScipClang if target_conf == Confidence::Certain => {
+                    self.resolve_overload_node(&mapped)
+                }
+                SymbolScheme::ScipClang => None,
+                SymbolScheme::RustAnalyzer => self.node_by_fqn.get(&mapped.qname).copied(),
+            };
+            if let Some(target) = target {
                 let edge = &mut self.graph.edges[i].edge;
                 if edge.dst != target {
                     edge.dst = target;
@@ -240,6 +331,19 @@ impl<'g, 's> ScipRelabel<'g, 's> {
                 }
             }
         }
+    }
+
+    /// Resolve the node for a scip-clang overloaded call: the node at the unique
+    /// definition's span (overload-precise), falling back to the signature-free
+    /// qname map when the def span matches no node.
+    fn resolve_overload_node(&self, mapped: &cgx_scip::MappedSymbol) -> Option<NodeId> {
+        if let Some(loc) = self.scip.unique_def_loc(mapped) {
+            let line1 = (loc.range.start_line as u32).saturating_add(1);
+            if let Some(&id) = self.node_by_loc.get(&(loc.relative_path.clone(), line1)) {
+                return Some(id);
+            }
+        }
+        self.node_by_fqn.get(&mapped.qname).copied()
     }
 
     /// Find a SCIP reference occurrence in `file` whose start coordinate matches

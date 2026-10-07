@@ -64,9 +64,9 @@ mod registry;
 
 pub use error::{IndexError, Result};
 pub use git::{compute_blob_oid, Repo, SourceFile};
-pub use pipeline::scip_relabel::{relabel as scip_relabel, ScipRelabelOpts};
+pub use pipeline::scip_relabel::{relabel as scip_relabel, CompdbCompleteness, ScipRelabelOpts};
 pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
-pub use pipeline::{IndexOpts, IndexStats, ScipStats};
+pub use pipeline::{CompdbReport, IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 
 use cgx_frontend::FrontendRegistry;
@@ -96,11 +96,17 @@ pub fn index_path(
     store: &mut impl FactStore,
     opts: &IndexOpts,
 ) -> Result<IndexOutcome> {
-    let repo = Repo::discover(repo_path)?;
+    let repo = Repo::discover(&repo_path)?;
     let tree_oid = repo.head_tree_oid()?;
     let sources = repo.enumerate_tree()?;
+    // Discovered C++ TU paths are relative to the repo root; anchor compdb
+    // coverage comparison there.
+    let source_root = repo
+        .workdir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo_path.as_ref().to_path_buf());
     let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
-    pipeline::apply_scip(&mut graph, &mut stats, opts)?;
+    pipeline::apply_scip(&mut graph, &mut stats, &sources, &source_root, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);
@@ -129,10 +135,12 @@ pub fn index_workdir(
     opts: &IndexOpts,
 ) -> Result<IndexOutcome> {
     let repo = Repo::discover(repo_path)?;
+    let dir = dir.as_ref();
     let sources = repo.enumerate_workdir(dir)?;
     let key = workdir_key(&sources);
     let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
-    pipeline::apply_scip(&mut graph, &mut stats, opts)?;
+    // Workdir rel-paths are relative to the walked directory; anchor there.
+    pipeline::apply_scip(&mut graph, &mut stats, &sources, dir, opts)?;
     pipeline::apply_cha(&mut graph, &mut stats);
     pipeline::apply_rta(&mut graph, &mut stats);
     pipeline::apply_sig(&mut graph, &mut stats);

@@ -10,6 +10,8 @@ description = "cgx indexing pipeline: enumerates source blobs from a git tree or
 [dependencies]
 cgx-core.workspace = true
 cgx-frontend.workspace = true
+cgx-lang-c = { path = "../cgx-lang-c" }
+cgx-lang-cpp = { path = "../cgx-lang-cpp" }
 cgx-lang-go = { path = "../cgx-lang-go" }
 cgx-lang-java = { path = "../cgx-lang-java" }
 cgx-lang-python = { path = "../cgx-lang-python" }
@@ -20,6 +22,8 @@ cgx-scip.workspace = true
 cgx-store = { path = "../cgx-store" }
 gix = { version = "0.80", default-features = false, features = ["blob-diff", "excludes"] }
 rayon = "1"
+serde = { workspace = true }
+serde_json = "1"
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-json.workspace = true

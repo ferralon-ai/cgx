@@ -31,15 +31,44 @@
 #![warn(missing_debug_implementations)]
 
 pub mod symbol;
+pub mod symbol_cxx;
 #[cfg(feature = "test-support")]
 pub mod testsupport;
 pub mod wire;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wire::{Reader, WireError, WireType};
 
 pub use symbol::{MappedSymbol, SymClass};
+
+/// Which producer's symbol grammar a SCIP index uses, selected once per index
+/// from [`ScipMetadata::tool`] (ADR B2 Decision 1). The wire format, the typed
+/// model, and the relabel loop are producer-agnostic; only symbol interpretation
+/// — qname packaging, overload identity, classification — varies, and this is
+/// the seam that isolates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolScheme {
+    /// rust-analyzer: `<scheme> cargo <pkg> <ver> <descriptors>`, crate-rooted
+    /// qnames, trait-member cap. The historical default.
+    RustAnalyzer,
+    /// scip-clang: placeholder package fields for project-local C/C++ symbols,
+    /// signature-free qnames with an overload disambiguator, virtual-member cap.
+    ScipClang,
+}
+
+impl SymbolScheme {
+    /// Choose the scheme from the index's producing-tool name. Unknown / empty
+    /// tool names default to [`SymbolScheme::RustAnalyzer`] so every pre-existing
+    /// index (and every test that omits metadata) keeps its behavior.
+    pub fn detect(tool: &str) -> SymbolScheme {
+        if tool.contains("scip-clang") {
+            SymbolScheme::ScipClang
+        } else {
+            SymbolScheme::RustAnalyzer
+        }
+    }
+}
 
 /// `Occurrence.symbol_roles` bit for a definition site (`Definition = 0x1`).
 pub const SYMBOL_ROLE_DEFINITION: i32 = 0x1;
@@ -122,8 +151,21 @@ impl ScipOccurrence {
     }
 }
 
+/// One SCIP `Relationship` edge on a [`ScipSymbolInfo`]. cgx decodes only the
+/// `symbol` and `is_implementation` fields: `is_implementation` marks an
+/// override relationship (this symbol overrides, or is overridden by,
+/// `symbol`), which is the C++ virtual/overridable signal (ADR B2 Decision 1.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScipRelationship {
+    /// The related symbol string.
+    pub symbol: String,
+    /// SCIP `Relationship.is_implementation` — the override signal.
+    pub is_implementation: bool,
+}
+
 /// Metadata about a symbol defined in (or referenced by) the index. Carries the
-/// `kind` needed for trait-member classification (gotcha 1).
+/// `kind` needed for trait-member classification (gotcha 1) and the
+/// `relationships` needed for C++ virtual-member classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScipSymbolInfo {
     /// The SCIP symbol string.
@@ -132,6 +174,8 @@ pub struct ScipSymbolInfo {
     pub kind: i32,
     /// The enclosing symbol string, when SCIP records one (post PR#18758).
     pub enclosing_symbol: String,
+    /// SCIP `Relationship`s (override graph), narrowed to the fields cgx uses.
+    pub relationships: Vec<ScipRelationship>,
 }
 
 /// One source document and its occurrences + locally-defined symbols.
@@ -189,8 +233,13 @@ const F_OCC_SYMBOL_ROLES: u32 = 3;
 // SymbolInformation { symbol=1, documentation=3, relationships=4, kind=5,
 //   display_name=6, signature_documentation=7, enclosing_symbol=8 }
 const F_SYM_SYMBOL: u32 = 1;
+const F_SYM_RELATIONSHIPS: u32 = 4;
 const F_SYM_KIND: u32 = 5;
 const F_SYM_ENCLOSING: u32 = 8;
+// Relationship { symbol=1, is_reference=2, is_implementation=3,
+//   is_type_definition=4, is_definition=5 }
+const F_REL_SYMBOL: u32 = 1;
+const F_REL_IS_IMPLEMENTATION: u32 = 3;
 
 impl ScipIndex {
     /// Parse a `.scip` protobuf byte stream into the typed model.
@@ -290,16 +339,35 @@ fn parse_symbol_info(mut r: Reader<'_>) -> Result<ScipSymbolInfo, ScipError> {
         symbol: String::new(),
         kind: 0,
         enclosing_symbol: String::new(),
+        relationships: Vec::new(),
     };
     while let Some(h) = r.next_field()? {
         match (h.number, h.wire_type) {
             (F_SYM_SYMBOL, WireType::Len) => info.symbol = r.read_str()?.to_string(),
             (F_SYM_KIND, WireType::Varint) => info.kind = r.read_i32()?,
             (F_SYM_ENCLOSING, WireType::Len) => info.enclosing_symbol = r.read_str()?.to_string(),
+            (F_SYM_RELATIONSHIPS, WireType::Len) => {
+                info.relationships.push(parse_relationship(r.read_message()?)?);
+            }
             (_, wt) => r.skip(wt)?,
         }
     }
     Ok(info)
+}
+
+fn parse_relationship(mut r: Reader<'_>) -> Result<ScipRelationship, ScipError> {
+    let mut rel = ScipRelationship {
+        symbol: String::new(),
+        is_implementation: false,
+    };
+    while let Some(h) = r.next_field()? {
+        match (h.number, h.wire_type) {
+            (F_REL_SYMBOL, WireType::Len) => rel.symbol = r.read_str()?.to_string(),
+            (F_REL_IS_IMPLEMENTATION, WireType::Varint) => rel.is_implementation = r.read_i32()? != 0,
+            (_, wt) => r.skip(wt)?,
+        }
+    }
+    Ok(rel)
 }
 
 /// A resolved definition location: which document and where in it.
@@ -327,22 +395,35 @@ pub struct DefLoc {
 #[derive(Debug, Clone)]
 pub struct ScipResolver {
     index: ScipIndex,
+    /// The producer scheme, selected once from [`ScipMetadata::tool`].
+    scheme: SymbolScheme,
     def_sites: BTreeMap<String, Vec<DefLoc>>,
+    /// `(qname, overload_key) → def sites` — the overload-precise multiplicity
+    /// map backing [`ScipResolver::def_count`]. For rust-analyzer the inner key
+    /// equals the qname, so this agrees with [`ScipResolver::def_sites`]; for
+    /// scip-clang it splits a qname's def sites per overload.
+    def_by_overload: BTreeMap<(String, String), Vec<DefLoc>>,
     refs_by_doc: BTreeMap<String, Vec<(ScipRange, String)>>,
     /// symbol-string → SCIP `Kind` (joined from local + external symbol info).
     kind_by_symbol: BTreeMap<String, i32>,
     /// symbol-string → enclosing-symbol string.
     enclosing_by_symbol: BTreeMap<String, String>,
+    /// Symbols that participate in a SCIP override relationship (either side),
+    /// i.e. the C++ virtual/overridable set.
+    overridable: BTreeSet<String>,
 }
 
 impl ScipResolver {
     /// Build the resolver from a parsed index. O(occurrences log) — sorts every
     /// accessor's backing vector once so reads are already canonical.
     pub fn new(index: ScipIndex) -> ScipResolver {
+        let scheme = SymbolScheme::detect(&index.metadata.tool);
         let mut def_sites: BTreeMap<String, Vec<DefLoc>> = BTreeMap::new();
+        let mut def_by_overload: BTreeMap<(String, String), Vec<DefLoc>> = BTreeMap::new();
         let mut refs_by_doc: BTreeMap<String, Vec<(ScipRange, String)>> = BTreeMap::new();
         let mut kind_by_symbol: BTreeMap<String, i32> = BTreeMap::new();
         let mut enclosing_by_symbol: BTreeMap<String, String> = BTreeMap::new();
+        let mut overridable: BTreeSet<String> = BTreeSet::new();
 
         for info in index
             .documents
@@ -355,26 +436,42 @@ impl ScipResolver {
                 if !info.enclosing_symbol.is_empty() {
                     enclosing_by_symbol.insert(info.symbol.clone(), info.enclosing_symbol.clone());
                 }
+                // An override relationship marks both ends as virtual/overridable:
+                // the overriding method and the base method it refines.
+                for rel in &info.relationships {
+                    if rel.is_implementation {
+                        overridable.insert(info.symbol.clone());
+                        if !rel.symbol.is_empty() {
+                            overridable.insert(rel.symbol.clone());
+                        }
+                    }
+                }
             }
         }
 
         for doc in &index.documents {
             let refs = refs_by_doc.entry(doc.relative_path.clone()).or_default();
             for occ in &doc.occurrences {
-                if occ.symbol.is_empty() || symbol::is_local(&occ.symbol) {
-                    // Local symbols are intra-document only; still join refs so
-                    // a same-doc lexical resolution is available, but never as a
-                    // cross-file def site.
-                }
                 if occ.is_definition() {
-                    if let Some(mapped) = symbol::map_symbol(&occ.symbol) {
-                        def_sites.entry(mapped.qname).or_default().push(DefLoc {
+                    if let Some(mapped) = map_symbol_with(scheme, &occ.symbol) {
+                        let loc = DefLoc {
                             relative_path: doc.relative_path.clone(),
                             range: occ.range,
                             symbol: occ.symbol.clone(),
-                        });
+                        };
+                        def_sites
+                            .entry(mapped.qname.clone())
+                            .or_default()
+                            .push(loc.clone());
+                        def_by_overload
+                            .entry((mapped.qname, mapped.overload_key))
+                            .or_default()
+                            .push(loc);
                     }
                 } else {
+                    // Non-definition occurrence. Local symbols are intra-document
+                    // only; they still join refs for a same-doc lexical resolution
+                    // but never as a cross-file def site.
                     refs.push((occ.range, occ.symbol.clone()));
                 }
             }
@@ -384,16 +481,23 @@ impl ScipResolver {
             locs.sort();
             locs.dedup();
         }
+        for locs in def_by_overload.values_mut() {
+            locs.sort();
+            locs.dedup();
+        }
         for refs in refs_by_doc.values_mut() {
             refs.sort();
         }
 
         ScipResolver {
             index,
+            scheme,
             def_sites,
+            def_by_overload,
             refs_by_doc,
             kind_by_symbol,
             enclosing_by_symbol,
+            overridable,
         }
     }
 
@@ -407,11 +511,45 @@ impl ScipResolver {
         &self.index
     }
 
+    /// The producer scheme selected for this index (from [`ScipMetadata::tool`]).
+    pub fn scheme(&self) -> SymbolScheme {
+        self.scheme
+    }
+
     /// Every definition location for a cgx qname, sorted. Empty when the qname
     /// has no SCIP definition. **`len() > 1` flags the #18772 collision**
     /// (gotcha 2) — downstream must cap such a symbol at `probable`.
     pub fn def_sites(&self, qname: &str) -> &[DefLoc] {
         self.def_sites.get(qname).map_or(&[], |v| v.as_slice())
+    }
+
+    /// The overload-precise definition count for a mapped symbol: the number of
+    /// distinct definition sites keyed on `(qname, overload_key)`. For a
+    /// rust-analyzer symbol this equals `def_sites(qname).len()` (the overload
+    /// key is the qname). For a scip-clang C++ symbol it counts only the sites of
+    /// *that specific overload*, so two resolved overloads of `ns::f` each read
+    /// as `1` instead of collapsing to a false `def_count == 2` collision. A
+    /// header declaration + `.cpp` definition of one overload share the key, so
+    /// they count as the single definition they are.
+    pub fn def_count(&self, mapped: &MappedSymbol) -> usize {
+        self.def_by_overload
+            .get(&(mapped.qname.clone(), mapped.overload_key.clone()))
+            .map_or(0, |v| v.len())
+    }
+
+    /// The sole definition site of a mapped symbol when `def_count == 1`, else
+    /// `None`. Used by the relabel pass to redirect a C++ overloaded call edge to
+    /// the exact resolved overload's node (by span), rather than to the arbitrary
+    /// last node sharing the signature-free qname.
+    pub fn unique_def_loc(&self, mapped: &MappedSymbol) -> Option<&DefLoc> {
+        match self
+            .def_by_overload
+            .get(&(mapped.qname.clone(), mapped.overload_key.clone()))
+            .map(|v| v.as_slice())
+        {
+            Some([loc]) => Some(loc),
+            _ => None,
+        }
     }
 
     /// Every reference occurrence in a document, sorted by (range, symbol).
@@ -423,13 +561,28 @@ impl ScipResolver {
     /// Map a SCIP symbol string to a cgx qname + `(pkg, version)`. `None` for an
     /// unparseable or `local` symbol (locals carry no cross-file qname).
     pub fn map_symbol(&self, symbol: &str) -> Option<MappedSymbol> {
-        symbol::map_symbol(symbol)
+        map_symbol_with(self.scheme, symbol)
     }
 
-    /// Classify a SCIP symbol as trait-member vs free/inherent (gotcha 1). Uses
-    /// the joined symbol-kind / enclosing-symbol tables when available, falling
-    /// back to the descriptor grammar otherwise.
+    /// Classify a SCIP symbol for the confidence ceiling. For rust-analyzer this
+    /// is the trait-member cap (gotcha 1), using the joined kind / enclosing
+    /// tables. For scip-clang it is the C++ virtual-member cap, using the SCIP
+    /// override-relationship set.
     pub fn classify(&self, symbol: &str) -> SymClass {
-        symbol::classify(symbol, &self.kind_by_symbol, &self.enclosing_by_symbol)
+        match self.scheme {
+            SymbolScheme::RustAnalyzer => {
+                symbol::classify(symbol, &self.kind_by_symbol, &self.enclosing_by_symbol)
+            }
+            SymbolScheme::ScipClang => symbol_cxx::classify(symbol, &self.overridable),
+        }
+    }
+}
+
+/// Map a SCIP symbol under an explicit scheme (used during resolver construction
+/// before the resolver value exists).
+fn map_symbol_with(scheme: SymbolScheme, symbol: &str) -> Option<MappedSymbol> {
+    match scheme {
+        SymbolScheme::RustAnalyzer => symbol::map_symbol(symbol),
+        SymbolScheme::ScipClang => symbol_cxx::map_symbol(symbol),
     }
 }

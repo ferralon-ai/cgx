@@ -65,6 +65,10 @@ pub struct SymbolTable {
     /// "import/re-export chains"). Keyed by last segment to match the suffix
     /// resolution `resolve_member` already uses for path-style specifiers.
     reexports: BTreeMap<(String, String), (String, String)>,
+    /// Last `::` segment of a module prefix → the module prefixes (keys of
+    /// `by_module_prefix`) ending in that segment, in key order. Backs the suffix
+    /// match in `resolve_member_direct` without scanning every module per lookup.
+    by_module_last: BTreeMap<String, Vec<String>>,
 }
 
 impl SymbolTable {
@@ -104,6 +108,12 @@ impl SymbolTable {
         }
         for v in t.by_module_prefix.values_mut() {
             v.sort_by_key(|a| a.node_id.0);
+        }
+        for m in t.by_module_prefix.keys() {
+            t.by_module_last
+                .entry(short_name(m).to_owned())
+                .or_default()
+                .push(m.clone());
         }
         t
     }
@@ -204,12 +214,10 @@ impl SymbolTable {
             // last segment (relative path `./direct` → module `*::direct`).
             if let Some(last) = prefix.rsplit("::").next() {
                 let mut hits: Vec<&DefEntry> = Vec::new();
-                for (mod_fqn, members) in &self.by_module_prefix {
-                    if mod_fqn.rsplit("::").next() == Some(last) {
-                        for d in members {
-                            if short_name(&d.fqn) == name {
-                                hits.push(d);
-                            }
+                for mod_fqn in self.by_module_last.get(last).into_iter().flatten() {
+                    for d in self.by_module_prefix.get(mod_fqn).into_iter().flatten() {
+                        if short_name(&d.fqn) == name {
+                            hits.push(d);
                         }
                     }
                 }
@@ -320,4 +328,162 @@ fn candidate_module_prefixes(specifier: &str) -> Vec<String> {
     }
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgx_core::node::Visibility;
+
+    fn node(id: u32, fqn: &str) -> NodeRecord {
+        NodeRecord {
+            id: NodeId(id),
+            kind: SymbolKind::Function,
+            fqn: fqn.to_string(),
+            file: "src/lib.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            lang: "rust".to_string(),
+            visibility: Visibility::Public,
+            is_abstract: false,
+            entrypoint_kind: None,
+            signature: None,
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
+        }
+    }
+
+    /// The full-scan suffix match `by_module_last` replaced, kept as the oracle.
+    fn scan_suffix<'a>(t: &'a SymbolTable, last: &str, name: &str) -> Vec<&'a DefEntry> {
+        let mut hits: Vec<&DefEntry> = Vec::new();
+        for (mod_fqn, members) in &t.by_module_prefix {
+            if mod_fqn.rsplit("::").next() == Some(last) {
+                for d in members {
+                    if short_name(&d.fqn) == name {
+                        hits.push(d);
+                    }
+                }
+            }
+        }
+        hits.sort_by_key(|a| a.node_id.0);
+        hits.dedup_by(|a, b| a.node_id == b.node_id);
+        hits
+    }
+
+    fn indexed_suffix<'a>(t: &'a SymbolTable, last: &str, name: &str) -> Vec<&'a DefEntry> {
+        let mut hits: Vec<&DefEntry> = Vec::new();
+        for mod_fqn in t.by_module_last.get(last).into_iter().flatten() {
+            for d in &t.by_module_prefix[mod_fqn] {
+                if short_name(&d.fqn) == name {
+                    hits.push(d);
+                }
+            }
+        }
+        hits.sort_by_key(|a| a.node_id.0);
+        hits.dedup_by(|a, b| a.node_id == b.node_id);
+        hits
+    }
+
+    fn ids(v: &[&DefEntry]) -> Vec<u32> {
+        v.iter().map(|d| d.node_id.0).collect()
+    }
+
+    /// Module shapes the suffix match must treat identically to the old scan:
+    /// flat and nested modules sharing a last segment, a module equal to its own
+    /// last segment (no `::`), an empty module prefix, an empty last segment
+    /// (trailing `::`), and a nested prefix whose last segment equals a parent's.
+    fn table() -> SymbolTable {
+        let nodes = vec![
+            node(0, "util::run"),
+            node(1, "a::util::run"),
+            node(2, "a::util::stop"),
+            node(3, "b::a::util::run"),
+            node(4, "util::util::run"),
+            node(5, "a::utility::run"),
+            node(6, "::run"),
+            node(7, "a::::run"),
+            node(8, "plain"),
+            node(9, "m::direct::go"),
+            node(10, "n::direct::go"),
+        ];
+        SymbolTable::build(&nodes, &[])
+    }
+
+    #[test]
+    fn suffix_index_matches_full_scan_for_every_module_shape() {
+        let t = table();
+        let lasts: Vec<String> = t
+            .by_module_prefix
+            .keys()
+            .map(|m| short_name(m).to_owned())
+            .chain(["missing".to_owned(), String::new()])
+            .collect();
+        for last in &lasts {
+            for name in ["run", "stop", "go", "plain", "missing", ""] {
+                assert_eq!(
+                    ids(&indexed_suffix(&t, last, name)),
+                    ids(&scan_suffix(&t, last, name)),
+                    "last={last:?} name={name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn index_buckets_every_module_exactly_once_in_key_order() {
+        let t = table();
+        let total: usize = t.by_module_last.values().map(Vec::len).sum();
+        assert_eq!(total, t.by_module_prefix.len());
+        for (last, mods) in &t.by_module_last {
+            assert!(mods.windows(2).all(|w| w[0] < w[1]), "unsorted: {mods:?}");
+            assert!(mods.iter().all(|m| short_name(m) == last));
+        }
+        // Empty module prefix and trailing-`::` prefix land in the empty bucket.
+        assert_eq!(t.by_module_last[""], vec!["".to_owned(), "a::".to_owned()]);
+        // A module with no `::` is its own last segment.
+        assert_eq!(
+            t.by_module_last["util"],
+            vec![
+                "a::util".to_owned(),
+                "b::a::util".to_owned(),
+                "util".to_owned(),
+                "util::util".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_member_suffix_returns_candidates_in_node_id_order() {
+        let t = table();
+        // No module is literally `x::util`, so the suffix match runs: every module
+        // ending in `util` contributes, at any nesting depth, sorted by node id.
+        match t.resolve_member("x::util", "run") {
+            ResolveOutcome::Ambiguous(hits) => assert_eq!(ids(&hits), vec![0, 1, 3, 4]),
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+        // A literal module hit wins over the suffix path.
+        match t.resolve_member("./util", "run") {
+            ResolveOutcome::Unique(d) => assert_eq!(d.node_id.0, 0),
+            other => panic!("expected unique, got {other:?}"),
+        }
+        // The literal module has no `stop`, so lookup falls through to the suffix.
+        match t.resolve_member("./util", "stop") {
+            ResolveOutcome::Unique(d) => assert_eq!(d.node_id.0, 2),
+            other => panic!("expected unique, got {other:?}"),
+        }
+        // `utility` is not a suffix match for `util`.
+        match t.resolve_member("./utility", "run") {
+            ResolveOutcome::Unique(d) => assert_eq!(d.node_id.0, 5),
+            other => panic!("expected unique, got {other:?}"),
+        }
+        assert!(matches!(
+            t.resolve_member("./direct", "nope"),
+            ResolveOutcome::None
+        ));
+        match t.resolve_member("./direct", "go") {
+            ResolveOutcome::Ambiguous(hits) => assert_eq!(ids(&hits), vec![9, 10]),
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+    }
 }

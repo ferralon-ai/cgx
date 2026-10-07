@@ -36,6 +36,7 @@ use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, Tr
 use cgx_core::codec::{decode, encode};
 use cgx_core::{Candidate, EdgeRecord, NodeRecord};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Write as _;
@@ -48,6 +49,15 @@ use std::path::{Path, PathBuf};
 struct Shard {
     nodes: Vec<NodeRecord>,
     edges: Vec<EdgeRecord>,
+}
+
+/// Borrowing twin of [`Shard`] for the write path, so sharding a graph does not
+/// copy every record. Postcard encodes `&T` exactly as `T`, so a `ShardRef`
+/// encodes to the same bytes (and OID) as the equivalent `Shard`.
+#[derive(Default, Serialize)]
+struct ShardRef<'a> {
+    nodes: Vec<&'a NodeRecord>,
+    edges: Vec<&'a EdgeRecord>,
 }
 
 /// A stored Layer-1 fragment object: the frontend metadata plus the canonical
@@ -178,15 +188,15 @@ impl ObjectStore {
 /// callable ancestor (a top-level type/module/constant) keys to its own FQN. Pure
 /// and deterministic — the whole attribution is derived from the sorted callable
 /// set, never from hash iteration.
-fn owning_key(fqn: &str, callables: &BTreeSet<&str>) -> String {
+fn owning_key<'a>(fqn: &'a str, callables: &BTreeSet<&str>) -> &'a str {
     let mut s = fqn;
     loop {
         if callables.contains(s) {
-            return s.to_owned();
+            return s;
         }
         match s.rfind("::") {
             Some(i) => s = &s[..i],
-            None => return fqn.to_owned(),
+            None => return fqn,
         }
     }
 }
@@ -243,22 +253,22 @@ impl FactStore for ObjectStore {
             .map(|n| n.fqn.as_str())
             .collect();
 
-        let mut node_key: BTreeMap<u32, String> = BTreeMap::new();
-        let mut shards: BTreeMap<String, Shard> = BTreeMap::new();
+        let mut node_key: BTreeMap<u32, &str> = BTreeMap::new();
+        let mut shards: BTreeMap<Cow<'_, str>, ShardRef<'_>> = BTreeMap::new();
         for n in &g.nodes {
             let key = owning_key(&n.fqn, &callables);
-            node_key.insert(n.id.0, key.clone());
-            shards.entry(key).or_default().nodes.push(n.clone());
+            node_key.insert(n.id.0, key);
+            shards.entry(Cow::Borrowed(key)).or_default().nodes.push(n);
         }
         // Edges follow their source node's owning function. A src with no node
         // record (should not happen for a well-formed graph) falls back to a
         // synthetic key so the edge is never silently dropped (honesty spine).
         for e in &g.edges {
-            let key = node_key
-                .get(&e.src.0)
-                .cloned()
-                .unwrap_or_else(|| format!("\u{0}orphan\u{0}{}", e.src.0));
-            shards.entry(key).or_default().edges.push(e.clone());
+            let key = match node_key.get(&e.src.0) {
+                Some(k) => Cow::Borrowed(*k),
+                None => Cow::Owned(format!("\u{0}orphan\u{0}{}", e.src.0)),
+            };
+            shards.entry(key).or_default().edges.push(e);
         }
 
         // Canonicalize each shard's contents and write it. `shards` is a BTreeMap,
@@ -269,7 +279,10 @@ impl FactStore for ObjectStore {
             shard.nodes.sort_by_key(|n| n.id.0);
             shard.edges.sort_by_key(|e| e.id.0);
             let oid = self.write_object(&self.objects_dir, &encode(&shard)?)?;
-            shard_entries.push(ShardEntry { fn_key, oid });
+            shard_entries.push(ShardEntry {
+                fn_key: fn_key.into_owned(),
+                oid,
+            });
         }
 
         // Candidates: a single per-tree object, sorted (group, rank, dst) to match
@@ -277,7 +290,7 @@ impl FactStore for ObjectStore {
         let candidates = if g.candidates.is_empty() {
             None
         } else {
-            let mut cands = g.candidates.clone();
+            let mut cands: Vec<&Candidate> = g.candidates.iter().collect();
             cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
             Some(self.write_object(&self.objects_dir, &encode(&cands)?)?)
         };

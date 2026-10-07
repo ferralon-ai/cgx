@@ -174,14 +174,9 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
         .iter()
         .filter_map(|i| graph.edges[*i].edge.candidate_group)
         .collect();
-    let mut kept: Vec<EdgeWithProvenance> = Vec::with_capacity(graph.edges.len());
-    for (i, e) in graph.edges.drain(..).enumerate() {
-        if !drop_edge_idx.contains(&i) {
-            kept.push(e);
-        }
-    }
-    kept.extend(new_edges);
-    graph.edges = kept;
+    crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
+    graph.edges.reserve_exact(new_edges.len());
+    graph.edges.extend(new_edges);
 
     graph
         .candidates

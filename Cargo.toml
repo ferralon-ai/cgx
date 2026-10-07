@@ -14,6 +14,7 @@ cgx-frontend = { path = "crates/cgx-frontend" }
 cgx-scip = { path = "crates/cgx-scip" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+schemars = "1"
 postcard = { version = "1", features = ["use-std"] }
 smallvec = { version = "1", features = ["serde"] }
 thiserror = "2"

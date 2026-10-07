@@ -450,6 +450,11 @@ enum Command {
         /// Default repository root injected into tool calls that omit it.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Print the JSON Schema of every tool's arguments and
+        /// `structuredContent` (one document, `$defs` keyed by type name) and
+        /// exit instead of serving.
+        #[arg(long, conflicts_with = "root")]
+        print_schemas: bool,
     },
     /// Test entrypoints whose call graph reaches a symbol changed between two git
     /// refs, or in the uncommitted working tree.
@@ -871,7 +876,16 @@ fn run(command: Command) -> Result<(), CliError> {
             limit,
             format,
         }),
-        Command::Mcp { root } => {
+        Command::Mcp {
+            print_schemas: true,
+            ..
+        } => {
+            let doc = serde_json::to_string_pretty(&cgx_mcp::schema_document())
+                .map_err(|e| CliError::graph(e.to_string()))?;
+            println!("{doc}");
+            Ok(())
+        }
+        Command::Mcp { root, .. } => {
             cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
         }
         Command::ImpactedTests {

@@ -9,20 +9,27 @@
 //! tool performs any network or LLM call; given the same tree, every tool is a
 //! pure function of its arguments.
 
-use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern, Tier};
+use cgx_core::{Confidence, EdgeCondition, EdgeKind, NodeId, SymbolKind, SymbolPattern};
 use cgx_diff::impacted::Sides;
 use cgx_query::{
     callees, callers, contract, entrypoint_roots, explain, impacted::ImpactedWitness,
     paths as query_paths, rank_symbols, reaches, reaches_all, resolve_anchor, search_symbols,
-    unused, ApproximationContract, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter,
-    FreshnessEnvelope, GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult,
-    SearchMatch, SymbolHit, SymbolRank,
+    unused, ConditionFilter, Direction, EdgeBreakdown, EdgeFilter, FreshnessEnvelope, GraphView,
+    NeighborResult, PathResult, PathWalker, RankBy, ReachResult, SearchMatch, SymbolHit,
+    SymbolRank,
 };
 use cgx_store::SqliteStore;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::error::ToolError;
+use crate::output::{
+    self, CqlCell, CqlEdge, CqlNode, EdgeDirection, ExplainEdgeRow, ExplainOutput,
+    GraphQueryOutput, GraphQueryPathsOutput, GraphQueryTableOutput, ImpactedRow,
+    ImpactedTestsOutput, NeighborOutput, NeighborRow, Page, PathRow, PathStepRow, PathsOutput,
+    ReachesOutput, ReachesPairOutput, ReachesSetOutput, SearchOutput, SessionMeta, SiteRef,
+    SymbolHitRow, SymbolRankRow, SymbolsOutput, UnusedOutput, UnusedRow,
+};
 use crate::session::{self, GraphSession};
 
 /// Default page size for list-shaped tool results (docs/07 IF-18).
@@ -53,9 +60,45 @@ const CALL_EDGE_KINDS: &[(&str, EdgeKind)] = &[
 ];
 
 /// The tool registrations returned by `tools/list`. Order is fixed for
-/// determinism. Each declares its `inputSchema` per docs/07; the agent-facing
+/// determinism. Each declares its `inputSchema` per docs/07 and the
+/// `outputSchema` of its `structuredContent` (IF-17); the agent-facing
 /// `include_dirty` default is `true` on every graph-reading tool (ADR-06).
+///
+/// A tool with no output type in [`crate::output`] is listed without an
+/// `outputSchema` rather than failing `tools/list`; `tests/output_schema.rs`
+/// fails the build instead.
 pub fn tool_list() -> Value {
+    let mut list = registrations();
+    if let Some(tools) = list.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let schema = output::output_schema(name);
+            debug_assert!(schema.is_some(), "tool `{name}` has no output type");
+            if let (Some(schema), Some(obj)) = (schema, tool.as_object_mut()) {
+                obj.insert("outputSchema".into(), output::for_tools_list(schema));
+            }
+        }
+    }
+    list
+}
+
+/// Each registered tool's `(name, inputSchema)`, in `tools/list` order.
+pub(crate) fn input_schemas() -> Vec<(String, Value)> {
+    let list = registrations();
+    list.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?.to_string();
+            Some((name, t.get("inputSchema")?.clone()))
+        })
+        .collect()
+}
+
+fn registrations() -> Value {
     json!({
         "tools": [
             neighbor_tool("callers", "Symbols that (transitively, to `depth`) call the named symbol."),
@@ -460,34 +503,6 @@ fn parse_confidence(s: &str) -> Result<Confidence, ToolError> {
     }
 }
 
-fn condition_token(c: EdgeCondition) -> &'static str {
-    match c {
-        EdgeCondition::Always => "always",
-        EdgeCondition::Conditional => "conditional",
-        EdgeCondition::Loop => "loop",
-        EdgeCondition::Exception => "exception",
-        EdgeCondition::Panic => "panic",
-    }
-}
-
-fn confidence_token(c: Confidence) -> &'static str {
-    match c {
-        Confidence::Possible => "possible",
-        Confidence::Probable => "probable",
-        Confidence::Certain => "certain",
-    }
-}
-
-fn tier_token(t: Tier) -> &'static str {
-    match t {
-        Tier::NameSyntactic => "name_syntactic",
-        Tier::ScopeGraph => "scope_graph",
-        Tier::Scip => "scip",
-        Tier::ChaRta => "cha_rta",
-        Tier::PointsTo => "points_to",
-    }
-}
-
 /// Build the edge filter from the optional `edge_condition` / `confidence` /
 /// `kind` args. `kind` narrows the traversed call-family edges (Q-11/Q-18).
 fn neighbor_filter(args: &Value) -> Result<EdgeFilter, ToolError> {
@@ -565,45 +580,48 @@ fn resolve(view: &GraphView, name: &str) -> Result<NodeId, ToolError> {
 
 // --- result rendering -------------------------------------------------------
 
-fn neighbor_json(r: &NeighborResult) -> Value {
-    json!({
-        "name": r.node.fqn,
-        "file": r.node.file,
-        "line": r.node.line_start,
-        "depth": r.depth,
-        "edge_condition": condition_token(r.condition),
-        "confidence": confidence_token(r.confidence),
-        "min_confidence_on_path": confidence_token(r.min_confidence_on_path),
-        "exception_transient": r.exception_transient
-    })
+fn neighbor_row(r: &NeighborResult) -> NeighborRow {
+    NeighborRow {
+        name: r.node.fqn.clone(),
+        file: r.node.file.clone(),
+        line: r.node.line_start,
+        depth: r.depth,
+        edge_condition: r.condition,
+        confidence: r.confidence,
+        min_confidence_on_path: r.min_confidence_on_path,
+        exception_transient: r.exception_transient,
+    }
 }
 
-fn path_json(p: &PathResult) -> Value {
-    let steps: Vec<Value> = p
-        .steps
-        .iter()
-        .map(|s| {
-            json!({
-                "name": s.node.fqn,
-                "file": s.node.file,
-                "line": s.node.line_start,
-                "edge_condition": s.via.as_ref().map(|e| condition_token(e.condition)),
-                "confidence": s.via.as_ref().map(|e| confidence_token(e.confidence)),
-                "exception_transient": s.exception_transient
+fn path_row(p: &PathResult) -> PathRow {
+    PathRow {
+        hops: p.hops(),
+        min_confidence: p.min_confidence,
+        crosses_exceptional: p.crosses_exceptional,
+        steps: p
+            .steps
+            .iter()
+            .map(|s| PathStepRow {
+                name: s.node.fqn.clone(),
+                file: s.node.file.clone(),
+                line: s.node.line_start,
+                edge_condition: s.via.as_ref().map(|e| e.condition),
+                confidence: s.via.as_ref().map(|e| e.confidence),
+                exception_transient: s.exception_transient,
             })
-        })
-        .collect();
-    json!({
-        "hops": p.hops(),
-        "min_confidence": confidence_token(p.min_confidence),
-        "crosses_exceptional": p.crosses_exceptional,
-        "steps": steps
-    })
+            .collect(),
+    }
 }
 
-/// Apply offset/limit pagination to a result slice, returning the page plus the
-/// `has_more` flag and next cursor (docs/07 IF-18).
-fn paginate(total: usize, offset: usize, limit: usize) -> (usize, usize, bool, Option<String>) {
+/// Serialize a typed tool output (see [`crate::output`]) into the
+/// `structuredContent` body.
+fn to_body<T: serde::Serialize>(output: &T) -> Value {
+    serde_json::to_value(output).expect("tool output serializes")
+}
+
+/// Apply offset/limit pagination to a result slice, returning the slice bounds
+/// plus the IF-18 page fields (docs/07 IF-18).
+fn paginate(total: usize, offset: usize, limit: usize) -> (usize, usize, Page) {
     let start = offset.min(total);
     let end = (start + limit).min(total);
     let has_more = end < total;
@@ -612,48 +630,32 @@ fn paginate(total: usize, offset: usize, limit: usize) -> (usize, usize, bool, O
     } else {
         None
     };
-    (start, end, has_more, cursor)
+    let page = Page {
+        total_matched: total,
+        has_more,
+        cursor,
+    };
+    (start, end, page)
 }
 
-/// Attach the A3/A4 answer-honesty contract to a result envelope. The contract is
-/// serialized straight off the shared `cgx_query` type, so the MCP tool emits the
-/// same `approximation` schema the CLI `--format json` surface does (the MCP tools
-/// reuse the query layer, so they inherit the contract verbatim).
-fn with_contract(mut body: Value, contract: &ApproximationContract) -> Value {
-    let obj = body.as_object_mut().expect("result body is an object");
-    obj.insert(
-        "approximation".into(),
-        serde_json::to_value(contract).expect("approximation contract serializes"),
-    );
-    body
-}
-
-/// Attach the ADR-06 honesty metadata plus the index-freshness envelope to a
-/// result envelope.
+/// The ADR-06 honesty metadata plus the index-freshness envelope.
 ///
-/// This is the one function every **graph-backed** tool's response passes through —
-/// deliberately not the `with_contract` sibling above, which `explain`/`search`/
-/// `symbols` skip. Anything that must ride on every graph-derived answer belongs
-/// here; `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and fails if
-/// such a tool's response ever misses the `freshness` key.
+/// Every **graph-backed** single-session output type flattens this in, so
+/// anything that must ride on every graph-derived answer belongs here;
+/// `crates/cgx-mcp/tests/dispatch.rs` enumerates `tool_list()` and fails if such
+/// a tool's response ever misses the `freshness` key.
 ///
-/// `coupling` does **not** pass through here, and that is the contract, not an
+/// `coupling` does **not** carry it, and that is the contract, not an
 /// oversight: it answers from committed git history with no index open, so an
 /// index-freshness envelope on its answer would describe a store it never read.
 /// The test's `INDEX_FREE_TOOLS` is the closed list of such tools.
-fn with_session_meta(mut body: Value, session: &GraphSession) -> Value {
-    let obj = body.as_object_mut().expect("result body is an object");
-    obj.insert("graph_version".into(), json!(session.graph_version));
-    obj.insert("dirty".into(), json!(session.dirty));
-    obj.insert(
-        "dirty_files_analyzed".into(),
-        json!(session.dirty_files_analyzed),
-    );
-    obj.insert(
-        "freshness".into(),
-        serde_json::to_value(&session.freshness).expect("freshness envelope serializes"),
-    );
-    body
+fn session_meta(session: &GraphSession) -> SessionMeta {
+    SessionMeta {
+        graph_version: session.graph_version.clone(),
+        dirty: session.dirty,
+        dirty_files_analyzed: session.dirty_files_analyzed,
+        freshness: session.freshness.clone(),
+    }
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -677,17 +679,15 @@ fn neighbor_call(args: &Value, dir: Direction) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
-    let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
+    let (start, end, page) = paginate(results.len(), offset, limit);
 
-    let body = json!({
-        "symbol": symbol,
-        "results": page,
-        "total_matched": results.len(),
-        "has_more": has_more,
-        "cursor": cursor
-    });
-    Ok(with_session_meta(with_contract(body, &approximation), &session))
+    Ok(to_body(&NeighborOutput {
+        symbol: symbol.to_string(),
+        results: results[start..end].iter().map(neighbor_row).collect(),
+        page,
+        approximation,
+        session: session_meta(&session),
+    }))
 }
 
 fn paths_call(args: &Value) -> Result<Value, ToolError> {
@@ -721,22 +721,20 @@ fn paths_call(args: &Value) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_PATHS_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
-    let page: Vec<Value> = results[start..end].iter().map(path_json).collect();
+    let (start, end, page) = paginate(results.len(), offset, limit);
 
-    let body = json!({
-        "from": from,
-        "to": to,
-        "paths": page,
-        "total_matched": results.len(),
-        "has_more": has_more,
-        "cursor": cursor,
+    Ok(to_body(&PathsOutput {
+        from: from.to_string(),
+        to: to.to_string(),
+        paths: results[start..end].iter().map(path_row).collect(),
+        page,
         // ADR-06 honesty: a budget/cap cutoff is surfaced, never silent. `null`
         // when the enumeration was complete.
-        "truncated": result.truncated(),
-        "truncation_reason": result.truncation.map(|r| r.token())
-    });
-    Ok(with_session_meta(with_contract(body, &approximation), &session))
+        truncated: result.truncated(),
+        truncation_reason: result.truncation,
+        approximation,
+        session: session_meta(&session),
+    }))
 }
 
 fn unused_call(args: &Value) -> Result<Value, ToolError> {
@@ -765,26 +763,22 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
-    let page: Vec<Value> = results[start..end]
-        .iter()
-        .map(|n| {
-            json!({
-                "name": n.fqn,
-                "file": n.file,
-                "line": n.line_start,
-                "kind": format!("{:?}", n.kind).to_lowercase()
-            })
-        })
-        .collect();
+    let (start, end, page) = paginate(results.len(), offset, limit);
 
-    let body = json!({
-        "results": page,
-        "total_matched": results.len(),
-        "has_more": has_more,
-        "cursor": cursor
-    });
-    Ok(with_session_meta(with_contract(body, &approximation), &session))
+    Ok(to_body(&UnusedOutput {
+        results: results[start..end]
+            .iter()
+            .map(|n| UnusedRow {
+                name: n.fqn.clone(),
+                file: n.file.clone(),
+                line: n.line_start,
+                kind: n.kind,
+            })
+            .collect(),
+        page,
+        approximation,
+        session: session_meta(&session),
+    }))
 }
 
 /// `impacted_tests`: the test entrypoints whose call graph reaches a symbol
@@ -797,7 +791,7 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
 ///    graphs readable from one store, so it owns its store and calls
 ///    [`cgx_diff::impacted::run`] — the same entry point the CLI uses, so the
 ///    two surfaces cannot drift.
-/// 2. **The envelope is not [`with_session_meta`].** Without a `GraphSession`
+/// 2. **The envelope carries no [`SessionMeta`].** Without a `GraphSession`
 ///    there is no `graph_version`; the two `graph_key`s are emitted instead,
 ///    which are strictly more informative (a real tree OID, or a
 ///    `workdir:<digest>`), alongside the resolved refs.
@@ -867,37 +861,34 @@ fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
     let total = answer.tests.tests.len();
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(total, offset, limit);
+    let (start, end, page) = paginate(total, offset, limit);
     // `witnesses` is index-parallel to `tests`, so the same slice bounds apply.
-    let page: Vec<Value> = answer.tests.tests[start..end]
+    let results = answer.tests.tests[start..end]
         .iter()
         .zip(&answer.tests.witnesses[start..end])
-        .map(|(r, w)| impacted_row_json(&answer.view, r, w))
+        .map(|(r, w)| impacted_row(&answer.view, r, w))
         .collect();
 
-    let body = json!({
-        "results": page,
-        "total_matched": total,
-        "has_more": has_more,
-        "cursor": cursor,
-        "base_ref": answer.base_ref,
-        "head_ref": answer.head_ref,
-        "base_graph_key": answer.base_graph_key,
-        "head_graph_key": answer.head_graph_key,
-        "changed_symbols": answer.changed.len(),
-        "dirty": dirty,
-        "dirty_files_analyzed": answer.dirty_files,
-        "degenerate": answer.degenerate,
-        "degenerate_reason": answer.degenerate_reason,
-        "freshness": serde_json::to_value(impacted_freshness(&root, &answer))
-            .expect("freshness envelope serializes"),
-    });
-    Ok(with_contract(body, &answer.contract))
+    Ok(to_body(&ImpactedTestsOutput {
+        results,
+        page,
+        base_ref: answer.base_ref.clone(),
+        head_ref: answer.head_ref.clone(),
+        base_graph_key: answer.base_graph_key.clone(),
+        head_graph_key: answer.head_graph_key.clone(),
+        changed_symbols: answer.changed.len(),
+        dirty,
+        dirty_files_analyzed: answer.dirty_files,
+        degenerate: answer.degenerate,
+        degenerate_reason: answer.degenerate_reason.clone(),
+        freshness: impacted_freshness(&root, &answer),
+        approximation: answer.contract.clone(),
+    }))
 }
 
 /// The index-freshness envelope for a two-graph answer.
 ///
-/// This tool cannot use [`with_session_meta`]: it has no [`GraphSession`], because
+/// This tool cannot carry [`SessionMeta`]: it has no [`GraphSession`], because
 /// it builds *two* graphs rather than one. The envelope's semantics are still the
 /// ones `session.rs` established — `indexed_tree` names **the graph the answer was
 /// computed over**, which here is unambiguously the *head* side. The base side is
@@ -930,19 +921,16 @@ fn impacted_freshness(root: &std::path::Path, answer: &cgx_diff::Answer) -> Fres
     FreshnessEnvelope::new(indexed_tree, head_tree, dirty)
 }
 
-/// One `impacted_tests` row: the shipped [`neighbor_json`] shape plus the two
+/// One `impacted_tests` row: the shipped [`neighbor_row`] shape plus the two
 /// facts that make the row actionable — *which* changed symbol it reaches, and
 /// whether the path crossed a closure-containment lift (containment is not
 /// invocation, so such a row is an over-approximation).
-fn impacted_row_json(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) -> Value {
-    let mut obj = neighbor_json(r);
-    let map = obj.as_object_mut().expect("neighbor row is an object");
-    map.insert(
-        "reached_change".into(),
-        json!(view.try_node(w.root).map(|n| n.fqn.as_str())),
-    );
-    map.insert("via_containment_lift".into(), json!(w.via_containment_lift));
-    obj
+fn impacted_row(view: &GraphView, r: &NeighborResult, w: &ImpactedWitness) -> ImpactedRow {
+    ImpactedRow {
+        neighbor: neighbor_row(r),
+        reached_change: view.try_node(w.root).map(|n| n.fqn.clone()),
+        via_containment_lift: w.via_containment_lift,
+    }
 }
 
 fn explain_call(args: &Value) -> Result<Value, ToolError> {
@@ -953,36 +941,41 @@ fn explain_call(args: &Value) -> Result<Value, ToolError> {
     let explanation = explain(view, anchor)
         .ok_or_else(|| ToolError::resolve(format!("no symbol matched pattern `{symbol}`")))?;
 
-    let edges: Vec<Value> = explanation
+    let edges = explanation
         .edges
         .iter()
-        .map(|e| {
-            json!({
-                "direction": if e.incoming { "incoming" } else { "outgoing" },
-                "peer": e.peer.fqn,
-                "condition": condition_token(e.condition),
-                "confidence": confidence_token(e.confidence),
-                "peer_file": e.peer.file,
-                "peer_line": e.peer.line_start,
-                "tier": tier_token(e.tier),
-                "rule": e.rule,
-                "resolution_source": e.resolution_source,
-                "site": e.site.as_ref().map(|s| json!({ "file": s.file, "line": s.line }))
-            })
+        .map(|e| ExplainEdgeRow {
+            direction: if e.incoming {
+                EdgeDirection::Incoming
+            } else {
+                EdgeDirection::Outgoing
+            },
+            peer: e.peer.fqn.clone(),
+            condition: e.condition,
+            confidence: e.confidence,
+            peer_file: e.peer.file.clone(),
+            peer_line: e.peer.line_start,
+            tier: e.tier,
+            rule: e.rule.clone(),
+            resolution_source: e.resolution_source.clone(),
+            site: e.site.as_ref().map(|s| SiteRef {
+                file: s.file.clone(),
+                line: s.line,
+            }),
         })
         .collect();
 
     let node = &explanation.node;
-    let body = json!({
-        "symbol": node.fqn,
-        "file": node.file,
-        "line": node.line_start,
-        "kind": format!("{:?}", node.kind).to_lowercase(),
-        "callers_count": explanation.callers_count,
-        "callees_count": explanation.callees_count,
-        "edges": edges
-    });
-    Ok(with_session_meta(body, &session))
+    Ok(to_body(&ExplainOutput {
+        symbol: node.fqn.clone(),
+        file: node.file.clone(),
+        line: node.line_start,
+        kind: node.kind,
+        callers_count: explanation.callers_count,
+        callees_count: explanation.callees_count,
+        edges,
+        session: session_meta(&session),
+    }))
 }
 
 /// `reaches` (Q-19): with `to`, a single reachability answer plus its witness
@@ -1014,13 +1007,14 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
             };
             let result: ReachResult = reaches(view, from_id, to_id, &walker);
             let approximation = contract::for_reaches(view, &walker, from_id, &result);
-            let body = json!({
-                "from": from,
-                "to": to,
-                "reachable": result.reachable,
-                "witness": result.witness.as_ref().map(path_json),
-            });
-            Ok(with_session_meta(with_contract(body, &approximation), &session))
+            Ok(to_body(&ReachesOutput::Pair(ReachesPairOutput {
+                from: from.to_string(),
+                to: to.to_string(),
+                reachable: result.reachable,
+                witness: result.witness.as_ref().map(path_row),
+                approximation,
+                session: session_meta(&session),
+            })))
         }
         // `from → *`: every reachable symbol, paginated.
         None => {
@@ -1035,16 +1029,14 @@ fn reaches_call(args: &Value) -> Result<Value, ToolError> {
                 contract::for_neighbors(view, &walker, from_id, Direction::Forward, &results);
             let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
             let offset = cursor_offset(args)?;
-            let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
-            let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
-            let body = json!({
-                "from": from,
-                "results": page,
-                "total_matched": results.len(),
-                "has_more": has_more,
-                "cursor": cursor,
-            });
-            Ok(with_session_meta(with_contract(body, &approximation), &session))
+            let (start, end, page) = paginate(results.len(), offset, limit);
+            Ok(to_body(&ReachesOutput::Set(ReachesSetOutput {
+                from: from.to_string(),
+                results: results[start..end].iter().map(neighbor_row).collect(),
+                page,
+                approximation,
+                session: session_meta(&session),
+            })))
         }
     }
 }
@@ -1079,15 +1071,12 @@ fn search_call(args: &Value) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(hits.len(), offset, limit);
-    let page: Vec<Value> = hits[start..end].iter().map(symbol_hit_json).collect();
-    let body = json!({
-        "results": page,
-        "total_matched": hits.len(),
-        "has_more": has_more,
-        "cursor": cursor,
-    });
-    Ok(with_session_meta(body, &session))
+    let (start, end, page) = paginate(hits.len(), offset, limit);
+    Ok(to_body(&SearchOutput {
+        results: hits[start..end].iter().map(symbol_hit_row).collect(),
+        page,
+        session: session_meta(&session),
+    }))
 }
 
 /// `symbols` (B-2): rank symbols by reference count with a per-symbol edge
@@ -1105,15 +1094,12 @@ fn symbols_call(args: &Value) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(ranks.len(), offset, limit);
-    let page: Vec<Value> = ranks[start..end].iter().map(symbol_rank_json).collect();
-    let body = json!({
-        "results": page,
-        "total_matched": ranks.len(),
-        "has_more": has_more,
-        "cursor": cursor,
-    });
-    Ok(with_session_meta(body, &session))
+    let (start, end, page) = paginate(ranks.len(), offset, limit);
+    Ok(to_body(&SymbolsOutput {
+        results: ranks[start..end].iter().map(symbol_rank_row).collect(),
+        page,
+        session: session_meta(&session),
+    }))
 }
 
 /// Data-flow direction for `flows_to` / `flows_from`.
@@ -1157,49 +1143,50 @@ fn flow_call(args: &Value, dir: FlowDir) -> Result<Value, ToolError> {
 
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
-    let (start, end, has_more, cursor) = paginate(results.len(), offset, limit);
-    let page: Vec<Value> = results[start..end].iter().map(neighbor_json).collect();
-    let body = json!({
-        "symbol": symbol,
-        "results": page,
-        "total_matched": results.len(),
-        "has_more": has_more,
-        "cursor": cursor,
-    });
-    Ok(with_session_meta(with_contract(body, &approximation), &session))
+    let (start, end, page) = paginate(results.len(), offset, limit);
+    Ok(to_body(&NeighborOutput {
+        symbol: symbol.to_string(),
+        results: results[start..end].iter().map(neighbor_row).collect(),
+        page,
+        approximation,
+        session: session_meta(&session),
+    }))
 }
 
 // --- search/symbols result renderers ------------------------------------------
 
-fn symbol_hit_json(h: &SymbolHit) -> Value {
-    json!({
-        "fqn": h.fqn,
-        "file": h.file,
-        "line": h.line,
-        "kind": format!("{:?}", h.kind).to_lowercase(),
-    })
+fn symbol_hit_row(h: &SymbolHit) -> SymbolHitRow {
+    SymbolHitRow {
+        fqn: h.fqn.clone(),
+        file: h.file.clone(),
+        line: h.line,
+        kind: h.kind,
+    }
 }
 
-fn symbol_rank_json(r: &SymbolRank) -> Value {
-    json!({
-        "fqn": r.fqn,
-        "file": r.file,
-        "line": r.line,
-        "kind": format!("{:?}", r.kind).to_lowercase(),
-        "in_degree": r.in_degree,
-        "out_degree": r.out_degree,
-        "inbound": breakdown_json(&r.inbound),
-        "outbound": breakdown_json(&r.outbound),
-    })
+fn symbol_rank_row(r: &SymbolRank) -> SymbolRankRow {
+    SymbolRankRow {
+        fqn: r.fqn.clone(),
+        file: r.file.clone(),
+        line: r.line,
+        kind: r.kind,
+        in_degree: r.in_degree,
+        out_degree: r.out_degree,
+        inbound: breakdown(&r.inbound),
+        outbound: breakdown(&r.outbound),
+    }
 }
 
-fn breakdown_json(b: &EdgeBreakdown) -> Value {
-    json!({
-        "total": b.total,
-        "by_family": b.by_family,
-        "by_condition": b.by_condition,
-        "by_confidence": b.by_confidence,
-    })
+fn breakdown(b: &EdgeBreakdown) -> output::EdgeBreakdown {
+    let owned = |m: &std::collections::BTreeMap<&'static str, usize>| {
+        m.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    };
+    output::EdgeBreakdown {
+        total: b.total,
+        by_family: owned(&b.by_family),
+        by_condition: owned(&b.by_condition),
+        by_confidence: owned(&b.by_confidence),
+    }
 }
 
 /// `graph_query` (P8): route to the live CQL engine (`cgx_cql::run`) — the same
@@ -1217,7 +1204,7 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
     let limit = page_size(args, DEFAULT_MAX_RESULTS)?;
     let offset = cursor_offset(args)?;
     let truncated = table.truncation.is_some();
-    let truncation_reason = table.truncation.map(|r| r.token());
+    let truncation_reason = table.truncation;
 
     // A `RETURN path` query populates the path channel: surface paths (same shape
     // as the `paths` tool) rather than opaque table cells.
@@ -1229,37 +1216,32 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
             truncation: table.truncation,
         };
         let approximation = contract::for_path_set(&set);
-        let all: Vec<Value> = table.paths.iter().map(|p| cql_path_json(view, p)).collect();
-        let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
-        let body = json!({
-            "columns": table.columns,
-            "paths": all[start..end].to_vec(),
-            "total_matched": all.len(),
-            "has_more": has_more,
-            "cursor": cursor,
-            "truncated": truncated,
-            "truncation_reason": truncation_reason,
-        });
-        return Ok(with_session_meta(with_contract(body, &approximation), &session));
+        let (start, end, page) = paginate(set.paths.len(), offset, limit);
+        return Ok(to_body(&GraphQueryOutput::Paths(GraphQueryPathsOutput {
+            columns: table.columns.clone(),
+            paths: set.paths[start..end].iter().map(path_row).collect(),
+            page,
+            truncated,
+            truncation_reason,
+            approximation,
+            session: session_meta(&session),
+        })));
     }
 
     let approximation = contract::over_only(table_has_over_approx_edge(view, &table));
-    let all: Vec<Value> = table
-        .rows
-        .iter()
-        .map(|row| Value::Array(row.iter().map(|v| cql_cell_json(view, v)).collect()))
-        .collect();
-    let (start, end, has_more, cursor) = paginate(all.len(), offset, limit);
-    let body = json!({
-        "columns": table.columns,
-        "rows": all[start..end].to_vec(),
-        "total_matched": all.len(),
-        "has_more": has_more,
-        "cursor": cursor,
-        "truncated": truncated,
-        "truncation_reason": truncation_reason,
-    });
-    Ok(with_session_meta(with_contract(body, &approximation), &session))
+    let (start, end, page) = paginate(table.rows.len(), offset, limit);
+    Ok(to_body(&GraphQueryOutput::Table(GraphQueryTableOutput {
+        columns: table.columns.clone(),
+        rows: table.rows[start..end]
+            .iter()
+            .map(|row| row.iter().map(|v| cql_cell(view, v)).collect())
+            .collect(),
+        page,
+        truncated,
+        truncation_reason,
+        approximation,
+        session: session_meta(&session),
+    })))
 }
 
 /// `coupling`: co-change over an explicit commit range, straight off
@@ -1268,11 +1250,10 @@ fn graph_query_call(args: &Value) -> Result<Value, ToolError> {
 ///
 /// **Two deliberate departures from every other handler here, both decisions:**
 ///
-/// 1. **No `with_contract(..)`.** The approximation contract already *is* a field
-///    of `CouplingReport`, and it serializes through `serde_json::to_value` to the
-///    same bytes `with_contract` would insert; calling it would emit the
-///    `approximation` key twice.
-/// 2. **No `session_for(..)`/`with_session_meta(..)`.** `graph_version`/`dirty`/
+/// 1. **No output type in [`crate::output`].** `CouplingReport` already is the
+///    typed answer, approximation contract included, so it is serialized and
+///    schema'd as-is.
+/// 2. **No `session_for(..)`/[`SessionMeta`].** `graph_version`/`dirty`/
 ///    `dirty_files_analyzed` describe the ADR-06 working-tree overlay on the call
 ///    graph. Coupling never opens the graph and needs no index to exist at all, so
 ///    `session_for` would trigger an unnecessary — possibly failing — index for an
@@ -1323,38 +1304,41 @@ fn table_has_over_approx_edge(view: &GraphView, table: &cgx_cql::ResultTable) ->
 
 /// Resolve one CQL result-table cell to self-contained JSON (node/edge/path ids
 /// become their record fields) — the same contract `cgx query --format json` emits.
-fn cql_cell_json(view: &GraphView, v: &cgx_cql::Value) -> Value {
+fn cql_cell(view: &GraphView, v: &cgx_cql::Value) -> CqlCell {
     use cgx_cql::Value as V;
     match v {
-        V::Null => Value::Null,
-        V::Bool(b) => json!(b),
-        V::Int(i) => json!(i),
-        V::Float(f) => json!(f),
-        V::Str(s) => json!(s),
-        V::List(items) => Value::Array(items.iter().map(|i| cql_cell_json(view, i)).collect()),
+        V::Null => CqlCell::Null,
+        V::Bool(b) => CqlCell::Bool(*b),
+        V::Int(i) => CqlCell::Int(*i),
+        V::Float(f) => CqlCell::Float(*f),
+        V::Str(s) => CqlCell::Str(s.clone()),
+        V::List(items) => CqlCell::List(items.iter().map(|i| cql_cell(view, i)).collect()),
         V::Node(id) => match view.try_node(*id) {
-            Some(n) => json!({
-                "fqn": n.fqn,
-                "file": n.file,
-                "line": n.line_start,
-                "kind": format!("{:?}", n.kind).to_lowercase(),
+            Some(n) => CqlCell::Node(CqlNode {
+                fqn: n.fqn.clone(),
+                file: n.file.clone(),
+                line: n.line_start,
+                kind: n.kind,
             }),
-            None => Value::Null,
+            None => CqlCell::Null,
         },
         V::Edge(id) => match view.edge(*id) {
-            Some(e) => json!({
-                "kind": cgx_cql::eval::edge_kind_token(e.kind),
-                "condition": condition_token(e.condition),
-                "confidence": confidence_token(e.confidence),
+            Some(e) => CqlCell::Edge(CqlEdge {
+                kind: e.kind,
+                condition: e.condition,
+                confidence: e.confidence,
             }),
-            None => Value::Null,
+            None => CqlCell::Null,
         },
-        V::Path(p) => Value::Array(
+        V::Path(p) => CqlCell::List(
             p.nodes
                 .iter()
-                .map(|n| match view.try_node(*n) {
-                    Some(rec) => json!(rec.fqn),
-                    None => json!(""),
+                .map(|n| {
+                    CqlCell::Str(
+                        view.try_node(*n)
+                            .map(|rec| rec.fqn.clone())
+                            .unwrap_or_default(),
+                    )
                 })
                 .collect(),
         ),
@@ -1397,9 +1381,4 @@ fn cql_path_result(view: &GraphView, p: &cgx_cql::PathValue) -> PathResult {
         min_confidence,
         crosses_exceptional,
     }
-}
-
-/// Render a CQL path through the shared [`path_json`], matching the `paths` tool.
-fn cql_path_json(view: &GraphView, p: &cgx_cql::PathValue) -> Value {
-    path_json(&cql_path_result(view, p))
 }

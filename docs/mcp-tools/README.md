@@ -34,9 +34,34 @@ Note the **underscore** spelling of `flows_to`, `flows_from` and `graph_query`. 
 
 A successful `tools/call` returns the answer twice: as a JSON object in `structuredContent`, and as the same JSON serialized into `content[0].text`. Beyond each tool's own result keys, up to three groups of metadata ride along.
 
+### `outputSchema` — the declared shape
+
+Every entry in `tools/list` carries an `outputSchema`: a self-contained JSON Schema (draft 2020-12) for that tool's `structuredContent`, with an `object` root and every referenced type under `$defs` by its Rust type name. The schemas are generated from the types the handlers serialize (`crates/cgx-mcp/src/output.rs`). `crates/cgx-mcp/tests/output_schema.rs` validates real answers from every tool against them and pins the bytes of those answers to a golden snapshot (`crates/cgx-mcp/tests/golden/tool-outputs.ndjson`).
+
+A field that is always emitted is `required` even when its value can be `null` (`cursor`, `truncation_reason`, `witness`, the `freshness` members). The one optional field is `approximation.scope`, which is absent rather than `null` when not attached. FQNs are plain strings; confidence, condition, tier, symbol-kind and edge-kind tokens are closed `enum`s. `approximation.reasons[].code` is a plain string: the code set is open.
+
+Two tools have two shapes, declared as `oneOf` under an object root; the branches are mutually exclusive by their `required` keys, but no field names the branch, so a client decides by key presence. `reaches` returns `ReachesPairOutput` (key `reachable`) when `to` is given and `ReachesSetOutput` (key `results`) otherwise. `graph_query` returns `GraphQueryPathsOutput` (key `paths`) for a `RETURN path` query and `GraphQueryTableOutput` (key `rows`) otherwise.
+
+A `graph_query` table cell is a `CqlCell`, an untagged union declared as `anyOf`, and its JSON value does **not** always identify its variant. `Int` and `Float` are both JSON numbers — every integer also matches the `Float` branch, and `1` vs `1.0` survives only in the raw text. A bound path is an array of FQN strings, the same JSON as a CQL list of strings. Decode cells lazily (in Go, `json.RawMessage`, with numbers via `json.Number`) and use `columns` and your own `RETURN` clause to know which column holds a path.
+
+`tools/list` strips `description` and `format` annotations to keep the registry small and avoid unknown-format warnings in validators; neither affects validation. For the annotated document — every tool's `inputSchema` and output schema in one file, for code generation — run `cgx mcp --print-schemas`, or read the checked-in copy at `schemas/mcp-tools.schema.json`. That document is itself a JSON Schema describing `{ <tool>: { "input": <arguments>, "output": <structuredContent> } }`: output types sit under `$defs` by Rust type name, and each tool's `inputSchema`, byte-for-byte as `tools/list` declares it, sits under `$defs` as the tool name in PascalCase plus `Input` (`callers` → `CallersInput`, `graph_query` → `GraphQueryInput`).
+
+| Tool | Output type |
+|------|-------------|
+| `callers`, `callees`, `flows_to`, `flows_from` | `NeighborOutput` |
+| `reaches` | `ReachesOutput` = `ReachesPairOutput` \| `ReachesSetOutput` |
+| `paths` | `PathsOutput` |
+| `unused` | `UnusedOutput` |
+| `explain` | `ExplainOutput` |
+| `search` | `SearchOutput` |
+| `symbols` | `SymbolsOutput` |
+| `graph_query` | `GraphQueryOutput` = `GraphQueryPathsOutput` \| `GraphQueryTableOutput` |
+| `coupling` | `CouplingReport` |
+| `impacted_tests` | `ImpactedTestsOutput` |
+
 ### ADR-06 session metadata
 
-Attached by `with_session_meta` (`crates/cgx-mcp/src/tools.rs:575`) to every graph-backed tool.
+`SessionMeta` (`crates/cgx-mcp/src/output.rs`), flattened into every graph-backed tool's output type.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -78,7 +103,7 @@ Do not read `matches_head` as a boolean. A client that treats `null` as falsey r
 
 ### `approximation` — which direction the answer can be wrong in
 
-The A3/A4 answer-honesty contract, serialized straight off the shared `cgx_query` type, so an MCP tool emits the same schema as CLI `--format json` (`tools.rs:553`).
+The A3/A4 answer-honesty contract, serialized straight off the shared `cgx_query::ApproximationContract` type, so an MCP tool emits the same schema as CLI `--format json`.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -130,7 +155,7 @@ Not every answer carries both objects. Of the twelve tools, **eleven emit `fresh
 | `explain`, `search`, `symbols` | 3 | ✓ | ✓ | **✗** by design |
 | `coupling` | 1 | **✗** | **✗** | ✓ |
 
-`explain`, `search` and `symbols` skip `with_contract` deliberately (`tools.rs:566`): none performs a graph traversal, so there is no frontier to under-approximate and no candidate set to over-approximate.
+`explain`, `search` and `symbols` have no `approximation` field by design (`ExplainOutput`, `SearchOutput`, `SymbolsOutput` in `crates/cgx-mcp/src/output.rs`): none performs a graph traversal, so there is no frontier to under-approximate and no candidate set to over-approximate.
 
 `coupling` is the closed list of index-free tools (`INDEX_FREE_TOOLS` in `crates/cgx-mcp/tests/dispatch.rs`). It answers from committed git history with no index open, so an index-freshness envelope on its answer would describe a store it never read, and `dirty: false` would assert something about a graph it never consulted. Its `approximation` is a field of the coupling report itself rather than an attachment.
 

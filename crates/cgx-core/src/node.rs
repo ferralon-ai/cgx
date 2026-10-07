@@ -4,10 +4,13 @@ use crate::effect::EffectSet;
 use crate::id::{NodeId, SiteId, ValueId};
 use crate::provenance::{Provenance, Span};
 use crate::signature::Signature;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Symbol kinds (GM-1.1). Every named program entity is a symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum SymbolKind {

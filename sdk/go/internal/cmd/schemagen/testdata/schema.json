@@ -1,0 +1,625 @@
+{
+  "$defs": {
+    "CalleesInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "depth": {
+          "default": 3,
+          "type": "integer"
+        },
+        "include_dirty": {
+          "default": true,
+          "type": "boolean"
+        },
+        "kind": {
+          "items": {
+            "enum": [
+              "calls",
+              "calls_virtual"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "root": {
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
+    "CallersInput": {
+      "properties": {
+        "confidence": {
+          "enum": [
+            "certain",
+            "probable",
+            "possible"
+          ],
+          "type": "string"
+        },
+        "depth": {
+          "default": 3,
+          "type": "integer"
+        },
+        "include_dirty": {
+          "default": true,
+          "type": "boolean"
+        },
+        "kind": {
+          "items": {
+            "enum": [
+              "calls",
+              "calls_virtual"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "root": {
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Qualified symbol name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "root"
+      ],
+      "type": "object"
+    },
+    "Cell": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/Cell"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "Confidence": {
+      "description": "How sure.",
+      "enum": [
+        "possible",
+        "probable",
+        "certain"
+      ],
+      "type": "string"
+    },
+    "CouplingInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "ExplainInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "FlowsFromInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "FlowsToInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "GraphQueryInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "ListOutput": {
+      "properties": {
+        "cells": {
+          "items": {
+            "$ref": "#/$defs/Cell"
+          },
+          "type": "array"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/Row"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "results",
+        "cells"
+      ],
+      "type": "object"
+    },
+    "PairOutput": {
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "reachable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "from",
+        "reachable"
+      ],
+      "type": "object"
+    },
+    "PathsInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "ReachOutput": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PairOutput"
+        },
+        {
+          "$ref": "#/$defs/SetOutput"
+        }
+      ],
+      "type": "object"
+    },
+    "ReachesInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "Row": {
+      "properties": {
+        "by_kind": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence",
+          "description": "Edge confidence."
+        },
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Opaque FQN.",
+          "type": "string"
+        },
+        "ratio": {
+          "format": "double",
+          "type": "number"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "line",
+        "count",
+        "confidence",
+        "cursor",
+        "depth",
+        "by_kind",
+        "ratio",
+        "tags"
+      ],
+      "type": "object"
+    },
+    "Scope": {
+      "properties": {
+        "max_depth": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_depth"
+      ],
+      "type": "object"
+    },
+    "SearchInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "SetOutput": {
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/Row"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "from",
+        "results"
+      ],
+      "type": "object"
+    },
+    "SymbolsInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
+    "UnusedInput": {
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "callees": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CalleesInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "callers": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CallersInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "coupling": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/CouplingInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "explain": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ExplainInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "flows_from": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FlowsFromInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "flows_to": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/FlowsToInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "graph_query": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/GraphQueryInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "paths": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/PathsInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "reaches": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ReachesInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ReachOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "search": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/SearchInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "symbols": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/SymbolsInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "unused": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/UnusedInput"
+        },
+        "output": {
+          "$ref": "#/$defs/ListOutput"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    }
+  },
+  "title": "test tools",
+  "type": "object"
+}

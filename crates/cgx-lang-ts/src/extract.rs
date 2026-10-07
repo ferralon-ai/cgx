@@ -36,19 +36,40 @@ use cgx_frontend::facts::{
 use cgx_frontend::frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashSet};
-use tree_sitter::{Language, Node, Parser};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 2;
+const TS_FRAGMENT_VERSION: u32 = 3;
 
 /// The TypeScript/JavaScript language frontend.
 ///
-/// Handles `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts` files.
-/// Uses `tree-sitter-typescript`'s `LANGUAGE_TYPESCRIPT` grammar for TS/TSX
-/// and the same grammar (with JS compatibility) for JS variants.
+/// Handles `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` files.
+///
+/// `.tsx` and `.jsx` parse with `tree-sitter-typescript`'s `LANGUAGE_TSX`
+/// grammar so JSX elements are real syntax. `.ts`/`.mts`/`.cts` always use
+/// `LANGUAGE_TYPESCRIPT`: under TSX the `<T>expr` cast is ambiguous with a JSX
+/// element. `.js`/`.mjs`/`.cjs` parse with `LANGUAGE_TYPESCRIPT` first (JavaScript
+/// is a near-subset of it); only if that tree has errors is the file re-parsed
+/// with TSX, and the TSX tree is kept only when it has strictly fewer error
+/// nodes, so JSX in plain JavaScript is recovered and ties keep the TypeScript tree.
 pub struct TypeScriptFrontend {
     ts_language: Language,
+    tsx_language: Language,
+    js_reparsed: AtomicUsize,
+    js_tsx_kept: AtomicUsize,
+}
+
+/// How often the JavaScript TSX fallback fired on this frontend instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FallbackStats {
+    /// `.js`/`.mjs`/`.cjs` files whose TypeScript-grammar tree had errors and
+    /// were re-parsed with TSX.
+    pub reparsed: usize,
+    /// Of those, files where the TSX tree had strictly fewer ERROR/MISSING
+    /// nodes and replaced the TypeScript tree.
+    pub tsx_kept: usize,
 }
 
 impl std::fmt::Debug for TypeScriptFrontend {
@@ -62,6 +83,71 @@ impl TypeScriptFrontend {
     pub fn new() -> Self {
         TypeScriptFrontend {
             ts_language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            tsx_language: tree_sitter_typescript::LANGUAGE_TSX.into(),
+            js_reparsed: AtomicUsize::new(0),
+            js_tsx_kept: AtomicUsize::new(0),
+        }
+    }
+
+    /// Counts of the JavaScript TSX fallback since this frontend was created,
+    /// so callers can report the fallback rate per repository.
+    pub fn fallback_stats(&self) -> FallbackStats {
+        FallbackStats {
+            reparsed: self.js_reparsed.load(Ordering::Relaxed),
+            tsx_kept: self.js_tsx_kept.load(Ordering::Relaxed),
+        }
+    }
+
+    fn parse(&self, src: &[u8], path: &RelPath) -> Result<Option<Tree>, FrontendError> {
+        let ext = path.extension();
+        let ext = ext.as_deref();
+        if matches!(ext, Some("tsx" | "jsx")) {
+            return self.parse_with(&self.tsx_language, src);
+        }
+        let Some(tree) = self.parse_with(&self.ts_language, src)? else {
+            return Ok(None);
+        };
+        if !matches!(ext, Some("js" | "mjs" | "cjs")) || !tree.root_node().has_error() {
+            return Ok(Some(tree));
+        }
+        self.js_reparsed.fetch_add(1, Ordering::Relaxed);
+        match self.parse_with(&self.tsx_language, src)? {
+            Some(tsx) if error_nodes(&tsx) < error_nodes(&tree) => {
+                self.js_tsx_kept.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(tsx))
+            }
+            _ => Ok(Some(tree)),
+        }
+    }
+
+    fn parse_with(&self, language: &Language, src: &[u8]) -> Result<Option<Tree>, FrontendError> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(language)
+            .map_err(|e| FrontendError::Parser {
+                lang: "typescript".to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(parser.parse(src, None))
+    }
+}
+
+/// Number of ERROR and MISSING nodes in `tree`.
+fn error_nodes(tree: &Tree) -> usize {
+    let mut cursor = tree.walk();
+    let mut count = 0;
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            count += 1;
+        }
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return count;
+            }
         }
     }
 }
@@ -93,15 +179,7 @@ impl LanguageFrontend for TypeScriptFrontend {
     }
 
     fn extract(&self, src: &[u8], ctx: &FileCtx) -> Result<FileFacts, FrontendError> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&self.ts_language)
-            .map_err(|e| FrontendError::Parser {
-                lang: "typescript".to_string(),
-                detail: e.to_string(),
-            })?;
-
-        let tree = match parser.parse(src, None) {
+        let tree = match self.parse(src, &ctx.path)? {
             Some(t) => t,
             None => return Ok(FileFacts::empty()),
         };

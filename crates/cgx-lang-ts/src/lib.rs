@@ -65,5 +65,5 @@ mod extract;
 mod module;
 mod query;
 
-pub use extract::TypeScriptFrontend;
+pub use extract::{FallbackStats, TypeScriptFrontend};
 pub use module::module_path_for;

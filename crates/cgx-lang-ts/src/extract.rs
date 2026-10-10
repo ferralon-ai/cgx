@@ -11,7 +11,9 @@
 //! - **`condition_stack`** — a stack of [`EdgeCondition`] frames; the ADR-03
 //!   maximum of all active frames is the condition assigned to calls at any point.
 //! - **`lambda_names`** — a set of local binding names that hold arrow functions
-//!   or function expressions; calls to these emit [`RefKind::CallClosure`].
+//!   or function expressions; calls to these emit [`RefKind::CallClosure`], or
+//!   [`RefKind::CallPinnedClosure`] when [`crate::pin`] proves the call can only
+//!   reach one `const` declaration.
 //! - **`stmt_index`** — a shared monotonic counter used as the intra-procedural
 //!   statement index (ADR-02 reservation).
 //!
@@ -35,20 +37,41 @@ use cgx_frontend::facts::{
 };
 use cgx_frontend::frontend::{FileCtx, FrontendError, Lang, LanguageFrontend, RelPath};
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, HashSet};
-use tree_sitter::{Language, Node, Parser};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Fragment version for the TS adapter extraction rules.  Bump this when
 /// extraction logic changes in a way that invalidates cached fragments.
-const TS_FRAGMENT_VERSION: u32 = 2;
+const TS_FRAGMENT_VERSION: u32 = 4;
 
 /// The TypeScript/JavaScript language frontend.
 ///
-/// Handles `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts` files.
-/// Uses `tree-sitter-typescript`'s `LANGUAGE_TYPESCRIPT` grammar for TS/TSX
-/// and the same grammar (with JS compatibility) for JS variants.
+/// Handles `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` files.
+///
+/// `.tsx` and `.jsx` parse with `tree-sitter-typescript`'s `LANGUAGE_TSX`
+/// grammar so JSX elements are real syntax. `.ts`/`.mts`/`.cts` always use
+/// `LANGUAGE_TYPESCRIPT`: under TSX the `<T>expr` cast is ambiguous with a JSX
+/// element. `.js`/`.mjs`/`.cjs` parse with `LANGUAGE_TYPESCRIPT` first (JavaScript
+/// is a near-subset of it); only if that tree has errors is the file re-parsed
+/// with TSX, and the TSX tree is kept only when it has strictly fewer error
+/// nodes, so JSX in plain JavaScript is recovered and ties keep the TypeScript tree.
 pub struct TypeScriptFrontend {
     ts_language: Language,
+    tsx_language: Language,
+    js_reparsed: AtomicUsize,
+    js_tsx_kept: AtomicUsize,
+}
+
+/// How often the JavaScript TSX fallback fired on this frontend instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FallbackStats {
+    /// `.js`/`.mjs`/`.cjs` files whose TypeScript-grammar tree had errors and
+    /// were re-parsed with TSX.
+    pub reparsed: usize,
+    /// Of those, files where the TSX tree had strictly fewer ERROR/MISSING
+    /// nodes and replaced the TypeScript tree.
+    pub tsx_kept: usize,
 }
 
 impl std::fmt::Debug for TypeScriptFrontend {
@@ -62,6 +85,71 @@ impl TypeScriptFrontend {
     pub fn new() -> Self {
         TypeScriptFrontend {
             ts_language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            tsx_language: tree_sitter_typescript::LANGUAGE_TSX.into(),
+            js_reparsed: AtomicUsize::new(0),
+            js_tsx_kept: AtomicUsize::new(0),
+        }
+    }
+
+    /// Counts of the JavaScript TSX fallback since this frontend was created,
+    /// so callers can report the fallback rate per repository.
+    pub fn fallback_stats(&self) -> FallbackStats {
+        FallbackStats {
+            reparsed: self.js_reparsed.load(Ordering::Relaxed),
+            tsx_kept: self.js_tsx_kept.load(Ordering::Relaxed),
+        }
+    }
+
+    fn parse(&self, src: &[u8], path: &RelPath) -> Result<Option<Tree>, FrontendError> {
+        let ext = path.extension();
+        let ext = ext.as_deref();
+        if matches!(ext, Some("tsx" | "jsx")) {
+            return self.parse_with(&self.tsx_language, src);
+        }
+        let Some(tree) = self.parse_with(&self.ts_language, src)? else {
+            return Ok(None);
+        };
+        if !matches!(ext, Some("js" | "mjs" | "cjs")) || !tree.root_node().has_error() {
+            return Ok(Some(tree));
+        }
+        self.js_reparsed.fetch_add(1, Ordering::Relaxed);
+        match self.parse_with(&self.tsx_language, src)? {
+            Some(tsx) if error_nodes(&tsx) < error_nodes(&tree) => {
+                self.js_tsx_kept.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(tsx))
+            }
+            _ => Ok(Some(tree)),
+        }
+    }
+
+    fn parse_with(&self, language: &Language, src: &[u8]) -> Result<Option<Tree>, FrontendError> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(language)
+            .map_err(|e| FrontendError::Parser {
+                lang: "typescript".to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(parser.parse(src, None))
+    }
+}
+
+/// Number of ERROR and MISSING nodes in `tree`.
+fn error_nodes(tree: &Tree) -> usize {
+    let mut cursor = tree.walk();
+    let mut count = 0;
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            count += 1;
+        }
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return count;
+            }
         }
     }
 }
@@ -93,15 +181,7 @@ impl LanguageFrontend for TypeScriptFrontend {
     }
 
     fn extract(&self, src: &[u8], ctx: &FileCtx) -> Result<FileFacts, FrontendError> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&self.ts_language)
-            .map_err(|e| FrontendError::Parser {
-                lang: "typescript".to_string(),
-                detail: e.to_string(),
-            })?;
-
-        let tree = match parser.parse(src, None) {
+        let tree = match self.parse(src, &ctx.path)? {
             Some(t) => t,
             None => return Ok(FileFacts::empty()),
         };
@@ -109,6 +189,7 @@ impl LanguageFrontend for TypeScriptFrontend {
         let module_prefix = module_path_for(ctx.path.as_str());
 
         let mut builder = Builder::new(src, ctx.path.as_str(), &module_prefix);
+        builder.pinned_closure_calls = crate::pin::pinned_closure_calls(tree.root_node(), src);
         builder.walk_program(tree.root_node());
         let mut facts = builder.finish();
         facts.canonicalize();
@@ -141,6 +222,14 @@ struct Builder<'a> {
     /// `call_expression` whose callee is one of these names, we emit
     /// `RefKind::CallClosure` instead of `RefKind::Call`.
     lambda_names: HashSet<String>,
+    /// Closure-call callee start byte → start byte of the single `const`
+    /// declarator the call is pinned to (see [`crate::pin`]).
+    pinned_closure_calls: HashMap<usize, usize>,
+    /// Start bytes of the declarators a `Lambda` def was emitted for.
+    lambda_decl_starts: HashSet<usize>,
+    /// `(index into facts.refs, declarator start)` for every emitted
+    /// `CallPinnedClosure`, checked against `lambda_decl_starts` in `finish`.
+    pinned_refs: Vec<(usize, usize)>,
     /// FQNs of callable parameter bindings (function-typed parameters). Calls
     /// to these emit `RefKind::CallCallback`.
     callback_names: HashSet<String>,
@@ -166,6 +255,9 @@ impl<'a> Builder<'a> {
             condition_stack: Vec::new(),
             stmt_index: 0,
             lambda_names: HashSet::new(),
+            pinned_closure_calls: HashMap::new(),
+            lambda_decl_starts: HashSet::new(),
+            pinned_refs: Vec::new(),
             callback_names: HashSet::new(),
             effects: BTreeMap::new(),
             data_flows: BTreeMap::new(),
@@ -173,6 +265,15 @@ impl<'a> Builder<'a> {
     }
 
     fn finish(mut self) -> FileFacts {
+        // A pin names a syntactic declaration; the resolver binds the call to a
+        // `Lambda` def. If this walk emitted no def for that declaration (the
+        // walker skips it), the resolver would bind some other same-named
+        // lambda, so the call goes back to the unpinned fan-out.
+        for (idx, decl) in std::mem::take(&mut self.pinned_refs) {
+            if !self.lambda_decl_starts.contains(&decl) {
+                self.facts.refs[idx].kind = RefKind::CallClosure;
+            }
+        }
         for (fqn, set) in std::mem::take(&mut self.effects) {
             if !set.is_empty() {
                 self.facts.effects.push(EffectFact { fqn, effects: set });
@@ -997,6 +1098,7 @@ impl<'a> Builder<'a> {
             let new_scope = self.facts.scopes.push(scope, Some(fqn.clone()));
 
             self.lambda_names.insert(name.clone());
+            self.lambda_decl_starts.insert(node.start_byte());
 
             self.facts.defs.push(SymbolDef {
                 fqn: fqn.clone(),
@@ -1409,6 +1511,14 @@ impl<'a> Builder<'a> {
 
         let condition = self.current_condition();
 
+        if ref_kind == RefKind::CallPinnedClosure {
+            let decl = crate::pin::callee_ident(callee)
+                .and_then(|ident| self.pinned_closure_calls.get(&ident.start_byte()))
+                .copied()
+                .unwrap_or(usize::MAX);
+            self.pinned_refs.push((self.facts.refs.len(), decl));
+        }
+
         // Emit the primary call ref
         self.facts.refs.push(RawRef {
             name_path: name_path.clone(),
@@ -1559,7 +1669,11 @@ impl<'a> Builder<'a> {
                 }
                 // Check if it's a known lambda binding
                 let kind = if self.lambda_names.contains(&name) {
-                    RefKind::CallClosure
+                    if self.pinned_closure_calls.contains_key(&callee.start_byte()) {
+                        RefKind::CallPinnedClosure
+                    } else {
+                        RefKind::CallClosure
+                    }
                 } else if self.callback_names.contains(&name) {
                     RefKind::CallCallback
                 } else {

@@ -51,7 +51,7 @@
 //! dedup, and the confidence band match the link pass exactly. New group ids are
 //! allocated above the existing maximum in a deterministic site order.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use cgx_core::confidence::{Confidence, Tier};
 use cgx_core::cut::CutMarker;
@@ -100,6 +100,7 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     if sites.is_empty() {
         return stats;
     }
+    let node_index = node_index(graph);
 
     // Allocate new group ids above the current maximum, deterministically.
     let mut next_group: u32 = graph
@@ -119,7 +120,7 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
 
     for site in &sites {
         let template = &graph.edges[site.edge_indices[0]];
-        let method = match short_name_of(graph, template.edge.dst) {
+        let method = match short_name_of(graph, &node_index, template.edge.dst) {
             Some(m) => m,
             None => continue,
         };
@@ -173,14 +174,9 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
         .iter()
         .filter_map(|i| graph.edges[*i].edge.candidate_group)
         .collect();
-    let mut kept: Vec<EdgeWithProvenance> = Vec::with_capacity(graph.edges.len());
-    for (i, e) in graph.edges.drain(..).enumerate() {
-        if !drop_edge_idx.contains(&i) {
-            kept.push(e);
-        }
-    }
-    kept.extend(new_edges);
-    graph.edges = kept;
+    crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
+    graph.edges.reserve_exact(new_edges.len());
+    graph.edges.extend(new_edges);
 
     graph
         .candidates
@@ -213,13 +209,28 @@ fn collect_name_method_sites(graph: &ResolvedGraph) -> Vec<Site> {
     by_site.into_values().map(|edge_indices| Site { edge_indices }).collect()
 }
 
+/// `NodeId` → position in `graph.nodes` (the first node carrying that id, as a
+/// linear `find` would return). Node ids are dense but `graph.nodes` is not
+/// guaranteed to be in id order, so look them up through this index rather than
+/// scanning the node list per lookup.
+fn node_index(graph: &ResolvedGraph) -> HashMap<NodeId, usize> {
+    let mut index = HashMap::with_capacity(graph.nodes.len());
+    for (i, n) in graph.nodes.iter().enumerate() {
+        index.entry(n.node.id).or_insert(i);
+    }
+    index
+}
+
 /// The short (last-segment) name of a node's FQN.
-fn short_name_of(graph: &ResolvedGraph, id: NodeId) -> Option<String> {
-    graph
-        .nodes
-        .iter()
-        .find(|n| n.node.id == id)
-        .map(|n| n.node.fqn.rsplit("::").next().unwrap_or(&n.node.fqn).to_owned())
+fn short_name_of(
+    graph: &ResolvedGraph,
+    index: &HashMap<NodeId, usize>,
+    id: NodeId,
+) -> Option<String> {
+    index.get(&id).map(|&i| {
+        let fqn = &graph.nodes[i].node.fqn;
+        fqn.rsplit("::").next().unwrap_or(fqn).to_owned()
+    })
 }
 
 /// Build a trait-scoped CHA edge from a name-method edge prototype, keeping the
@@ -313,12 +324,9 @@ impl Lattice {
             }
         }
 
+        let index = node_index(graph);
         let fqn_of = |id: NodeId| -> Option<&String> {
-            graph
-                .nodes
-                .iter()
-                .find(|n| n.node.id == id)
-                .map(|n| &n.node.fqn)
+            index.get(&id).map(|&i| &graph.nodes[i].node.fqn)
         };
 
         for e in &graph.edges {

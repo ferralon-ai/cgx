@@ -158,11 +158,14 @@ impl ResolvedGraph {
     /// store schema denormalizes `rule`/`tier` onto the edge record itself
     /// (architecture §3 `edges.rule`); the indexer persists fragments separately.
     pub fn into_linked(self) -> (Vec<NodeRecord>, Vec<EdgeRecord>, Vec<Candidate>) {
-        (
-            self.nodes.into_iter().map(|n| n.node).collect(),
-            self.edges.into_iter().map(|e| e.edge).collect(),
-            self.candidates,
-        )
+        let mut nodes: Vec<NodeRecord> = self.nodes.into_iter().map(|n| n.node).collect();
+        let mut edges: Vec<EdgeRecord> = self.edges.into_iter().map(|e| e.edge).collect();
+        // These collects reuse the source allocations, which were sized for the
+        // larger provenance-carrying records plus growth slack. Release the
+        // excess before the graph is held through the store write.
+        nodes.shrink_to_fit();
+        edges.shrink_to_fit();
+        (nodes, edges, self.candidates)
     }
 
     /// Borrowing view of the resolved symbol nodes.

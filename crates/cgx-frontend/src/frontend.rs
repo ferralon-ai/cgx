@@ -168,6 +168,59 @@ impl FileCtx {
         self.manifest = manifest;
         self
     }
+
+    /// A canonical, injective encoding of every field of this context. Together
+    /// with the source bytes (named by `blob_oid`) it determines `extract`'s
+    /// output, so the indexer keys the Layer-1 fragment cache on it.
+    ///
+    /// Destructured exhaustively so a new field fails to compile here until it is
+    /// either encoded or argued irrelevant to extraction.
+    pub fn cache_identity(&self) -> Vec<u8> {
+        let FileCtx {
+            path,
+            blob_oid,
+            package,
+            manifest,
+        } = self;
+        let mut out = Vec::new();
+        put_str(&mut out, blob_oid);
+        put_str(&mut out, path.as_str());
+        put_opt_str(&mut out, package.as_deref());
+        match manifest {
+            None => out.push(0),
+            Some(ManifestInfo {
+                kind,
+                identity,
+                root_dir,
+            }) => {
+                out.push(1);
+                out.push(match kind {
+                    ManifestKind::Cargo => 0,
+                    ManifestKind::GoMod => 1,
+                    ManifestKind::PackageJson => 2,
+                    ManifestKind::PyProject => 3,
+                });
+                put_opt_str(&mut out, identity.as_deref());
+                put_str(&mut out, root_dir);
+            }
+        }
+        out
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            put_str(out, s);
+        }
+    }
 }
 
 /// An error raised while extracting a file.
@@ -241,5 +294,35 @@ mod tests {
             .with_manifest(Some(info.clone()));
         assert_eq!(ctx.package.as_deref(), Some("pkg"));
         assert_eq!(ctx.manifest, Some(info));
+    }
+
+    #[test]
+    fn cache_identity_separates_every_context_field() {
+        let manifest = |kind, identity: Option<&str>, root: &str| {
+            Some(ManifestInfo {
+                kind,
+                identity: identity.map(str::to_string),
+                root_dir: root.to_string(),
+            })
+        };
+        let base = || FileCtx::new("a/b.py", "oid");
+        let cases = [
+            base(),
+            FileCtx::new("a/c.py", "oid"),
+            FileCtx::new("a/b.py", "oid2"),
+            // Field boundaries: moving bytes between path and blob OID must differ.
+            FileCtx::new("a/b.pyo", "id"),
+            base().with_package(Some(String::new())),
+            base().with_package(Some("p".into())),
+            base().with_manifest(manifest(ManifestKind::PyProject, None, "")),
+            base().with_manifest(manifest(ManifestKind::PyProject, None, "a")),
+            base().with_manifest(manifest(ManifestKind::GoMod, None, "a")),
+            base().with_manifest(manifest(ManifestKind::GoMod, Some(""), "a")),
+            base().with_manifest(manifest(ManifestKind::GoMod, Some("m"), "a")),
+        ];
+        let ids: std::collections::BTreeSet<Vec<u8>> =
+            cases.iter().map(FileCtx::cache_identity).collect();
+        assert_eq!(ids.len(), cases.len());
+        assert_eq!(base().cache_identity(), base().cache_identity());
     }
 }

@@ -96,11 +96,11 @@ fn overload_graph() -> ResolvedGraph {
             node(1, "app::f", "src/f.cpp", 3, SymbolKind::Function), // f(int)
             node(2, "app::f", "src/f.cpp", 7, SymbolKind::Function), // f(double)
         ],
-        // Lexical default dst = node 2; both overloads are candidates (group 7).
-        edges: vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 7)],
+        // Lexical default dst = node 2; both overloads are candidates (group 0).
+        edges: vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 0)],
         candidates: vec![
-            Candidate { candidate_group: 7, dst: NodeId(2), rank: 0 },
-            Candidate { candidate_group: 7, dst: NodeId(1), rank: 1 },
+            Candidate { candidate_group: 0, dst: NodeId(2), rank: 0 },
+            Candidate { candidate_group: 0, dst: NodeId(1), rank: 1 },
         ],
         ..Default::default()
     };
@@ -182,7 +182,7 @@ fn overload_caps_at_probable_under_partial_compdb() {
     assert_eq!(e.confidence, Confidence::Probable, "PARTIAL compdb: fail-closed cap, never certain");
     assert_eq!(e.tier, Tier::Scip);
     assert_eq!(e.dst, NodeId(2), "no redirect under fail-closed: possibly-false singleton");
-    assert_eq!(e.candidate_group, Some(7), "candidate group left intact under fail-closed");
+    assert_eq!(e.candidate_group, Some(0), "candidate group left intact under fail-closed");
     assert_eq!(stats.upgraded_certain, 0, "fail-closed emits zero certain");
     assert_eq!(stats.upgraded_probable, 1);
     assert_eq!(stats.capped_partial_compdb, 1, "the capped-certain counter ticks for cgx doctor");
@@ -202,7 +202,7 @@ fn no_scip_occurrence_leaves_edge_untouched() {
     assert_eq!(e.confidence, Confidence::Possible, "degrade-without-resolution stays honest");
     assert_eq!(e.tier, Tier::NameSyntactic);
     assert_eq!(e.dst, NodeId(2));
-    assert_eq!(e.candidate_group, Some(7));
+    assert_eq!(e.candidate_group, Some(0));
     assert_eq!(stats.upgraded_certain, 0);
     assert_eq!(stats.upgraded_probable, 0);
 }
@@ -219,8 +219,8 @@ fn virtual_dispatch_caps_at_probable_even_under_complete_compdb() {
             node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
             node(1, "shape::Circle::area", "src/shape.cpp", 5, SymbolKind::Method),
         ],
-        edges: vec![call_edge(0, 1, EdgeKind::CallsVirtual, "src/main.cpp", 10, 5, 3)],
-        candidates: vec![Candidate { candidate_group: 3, dst: NodeId(1), rank: 0 }],
+        edges: vec![call_edge(0, 1, EdgeKind::CallsVirtual, "src/main.cpp", 10, 5, 0)],
+        candidates: vec![Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 }],
         ..Default::default()
     };
     cgx_resolve::canonicalize(&mut g);
@@ -247,7 +247,7 @@ fn virtual_dispatch_caps_at_probable_even_under_complete_compdb() {
     let e = call_edge_of(&g);
     assert_eq!(e.confidence, Confidence::Probable, "virtual dispatch never promotes to certain");
     assert_eq!(e.tier, Tier::Scip);
-    assert_eq!(e.candidate_group, Some(3), "virtual candidate set preserved (no collapse)");
+    assert_eq!(e.candidate_group, Some(0), "virtual candidate set preserved (no collapse)");
     assert_eq!(stats.upgraded_certain, 0);
     assert_eq!(stats.upgraded_probable, 1);
 }

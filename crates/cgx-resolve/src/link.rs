@@ -100,6 +100,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     } else {
         DataflowOutput::default()
     };
+    sort_nodes_canonical(&mut nodes, &mut edges, &mut candidates);
 
     let mut graph = finalize(nodes, edges, candidates, unresolved);
     graph.dataflow = dataflow;
@@ -182,6 +183,39 @@ fn build_nodes(
         });
     }
     (nodes, map)
+}
+
+/// Put every node, symbol and SSA value alike, into the canonical
+/// `(file, line_start, fqn)` order, reassign dense ids by position, and remap
+/// every edge endpoint and candidate dst. Value nodes are minted after the
+/// symbol nodes; leaving them as an appended suffix would make node order depend
+/// on a node's class rather than its content, and a store that drops ids could
+/// not rebuild it. The sort is stable and the symbol prefix is already in this
+/// order, so symbol nodes keep their relative order (candidate ranks hold).
+fn sort_nodes_canonical(
+    nodes: &mut [NodeWithProvenance],
+    edges: &mut [EdgeWithProvenance],
+    candidates: &mut [Candidate],
+) {
+    fn key(n: &NodeWithProvenance) -> (&str, u32, &str) {
+        cgx_core::sort::node_sort_key(&n.node)
+    }
+    if nodes.is_sorted_by(|a, b| key(a) <= key(b)) {
+        return;
+    }
+    nodes.sort_by(|a, b| key(a).cmp(&key(b)));
+    let mut remap = vec![NodeId(0); nodes.len()];
+    for (i, n) in nodes.iter_mut().enumerate() {
+        remap[n.node.id.index()] = NodeId(i as u32);
+        n.node.id = NodeId(i as u32);
+    }
+    for e in edges.iter_mut() {
+        e.edge.src = remap[e.edge.src.index()];
+        e.edge.dst = remap[e.edge.dst.index()];
+    }
+    for c in candidates.iter_mut() {
+        c.dst = remap[c.dst.index()];
+    }
 }
 
 fn node_records(nodes: &[NodeWithProvenance]) -> Vec<NodeRecord> {
@@ -1671,6 +1705,7 @@ pub(crate) fn remove_edges_at(
 /// This is the determinism contract (architecture §4): edges are sorted by
 /// `(src, dst, kind, stmt_index, candidate_group)` — matching
 /// [`cgx_core::sort::edge_sort_key`] — and assigned dense ids by position;
+/// candidate groups are numbered densely by first appearance in that order;
 /// candidates are sorted by `(group, rank, dst)`. Nodes are left untouched (the
 /// link step assigns their ids once at build time, before any post-pass runs).
 ///
@@ -1686,15 +1721,57 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     // order, which is part of the byte-identity contract. `sort_by_cached_key`
     // is stable and sorts (key, u32 index) pairs, then permutes the edges in
     // place, instead of a merge sort whose scratch buffer holds half the edges.
-    graph.edges.sort_by_cached_key(|e| {
-        (
-            e.edge.src.0,
-            e.edge.dst.0,
-            e.edge.kind as u8,
-            e.edge.stmt_index.unwrap_or(u32::MAX),
-            e.edge.candidate_group.unwrap_or(u32::MAX),
-        )
-    });
+    let sort = |edges: &mut Vec<EdgeWithProvenance>| {
+        edges.sort_by_cached_key(|e| {
+            (
+                e.edge.src.0,
+                e.edge.dst.0,
+                e.edge.kind as u8,
+                e.edge.stmt_index.unwrap_or(u32::MAX),
+                e.edge.candidate_group.unwrap_or(u32::MAX),
+            )
+        })
+    };
+    sort(&mut graph.edges);
+
+    // Candidate groups: renumber densely by first appearance in edge order, then
+    // re-sort. A group's edges share one src, so within a src this numbering is
+    // the order the groups first appear among that src's edges: a store can
+    // rebuild it from per-function shards that carry only shard-local group
+    // ordinals. One renumber + re-sort is a fixed point: the re-sort only reorders
+    // edges inside equal-(src, dst, kind, stmt) runs, by the new numbers, which
+    // cannot move a group's first edge ahead of an earlier-numbered group's.
+    let mut renumber: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut identity = true;
+    for e in &mut graph.edges {
+        if let Some(g) = e.edge.candidate_group.as_mut() {
+            let next = renumber.len() as u32;
+            let new = *renumber.entry(*g).or_insert(next);
+            identity &= new == *g;
+            *g = new;
+        }
+    }
+    // Rows of a group no edge carries (none are expected) keep distinct numbers
+    // above every edge group, in their old order.
+    let mut edgeless: Vec<u32> = graph
+        .candidates
+        .iter()
+        .map(|c| c.candidate_group)
+        .filter(|g| !renumber.contains_key(g))
+        .collect();
+    edgeless.sort_unstable();
+    edgeless.dedup();
+    for g in edgeless {
+        let next = renumber.len() as u32;
+        identity &= next == g;
+        renumber.insert(g, next);
+    }
+    if !identity {
+        for c in &mut graph.candidates {
+            c.candidate_group = renumber[&c.candidate_group];
+        }
+        sort(&mut graph.edges);
+    }
     for (i, e) in graph.edges.iter_mut().enumerate() {
         e.edge.id = EdgeId(i as u32);
     }

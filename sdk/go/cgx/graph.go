@@ -11,6 +11,21 @@
 //
 // The index persists in <repo>/.cgx, shared with the cgx CLI, so Open on an
 // indexed repository is a warm load, not a re-index.
+//
+// # Cancellation
+//
+// An operation whose context is done, or that Close aborts, returns the
+// context's error. The native transport stops its session process. The wasm
+// engine stops at its next yield point: the extractors run with wazero's
+// termination checks, and the session module calls back into the host every
+// few thousand allocations, every few tens of thousands of iterations of its
+// allocation-free loops, and once per object it writes, so latency is bounded
+// by that cadence (typically milliseconds). The same calls are where the Go
+// runtime can stop the world for garbage collection while the engine runs.
+//
+// A cancelled Index never leaves the store half-written: objects land by
+// rename and the ref and HEAD.json that name a graph are written last, so the
+// store opens to the graph it held before (or to none, on a first index).
 package cgx
 
 import (

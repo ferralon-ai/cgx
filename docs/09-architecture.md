@@ -45,6 +45,18 @@ extraction across instances and holds the store's write lock. `cgx-session` is
 the single implementation of session semantics for that module and for the
 native `cgx session` verb.
 
+The module imports one host function besides WASI: `cgx_host.yield() -> i32`.
+A host may run the session instance without per-loop termination checks
+(they multiply the instruction count of link-heavy work), so the engine calls
+out at a bounded cadence instead: every 4,096 allocator calls, every 65,536
+iterations of the allocation-free loops in linking (sorts and scans of a
+file's definitions), and once per object the store writes. The call gives the host a point to run its own
+scheduler (a Go host's garbage collector cannot stop the world while compiled
+guest code runs) and to cancel: a non-zero return makes the module exit at
+once with status 125. Exiting there is safe because store writes are
+temp-then-rename with the ref and `HEAD.json` written last. Native builds
+compile the yield points to nothing.
+
 This document specifies:
 
 - AR-1: Language choice (Rust decision and Go fallback assessment)

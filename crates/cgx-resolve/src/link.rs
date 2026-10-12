@@ -185,7 +185,10 @@ fn build_nodes(
     }
 
     // Canonical node order: (file, line_start, fqn). Assign dense ids by position.
+    // Whole-graph sorts tick per comparison: they neither allocate nor call out,
+    // so on wasm they would otherwise run without a yield point.
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.0.file.as_str(), a.0.line_start, a.0.fqn.as_str()).cmp(&(
             b.0.file.as_str(),
             b.0.line_start,
@@ -227,7 +230,10 @@ fn sort_nodes_canonical(
     if nodes.is_sorted_by(|a, b| key(a) <= key(b)) {
         return None;
     }
-    nodes.sort_by(|a, b| key(a).cmp(&key(b)));
+    nodes.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        key(a).cmp(&key(b))
+    });
     let mut remap = vec![NodeId(0); nodes.len()];
     for (i, n) in nodes.iter_mut().enumerate() {
         remap[n.node.id.index()] = NodeId(i as u32);
@@ -286,7 +292,11 @@ fn enclosing_def<'a>(
             .get(sid.index())
             .and_then(|s| s.owner_fqn.as_ref())
         {
-            if let Some(def) = defs.iter().find(|d| &d.fqn == owner) {
+            // Linear in the file's defs, per ref: tick (see `resolve_local`).
+            if let Some(def) = defs.iter().find(|d| {
+                cgx_core::yield_hook::tick();
+                &d.fqn == owner
+            }) {
                 return Some(def);
             }
         }
@@ -857,6 +867,7 @@ fn resolve_data_flows(
     // in canonical (file, line, fqn) order. Symbol node ids are unchanged.
     let mut staged: Vec<ValueNodeStage> = value_nodes.into_values().collect();
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.file.as_str(), a.line, a.fqn.as_str()).cmp(&(b.file.as_str(), b.line, b.fqn.as_str()))
     });
     let mut value_fqn_to_node: std::collections::BTreeMap<String, NodeId> =
@@ -903,7 +914,10 @@ fn resolve_data_flows(
         let bytes = cgx_core::codec::encode(facts).unwrap_or_default();
         output.fn_summaries.push(((blob, fn_fqn.clone()), bytes));
     }
-    output.fn_summaries.sort();
+    output.fn_summaries.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
     output.ifds_stats = crate::graph::IfdsDataflowStats {
         summaries_computed: ifds.stats.summaries_computed,
         summary_edges_materialized: ifds.stats.summary_edges_materialized,
@@ -1422,9 +1436,15 @@ fn resolve_local<'a>(
     name: &str,
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
+        // A scan of every def in the file, per ref and ancestor scope: a file
+        // with tens of thousands of defs makes this seconds of allocation-free
+        // work, so it ticks per def visited.
         if let Some(def) = defs
             .iter()
-            .filter(|d| d.scope == sid && short_name(&d.fqn) == name)
+            .filter(|d| {
+                cgx_core::yield_hook::tick();
+                d.scope == sid && short_name(&d.fqn) == name
+            })
             .min_by(|a, b| a.fqn.cmp(&b.fqn))
         {
             return Some(def);
@@ -1447,6 +1467,7 @@ fn resolve_pinned_closure<'a>(
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
         let mut hits = defs.iter().filter(|d| {
+            cgx_core::yield_hook::tick();
             d.scope == sid && d.kind == SymbolKind::Lambda && short_name(&d.fqn) == name
         });
         if let Some(first) = hits.next() {
@@ -1738,7 +1759,10 @@ fn finalize(
     mut unresolved: Vec<UnresolvedRef>,
     narrowing: &std::collections::BTreeMap<NodeId, NarrowingCounts>,
 ) -> ResolvedGraph {
-    unresolved.sort();
+    unresolved.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
 
     // Stamp each caller's dangling-ref counts onto its node record, one field per
     // marker. Dangling refs leave *no edge*, so these counts are the only trace
@@ -1826,11 +1850,9 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     // Edges: canonical order is (src, dst, kind, stmt_index, candidate_group),
     // matching cgx_core::sort::edge_sort_key. Assign dense ids by position.
     // The key is not total, so the sort must be stable: ties keep their input
-    // order, which is part of the byte-identity contract. `sort_by_cached_key`
-    // is stable and sorts (key, u32 index) pairs, then permutes the edges in
-    // place, instead of a merge sort whose scratch buffer holds half the edges.
+    // order, which is part of the byte-identity contract.
     let sort = |edges: &mut Vec<EdgeWithProvenance>| {
-        edges.sort_by_cached_key(|e| {
+        sort_by_cached_key_ticking(edges, |e| {
             (
                 e.edge.src.0,
                 e.edge.dst.0,
@@ -1891,10 +1913,39 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
         .sort_unstable_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
 }
 
+/// `slice::sort_by_cached_key`, with a yield tick per comparison: the sort is
+/// one long allocation-free loop over every edge, which on wasm would
+/// otherwise run without a yield point. The same algorithm as std's: sort
+/// (key, original index) pairs — a total order, so the unstable sort is
+/// deterministic and stable in effect — then apply the permutation in place.
+/// This keeps the scratch at one (key, u32) pair per edge instead of the half
+/// of the edges a merge sort's buffer holds.
+fn sort_by_cached_key_ticking<T, K: Ord>(v: &mut [T], key: impl Fn(&T) -> K) {
+    assert!(u32::try_from(v.len()).is_ok(), "more than u32::MAX elements");
+    let mut keyed: Vec<(K, u32)> = v.iter().enumerate().map(|(i, x)| (key(x), i as u32)).collect();
+    keyed.sort_unstable_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
+    // keyed[i].1 is the original index of the element that belongs at i.
+    // Elements before i are placed; one that started below i has since been
+    // swapped to the position its own entry now records, so follow the chain.
+    for i in 0..v.len() {
+        let mut from = keyed[i].1 as usize;
+        while from < i {
+            from = keyed[from].1 as usize;
+        }
+        keyed[i].1 = from as u32;
+        v.swap(i, from);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
 
     fn node(id: u32, fqn: &str, file: &str) -> NodeWithProvenance {
         NodeWithProvenance {
@@ -2029,5 +2080,20 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    proptest! {
+        /// Same order as std's stable sort by the same key, ties included:
+        /// elements carry their input position, and keys come from a small
+        /// domain so most of them tie.
+        #[test]
+        fn ticking_sort_matches_stable_sort(keys in proptest::collection::vec(0u8..8, 0..400)) {
+            let items: Vec<(u8, usize)> = keys.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+            let mut want = items.clone();
+            want.sort_by_key(|x| x.0);
+            let mut got = items;
+            sort_by_cached_key_ticking(&mut got, |x| x.0);
+            prop_assert_eq!(got, want);
+        }
     }
 }

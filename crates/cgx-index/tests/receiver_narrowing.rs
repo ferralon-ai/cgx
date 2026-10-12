@@ -1088,8 +1088,14 @@ class Unrelated:
 fn suffix_matches_that_lack_the_member_are_out_of_repo() {
     let (_o, off) = index_files(SHADOW_FILES, false);
     let (o, on) = index_files(SHADOW_FILES, true);
-    assert_eq!(callees(&on, "pkg::models::M::check"), set(&["pkg::models::M::m"]));
-    assert_eq!(callees(&on, "pkg::models::G::run"), set(&["pkg::models::G::m"]));
+    assert_eq!(
+        callees(&on, "pkg::models::M::check"),
+        set(&["pkg::models::M::m"])
+    );
+    assert_eq!(
+        callees(&on, "pkg::models::G::run"),
+        set(&["pkg::models::G::m"])
+    );
     for caller in ["pkg::models::M::dump", "pkg::models::M::init"] {
         assert!(!callees(&off, caller).is_empty(), "{caller}");
         assert!(callees(&on, caller).is_empty(), "{caller}");
@@ -1113,7 +1119,10 @@ fn suffix_matches_that_lack_the_member_are_out_of_repo() {
 const SHADOW_KEEP_FILES: &[(&str, &str)] = &[
     ("pkg/__init__.py", ""),
     ("pkg/sub/__init__.py", ""),
-    ("pkg/sub/attrs.py", "def __getattr__(name):\n    return object\n"),
+    (
+        "pkg/sub/attrs.py",
+        "def __getattr__(name):\n    return object\n",
+    ),
     ("pkg/sub/marshmallow.py", "from .impl_missing import *\n"),
     ("pkg/sub/loaders.py", "def load():\n    return 1\n"),
     ("pkg/sub/yaml.py", "from pkg.sub.loaders import Loader\n"),

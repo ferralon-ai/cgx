@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -251,30 +252,58 @@ func TestMemoryLimit(t *testing.T) {
 	}
 }
 
+// TestCancelMidIndex cancels an index in each instance role: an extractor
+// spinning without ever yielding (stopped by the extractor runtime's
+// termination checks) and the session instance spinning in finish after its
+// objects are written, calling cgx_host.yield as the engine does (the session
+// runtime has no termination checks, so the yield is its only way out).
 func TestCancelMidIndex(t *testing.T) {
-	dir := repo(t, basic)
-	h := newHost(t, dir, nil)
-	headIndex(t, h, false)
-	before, _ := os.ReadFile(filepath.Join(dir, ".cgx", "HEAD.json"))
+	for _, tc := range []struct {
+		name     string
+		files    map[string]string
+		bound    time.Duration // deadline → return
+		midWrite bool          // cancelled after finish wrote objects, before the pointer
+	}{
+		// The extractor's checks stop it at its next loop header. The bound
+		// is loose: it covers instantiating and closing a module under -race
+		// on a loaded machine, not the check itself.
+		{"extractor termination checks", map[string]string{"spin.go": "SPIN\n"}, 5 * time.Second, false},
+		// The fake guest yields on every loop pass, so latency is one host
+		// call plus the guest's exit.
+		{"session host yield", map[string]string{"YIELDSPIN.go": "package main\n"}, 5 * time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := repo(t, basic)
+			h := newHost(t, dir, nil)
+			headIndex(t, h, false)
+			before, _ := os.ReadFile(filepath.Join(dir, ".cgx", "HEAD.json"))
+			objects := countFiles(t, filepath.Join(dir, ".cgx", "objects"))
 
-	commit(t, dir, map[string]string{"spin.go": "SPIN\n"})
-	cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, err := h.Index(cctx, transport.IndexRequest{Mode: abi.ModeHead})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want DeadlineExceeded", err)
-	}
-	if time.Since(start) > 10*time.Second {
-		t.Fatal("cancel did not interrupt the guest promptly")
-	}
-	after, _ := os.ReadFile(filepath.Join(dir, ".cgx", "HEAD.json"))
-	if !bytes.Equal(before, after) {
-		t.Fatalf("pointer changed by a cancelled index: %q → %q", before, after)
-	}
-	h2 := newHost(t, dir, nil)
-	if r, err := h2.Open(ctx); err != nil || r.State != abi.StateStale {
-		t.Fatalf("reopen = %+v %v, want stale", r, err)
+			commit(t, dir, tc.files)
+			cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+			defer cancel()
+			_, err := h.Index(cctx, transport.IndexRequest{Mode: abi.ModeHead})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want DeadlineExceeded", err)
+			}
+			deadline, _ := cctx.Deadline()
+			if late := time.Since(deadline); late > tc.bound {
+				t.Fatalf("Index returned %v after its deadline, want ≤ %v", late, tc.bound)
+			} else {
+				t.Logf("returned %v after the deadline", late)
+			}
+			after, _ := os.ReadFile(filepath.Join(dir, ".cgx", "HEAD.json"))
+			if !bytes.Equal(before, after) {
+				t.Fatalf("pointer changed by a cancelled index: %q → %q", before, after)
+			}
+			if wrote := countFiles(t, filepath.Join(dir, ".cgx", "objects")) > objects; wrote != tc.midWrite {
+				t.Fatalf("new objects written = %v, want %v", wrote, tc.midWrite)
+			}
+			h2 := newHost(t, dir, nil)
+			if r, err := h2.Open(ctx); err != nil || r.State != abi.StateStale {
+				t.Fatalf("reopen = %+v %v, want stale", r, err)
+			}
+		})
 	}
 }
 
@@ -313,6 +342,18 @@ func TestMismatches(t *testing.T) {
 	if _, err := h.Open(ctx); !errors.Is(err, transport.ErrABIMismatch) {
 		t.Fatalf("abi: %v", err)
 	}
+	// A module built before the yield import existed (here: an empty one)
+	// would run the session uncancellably; it is refused.
+	noYield := []byte("\x00asm\x01\x00\x00\x00")
+	if h4, err := New(ctx, transport.Config{Repo: dir, SchemaHash: "fakehash"}, Options{Module: noYield}); err == nil {
+		defer h4.Close()
+		_, err = h4.Open(ctx)
+		if !errors.Is(err, transport.ErrABIMismatch) {
+			t.Fatalf("module without the yield import: %v", err)
+		}
+	} else if !errors.Is(err, transport.ErrABIMismatch) {
+		t.Fatalf("module without the yield import: %v", err)
+	}
 	h2, _ := New(ctx, transport.Config{Repo: dir, SchemaHash: "other"}, Options{Module: fakeModule})
 	defer h2.Close()
 	if _, err := h2.Open(ctx); !errors.Is(err, transport.ErrSchemaMismatch) {
@@ -346,19 +387,44 @@ func TestCompilationCacheHit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e1.rt.Close(ctx)
+	defer closeEngine(e1)
 	if e1.cacheHit {
 		t.Fatal("first compile reported a cache hit")
+	}
+	// One cache, one entry per runtime: the termination setting is part of
+	// the compiled module's identity.
+	if n := countCacheEntries(dir); n != 2 {
+		t.Fatalf("cold compile left %d cache entries, want 2 (session + extractor)", n)
 	}
 	e2, err := newEngine(ctx, fakeModule, dir, limitPages(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e2.rt.Close(ctx)
+	defer closeEngine(e2)
 	if !e2.cacheHit {
 		t.Fatal("second compile against the same cache dir missed")
 	}
 	t.Logf("compile cold %v, cached %v", e1.compileDur, e2.compileDur)
+}
+
+func countFiles(t *testing.T, dir string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			n++
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func closeEngine(e *engine) {
+	e.session.rt.Close(ctx)
+	e.extract.rt.Close(ctx)
 }
 
 func TestClassifyNearCeilingIsMemoryLimit(t *testing.T) {

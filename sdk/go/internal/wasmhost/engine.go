@@ -9,6 +9,7 @@ package wasmhost
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -28,15 +29,36 @@ const pageSize = 64 << 10
 // DefaultMemoryLimit is wazero's (and wasm32's) 4 GiB linear-memory ceiling.
 const DefaultMemoryLimit = 4 << 30
 
-// engine is one wazero runtime with the module compiled into it. Engines are
-// shared by every Graph in the process with the same module and config, and
-// live for the life of the process.
+// engine is the module compiled into two wazero runtimes, one per instance
+// role (see newEngine). Engines are shared by every Graph in the process with
+// the same module and config, and live for the life of the process.
 type engine struct {
-	rt         wazero.Runtime
-	compiled   wazero.CompiledModule
+	session    compiledRuntime // the session instance: termination checks off
+	extract    compiledRuntime // extractor instances: termination checks on
 	limitPages uint32
 	compileDur time.Duration
 	cacheHit   bool
+}
+
+// compiledRuntime is one wazero runtime with the module compiled into it.
+type compiledRuntime struct {
+	rt       wazero.Runtime
+	compiled wazero.CompiledModule
+}
+
+// role selects the runtime an instance runs in.
+type role int
+
+const (
+	roleSession role = iota
+	roleExtract
+)
+
+func (e *engine) runtime(r role) compiledRuntime {
+	if r == roleSession {
+		return e.session
+	}
+	return e.extract
 }
 
 type engineKey struct {
@@ -79,8 +101,29 @@ func limitPages(bytes uint64) uint32 {
 	return uint32(p)
 }
 
-// newEngine builds a runtime and compiles module. cacheDir "" keeps the
-// compilation cache in memory only.
+// newEngine compiles module into the session and extractor runtimes. cacheDir
+// "" keeps the compilation cache in memory only.
+//
+// The two runtimes differ only in wazero's termination checks
+// (WithCloseOnContextDone), which make compiled code test for a closed context
+// at every loop header and function entry:
+//
+//   - Extractor instances keep them. Extraction spends most of its time in C
+//     parsers (tree-sitter), code that never returns to Rust and so never
+//     yields: only the checks can stop a pathological parse. Extraction is a
+//     small share of an index, so the checks cost little there.
+//   - The session instance turns them off. Linking and the store write are
+//     loop-heavy Rust, where the checks (each one an exit to Go) multiply
+//     instruction count several-fold. Instead the engine calls the host import
+//     cgx_host.yield at a bounded cadence (yield.go): each call is a Go
+//     safepoint, so the garbage collector can stop the world, and it reports
+//     a done context, on which the guest exits and the call returns the
+//     context's error.
+//
+// Both runtimes share one compilation cache. wazero folds the termination
+// setting into the compiled module's identity, so the cache holds two entries
+// per module and a cold start compiles twice; the two compiles run
+// concurrently.
 func newEngine(ctx context.Context, module []byte, cacheDir string, limit uint32) (*engine, error) {
 	var cache wazero.CompilationCache
 	before := -1
@@ -94,35 +137,73 @@ func newEngine(ctx context.Context, module []byte, cacheDir string, limit uint32
 	} else {
 		cache = wazero.NewCompilationCache()
 	}
-	cfg := wazero.NewRuntimeConfigCompiler().
-		WithCloseOnContextDone(true).
-		WithMemoryLimitPages(limit).
-		WithCompilationCache(cache)
-	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
-	if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
-		rt.Close(ctx)
-		return nil, err
-	}
-	if err := instantiateHost(ctx, rt); err != nil {
-		rt.Close(ctx)
-		return nil, err
-	}
 	start := time.Now()
-	compiled, err := rt.CompileModule(ctx, module)
-	if err != nil {
-		rt.Close(ctx)
-		if isLimitError(err) {
-			return nil, limitError("compile", uint64(limit)*pageSize, err)
+	var (
+		wg         sync.WaitGroup
+		sess, ext  compiledRuntime
+		sErr, eErr error
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); sess, sErr = compileRuntime(ctx, module, cache, limit, false) }()
+	go func() { defer wg.Done(); ext, eErr = compileRuntime(ctx, module, cache, limit, true) }()
+	wg.Wait()
+	if err := errors.Join(sErr, eErr); err != nil {
+		for _, cr := range []compiledRuntime{sess, ext} {
+			if cr.rt != nil {
+				cr.rt.Close(ctx)
+			}
+		}
+		if lim := firstLimitError(sErr, eErr); lim != nil {
+			return nil, limitError("compile", uint64(limit)*pageSize, lim)
 		}
 		return nil, fmt.Errorf("cgx: compiling engine module: %w", err)
 	}
-	e := &engine{rt: rt, compiled: compiled, limitPages: limit, compileDur: time.Since(start)}
-	// wazero exposes no hit/miss signal; a compile that added no entry to a
-	// non-empty on-disk cache was served from it.
+	if !importsYield(sess.compiled) {
+		// A module without the yield import would run the session with no
+		// way to cancel it and no point for the Go runtime to stop the world.
+		sess.rt.Close(ctx)
+		ext.rt.Close(ctx)
+		return nil, fmt.Errorf("%w: module does not import %s.%s", transport.ErrABIMismatch, hostModule, yieldImport)
+	}
+	e := &engine{session: sess, extract: ext, limitPages: limit, compileDur: time.Since(start)}
+	// wazero exposes no hit/miss signal; compiles that added no entry to a
+	// non-empty on-disk cache were served from it.
 	if before > 0 && countCacheEntries(cacheDir) == before {
 		e.cacheHit = true
 	}
 	return e, nil
+}
+
+// compileRuntime builds one runtime (WASI and cgx_host registered) and
+// compiles module into it. On error the returned runtime, if any, is open.
+func compileRuntime(ctx context.Context, module []byte, cache wazero.CompilationCache, limit uint32, terminationChecks bool) (compiledRuntime, error) {
+	cfg := wazero.NewRuntimeConfigCompiler().
+		WithCloseOnContextDone(terminationChecks).
+		WithMemoryLimitPages(limit).
+		WithCompilationCache(cache)
+	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
+	cr := compiledRuntime{rt: rt}
+	if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
+		return cr, err
+	}
+	if err := instantiateHost(ctx, rt); err != nil {
+		return cr, err
+	}
+	compiled, err := rt.CompileModule(ctx, module)
+	if err != nil {
+		return cr, err
+	}
+	cr.compiled = compiled
+	return cr, nil
+}
+
+func firstLimitError(errs ...error) error {
+	for _, err := range errs {
+		if err != nil && isLimitError(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // isLimitError reports wazero's validation failure for a module whose memory

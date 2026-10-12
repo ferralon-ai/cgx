@@ -6,9 +6,13 @@
 //
 //	GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o fake.wasm ./internal/wasmhost/testdata/fakeguest
 //
-// Behaviour knobs ride in file contents, never in host configuration:
-// "PANIC" traps in extract, "GROW:<MiB>" holds that much memory, "SPIN" loops
-// until the host interrupts it, "OOM" reports an allocation failure the way Rust does.
+// Behaviour knobs ride in file contents or paths, never in host configuration:
+// content "PANIC" traps in extract, "GROW:<MiB>" holds that much memory, "SPIN"
+// loops in extract without ever yielding (only the extractor runtime's
+// termination checks can stop it), "OOM" reports an allocation failure the way
+// Rust does; a path containing "YIELDSPIN" makes finish write its objects and
+// then loop, calling cgx_host.yield as the engine does, until the host reports
+// a done context.
 package main
 
 import (
@@ -32,6 +36,13 @@ var (
 )
 
 func main() {}
+
+//go:wasmimport cgx_host yield
+func hostYield() int32
+
+// cancelledExit is the engine's exit status when cgx_host.yield reports a done
+// context.
+const cancelledExit = 125
 
 var pinned = map[uintptr][]byte{}
 
@@ -276,6 +287,13 @@ func cgxIndexFinish(p, n int32) int64 {
 	}
 	if err := writeFile("/.cgx/objects/"+manifest[:2]+"/"+manifest[2:], []byte(graphKey)); err != nil {
 		return fail(abi.KindIndex, err.Error())
+	}
+	for _, path := range paths {
+		if strings.Contains(string(path), "YIELDSPIN") {
+			for hostYield() == 0 {
+			}
+			os.Exit(cancelledExit)
+		}
 	}
 	if err := writeFile("/.cgx/HEAD.json", []byte(graphKey+"\n")); err != nil {
 		return fail(abi.KindIndex, err.Error())

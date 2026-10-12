@@ -52,9 +52,10 @@ func (m *meter) notePeak(v uint64) {
 	}
 }
 
-// newInstance instantiates the module. mountCgx, when non-empty, is mounted
-// read-write at /.cgx; otherwise the instance has no filesystem.
-func newInstance(ctx context.Context, eng *engine, mountCgx string, stderr io.Writer, m *meter) (*instance, error) {
+// newInstance instantiates the module in the runtime for r. mountCgx, when
+// non-empty, is mounted read-write at /.cgx; otherwise the instance has no
+// filesystem.
+func newInstance(ctx context.Context, eng *engine, r role, mountCgx string, stderr io.Writer, m *meter) (*instance, error) {
 	ring := transport.NewRing(stderr)
 	cfg := wazero.NewModuleConfig().
 		WithName("").
@@ -65,7 +66,8 @@ func newInstance(ctx context.Context, eng *engine, mountCgx string, stderr io.Wr
 		cfg = cfg.WithFSConfig(wazero.NewFSConfig().WithDirMount(mountCgx, "/.cgx"))
 	}
 	ictx := experimental.WithMemoryAllocator(context.WithoutCancel(ctx), allocator())
-	mod, err := eng.rt.InstantiateModule(ictx, eng.compiled, cfg)
+	cr := eng.runtime(r)
+	mod, err := cr.rt.InstantiateModule(ictx, cr.compiled, cfg)
 	if err != nil && isLimitError(err) {
 		return nil, limitError("instantiate", uint64(eng.limitPages)*pageSize, err)
 	}

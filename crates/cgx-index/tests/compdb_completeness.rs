@@ -183,6 +183,25 @@ fn complete_compdb_promotes_overload_to_certain() {
     assert_eq!(c.missing_tus, 0);
 }
 
+/// A collapsed candidate group leaves no orphan candidate rows: the production
+/// object store, which refuses a non-canonical graph, accepts the overlaid graph.
+#[test]
+fn collapsed_group_persists_to_the_object_store() {
+    let (_tmp, aux, repo, scip_path) = fixture();
+    let compdb = repo.join("compile_commands.json");
+    write_compdb(&compdb, &repo, &["src/over.cpp", "src/main.cpp"]);
+    let mut store = cgx_store::object_store::ObjectStore::open(aux.path().join("store")).unwrap();
+    let opts = IndexOpts {
+        scip: Some(scip_path),
+        dataflow: false,
+        compdb: Some(compdb),
+        compdb_complete: false,
+        ..IndexOpts::default()
+    };
+    let outcome = index_path(&repo, &cgx_index::default_registry(), &mut store, &opts).unwrap();
+    assert!(outcome.stats.scip.expect("scip stats").upgraded_certain > 0);
+}
+
 #[test]
 fn partial_compdb_caps_overload_at_probable_with_diagnostic() {
     let (_tmp, _aux, repo, scip_path) = fixture();

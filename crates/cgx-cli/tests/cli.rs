@@ -2311,7 +2311,12 @@ fn callers_of_a_method_narrowing_excluded_reports_the_narrowed_sites() {
             .map(|r| r["code"].as_str().unwrap_or_default().to_owned())
             .collect()
     };
-    let query = ["callers", "pkg::widgets::Unrelated::validate", "--format", "json"];
+    let query = [
+        "callers",
+        "pkg::widgets::Unrelated::validate",
+        "--format",
+        "json",
+    ];
 
     let (_t, narrowed) = repo_of();
     let (out, code) = run_cgx(&narrowed, &["index", "--receiver-narrowing"]);
@@ -2319,8 +2324,16 @@ fn callers_of_a_method_narrowing_excluded_reports_the_narrowed_sites() {
     let (out, code) = run_cgx(&narrowed, &query);
     assert_eq!(code, 0, "callers: {out}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");
-    assert_eq!(v["count"], serde_json::json!(0), "narrowing dropped the only caller: {out}");
-    assert_eq!(v["approximation"]["direction"], serde_json::json!("under"), "{out}");
+    assert_eq!(
+        v["count"],
+        serde_json::json!(0),
+        "narrowing dropped the only caller: {out}"
+    );
+    assert_eq!(
+        v["approximation"]["direction"],
+        serde_json::json!("under"),
+        "{out}"
+    );
     assert!(
         codes(&out).iter().any(|c| c == "receiver-narrowed-away"),
         "the narrowed-away site is reported: {out}"
@@ -2330,9 +2343,14 @@ fn callers_of_a_method_narrowing_excluded_reports_the_narrowed_sites() {
     index(&legacy);
     let (out, code) = run_cgx(&legacy, &query);
     assert_eq!(code, 0, "callers: {out}");
-    assert!(out.contains("pkg::base::Base::save"), "legacy keeps the same-name caller: {out}");
     assert!(
-        !codes(&out).iter().any(|c| c.starts_with("receiver-narrowed")),
+        out.contains("pkg::base::Base::save"),
+        "legacy keeps the same-name caller: {out}"
+    );
+    assert!(
+        !codes(&out)
+            .iter()
+            .any(|c| c.starts_with("receiver-narrowed")),
         "no narrowing reason without narrowing: {out}"
     );
 }

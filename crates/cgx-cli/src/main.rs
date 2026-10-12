@@ -24,7 +24,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, TreeOid};
+use cgx_store::{FactStore, ObjectStore, StoreError, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -36,8 +36,9 @@ use cgx_cli::output::{
 };
 use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::shadow_store::ShadowStore;
-use cgx_cli::store_loc::{ensure_cgx_dir, read_pointer, write_pointer, IndexPointer};
+use cgx_cli::store_loc::{
+    cgx_dir, ensure_cgx_dir, read_pointer, remove_retired_files, write_pointer, IndexPointer,
+};
 use cgx_cli::CliError;
 
 /// The full LICENSE text, embedded at build time. At release-build time
@@ -105,13 +106,33 @@ enum Command {
     Index {
         /// Path to the repository (defaults to the current directory).
         path: Option<PathBuf>,
-        /// Path to a `.scip` index (e.g. from `rust-analyzer scip`) to ingest for
-        /// the SCIP semantic-precision re-label pass: name-matched call edges are
-        /// upgraded to `certain`/`probable` where SCIP gives a precise resolution,
-        /// and cross-crate dependency edges are recorded (Phase 2). Omitted ⇒ the
-        /// Phase-1 syntactic graph, unchanged.
+        /// Path to a `.scip` index to ingest for the SCIP semantic-precision
+        /// re-label pass: name-matched call edges are upgraded to
+        /// `certain`/`probable` where SCIP gives a precise resolution, and
+        /// cross-crate dependency edges are recorded (Phase 2). The producer is
+        /// auto-detected from the index metadata: `rust-analyzer scip` for Rust,
+        /// or `scip-clang` for C/C++ (overload/ADL/template resolution, keyed on
+        /// the overload disambiguator). A scip-clang index needs a
+        /// `compile_commands.json`-backed build; its promotions are fail-closed
+        /// (capped at `probable`) until the compdb is verified complete. Omitted
+        /// ⇒ the Phase-1 syntactic graph, unchanged.
         #[arg(long, value_name = "SCIP_INDEX")]
         scip: Option<PathBuf>,
+        /// Path to the `compile_commands.json` backing a scip-clang (C++) index.
+        /// cgx verifies it covers every C++ translation unit (`.cpp/.cc/.cxx`, not
+        /// headers) discovered in the source tree; only a fully-covering compdb
+        /// lets C++ promotions reach `certain`. Any discovered TU missing ⇒
+        /// fail-closed to `probable`, with the missing-TU diagnostic. Ignored for a
+        /// rust-analyzer index.
+        #[arg(long, value_name = "COMPILE_COMMANDS")]
+        compdb: Option<PathBuf>,
+        /// Assert (for CI) that the compdb is complete for every discovered C++ TU,
+        /// skipping the coverage self-check. Use when the build system guarantees a
+        /// full compile_commands.json. Without it, completeness is verified from
+        /// `--compdb`; absent both, a scip-clang index stays fail-closed at
+        /// `probable`.
+        #[arg(long = "compdb-complete")]
+        compdb_complete: bool,
         /// Skip the v0.3 DATA_FLOW layer (SSA value nodes + `derives-from` edges,
         /// intraprocedural, Rust-only). Dataflow is built BY DEFAULT (v0.3 SC6);
         /// pass `--no-dataflow` (or set `[index] data_flow = false` in `cgx.toml`)
@@ -773,7 +794,9 @@ fn main() -> ProcExitCode {
 
 fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Index { path, scip, no_dataflow } => run_index(path, scip, no_dataflow),
+        Command::Index { path, scip, compdb, compdb_complete, no_dataflow } => {
+            run_index(path, scip, compdb, compdb_complete, no_dataflow)
+        }
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
         Command::FlowsTo { symbol, query } => run_flow(&symbol, query, FlowDir::Forward),
@@ -912,6 +935,8 @@ fn run(command: Command) -> Result<(), CliError> {
 fn run_index(
     path: Option<PathBuf>,
     scip: Option<PathBuf>,
+    compdb: Option<PathBuf>,
+    compdb_complete: bool,
     no_dataflow: bool,
 ) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
@@ -920,13 +945,21 @@ fn run_index(
     // disables it. The library `IndexOpts::default()` stays base (dataflow off) —
     // the on-by-default decision lives here at the application boundary.
     let dataflow = resolve_dataflow_default(&repo_root) && !no_dataflow;
-    let outcome = index_repo(&repo_root, &IndexOpts { scip, dataflow })?;
+    let outcome = index_repo(
+        &repo_root,
+        &IndexOpts {
+            scip,
+            dataflow,
+            compdb,
+            compdb_complete,
+        },
+    )?;
 
     let s = &outcome.stats;
     println!("Indexed {} ({})", repo_root.display(), outcome.graph_key);
     println!(
-        "  blobs: {} indexed, {} extracted, {} cached, {} unsupported",
-        s.blobs_indexed, s.blobs_extracted, s.blobs_cached, s.blobs_unsupported
+        "  blobs: {} indexed, {} extracted, {} cached, {} stale, {} unsupported",
+        s.blobs_indexed, s.blobs_extracted, s.blobs_cached, s.blobs_stale, s.blobs_unsupported
     );
     println!(
         "  graph: {} nodes, {} edges, {} unresolved",
@@ -934,9 +967,32 @@ fn run_index(
     );
     if let Some(scip) = &s.scip {
         println!(
-            "  scip: {} certain, {} probable, {} dep edges, {} collisions",
-            scip.upgraded_certain, scip.upgraded_probable, scip.dep_edges, scip.collisions
+            "  scip: {} certain, {} probable, {} dep edges, {} collisions, {} capped (partial compdb)",
+            scip.upgraded_certain,
+            scip.upgraded_probable,
+            scip.dep_edges,
+            scip.collisions,
+            scip.capped_partial_compdb
         );
+    }
+    if let Some(c) = &s.compdb {
+        match c.completeness {
+            cgx_index::CompdbCompleteness::Complete => println!(
+                "  compdb: COMPLETE — {}/{} C++ TUs covered; C++ promotions may reach certain",
+                c.covered_tus, c.discovered_tus
+            ),
+            _ => {
+                println!(
+                    "  compdb: PARTIAL — {}/{} C++ TUs covered, {} missing; C++ capped at probable (fail-closed)",
+                    c.covered_tus, c.discovered_tus, c.missing_tus
+                );
+                if !c.missing_sample.is_empty() {
+                    let more = c.missing_tus.saturating_sub(c.missing_sample.len());
+                    let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                    println!("    missing TUs: {}{}", c.missing_sample.join(", "), suffix);
+                }
+            }
+        }
     }
     if s.cha.sites_rescoped > 0 {
         println!(
@@ -988,11 +1044,12 @@ fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutc
     // Blast-radius fix (sparse-storage RFC P1): GC every superseded Layer-2 graph,
     // keeping only the one we just wrote. No read path needs historical graphs on
     // the normal index path; the `diff` path uses its own session and never lands
-    // here. Bounded (retain exactly 1) and deterministic (delete-by-key, no VACUUM).
+    // here. Bounded (retain exactly 1) and deterministic (delete-by-key).
     let keep = cgx_store::TreeOid::new(outcome.graph_key.clone());
     store
         .prune_graphs_except(&[&keep])
         .map_err(|e| CliError::graph(format!("pruning stale graphs: {e}")))?;
+    remove_retired_files(repo_root)?;
     write_pointer(
         repo_root,
         &IndexPointer {
@@ -1021,13 +1078,7 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         .and_then(|r| r.head_tree_oid())
         .ok();
 
-    // v0.3 SC6: an auto-built index is a STANDARD index — dataflow ON by default,
-    // so a fresh `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`.
-    // The `[index] data_flow = false` cgx.toml key opts back out.
-    let opts = IndexOpts {
-        dataflow: resolve_dataflow_default(repo_root),
-        ..IndexOpts::default()
-    };
+    let opts = auto_index_opts(repo_root);
     match read_pointer(repo_root) {
         Ok(ptr) => match &current_tree {
             // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
@@ -1037,6 +1088,17 @@ fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
         },
         // No index yet: build one.
         Err(_) => index_repo(repo_root, &opts).map(|_| ()),
+    }
+}
+
+/// The options an automatic (query-triggered) index runs with. v0.3 SC6: an
+/// auto-built index is a STANDARD index — dataflow ON by default, so a fresh
+/// `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`. The
+/// `[index] data_flow = false` cgx.toml key opts back out.
+fn auto_index_opts(repo_root: &Path) -> IndexOpts {
+    IndexOpts {
+        dataflow: resolve_dataflow_default(repo_root),
+        ..IndexOpts::default()
     }
 }
 
@@ -1479,7 +1541,7 @@ fn run_impacted_tests(
     // unchanged file re-extracts nothing. `index_repo` is deliberately not used —
     // it prunes the store to a single graph and would delete the other side.
     ensure_cgx_dir(&repo_root)?;
-    let mut store = ShadowStore::open(&repo_root)
+    let mut store = ObjectStore::open(cgx_dir(&repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     // Unbounded by default: a test three hops from the change is still impacted,
@@ -1830,7 +1892,7 @@ fn run_explain(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let pat: SymbolPattern = parse_symbol(symbol);
     let anchor = view
@@ -1913,7 +1975,7 @@ fn run_search(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let kind_filter = kind.map(SymbolKind::from);
     let hits =
@@ -1964,7 +2026,7 @@ fn run_search_selector(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let opts = if agnostic {
         cgx_select::MatchOptions::agnostic()
@@ -2039,7 +2101,7 @@ fn run_symbols(
     if !no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !no_auto_index)?;
 
     let kind_filter = kind.map(SymbolKind::from);
     let ranks = rank_symbols(&view, RankBy::from(rank), kind_filter);
@@ -2318,7 +2380,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    let view = load_view(&repo_root)?;
+    let view = load_view(&repo_root, !args.no_auto_index)?;
     let ptr = read_pointer(&repo_root)?;
     let store = open_store(&repo_root)?;
     let doctor = cgx_doctor::report(&store, &TreeOid::new(ptr.graph_key.clone()))
@@ -2378,7 +2440,7 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
 fn index_ref(
     repo_root: &Path,
     commit_hex: &str,
-    store: &mut ShadowStore,
+    store: &mut ObjectStore,
 ) -> Result<TreeOid, CliError> {
     let tmp = tempfile::Builder::new()
         .prefix("cgx-diff-")
@@ -2509,7 +2571,7 @@ fn run_diff(args: DiffArgs) -> Result<(), CliError> {
 
     // Open (or create) the shared on-disk store for this diff session.
     ensure_cgx_dir(&repo_root)?;
-    let mut store = ShadowStore::open(&repo_root)
+    let mut store = ObjectStore::open(cgx_dir(&repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(&repo_root)
@@ -2615,7 +2677,7 @@ fn run_coupling(args: CouplingArgs) -> Result<(), CliError> {
 /// usage error (exit 2), never an unanchored walk (the dense-graph blowup risk).
 fn run_path_added(
     args: &DiffArgs,
-    store: &ShadowStore,
+    store: &ObjectStore,
     base_tree: &TreeOid,
     head_tree: &TreeOid,
     blame: &BlameRepo,
@@ -2973,8 +3035,8 @@ fn resolve_repo(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .map_err(|e| CliError::usage(format!("path {raw:?} is not accessible: {e}")))
 }
 
-fn open_store(repo_root: &Path) -> Result<ShadowStore, CliError> {
-    ShadowStore::open(repo_root)
+fn open_store(repo_root: &Path) -> Result<ObjectStore, CliError> {
+    ObjectStore::open(cgx_dir(repo_root))
         .map_err(|e| CliError::graph(format!("opening store at {repo_root:?}: {e}")))
 }
 
@@ -2994,7 +3056,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
     if !args.no_auto_index {
         ensure_indexed(&repo_root)?;
     }
-    load_view(&repo_root)
+    load_view(&repo_root, !args.no_auto_index)
 }
 
 /// Load the [`GraphView`] for a single git ref (the `--at <ref>` path). Reuses the
@@ -3003,7 +3065,7 @@ fn prepare_view(args: &QueryArgs) -> Result<GraphView, CliError> {
 /// the store by id (no pointer involved).
 fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
     ensure_cgx_dir(repo_root)?;
-    let mut store = ShadowStore::open(repo_root)
+    let mut store = ObjectStore::open(cgx_dir(repo_root))
         .map_err(|e| CliError::graph(format!("opening store: {e}")))?;
 
     let blame = BlameRepo::discover(repo_root)
@@ -3019,13 +3081,20 @@ fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 
-/// Load the current Layer-2 graph into a queryable [`GraphView`].
-fn load_view(repo_root: &Path) -> Result<GraphView, CliError> {
+/// Load the current Layer-2 graph into a queryable [`GraphView`]. With
+/// `rebuild_if_corrupt`, a graph whose objects fail verification is treated as not
+/// indexed: it is re-indexed once and read again.
+fn load_view(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<GraphView, CliError> {
     let ptr = read_pointer(repo_root)?;
     let store = open_store(repo_root)?;
-    let graph = store
-        .read_graph(&TreeOid::new(ptr.graph_key.clone()))
-        .map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?;
+    let graph = match store.read_graph(&TreeOid::new(ptr.graph_key.clone())) {
+        Err(StoreError::Corrupt { .. }) if rebuild_if_corrupt => {
+            drop(store);
+            index_repo(repo_root, &auto_index_opts(repo_root))?;
+            return load_view(repo_root, false);
+        }
+        r => r.map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?,
+    };
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 

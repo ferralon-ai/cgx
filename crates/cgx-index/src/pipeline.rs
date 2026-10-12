@@ -5,8 +5,10 @@
 //!
 //! 1. **Enumerate** source files from a git tree or a working directory
 //!    ([`crate::git`]).
-//! 2. **Extract, blob-OID-cached.** For each file, consult the store's Layer-1
-//!    fragment cache keyed by blob OID. A *hit* (the blob was indexed before, on
+//! 2. **Extract, fragment-cached.** For each file, consult the store's Layer-1
+//!    fragment cache keyed by [`FragmentKey`]: the blob OID plus the path context
+//!    the frontend's output depends on (the whole [`FileCtx`]). A *hit* (the same
+//!    blob at the same path and package/manifest context was indexed before, on
 //!    any branch or worktree) reuses the cached [`FileFacts`] with **no
 //!    re-extraction** — the branch-aware incremental win (IX-1). A *miss* runs
 //!    the registry frontend, encodes the canonical fragment, and batches it for a
@@ -19,6 +21,7 @@
 //! extracted; files no adapter handles are skipped and counted, never
 //! mis-parsed.
 
+pub(crate) mod compdb;
 pub mod scip_relabel;
 
 use std::path::{Path, PathBuf};
@@ -34,8 +37,9 @@ use cgx_resolve::{
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
-use cgx_store::{BlobOid, FactStore, FragmentInput, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, FragmentInput, FragmentKey, LinkedGraph, TreeOid};
 
+pub use compdb::CompdbReport;
 pub use scip_relabel::ScipStats;
 
 /// Optional ingestion sources layered onto a base index run. `Default` (all
@@ -50,6 +54,15 @@ pub struct IndexOpts {
     /// value nodes, zero dataflow edges, unchanged latency). Set by
     /// `cgx index --dataflow`.
     pub dataflow: bool,
+    /// Path to a `compile_commands.json` backing a scip-clang (C++) index. When
+    /// set, the pipeline verifies it covers every C++ TU cgx discovers and passes
+    /// `Complete`/`Partial` to the fail-closed relabel gate (Phase F2). `None` ⇒
+    /// fail-closed `Partial` for a scip-clang index. Ignored for non-scip-clang
+    /// indices. Set by `cgx index --compdb`.
+    pub compdb: Option<PathBuf>,
+    /// CI assertion that the backing compdb is complete (`--compdb-complete`).
+    /// Overrides the coverage self-check to `Complete` for a scip-clang index.
+    pub compdb_complete: bool,
 }
 
 /// Counters describing what an index run did. The incremental win is observable
@@ -63,6 +76,10 @@ pub struct IndexStats {
     pub blobs_extracted: usize,
     /// Files whose facts came from the Layer-1 cache (no extraction).
     pub blobs_cached: usize,
+    /// Files whose cached fragment was written by a different frontend
+    /// version than the current one, so it was discarded and re-extracted. A
+    /// subset of `blobs_extracted`.
+    pub blobs_stale: usize,
     /// Files skipped because no registered adapter claims them.
     pub blobs_unsupported: usize,
     /// Nodes in the linked graph.
@@ -73,6 +90,10 @@ pub struct IndexStats {
     pub unresolved: usize,
     /// SCIP re-label counters, present only when an index was run with `--scip`.
     pub scip: Option<ScipStats>,
+    /// C++ compdb-completeness verdict + evidence, present only when a scip-clang
+    /// index was run (`--scip` with a scip-clang producer). Drives the fail-closed
+    /// gate and explains why C++ promotions did or did not reach `certain`.
+    pub compdb: Option<CompdbReport>,
     /// CHA trait-scoping counters. CHA is pure graph analysis and always runs
     /// (with or without `--scip`), so these are always present.
     pub cha: ChaStats,
@@ -134,16 +155,25 @@ pub(crate) fn extract_and_link<S: FactStore>(
     // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
     let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<&SourceFile> = Vec::new();
+    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
     for src in sources {
         let rel = RelPath::new(src.rel_path.clone());
         if !registry.has_adapter_for(&rel) {
             stats.blobs_unsupported += 1;
             continue;
         }
-        let blob = BlobOid::new(src.blob_oid.clone());
-        match store.fragment(&blob)? {
-            Some(cached) => {
+        // The key is derived from the exact context `extract` will see, so an
+        // identical blob at another path (or under another package/manifest)
+        // never reuses this file's path-derived FQNs.
+        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+        let manifest = manifest_map.manifest_for(&src.rel_path);
+        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+            .with_package(package)
+            .with_manifest(manifest);
+        let key = FragmentKey::derive(&ctx.cache_identity());
+        let want = registry.frontend_for(&rel).fragment_version();
+        match store.fragment(&key)? {
+            Some(cached) if cached.frontend_version == want => {
                 let facts: FileFacts = decode(&cached.fragment)?;
                 stats.blobs_cached += 1;
                 prepared.push(PreparedFile {
@@ -153,22 +183,25 @@ pub(crate) fn extract_and_link<S: FactStore>(
                     facts,
                 });
             }
-            None => misses.push(src),
+            // A fragment from another frontend version may not even decode under
+            // the current `FileFacts` schema, so it is never read: re-extract it
+            // and let the store overwrite it.
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push((src, ctx, key));
+            }
+            None => misses.push((src, ctx, key)),
         }
     }
 
     // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the blob-OID independence that makes Layer-1 cacheable
-    // (IX-1) is exactly what makes it embarrassingly parallel (IX-2 step 3).
-    let extracted: Vec<(PreparedFile, u32, Vec<u8>)> = misses
-        .par_iter()
-        .map(|src| {
+    // store/git access — the (content, context) purity that makes Layer-1
+    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
+    // step 3).
+    let extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = misses
+        .into_par_iter()
+        .map(|(src, ctx, key)| {
             let rel = RelPath::new(src.rel_path.clone());
-            let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
-            let manifest = manifest_map.manifest_for(&src.rel_path);
-            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
-                .with_package(package)
-                .with_manifest(manifest);
             let facts = registry.extract(&src.content, &ctx)?;
             let bytes = encode(&facts)?;
             let version = registry.frontend_for(&rel).fragment_version();
@@ -179,6 +212,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
                     lang: registry.lang_for(&rel).tag().to_string(),
                     facts,
                 },
+                key,
                 version,
                 bytes,
             ))
@@ -188,15 +222,10 @@ pub(crate) fn extract_and_link<S: FactStore>(
 
     // Batch-write the freshly extracted fragments in one transaction.
     if !extracted.is_empty() {
-        let blob_oids: Vec<BlobOid> = extracted
-            .iter()
-            .map(|(p, ..)| BlobOid::new(p.blob_oid.clone()))
-            .collect();
         let batch: Vec<FragmentInput<'_>> = extracted
             .iter()
-            .zip(&blob_oids)
-            .map(|((p, version, bytes), blob)| FragmentInput {
-                blob,
+            .map(|(p, key, version, bytes)| FragmentInput {
+                key,
                 lang: &p.lang,
                 frontend_version: *version,
                 bytes,
@@ -273,6 +302,8 @@ pub(crate) fn extract_and_link<S: FactStore>(
 pub(crate) fn apply_scip(
     graph: &mut ResolvedGraph,
     stats: &mut IndexStats,
+    sources: &[SourceFile],
+    source_root: &Path,
     opts: &IndexOpts,
 ) -> Result<()> {
     let Some(scip_path) = opts.scip.as_ref() else {
@@ -281,7 +312,31 @@ pub(crate) fn apply_scip(
     let bytes = read_scip(scip_path)?;
     let resolver = ScipResolver::from_bytes(&bytes)
         .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
-    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    // FAIL-CLOSED compdb policy (ADR B2 Decision 3 / Phase F2): rust-analyzer
+    // indices have no compile_commands.json, so the gate does not apply. A
+    // scip-clang index's completeness is verified against the discovered C++ TU
+    // set (Eric's 2026-10-06 policy) — `Complete` only when every discovered TU
+    // is covered (or `--compdb-complete` asserts it); otherwise `Partial` caps
+    // promotion at `probable`.
+    let compdb = match resolver.scheme() {
+        cgx_scip::SymbolScheme::RustAnalyzer => scip_relabel::CompdbCompleteness::NotApplicable,
+        cgx_scip::SymbolScheme::ScipClang => {
+            let report = compdb::completeness(
+                sources,
+                source_root,
+                opts.compdb.as_deref(),
+                opts.compdb_complete,
+            );
+            let completeness = report.completeness;
+            stats.compdb = Some(report);
+            completeness
+        }
+    };
+    let relabel_opts = scip_relabel::ScipRelabelOpts {
+        local_packages: Vec::new(),
+        compdb,
+    };
+    let scip_stats = scip_relabel::relabel(graph, &resolver, &relabel_opts);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
     stats.scip = Some(scip_stats);

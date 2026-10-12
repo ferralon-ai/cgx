@@ -1,5 +1,5 @@
 //! The per-tree **manifest**: the content-addressed root object that names every
-//! shard (and the candidates blob) of one linked graph, in canonical order.
+//! shard of one linked graph, in canonical order.
 //!
 //! The manifest is encoded with `cgx_core::codec::encode` exactly like every other
 //! unit, so it is itself content-addressed and byte-stable: two puts of the same
@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 /// any change to the on-disk shape of `Manifest`/`Shard`/`Node`/`Edge`/candidates.
 /// Unlike `created_rev` (git provenance), this is the compatibility gate: a reader
 /// rejects a manifest whose `store_format` exceeds this value rather than
-/// mis-decoding non-self-describing postcard bytes (recon §4 / D-3).
+/// mis-decoding non-self-describing postcard bytes (recon §4 / D-3), and treats an
+/// older one as corrupt so the index is rebuilt.
 ///
-/// 2: `NodeRecord` gains `external_calls` and `narrowing`. Format-1 shards are
-/// not readable by this binary; rebuild the index.
+/// 2: shards carry no dense ids (node ids by position, edge `src` shard-local, edge
+/// `dst` and candidate `dst` as stable keys, candidate groups shard-local) and hold
+/// their own candidate rows; the manifest has no candidates object. `NodeRecord`
+/// carries `external_calls` and `narrowing`.
 pub const CURRENT_STORE_FORMAT: u32 = 2;
 
 /// One shard entry: the owning-function key and the OID of the object holding that
@@ -46,19 +49,21 @@ pub struct Manifest {
     pub created_rev: Option<String>,
     /// Shard objects, one per owning-function key, sorted by `fn_key`.
     pub shards: Vec<ShardEntry>,
-    /// OID of the per-tree candidates object, or `None` when the graph has no
-    /// candidates.
-    pub candidates: Option<ObjectOid>,
+}
+
+/// The leading field of every manifest, decodable on its own whatever the rest of
+/// the schema: postcard encodes struct fields in order and `decode` ignores
+/// trailing bytes, so a reader can learn a manifest's format before trusting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestHeader {
+    /// See [`Manifest::store_format`].
+    pub store_format: u32,
 }
 
 impl Manifest {
-    /// Every object OID this manifest transitively references (its shards and the
-    /// candidates blob) — the manifest's own OID excluded. Used by GC to compute
-    /// the live set.
+    /// Every object OID this manifest transitively references (its shards) — the
+    /// manifest's own OID excluded. Used by GC to compute the live set.
     pub fn referenced_oids(&self) -> impl Iterator<Item = &ObjectOid> {
-        self.shards
-            .iter()
-            .map(|s| &s.oid)
-            .chain(self.candidates.iter())
+        self.shards.iter().map(|s| &s.oid)
     }
 }

@@ -42,6 +42,25 @@ The notes at `docs/releases/<version>.md` must already be on `main`. Everything
 else is identical to a forward release; the tag is created annotated, dated to
 `publication_date`.
 
+## Floating minor alias (`vX.Y`)
+
+After a release publishes, the workflow force-moves a **lightweight** tag `vX.Y`
+onto the same leaf commit `vX.Y.Z` names, so `vX.Y` always resolves to the newest
+patch on that minor line (the `actions/checkout@v4` model). The move is
+**monotonic**: the alias advances only when the version being released is the
+highest patch on its minor (read from the remote), so a hotfix cut from an older
+base never drags the alias backward.
+
+The alias is a plain tag ref pointed at an already-published commit — it pushes
+no new commit and is moved with `GITHUB_TOKEN`, so it neither trips the
+workflow-file push protection nor re-triggers the workflow. The push trigger
+matches only three-field tags (`vX.Y.Z`), so a two-field alias can never itself
+enter the workflow.
+
+(cgx ships as a binary, not a `uses:`-consumed GitHub Action, so the alias is a
+convenience pointer to the latest patch rather than a resolution target — but the
+mechanic mirrors `ferralon-assay` so the two release processes read alike.)
+
 ## Change Date basis
 
 The BUSL-1.1 Change Date is keyed to **publication**, not code authorship: it is

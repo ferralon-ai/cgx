@@ -12,9 +12,9 @@
 //!
 //! ```no_run
 //! use cgx_doctor::{report, render_text};
-//! use cgx_store::{SqliteStore, TreeOid};
+//! use cgx_store::{ObjectStore, TreeOid};
 //!
-//! let store = SqliteStore::open("index.db").unwrap();
+//! let store = ObjectStore::open(".cgx").unwrap();
 //! let tree = TreeOid::new("<tree-oid>");
 //! let rep = report(&store, &tree).unwrap();
 //! println!("{}", render_text(&rep));

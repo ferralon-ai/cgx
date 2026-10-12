@@ -71,7 +71,7 @@ impl FallbackFrontend {
 
 /// The fragment version of the Tier-0 extraction rules. Bump when the heuristics
 /// below change in a way that alters emitted facts.
-const FALLBACK_FRAGMENT_VERSION: u32 = 1;
+const FALLBACK_FRAGMENT_VERSION: u32 = 2;
 
 impl LanguageFrontend for FallbackFrontend {
     fn lang(&self) -> Lang {

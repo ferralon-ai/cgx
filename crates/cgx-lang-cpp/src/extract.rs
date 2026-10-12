@@ -66,7 +66,8 @@ impl CppFrontend {
 }
 
 /// Version of the C++ extraction rules; bumping invalidates cached fragments.
-const CPP_FRAGMENT_VERSION: u32 = 1;
+/// v2: `FileFacts` gained `module` and `type_facts`; v1 fragments no longer decode.
+const CPP_FRAGMENT_VERSION: u32 = 2;
 
 impl LanguageFrontend for CppFrontend {
     fn lang(&self) -> Lang {

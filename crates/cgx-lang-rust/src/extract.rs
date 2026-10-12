@@ -49,7 +49,8 @@ impl RustFrontend {
 /// v4: the resolved `Cargo.toml` package name now wins over the dir-before-`src/`
 /// name unconditionally (canonical crate root for all layouts), so v3 fragments
 /// may carry stale roots.
-const RUST_FRAGMENT_VERSION: u32 = 4;
+/// v5: `FileFacts` gained `module` and `type_facts`; v4 fragments no longer decode.
+const RUST_FRAGMENT_VERSION: u32 = 5;
 
 impl LanguageFrontend for RustFrontend {
     fn lang(&self) -> Lang {

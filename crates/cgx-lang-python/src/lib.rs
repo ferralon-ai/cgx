@@ -20,6 +20,7 @@
 mod effects;
 mod extract;
 mod module;
+mod typefacts;
 
 pub use extract::PythonFrontend;
 pub use module::{module_path_for, module_path_for_root};

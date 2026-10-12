@@ -71,7 +71,7 @@ impl JavaFrontend {
 }
 
 /// Version of the Java extraction rules; bumping invalidates cached fragments.
-const JAVA_FRAGMENT_VERSION: u32 = 1;
+const JAVA_FRAGMENT_VERSION: u32 = 2;
 
 impl LanguageFrontend for JavaFrontend {
     fn lang(&self) -> Lang {

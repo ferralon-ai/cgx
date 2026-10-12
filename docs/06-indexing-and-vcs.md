@@ -61,17 +61,16 @@ freshness: unknown | indexed tree unknown (HEAD unknown), working tree not inspe
 HEAD's tree, *and* the working tree was inspected and found undivergent. Anything left
 uninspected reads `unknown`, never `current`. An envelope never claims currency it did not check.
 
-### `matches_head` is three-valued, and `null` is the ordinary case over MCP
+### `matches_head` is three-valued
 
-`true` / `false` / `null`. Over MCP the default is `include_dirty: true`, and under that default
-**any indexed repository returns `null`** with a verdict of `unknown` — because the working-tree
-enumeration and the dirty-file count apply different ignore rules and disagree. A freshly
-indexed, clean repository reports `"matches_head": null`, `"dirty": true`,
-`"dirty_files_analyzed": 3` over MCP while the CLI reports `matches_head: true` and a `current`
-verdict for the same tree.
+`true` / `false` / `null`. Over MCP the default is `include_dirty: true`. A freshly indexed,
+clean repository reports `"matches_head": true`, `"dirty": false`, `"dirty_files_analyzed": 0`
+over MCP, as the CLI does. Under that default a repository with a gitignored or untracked source
+file on disk returns `null` with a verdict of `unknown`: the working-tree enumeration (no ignore
+rules beyond skipping `.git` and the root `.cgx/`) sees the file while the dirty-file count
+(ignore rules applied) does not, and the two disagree.
 
-**A client that treats `matches_head` as a boolean is wrong in the common case, not the edge
-case.** Read the verdict, or read `stale`; treat `null` as "not established," never as "false."
+**A client that treats `matches_head` as a boolean is wrong.** Read the verdict, or read `stale`; treat `null` as "not established," never as "false."
 
 ### `--at` changes what `dirty_files` counts
 

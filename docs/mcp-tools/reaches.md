@@ -28,7 +28,7 @@ confidence floor (`crates/cgx-mcp/src/tools.rs:767`).
 |-----------|------|----------|---------|---------|
 | `from` | string | yes | — | Source symbol (FQN or unambiguous short name). |
 | `to` | string | no | — | Target symbol. Omit — or pass `""` — for the `from → *` reachable set. |
-| `root` | string | yes | — | Repository root path. A `.cgx/` store is not required; the server indexes per call into an in-memory store. |
+| `root` | string | yes | — | Repository root path. A `.cgx/` store is not required in advance; the server builds and maintains it as the CLI does. |
 | `depth` | integer | no | `2` in the `from → *` form; **unbounded** in the `from → to` form | Maximum traversal depth. The registry advertises `2` for both; the handler applies it to one. See the note below. |
 | `confidence` | string | no | — | Minimum confidence floor. One of `certain`, `probable`, `possible`. Omitted = every edge. |
 | `max_results` | integer | no | `20` | Page size, `from → *` form only. Clamped to `[1, 200]` (`MAX_MAX_RESULTS`, `crates/cgx-mcp/src/tools.rs:28`); `0` clamps up to 1. |
@@ -297,23 +297,25 @@ condition-filtered reachability question, use [paths](paths.md)
 (`only_edge_condition` / `exclude_edge_condition`) or
 [graph_query](graph_query.md).
 
-### `matches_head` is three-valued, and `null` is the common case
+### `matches_head` is three-valued
 
 `freshness.matches_head` is `true`, `false`, or `null` — never treat it as a
-boolean. The example above shows `null` on a `git status`-clean fixture, which is
-the ordinary case, not an edge case: once `cgx index` has written `.cgx/`, the
-overlay enumeration (no ignore rules) sees those files while git's dirty count
-(ignore rules applied) does not, and the two views disagree about whether the
-graph is `HEAD`'s tree (`crates/cgx-mcp/src/session.rs:196`). Asserting either
-answer would be a claim nobody established, so the envelope declines.
+boolean. `null` arises when an ignored or untracked source file is on disk: the
+overlay enumeration (no ignore rules beyond skipping `.git` and the root `.cgx/`)
+sees it while git's dirty count (ignore rules applied) does not, and the two
+views disagree about whether the graph is `HEAD`'s tree
+(`crates/cgx-mcp/src/session.rs:195-200`). Asserting either answer would be a
+claim nobody established, so the envelope declines.
 
-Three live states from the same fixture, same query:
+The example above was captured with an earlier server whose overlay also enumerated the `.cgx/` store that `cgx index` writes, which is why a `git status`-clean fixture shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/` and serves the stored committed graph for a working tree content-identical to `HEAD`, so the same clean, indexed tree now reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`.
+
+Three live states from the same indexed, `git status`-clean two-fixture tree, same query:
 
 | Call | `indexed_tree` | `matches_head` | `dirty_files` |
 |------|----------------|----------------|---------------|
-| default `include_dirty: true`, tree contains `.cgx/` | `workdir:615bbb5…` | `null` | `0` |
-| default `include_dirty: true`, tree never indexed on disk | `03575d1…` | `true` | `0` |
-| `include_dirty: false` | `03575d1…` | `true` | `null` |
+| default `include_dirty: true` | `e2d14d3…` | `true` | `0` |
+| default `include_dirty: true`, a gitignored `.rs` file added under `src/` | `workdir:5484696…` | `null` | `0` |
+| `include_dirty: false` | `e2d14d3…` | `true` | `null` |
 
 `dirty_files: 0` (the working tree was inspected and found clean) and
 `dirty_files: null` (never inspected) are deliberately distinguishable.

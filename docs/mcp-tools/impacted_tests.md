@@ -10,9 +10,10 @@ entrypoint that reaches it. Use it to answer: *given this change, which tests
 could possibly exercise it?*
 
 Unlike every other tool here it compares **two** graphs, so it takes git refs
-rather than a symbol. It indexes both sides itself and does not read a `.cgx/`
-store, so the repository does not need a pre-built index — and, per ADR-06,
-nothing it indexes is ever persisted.
+rather than a symbol. It first brings the repository's `.cgx/` store current
+(building it if missing, as every tool does), then indexes both sides through an
+in-memory overlay over it, so the repository does not need a pre-built index —
+and, per ADR-06, nothing the overlay indexes is ever persisted.
 
 Results are paginated. The default page size is 20; the hard cap is 200.
 
@@ -24,7 +25,7 @@ not *no tests affected*. See [Degenerate answers](#degenerate-answers).
 
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
-| `root` | string | yes | — | Absolute path to the repository root. A `.cgx/` store is not required. |
+| `root` | string | yes | — | Absolute path to the repository root. A `.cgx/` store is not required in advance; the server builds and maintains it as the CLI does. |
 | `base` | string | no | — | Base git ref. Omit to compare the working tree against `HEAD`. |
 | `head` | string | no | `HEAD` | Head git ref. Used only when `base` is given and `include_dirty` is `false`. |
 | `merge_base` | boolean | no | `true` | Compare against `merge-base(base, head)` rather than the base ref's tip. Setting it `false` fires the `impacted-tip-to-tip-base` over-reason. |
@@ -364,10 +365,12 @@ response also carries `impacted-unresolved-external-calls` and
 
 ## Notes
 
-- **Cold cache per call.** The tool opens an in-memory store to preserve the
-  ADR-06 never-persist invariant, so the Layer-1 blob cache is cold on every
-  call and both sides are re-indexed. Expect a call to cost more than a
-  single-graph tool on the same repository.
+- **Re-link per call.** Both sides are indexed through an in-memory overlay over
+  `.cgx/`, which preserves the ADR-06 never-persist invariant while reusing the
+  Layer-1 blob cache: unchanged files are cache hits, so only files that differ
+  from the stored index are re-extracted. Both sides are still re-linked on
+  every call, because linking is whole-program. Expect a call to cost more than
+  a single-graph tool on the same repository.
 - **Edge-condition rendering:** the response returns the raw string token
   (`"always"`, `"conditional"`, …) for every edge, as every MCP tool does.
 - **Pagination:** `results` and the witness data behind it are index-parallel, so

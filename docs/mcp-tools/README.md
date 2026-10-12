@@ -61,20 +61,21 @@ Attached by `with_session_meta` (`crates/cgx-mcp/src/tools.rs:575`) to every gra
 
 The envelope carries **no timestamp**, deliberately (`freshness.rs:10-26`): age is the wrong primitive — an index built ten seconds ago against a rewritten tree is stale — and a `now()`-derived field would break the byte-identical repeat answers cgx guarantees. A caller who wants age can resolve the emitted tree OID locally.
 
-#### `matches_head` is three-valued, and `null` is the default over MCP
+#### `matches_head` is three-valued
 
-There are three routes to `null`: `head_tree` is unknown, `indexed_tree` is unknown, or — the interesting one — both trees are known but the surface holds two views of the working tree that disagree about whether the graph it answered over *is* `HEAD`'s tree (`crates/cgx-mcp/src/session.rs:196-202`).
+There are three routes to `null`: `head_tree` is unknown, `indexed_tree` is unknown, or — the interesting one — both trees are known but the surface holds two views of the working tree that disagree about whether the graph it answered over *is* `HEAD`'s tree (`crates/cgx-mcp/src/session.rs:185-211`).
 
-That third route is not an edge case. `cgx index` writes `.cgx/HEAD.json`, the object store under `.cgx/` and `.cgx/.gitignore`. The overlay comes from `Repo::enumerate_workdir`, which applies **no** ignore rules and therefore sees all of them; `dirty_files` comes from `Repo::dirty_file_count`, which applies git's ignore rules and sees none of them. A non-empty overlay beside `dirty_files: 0` means an indexed file is in the graph and not in `HEAD`'s tree: `true` would be a false clean bill, `false` would assert a divergence git denies, so the envelope declines. **Any repo that has been indexed and is then queried over MCP with the default `include_dirty: true` reports `matches_head: null`** — the shape every example in this tree shows. The code calls this a bridge, not a permanent shrug; it resolves to `true` once `enumerate_workdir` becomes ignore-aware.
+The overlay comes from `Repo::enumerate_workdir`, which applies **no** ignore rules (it skips only `.git` and cgx's own root-level `.cgx/` store); `dirty_files` comes from `Repo::dirty_file_count`, which applies git's ignore rules. A gitignored or untracked source file — a generated file, something under a build directory — is therefore in the overlay and invisible to `dirty_files`. A non-empty overlay beside `dirty_files: 0` means such a file is in the graph and not in `HEAD`'s tree: `true` would be a false clean bill, `false` would assert a divergence git denies, so the envelope declines. The code calls this a bridge, not a permanent shrug; it resolves to `true` once `enumerate_workdir` becomes ignore-aware.
 
-Two contexts produce different envelopes for the same clean repository, and a documented example has to say which it came from:
+An indexed, git-clean repository with nothing ignored or untracked on disk does **not** take that route: its overlay is empty, so the server serves the committed graph and reports `matches_head: true`. Three contexts, three envelopes:
 
 | context | `indexed_tree` | `matches_head` | `dirty_files` | `graph_version` |
 |---|---|---|---|---|
-| `include_dirty: true`, repo contains `.cgx/` (the common case) | `workdir:…` | `null` | `0` | `<oid>+dirty.<digest>` |
+| `include_dirty: true`, working tree content-identical to `HEAD` | tree OID | `true` | `0` | `<oid>` |
+| `include_dirty: true`, ignored or untracked source on disk, git-clean | `workdir:…` | `null` | `0` | `<oid>+dirty.<digest>` |
 | `include_dirty: false` | tree OID | `true` | `null` | `<oid>` |
 
-Do not read `matches_head` as a boolean. A client that treats `null` as falsey reports every indexed repository as diverged from `HEAD`.
+Do not read `matches_head` as a boolean. A client that treats `null` as falsey reports every repository with a stray ignored source file as diverged from `HEAD`.
 
 ### `approximation` — which direction the answer can be wrong in
 
@@ -169,14 +170,14 @@ Missing required arguments, unknown enum tokens, an unparseable `cursor`, and a 
 
 Every tool takes `root` (required — the only path input) and `include_dirty`. Every paginated tool takes `max_results` and `cursor`.
 
-- `root` must be inside a **git repository**, and that is the only requirement. **No `.cgx/` store is needed and none is created**: `session::acquire` (`crates/cgx-mcp/src/session.rs`) opens an in-memory SQLite store and indexes per call — the committed tree under `include_dirty: false`, the working directory otherwise. A repository `cgx index` has never touched answers normally; a repository it *has* touched is not read from disk either, though the `.cgx/` directory it left behind is what makes `matches_head` `null` (above). Pointing `root` at a directory that is not in a git repository is an index error, `-32603`, not `-32602`:
+- `root` must be inside a **git repository**, and that is the only requirement. A `.cgx/` store is **not** needed in advance: `session::acquire` (`crates/cgx-mcp/src/session.rs`) runs the CLI's own auto-index trigger, `cgx_index::local::ensure_indexed`, which builds `.cgx/` when it is missing and rebuilds it when `HEAD` has moved. The first call on a repository writes `.cgx/`; a warm repeat call does no extract and no link. Under `include_dirty: false` the stored committed graph is served; the working-tree path is described under `include_dirty` below. Pointing `root` at a directory that is not in a git repository is an index error, `-32603`, not `-32602`, and creates nothing:
 
   ```
   git error: Could not find a git repository in '/tmp/…' or in any of its parents
   ```
 
-  Per-call indexing is why the tools need no warm-up step and why an answer always reflects the tree as it is now — and also why the first call on a large repository pays the indexing cost.
-- `include_dirty` defaults to `true` on every tool: uncommitted working-tree changes are analyzed via a per-call content-addressed overlay that is never persisted. Absent or `null` means `true`; any non-boolean is `invalid_params`.
+  The same auto-index is why the tools need no warm-up step and why an answer always reflects the tree as it is now — and also why the first call on a large repository, or the first after `HEAD` moves, pays the indexing cost.
+- `include_dirty` defaults to `true` on every tool. When the working tree is content-identical to `HEAD`, the stored committed graph is served. Otherwise the working tree is indexed through an in-memory `OverlayStore` over `.cgx/`: unchanged files are Layer-1 cache hits, edited files are re-extracted, and the whole program is re-linked (linking is whole-program). Nothing from the overlay is ever persisted. Absent or `null` means `true`; any non-boolean is `invalid_params`.
 - `max_results` is clamped to `[1, 200]` (`MAX_MAX_RESULTS`, `tools.rs:28`). `0` clamps **up** to 1 and `5000` clamps **down** to 200; neither is an error. The default is 20 everywhere except `paths`, whose default is 10.
 - `cursor` is an opaque 0-based decimal offset string. `"0"` is a valid explicit first-page request. An unparseable value is `invalid_params`; `cursor` is `null` whenever `has_more` is `false`.
 - Symbol resolution tries the FQN first, then the short name (`tools.rs:491`), so both `rust_sample::conditions::dispatch` and `dispatch` resolve. The `symbol` key echoed in the response is the string **as received**, not the resolved FQN.
@@ -195,7 +196,7 @@ cd "$FX" && git init -q . && git add -A && git commit -qm init
 cgx index .
 ```
 
-Both fixtures are required: the cross-language `ts_sample` → `rust_sample` edges that appear in the `callers` and `explain` examples exist only when TypeScript and Rust are indexed together. Because the tree is indexed before any tool call, the examples show the common `matches_head: null` shape described above; `graph_version` and the tree OIDs differ per fixture and will not match yours literally.
+Both fixtures are required: the cross-language `ts_sample` → `rust_sample` edges that appear in the `callers` and `explain` examples exist only when TypeScript and Rust are indexed together. On this clean, indexed tree the current server reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version` (the `cgx index .` step is optional; the first tool call would build `.cgx/` itself). The `graph_query`, `paths` and `search` examples were regenerated in that state. The other pages' examples were captured with an earlier server that read an indexed tree through the overlay, so their envelopes show `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`; each page says so where it matters. `graph_version` and the tree OIDs differ per tree and will not match yours literally.
 
 ## See also
 

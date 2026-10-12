@@ -25,7 +25,7 @@ hop crosses an exceptional execution class. The tool is the MCP equivalent of `c
 |-----------|------|----------|---------|---------|
 | `from` | string | yes | — | FQN or short name of the source symbol |
 | `to` | string | yes | — | FQN or short name of the target symbol |
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters) |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters) |
 | `max_depth` | integer | no | `10` | Maximum traversal depth. **`0` is not an unlimited sentinel over MCP** — see below |
 | `max_results` | integer | no | `10` | Maximum paths to return per page. Clamped to `[1, 200]`; `0` is raised to 1 and values above 200 reduced to 200, neither an error |
 | `exclude_edge_condition` | string | no | — | Exclude paths that contain any edge with this condition. One of: `always`, `conditional`, `exception`, `loop`, `panic` |
@@ -170,18 +170,18 @@ Captured against the two-fixture tree described in
     "reasons": []
   },
   "cursor": null,
-  "dirty": true,
-  "dirty_files_analyzed": 3,
+  "dirty": false,
+  "dirty_files_analyzed": 0,
   "freshness": {
     "dirty_files": 0,
-    "dirty_files_base": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "head_tree": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "indexed_tree": "workdir:615bbb57f594774e2f6f9ef3783699ebc299e9ab",
-    "matches_head": null,
+    "dirty_files_base": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "head_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "indexed_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "matches_head": true,
     "stale": false
   },
   "from": "rust_sample::async_calls::fetch_data",
-  "graph_version": "03575d1+dirty.6a49a1506e74",
+  "graph_version": "e2d14d3",
   "has_more": false,
   "paths": [
     {
@@ -245,10 +245,10 @@ Both are `certain`, no candidate set was traversed and no truncation occurred, s
 still excludes external and unindexed callees. Because `paths` is non-empty, no
 `scope` object is attached.
 
-`matches_head: null` beside `dirty_files: 0` is the ordinary shape here, not a
-warning: the fixture was indexed before the call and `include_dirty` defaults to
-`true`, so the overlay saw the three files in `.cgx/` that git's ignore rules hide.
-See [README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+`matches_head: true` beside `dirty_files: 0` and `dirty: false`: the working tree
+is content-identical to `HEAD`, so the default `include_dirty: true` served the
+stored committed graph. `null` here would mean an ignored or untracked source file
+was in the graph. See [README](README.md#matches_head-is-three-valued).
 
 ---
 

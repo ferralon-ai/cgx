@@ -8,6 +8,7 @@
 
 use cgx_mcp::{dispatch, serve_io, Request, ServerConfig, PROTOCOL_VERSION};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -690,6 +691,100 @@ fn include_dirty_on_clean_tree_reports_committed_base() {
         .contains("+dirty"));
 }
 
+// --- the persistent index ------------------------------------------------------
+
+/// Every file under `.cgx/` with its length and modification time: a write of any
+/// kind — an index run rewrites `HEAD.json` by rename even when nothing else
+/// changed — shows up as a difference.
+fn store_snapshot(repo: &Path) -> BTreeMap<String, (u64, std::time::SystemTime)> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, (u64, std::time::SystemTime)>) {
+        for entry in std::fs::read_dir(dir).expect("read .cgx") {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                walk(root, &entry.path(), out);
+            } else {
+                let rel = entry.path().strip_prefix(root).unwrap().display().to_string();
+                out.insert(rel, (meta.len(), meta.modified().unwrap()));
+            }
+        }
+    }
+    let root = repo.join(".cgx");
+    let mut out = BTreeMap::new();
+    walk(&root, &root, &mut out);
+    out
+}
+
+/// MCP reads and maintains the same `.cgx/` index the CLI does: the first call
+/// builds it, and a repeat call — committed or over a clean working tree — finds
+/// it current and writes nothing.
+#[test]
+fn the_first_call_builds_the_index_and_a_repeat_call_reuses_it() {
+    let (_t, repo) = init_repo();
+    assert!(!repo.join(".cgx").exists());
+
+    let first = call_tool(&repo, "callers", json!({ "symbol": "leaf", "include_dirty": false }));
+    assert!(repo.join(".cgx/HEAD.json").is_file(), "the first call indexes HEAD");
+    let built = store_snapshot(&repo);
+
+    let again = call_tool(&repo, "callers", json!({ "symbol": "leaf", "include_dirty": false }));
+    let over_clean_tree = call_tool(&repo, "callers", json!({ "symbol": "leaf", "include_dirty": true }));
+    assert_eq!(store_snapshot(&repo), built, "a current index is not rebuilt");
+    assert_eq!(first, again);
+    assert_eq!(first["results"], over_clean_tree["results"]);
+}
+
+/// cgx's own `.cgx/` is not part of the working tree it describes, so an indexed,
+/// otherwise clean checkout answers as `HEAD`'s tree under `include_dirty`.
+#[test]
+fn the_index_directory_does_not_make_the_working_tree_dirty() {
+    let (_t, repo) = init_repo();
+    let committed = call_tool(&repo, "search", json!({ "all": true, "include_dirty": false }));
+    assert!(repo.join(".cgx").is_dir());
+
+    let s = call_tool(&repo, "search", json!({ "all": true, "include_dirty": true }));
+    assert_eq!(s["dirty"], json!(false), "{s}");
+    assert_eq!(s["dirty_files_analyzed"], json!(0));
+    assert_eq!(s["graph_version"], committed["graph_version"]);
+    assert_eq!(s["freshness"]["matches_head"], json!(true), "{}", s["freshness"]);
+}
+
+/// The working-tree overlay reads the stored fragments but writes nothing back:
+/// after a dirty call `.cgx/` is untouched, and a committed call does not see the
+/// edit (ADR-06).
+#[test]
+fn the_dirty_overlay_is_never_written_to_the_index() {
+    let (_t, repo) = init_repo();
+    call_tool(&repo, "callees", json!({ "symbol": "main", "include_dirty": false }));
+    let before = store_snapshot(&repo);
+
+    make_dirty(&repo);
+    let dirty = call_tool(&repo, "callees", json!({ "symbol": "main", "include_dirty": true }));
+    assert!(result_names(&dirty, "results").iter().any(|n| n.ends_with("orphan")), "{dirty}");
+    assert_eq!(dirty["dirty"], json!(true));
+    assert_eq!(store_snapshot(&repo), before, "the overlay left `.cgx/` untouched");
+
+    let committed = call_tool(&repo, "callees", json!({ "symbol": "main", "include_dirty": false }));
+    assert!(
+        !result_names(&committed, "results").iter().any(|n| n.ends_with("orphan")),
+        "the committed graph never sees the overlay: {committed}"
+    );
+}
+
+/// A pointer naming a graph that is no longer stored — what a concurrent index of
+/// another tree leaves behind once it prunes — is rebuilt, never served as an
+/// empty graph.
+#[test]
+fn a_pointer_to_a_pruned_graph_is_rebuilt_not_served_empty() {
+    let (_t, repo) = init_repo();
+    let first = call_tool(&repo, "callers", json!({ "symbol": "leaf", "include_dirty": false }));
+    std::fs::remove_dir_all(repo.join(".cgx/refs")).unwrap();
+    std::fs::create_dir_all(repo.join(".cgx/refs")).unwrap();
+
+    let again = call_tool(&repo, "callers", json!({ "symbol": "leaf", "include_dirty": false }));
+    assert_eq!(first, again);
+}
+
 // --- determinism ------------------------------------------------------------
 
 #[test]
@@ -820,8 +915,8 @@ fn tool_call_recipe(name: &str) -> Option<Value> {
 /// answer never opened is exactly the false claim this cycle exists to remove.
 ///
 /// This is a closed list on purpose. Adding to it is a contract decision, not a
-/// convenience: a tool belongs here only if it can answer with no `.cgx/` store in
-/// existence, which `coupling` proves separately in
+/// convenience: a tool belongs here only if it can answer without reading or
+/// building a `.cgx/` index, which `coupling` proves separately in
 /// `mcp_coupling_answer_carries_the_contract`.
 const INDEX_FREE_TOOLS: &[&str] = &["coupling"];
 
@@ -1263,17 +1358,6 @@ fn two_disagreeing_views_of_the_working_tree_yield_an_unestablished_matches_head
                 )
                 .unwrap();
                 Some("ignored_symbol")
-            },
-        },
-        Case {
-            // The mundane form, which fires on every repo `cgx index` has touched:
-            // `.cgx/` is untracked and self-ignored via its own `.gitignore`.
-            name: "indexed repo with .cgx/ present",
-            setup: |r| {
-                std::fs::create_dir_all(r.join(".cgx")).unwrap();
-                std::fs::write(r.join(".cgx/.gitignore"), "*\n").unwrap();
-                std::fs::write(r.join(".cgx/HEAD.json"), "{}\n").unwrap();
-                None
             },
         },
     ];

@@ -18,9 +18,11 @@ use cgx_query::{
     FreshnessEnvelope, GraphView, NeighborResult, PathResult, PathWalker, RankBy, ReachResult,
     SearchMatch, SymbolHit, SymbolRank,
 };
-use cgx_store::SqliteStore;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+
+use cgx_index::local::{ensure_indexed, open_store};
+use cgx_store::OverlayStore;
 
 use crate::error::ToolError;
 use crate::session::{self, GraphSession};
@@ -792,9 +794,9 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
 ///
 /// Two structural departures from every other handler here, both deliberate:
 ///
-/// 1. **It does not call [`session::acquire`].** `acquire` opens a fresh
-///    in-memory store per call and returns *one* graph; this tool needs two
-///    graphs readable from one store, so it owns its store and calls
+/// 1. **It does not call [`session::acquire`].** `acquire` returns *one*
+///    graph; this tool needs two graphs readable from one store, so it owns its
+///    store and calls
 ///    [`cgx_diff::impacted::run`] — the same entry point the CLI uses, so the
 ///    two surfaces cannot drift.
 /// 2. **The envelope is not [`with_session_meta`].** Without a `GraphSession`
@@ -802,9 +804,10 @@ fn unused_call(args: &Value) -> Result<Value, ToolError> {
 ///    which are strictly more informative (a real tree OID, or a
 ///    `workdir:<digest>`), alongside the resolved refs.
 ///
-/// The store is `open_in_memory` to preserve the ADR-06 never-persist invariant,
-/// at the cost of a cold Layer-1 blob cache on every call — the same cost every
-/// MCP tool already pays.
+/// The store is an [`OverlayStore`] over the repository's persistent `.cgx/`
+/// index, brought current first as every other tool does: unchanged files are
+/// Layer-1 cache hits, and both sides' fragments and graphs stay in the overlay,
+/// so neither is ever persisted (ADR-06).
 ///
 /// A degenerate answer is **not** `isError`: it is a successful call whose
 /// answer is vacuous, and the flag plus the contract's reasons say so. Marking
@@ -852,10 +855,10 @@ fn impacted_tests_call(args: &Value) -> Result<Value, ToolError> {
         max_steps: None,
     };
 
-    let mut store = SqliteStore::open_in_memory()
-        .map_err(|e| ToolError::index(format!("opening in-memory store: {e}")))?;
+    ensure_indexed(&root).map_err(|e| session::index_error("indexing committed tree", e))?;
+    let store = open_store(&root).map_err(|e| ToolError::index(e.to_string()))?;
     let answer = cgx_diff::impacted::run(
-        &mut store,
+        &mut OverlayStore::new(&store),
         cgx_diff::impacted::Request {
             repo_root: &root,
             sides,

@@ -13,7 +13,7 @@ Because `explain` returns all direct edges rather than performing a traversal, i
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
 | `symbol` | string | yes | — | Fully-qualified name (FQN) or unambiguous short name of the symbol to explain. The FQN is tried first, then the short name. |
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters). |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters). |
 | `include_dirty` | boolean | no | `true` | When `true`, overlay uncommitted working-tree changes onto the index before answering. The overlay is never persisted. |
 
 No other parameters are accepted. Passing unknown fields has no effect.
@@ -44,7 +44,7 @@ A single JSON object. The session-metadata fields (`graph_version`, `dirty`, `di
 
 Read those per-edge fields the way you would read a contract. An edge at `possible` was resolved through an over-approximated candidate set and may not occur at runtime. An edge with `tier: "scope_graph"` and `rule: "name-method"` is the one to distrust most: it is a global short-name method lookup with no receiver-type corroboration, yet it is banded `probable` (backlog **B-5**). `explain` is the right tool for spotting one, because it shows `tier` and `rule` where the traversal tools show only `confidence`.
 
-The `freshness` envelope still applies: `explain` reads the graph, so which tree it read is exactly as material here as anywhere else. `freshness.matches_head` is three-valued and `null` is the ordinary MCP value for an indexed repository — see [README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+The `freshness` envelope still applies: `explain` reads the graph, so which tree it read is exactly as material here as anywhere else. `freshness.matches_head` is three-valued, and `null` means an ignored or untracked source file put the graph and git's view of the checkout at odds — see [README](README.md#matches_head-is-three-valued).
 
 ### Edge object fields
 
@@ -135,7 +135,7 @@ All three incoming edges are `cha_rta` / `sig-compat` matches at `possible` conf
 
 This is what the missing `approximation` object would have summarized. Asked the inbound half of the same question, [`callers`](callers.md#a-positive-answer) folds exactly these three candidate-set edges into an `over-approx-candidate-set` reason and reports `direction: "over_under"` (its frontier also carries unresolved calls and a depth limit). `explain` shows you the edges themselves instead.
 
-`dirty_files_analyzed: 3` beside `freshness.dirty_files: 0` is the expected pairing for an indexed repository: the overlay saw the three files `cgx index` wrote into `.cgx/`, and git's ignore rules exclude all three from the dirty count. That disagreement is also why `matches_head` is `null`.
+`dirty_files_analyzed: 3` beside `freshness.dirty_files: 0` is the two views of the working tree disagreeing: the overlay saw the three files `cgx index` wrote into `.cgx/`, and git's ignore rules exclude all three from the dirty count. That disagreement is also why `matches_head` is `null`. The example above was captured with an earlier server whose overlay also enumerated the `.cgx/` store that `cgx index` writes, which is why a `git status`-clean fixture shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/` and serves the stored committed graph for a working tree content-identical to `HEAD`, so the same clean, indexed tree now reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`.
 
 ## Notes
 

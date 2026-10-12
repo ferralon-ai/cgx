@@ -6,7 +6,7 @@
 //! contract, and carries no store or git dependency — identity is threaded in
 //! from here, the layer that already holds it. `cgx index` writes the current
 //! graph key into `.cgx/HEAD.json`
-//! ([`IndexPointer`](crate::store_loc::IndexPointer)); until now every query
+//! ([`IndexPointer`](cgx_index::local::IndexPointer)); until now every query
 //! discarded it before building the `GraphView`.
 //!
 //! ## Never fails
@@ -22,7 +22,7 @@ use cgx_diff::BlameRepo;
 use cgx_index::Repo;
 use cgx_query::FreshnessEnvelope;
 
-use crate::store_loc::read_pointer;
+use cgx_index::local::read_pointer;
 
 /// The freshness envelope for an answer produced from `repo_root`'s index.
 ///

@@ -322,17 +322,17 @@ Every tool result carries the same outer shape, verified by a live call against 
       ]
     },
     "cursor": null,
-    "dirty": true,
-    "dirty_files_analyzed": 3,
+    "dirty": false,
+    "dirty_files_analyzed": 0,
     "freshness": {
       "dirty_files": 0,
       "dirty_files_base": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
       "head_tree": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
-      "indexed_tree": "workdir:392f44468f23d64bd30b53bbc19d63703cd65136",
-      "matches_head": null,
+      "indexed_tree": "7380e245ab98db2dfed12ed3ee3b005f0fbf7036",
+      "matches_head": true,
       "stale": false
     },
-    "graph_version": "7380e24+dirty.0a12fb8d97d6",
+    "graph_version": "7380e24",
     "has_more": false,
     "results": [
       {
@@ -351,7 +351,7 @@ Five things in that document are worth stating explicitly, because a doc that om
 
 1. **`structuredContent` is shipped**, and it is the canonical result. The `content[0].text` entry is a serialization of the same document, kept for clients that only consume `TextContent`. A declared `outputSchema` is not shipped.
 2. **`cursor`, `has_more` and `total_matched` are shipped** — pagination is real, driven by `max_results`.
-3. **`matches_head: null` is the *common* case, not an edge case.** With the MCP default `include_dirty: true`, any indexed repository returns `null` here and a freshness verdict of `unknown`. In the run above the working tree was clean and had just been indexed, yet `dirty: true` and `dirty_files_analyzed: 3`: the working-tree walk and the dirty-file count apply different ignore rules and disagree. **`matches_head` is three-valued (`true` / `false` / `null`); a client that treats it as a boolean is wrong in the ordinary case.**
+3. **`matches_head` is three-valued (`true` / `false` / `null`); a client that treats it as a boolean is wrong.** In the run above the working tree was clean and had just been indexed, so the server served the stored committed graph: `dirty: false`, `matches_head: true`. `null`, with a freshness verdict of `unknown`, arises under the MCP default `include_dirty: true` when a gitignored or untracked source file is on disk: the working-tree walk (no ignore rules beyond skipping `.git` and the root `.cgx/`) sees it and the dirty-file count (ignore rules applied) does not, so the two disagree.
 4. **`graph_version` exists on MCP and on no CLI format.** When an overlay is in play it takes the form `<indexed-tree>+dirty.<overlay-digest>`.
 5. **`approximation` is not universal.** Nine of the twelve tools carry it; `explain`, `search` and `symbols` omit it by design, and `coupling` carries `approximation` but no index `freshness` because it never opens the index. MCP *errors* carry neither.
 

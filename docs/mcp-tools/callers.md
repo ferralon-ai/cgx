@@ -15,7 +15,7 @@ Results are paginated. The default page size is 20; the hard cap is 200.
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
 | `symbol` | string | yes | — | Qualified symbol name (FQN or unambiguous short name). |
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters). |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters). |
 | `depth` | integer | no | `1` | Maximum backward traversal depth. `0` is not an "unlimited" sentinel — it bounds the walk at the seed and returns an empty result. |
 | `max_results` | integer | no | `20` | Page size. Clamped to `[1, 200]`; values above 200 are silently capped and `0` is silently raised to 1. |
 | `cursor` | string | no | — | Opaque pagination cursor returned by a previous response. Pass `"0"` to force an explicit first-page request. |
@@ -88,9 +88,9 @@ kinds, confidence floor and depth the walk actually searched before concluding
 there were no callers. Read it before treating an empty answer as evidence of
 dead code.
 
-`freshness.matches_head` is three-valued and `null` is the ordinary value over
-MCP for any repository that has been indexed. See
-[README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+`freshness.matches_head` is three-valued: `null` means an ignored or untracked
+source file put the graph and git's view of the checkout at odds. See
+[README](README.md#matches_head-is-three-valued).
 
 ## Examples
 
@@ -191,6 +191,8 @@ resolved through a candidate set, not definite edges. `min_confidence_on_path`
 carries the same value, so a client filtering on `certain` sees nothing here.
 The contract's `over` reason is exactly this, stated once at the top rather than
 left for the reader to infer from three per-edge fields.
+
+The example above was captured with an earlier server whose overlay also enumerated the `.cgx/` store that `cgx index` writes, which is why a `git status`-clean fixture shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/` and serves the stored committed graph for a working tree content-identical to `HEAD`, so the same clean, indexed tree now reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`.
 
 ### An empty answer, and the scope that makes it readable
 

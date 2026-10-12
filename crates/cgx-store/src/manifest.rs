@@ -1,5 +1,5 @@
 //! The per-tree **manifest**: the content-addressed root object that names every
-//! shard (and the candidates blob) of one linked graph, in canonical order.
+//! shard of one linked graph, in canonical order.
 //!
 //! The manifest is encoded with `cgx_core::codec::encode` exactly like every other
 //! unit, so it is itself content-addressed and byte-stable: two puts of the same
@@ -43,19 +43,12 @@ pub struct Manifest {
     pub created_rev: Option<String>,
     /// Shard objects, one per owning-function key, sorted by `fn_key`.
     pub shards: Vec<ShardEntry>,
-    /// OID of the per-tree candidates object, or `None` when the graph has no
-    /// candidates.
-    pub candidates: Option<ObjectOid>,
 }
 
 impl Manifest {
-    /// Every object OID this manifest transitively references (its shards and the
-    /// candidates blob) — the manifest's own OID excluded. Used by GC to compute
-    /// the live set.
+    /// Every object OID this manifest transitively references (its shards) — the
+    /// manifest's own OID excluded. Used by GC to compute the live set.
     pub fn referenced_oids(&self) -> impl Iterator<Item = &ObjectOid> {
-        self.shards
-            .iter()
-            .map(|s| &s.oid)
-            .chain(self.candidates.iter())
+        self.shards.iter().map(|s| &s.oid)
     }
 }

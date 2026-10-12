@@ -23,7 +23,7 @@
 //!
 //! Every object is written temp → writeout flush → atomic `rename` to its final
 //! OID path inside a [`Batch`], and is write-once: an existing file at the OID path
-//! is kept only if its bytes hash to that OID. Shards and the candidates blob land
+//! is kept only if its bytes hash to that OID. Shards land
 //! first, then the manifest object; the batch is then made durable with one full
 //! flush ([`Batch::commit`]), and only then does the ref pointer advance, itself
 //! written temp → full flush → `rename`. A reader therefore never observes a ref
@@ -42,30 +42,332 @@ use crate::oid::ObjectOid;
 use crate::store::{FactStore, FnSummaryRow, FragmentInput, SqliteStore};
 use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
 use cgx_core::codec::{decode, encode};
-use cgx_core::{Candidate, EdgeRecord, NodeRecord};
+use cgx_core::sort::node_sort_key;
+use cgx_core::{
+    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, EffectSet,
+    EntrypointKind, EstablishedBy, ImplicitKind, NodeId, NodeRecord, Signature, SiteId, SymbolKind,
+    Tier, Transform, Visibility,
+};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// One per-function shard: the nodes and edges attributed to a single owning
-/// function. Encoded canonically (nodes sorted by `node_id`, edges by `edge_id`)
-/// so its OID is byte-stable.
+/// function, plus the candidate rows of that function's candidate groups.
+///
+/// A shard carries no dense ids, so it does not change when an unrelated edit
+/// renumbers the graph: a node's id is its position, an edge's `src` indexes this
+/// shard's `nodes`, an edge's `dst` and a candidate's `dst` are the target's
+/// [stable key](sha1_stable_key), and candidate groups are numbered by first
+/// appearance among this shard's edges. Nodes and edges keep their canonical
+/// relative order and candidates are sorted `(group, rank, dst)`, so the OID is
+/// byte-stable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Shard {
-    nodes: Vec<NodeRecord>,
-    edges: Vec<EdgeRecord>,
+    nodes: Vec<StoredNode>,
+    edges: Vec<StoredEdge>,
+    candidates: Vec<StoredCandidate>,
+}
+
+/// [`NodeRecord`] without its id. Field order must match [`StoredNodeRef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredNode {
+    kind: SymbolKind,
+    fqn: String,
+    file: String,
+    line_start: u32,
+    line_end: u32,
+    lang: String,
+    visibility: Visibility,
+    is_abstract: bool,
+    entrypoint_kind: Option<EntrypointKind>,
+    signature: Option<Signature>,
+    own_effects: EffectSet,
+    transitive_effects: EffectSet,
+    unresolved_calls: u32,
+}
+
+/// [`EdgeRecord`] without its id, with a shard-local `src`, a stable-key `dst` and
+/// a shard-local `candidate_group`. Field order must match [`StoredEdgeRef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredEdge {
+    src: u32,
+    dst: u64,
+    kind: EdgeKind,
+    condition: EdgeCondition,
+    confidence: Confidence,
+    tier: Tier,
+    rule: String,
+    site_id: Option<SiteId>,
+    stmt_index: Option<u32>,
+    cut_markers: CutMarkers,
+    implicit: Option<ImplicitKind>,
+    candidate_group: Option<u32>,
+    established_by: Option<EstablishedBy>,
+    cfg_condition: Option<String>,
+    macro_origin: Option<String>,
+    transform: Option<Transform>,
+}
+
+/// A candidate row: shard-local group, stable-key `dst`, rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct StoredCandidate {
+    group: u32,
+    dst: u64,
+    rank: u32,
 }
 
 /// Borrowing twin of [`Shard`] for the write path, so sharding a graph does not
-/// copy every record. Postcard encodes `&T` exactly as `T`, so a `ShardRef`
-/// encodes to the same bytes (and OID) as the equivalent `Shard`.
+/// copy every record. Postcard encodes `&T` exactly as `T` (and `&str` as
+/// `String`), so a `ShardRef` encodes to the same bytes (and OID) as the
+/// equivalent `Shard`.
 #[derive(Default, Serialize)]
 struct ShardRef<'a> {
-    nodes: Vec<&'a NodeRecord>,
-    edges: Vec<&'a EdgeRecord>,
+    nodes: Vec<StoredNodeRef<'a>>,
+    edges: Vec<StoredEdgeRef<'a>>,
+    candidates: Vec<StoredCandidate>,
+}
+
+#[derive(Serialize)]
+struct StoredNodeRef<'a> {
+    kind: &'a SymbolKind,
+    fqn: &'a str,
+    file: &'a str,
+    line_start: u32,
+    line_end: u32,
+    lang: &'a str,
+    visibility: &'a Visibility,
+    is_abstract: bool,
+    entrypoint_kind: &'a Option<EntrypointKind>,
+    signature: &'a Option<Signature>,
+    own_effects: &'a EffectSet,
+    transitive_effects: &'a EffectSet,
+    unresolved_calls: u32,
+}
+
+impl<'a> From<&'a NodeRecord> for StoredNodeRef<'a> {
+    fn from(n: &'a NodeRecord) -> Self {
+        StoredNodeRef {
+            kind: &n.kind,
+            fqn: &n.fqn,
+            file: &n.file,
+            line_start: n.line_start,
+            line_end: n.line_end,
+            lang: &n.lang,
+            visibility: &n.visibility,
+            is_abstract: n.is_abstract,
+            entrypoint_kind: &n.entrypoint_kind,
+            signature: &n.signature,
+            own_effects: &n.own_effects,
+            transitive_effects: &n.transitive_effects,
+            unresolved_calls: n.unresolved_calls,
+        }
+    }
+}
+
+impl StoredNode {
+    /// [`node_sort_key`] of the record this node decodes to.
+    fn sort_key(&self) -> (&str, u32, &str) {
+        (&self.file, self.line_start, &self.fqn)
+    }
+
+    fn into_record(self, id: NodeId) -> NodeRecord {
+        NodeRecord {
+            id,
+            kind: self.kind,
+            fqn: self.fqn,
+            file: self.file,
+            line_start: self.line_start,
+            line_end: self.line_end,
+            lang: self.lang,
+            visibility: self.visibility,
+            is_abstract: self.is_abstract,
+            entrypoint_kind: self.entrypoint_kind,
+            signature: self.signature,
+            own_effects: self.own_effects,
+            transitive_effects: self.transitive_effects,
+            unresolved_calls: self.unresolved_calls,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StoredEdgeRef<'a> {
+    src: u32,
+    dst: u64,
+    kind: EdgeKind,
+    condition: &'a EdgeCondition,
+    confidence: &'a Confidence,
+    tier: &'a Tier,
+    rule: &'a str,
+    site_id: &'a Option<SiteId>,
+    stmt_index: Option<u32>,
+    cut_markers: &'a CutMarkers,
+    implicit: &'a Option<ImplicitKind>,
+    candidate_group: Option<u32>,
+    established_by: &'a Option<EstablishedBy>,
+    cfg_condition: &'a Option<String>,
+    macro_origin: &'a Option<String>,
+    transform: &'a Option<Transform>,
+}
+
+impl<'a> StoredEdgeRef<'a> {
+    fn new(e: &'a EdgeRecord, src: u32, dst: u64, candidate_group: Option<u32>) -> Self {
+        StoredEdgeRef {
+            src,
+            dst,
+            kind: e.kind,
+            condition: &e.condition,
+            confidence: &e.confidence,
+            tier: &e.tier,
+            rule: &e.rule,
+            site_id: &e.site_id,
+            stmt_index: e.stmt_index,
+            cut_markers: &e.cut_markers,
+            implicit: &e.implicit,
+            candidate_group,
+            established_by: &e.established_by,
+            cfg_condition: &e.cfg_condition,
+            macro_origin: &e.macro_origin,
+            transform: &e.transform,
+        }
+    }
+}
+
+impl StoredEdge {
+    fn into_record(self, src: NodeId, dst: NodeId) -> EdgeRecord {
+        EdgeRecord {
+            id: EdgeId(0),
+            src,
+            dst,
+            kind: self.kind,
+            condition: self.condition,
+            confidence: self.confidence,
+            tier: self.tier,
+            rule: self.rule,
+            site_id: self.site_id,
+            stmt_index: self.stmt_index,
+            cut_markers: self.cut_markers,
+            implicit: self.implicit,
+            candidate_group: None,
+            established_by: self.established_by,
+            cfg_condition: self.cfg_condition,
+            macro_origin: self.macro_origin,
+            transform: self.transform,
+        }
+    }
+}
+
+/// The stable key (SK) of a node: the first 8 bytes of SHA-1 over its FQN and
+/// its dup-ordinal (its rank among same-FQN nodes in canonical order). Unlike a
+/// dense id it does not move when unrelated nodes are added or removed, which is
+/// what lets an edge into another shard name its target without making that
+/// shard depend on the whole graph's numbering.
+pub(crate) fn sha1_stable_key(fqn: &str, dup_ordinal: u32) -> u64 {
+    let mut h = Sha1::new();
+    h.update((fqn.len() as u64).to_le_bytes());
+    h.update(fqn.as_bytes());
+    h.update(dup_ordinal.to_le_bytes());
+    let digest = h.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head)
+}
+
+/// The canonical edge order (`cgx_resolve::canonicalize`): `(src, dst, kind,
+/// stmt_index, group)`, with an absent stmt/group sorting last.
+fn edge_order_key<G: Copy>(src: NodeId, dst: NodeId, kind: EdgeKind, stmt: Option<u32>, group: Option<G>, none: G) -> (u32, u32, u8, u32, G) {
+    (src.0, dst.0, kind as u8, stmt.unwrap_or(u32::MAX), group.unwrap_or(none))
+}
+
+/// Stable keys for every node of `nodes` (in canonical order), indexed by node
+/// position. Fails closed on a collision, naming both FQNs.
+fn stable_keys<'a>(
+    nodes: impl Iterator<Item = &'a str>,
+    hasher: fn(&str, u32) -> u64,
+) -> Result<(Vec<u64>, HashMap<u64, u32>)> {
+    let mut ordinals: HashMap<&str, u32> = HashMap::new();
+    let mut keys = Vec::new();
+    let mut by_key: HashMap<u64, u32> = HashMap::new();
+    let mut fqns: Vec<&str> = Vec::new();
+    for (i, fqn) in nodes.enumerate() {
+        let ord = ordinals.entry(fqn).or_insert(0);
+        let sk = hasher(fqn, *ord);
+        *ord += 1;
+        if let Some(&prev) = by_key.get(&sk) {
+            return Err(StoreError::StableKeyCollision {
+                first: fqns[prev as usize].to_owned(),
+                second: fqn.to_owned(),
+            });
+        }
+        by_key.insert(sk, i as u32);
+        keys.push(sk);
+        fqns.push(fqn);
+    }
+    Ok((keys, by_key))
+}
+
+/// Check that `g` is in the canonical form `cgx_resolve::canonicalize` produces,
+/// which is what lets a reader rebuild every dense id from shard positions.
+fn check_canonical(g: &LinkedGraph) -> Result<()> {
+    let bad = |reason: String| Err(StoreError::NonCanonical { reason });
+    for (i, n) in g.nodes.iter().enumerate() {
+        if n.id.index() != i {
+            return bad(format!("node `{}` has id {} at position {i}", n.fqn, n.id.0));
+        }
+    }
+    if let Some(w) = g
+        .nodes
+        .windows(2)
+        .find(|w| node_sort_key(&w[0]) > node_sort_key(&w[1]))
+    {
+        return bad(format!("node `{}` sorts after `{}`", w[0].fqn, w[1].fqn));
+    }
+    let n = g.nodes.len();
+    let mut group_src: Vec<NodeId> = Vec::new();
+    let mut prev = None;
+    for (i, e) in g.edges.iter().enumerate() {
+        if e.id.index() != i {
+            return bad(format!("edge has id {} at position {i}", e.id.0));
+        }
+        if e.src.index() >= n || e.dst.index() >= n {
+            return bad(format!("edge {i} names a node outside the graph"));
+        }
+        let key = edge_order_key(e.src, e.dst, e.kind, e.stmt_index, e.candidate_group, u32::MAX);
+        if prev.is_some_and(|p| p > key) {
+            return bad(format!("edge {i} is out of canonical order"));
+        }
+        prev = Some(key);
+        if let Some(gr) = e.candidate_group {
+            match (gr as usize).cmp(&group_src.len()) {
+                std::cmp::Ordering::Less if group_src[gr as usize] == e.src => {}
+                std::cmp::Ordering::Less => {
+                    return bad(format!("candidate group {gr} spans more than one src"))
+                }
+                std::cmp::Ordering::Equal => group_src.push(e.src),
+                std::cmp::Ordering::Greater => {
+                    return bad(format!("candidate group {gr} is not numbered by first appearance"))
+                }
+            }
+        }
+    }
+    let mut prev = None;
+    for c in &g.candidates {
+        if c.candidate_group as usize >= group_src.len() {
+            return bad(format!("candidate group {} has no edge", c.candidate_group));
+        }
+        if c.dst.index() >= n {
+            return bad("candidate row names a node outside the graph".into());
+        }
+        let key = (c.candidate_group, c.rank, c.dst.0);
+        if prev.is_some_and(|p| p > key) {
+            return bad("candidate rows are out of (group, rank, dst) order".into());
+        }
+        prev = Some(key);
+    }
+    Ok(())
 }
 
 /// A stored Layer-1 fragment object: the frontend metadata plus the canonical
@@ -86,6 +388,8 @@ pub struct ObjectStore {
     lock_path: PathBuf,
     /// Scoped, gitignored SQLite backing **only** the three dataflow caches.
     cache: SqliteStore,
+    /// The stable-key function; [`sha1_stable_key`] outside tests.
+    stable_key: fn(&str, u32) -> u64,
 }
 
 impl ObjectStore {
@@ -108,6 +412,7 @@ impl ObjectStore {
             refs_dir,
             lock_path: root.join("objects.lock"),
             cache,
+            stable_key: sha1_stable_key,
         })
     }
 
@@ -272,9 +577,12 @@ impl FactStore for ObjectStore {
     }
 
     fn put_graph(&mut self, tree: &TreeOid, created_rev: Option<&str>, g: &LinkedGraph) -> Result<()> {
+        check_canonical(g)?;
+        let (sk, _) = stable_keys(g.nodes.iter().map(|n| n.fqn.as_str()), self.stable_key)?;
         let _lock = WriteLock::acquire(&self.lock_path)?;
 
         // Attribution: the callable FQNs, then each node's owning-function key.
+        // Same-FQN nodes share a key, so dup-ordinals are shard-local too.
         let callables: BTreeSet<&str> = g
             .nodes
             .iter()
@@ -282,55 +590,61 @@ impl FactStore for ObjectStore {
             .map(|n| n.fqn.as_str())
             .collect();
 
-        let mut node_key: BTreeMap<u32, &str> = BTreeMap::new();
-        let mut shards: BTreeMap<Cow<'_, str>, ShardRef<'_>> = BTreeMap::new();
+        // Per node: its shard key and its index within that shard.
+        let mut placement: Vec<(&str, u32)> = Vec::with_capacity(g.nodes.len());
+        let mut shards: BTreeMap<&str, ShardRef<'_>> = BTreeMap::new();
         for n in &g.nodes {
             let key = owning_key(&n.fqn, &callables);
-            node_key.insert(n.id.0, key);
-            shards.entry(Cow::Borrowed(key)).or_default().nodes.push(n);
+            let shard = shards.entry(key).or_default();
+            placement.push((key, shard.nodes.len() as u32));
+            shard.nodes.push(StoredNodeRef::from(n));
         }
-        // Edges follow their source node's owning function. A src with no node
-        // record (should not happen for a well-formed graph) falls back to a
-        // synthetic key so the edge is never silently dropped (honesty spine).
+        // Edges follow their source node's shard, in canonical order; candidate
+        // groups are renumbered by first appearance within the shard.
+        let mut group_place: Vec<(&str, u32)> = Vec::new();
+        let mut shard_groups: HashMap<&str, u32> = HashMap::new();
         for e in &g.edges {
-            let key = match node_key.get(&e.src.0) {
-                Some(k) => Cow::Borrowed(*k),
-                None => Cow::Owned(format!("\u{0}orphan\u{0}{}", e.src.0)),
-            };
-            shards.entry(key).or_default().edges.push(e);
+            let (key, src) = placement[e.src.index()];
+            let group = e.candidate_group.map(|gr| {
+                if gr as usize == group_place.len() {
+                    let next = shard_groups.entry(key).or_insert(0);
+                    group_place.push((key, *next));
+                    *next += 1;
+                }
+                group_place[gr as usize].1
+            });
+            let shard = shards.get_mut(key).expect("src node placed");
+            shard.edges.push(StoredEdgeRef::new(e, src, sk[e.dst.index()], group));
         }
-
-        // Canonicalize each shard's contents and write it. `shards` is a BTreeMap,
-        // so iteration is in `fn_key` order — the manifest's shard list is thereby
-        // canonical and its OID deterministic.
-        let mut batch = Batch::new();
-        let mut shard_entries = Vec::with_capacity(shards.len());
-        for (fn_key, mut shard) in shards {
-            shard.nodes.sort_by_key(|n| n.id.0);
-            shard.edges.sort_by_key(|e| e.id.0);
-            let oid = self.write_object(&mut batch, &encode(&shard)?)?;
-            shard_entries.push(ShardEntry {
-                fn_key: fn_key.into_owned(),
-                oid,
+        for c in &g.candidates {
+            let (key, group) = group_place[c.candidate_group as usize];
+            shards.get_mut(key).expect("group placed").candidates.push(StoredCandidate {
+                group,
+                dst: sk[c.dst.index()],
+                rank: c.rank,
             });
         }
 
-        // Candidates: a single per-tree object, sorted (group, rank, dst) to match
-        // SQLite's defensive read-order (D2).
-        let candidates = if g.candidates.is_empty() {
-            None
-        } else {
-            let mut cands: Vec<&Candidate> = g.candidates.iter().collect();
-            cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
-            Some(self.write_object(&mut batch, &encode(&cands)?)?)
-        };
+        // `shards` is a BTreeMap, so iteration is in `fn_key` order — the
+        // manifest's shard list is thereby canonical and its OID deterministic.
+        let mut batch = Batch::new();
+        let mut shard_entries = Vec::with_capacity(shards.len());
+        for (fn_key, mut shard) in shards {
+            shard
+                .candidates
+                .sort_unstable_by_key(|c| (c.group, c.rank, c.dst));
+            let oid = self.write_object(&mut batch, &encode(&shard)?)?;
+            shard_entries.push(ShardEntry {
+                fn_key: fn_key.to_owned(),
+                oid,
+            });
+        }
 
         let manifest = Manifest {
             store_format: CURRENT_STORE_FORMAT,
             graph_key: tree.as_str().to_owned(),
             created_rev: created_rev.map(|s| s.to_owned()),
             shards: shard_entries,
-            candidates,
         };
         let manifest_oid = self.write_object(&mut batch, &encode(&manifest)?)?;
         batch.commit(&self.objects_dir)?;
@@ -344,33 +658,107 @@ impl FactStore for ObjectStore {
         Ok(())
     }
 
+    /// Re-densify: rebuild the exact graph `put_graph` was given. Nodes are the
+    /// shards' nodes in canonical order (a stable sort of the concatenation
+    /// suffices: nodes with equal sort keys share an FQN, hence a shard, whose
+    /// order they keep); edges likewise, with each shard-local group standing in
+    /// for its global number (both order a src's groups by first appearance), and
+    /// groups then renumbered by first appearance. Any shard that does not decode
+    /// or names a node that is not there is [`StoreError::Corrupt`].
     fn read_graph(&self, tree: &TreeOid) -> Result<LinkedGraph> {
         let Some(manifest) = self.resolve_manifest(tree.as_str())? else {
             return Ok(LinkedGraph::default());
         };
 
-        let mut nodes: Vec<NodeRecord> = Vec::new();
-        let mut edges: Vec<EdgeRecord> = Vec::new();
+        let mut shards: Vec<Shard> = Vec::with_capacity(manifest.shards.len());
         for entry in &manifest.shards {
-            let shard = decode::<Shard>(&self.read_object(&entry.oid)?)?;
-            nodes.extend(shard.nodes);
-            edges.extend(shard.edges);
-        }
-        // Reconstruct the exact flat order SQLite returns: nodes by node_id, edges
-        // by edge_id (dense + unique, so a sort is a total reconstruction).
-        nodes.sort_by_key(|n| n.id.0);
-        edges.sort_by_key(|e| e.id.0);
-
-        let candidates = match &manifest.candidates {
-            None => Vec::new(),
-            Some(oid) => {
-                let mut cands = decode::<Vec<Candidate>>(&self.read_object(oid)?)?;
-                // Defensive re-sort on read (D2 / recon §F.12.5): match SQLite's
-                // `ORDER BY candidate_group, rank, dst` byte-for-byte.
-                cands.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
-                cands
+            let bytes = self.read_object(&entry.oid)?;
+            let corrupt = || StoreError::Corrupt {
+                oid: entry.oid.0.clone(),
+            };
+            let shard = decode::<Shard>(&bytes)?;
+            // The re-densify below relies on each shard's nodes being canonical.
+            if !shard.nodes.is_sorted_by(|a, b| a.sort_key() <= b.sort_key()) {
+                return Err(corrupt());
             }
+            shards.push(shard);
+        }
+        let corrupt = |si: usize| StoreError::Corrupt {
+            oid: manifest.shards[si].oid.0.clone(),
         };
+
+        // Nodes: (shard, local) in manifest order, stably sorted canonically.
+        let mut order: Vec<(u32, u32)> = shards
+            .iter()
+            .enumerate()
+            .flat_map(|(si, sh)| (0..sh.nodes.len() as u32).map(move |li| (si as u32, li)))
+            .collect();
+        let node_at = |&(si, li): &(u32, u32)| &shards[si as usize].nodes[li as usize];
+        order.sort_by(|a, b| node_at(a).sort_key().cmp(&node_at(b).sort_key()));
+        let mut dense: Vec<Vec<NodeId>> = shards
+            .iter()
+            .map(|sh| vec![NodeId(0); sh.nodes.len()])
+            .collect();
+        for (i, &(si, li)) in order.iter().enumerate() {
+            dense[si as usize][li as usize] = NodeId(i as u32);
+        }
+        let (_, by_key) = stable_keys(order.iter().map(|p| node_at(p).fqn.as_str()), self.stable_key)?;
+        let resolve = |si: usize, sk: u64| by_key.get(&sk).map(|&i| NodeId(i)).ok_or_else(|| corrupt(si));
+
+        // Edges and candidate rows, re-addressed to dense node ids.
+        let mut edges: Vec<(Option<(u32, u32)>, EdgeRecord)> = Vec::new();
+        let mut cands: Vec<((u32, u32), NodeId, u32)> = Vec::new();
+        for (si, sh) in shards.iter_mut().enumerate() {
+            for e in std::mem::take(&mut sh.edges) {
+                let src = *dense[si].get(e.src as usize).ok_or_else(|| corrupt(si))?;
+                let dst = resolve(si, e.dst)?;
+                let group = e.candidate_group.map(|gr| (si as u32, gr));
+                edges.push((group, e.into_record(src, dst)));
+            }
+            for c in &sh.candidates {
+                cands.push(((si as u32, c.group), resolve(si, c.dst)?, c.rank));
+            }
+        }
+        edges.sort_by_cached_key(|(g, e)| {
+            edge_order_key(e.src, e.dst, e.kind, e.stmt_index, *g, (u32::MAX, u32::MAX))
+        });
+        let mut groups: HashMap<(u32, u32), u32> = HashMap::new();
+        let edges: Vec<EdgeRecord> = edges
+            .into_iter()
+            .enumerate()
+            .map(|(i, (g, mut e))| {
+                e.id = EdgeId(i as u32);
+                e.candidate_group = g.map(|g| {
+                    let next = groups.len() as u32;
+                    *groups.entry(g).or_insert(next)
+                });
+                e
+            })
+            .collect();
+        let mut candidates = cands
+            .into_iter()
+            .map(|(g, dst, rank)| {
+                let candidate_group = *groups.get(&g).ok_or_else(|| corrupt(g.0 as usize))?;
+                Ok(Candidate {
+                    candidate_group,
+                    dst,
+                    rank,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        candidates.sort_unstable_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+
+        let mut nodes = Vec::with_capacity(order.len());
+        let mut taken: Vec<std::vec::IntoIter<StoredNode>> = shards
+            .into_iter()
+            .map(|sh| sh.nodes.into_iter())
+            .collect();
+        // `order` is grouped per shard in increasing local index, so pulling the
+        // next node from each shard's iterator yields the record at (si, li).
+        for (i, &(si, _)) in order.iter().enumerate() {
+            let n = taken[si as usize].next().expect("one node per placement");
+            nodes.push(n.into_record(NodeId(i as u32)));
+        }
 
         Ok(LinkedGraph {
             nodes,
@@ -541,3 +929,4 @@ fn read_dir_if_exists(dir: &Path) -> Result<Option<Vec<fs::DirEntry>>> {
         Err(e) => Err(e.into()),
     }
 }
+

@@ -21,6 +21,14 @@ pub enum StoreError {
     /// OID (a torn write that survived a crash). The bad file has been removed; the
     /// graph must be rebuilt by re-indexing.
     Corrupt { oid: String },
+    /// Two distinct nodes hash to the same stable key, so cross-shard edges could
+    /// not be resolved unambiguously. Fails closed rather than mis-linking; carries
+    /// both FQNs.
+    StableKeyCollision { first: String, second: String },
+    /// `put_graph` was handed a graph that is not in canonical form (dense ids in
+    /// canonical order, densely numbered candidate groups), so it could not be
+    /// stored with position-free ids and read back identically.
+    NonCanonical { reason: String },
     /// The advisory write lock could not be acquired within the timeout (IX-7).
     LockTimeout,
     /// An I/O error opening the index directory or lockfile.
@@ -45,6 +53,14 @@ impl core::fmt::Display for StoreError {
                 f,
                 "index object {oid} is missing or corrupt; re-index to rebuild it"
             ),
+            StoreError::StableKeyCollision { first, second } => write!(
+                f,
+                "stable node key collision between `{first}` and `{second}`; \
+                 the graph cannot be stored without ambiguity"
+            ),
+            StoreError::NonCanonical { reason } => {
+                write!(f, "graph is not in canonical form: {reason}")
+            }
             StoreError::LockTimeout => write!(f, "could not acquire index write lock within timeout"),
             StoreError::Io(e) => write!(f, "io error: {e}"),
         }

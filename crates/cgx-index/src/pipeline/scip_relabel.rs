@@ -506,6 +506,17 @@ impl<'g, 's> ScipRelabel<'g, 's> {
 
     fn finish(self) -> ScipStats {
         if self.dirty {
+            // A collapsed group's rows describe a call SCIP resolved; once no
+            // edge carries the group they are orphans, which a store rejects.
+            let carried: std::collections::BTreeSet<u32> = self
+                .graph
+                .edges
+                .iter()
+                .filter_map(|e| e.edge.candidate_group)
+                .collect();
+            self.graph
+                .candidates
+                .retain(|c| carried.contains(&c.candidate_group));
             cgx_resolve::canonicalize(self.graph);
         }
         self.stats

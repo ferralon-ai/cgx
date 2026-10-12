@@ -1,8 +1,9 @@
 //! Store location policy (IX-8) and the current-index pointer.
 //!
 //! Phase-1 policy: the index lives under a `.cgx/` directory at the repository
-//! root — `.cgx/index.db` holds the SQLite store, and `.cgx/HEAD.json` records
-//! the graph the last `cgx index` produced so a subsequent query knows which
+//! root — the content-addressed object store (`objects/`, `refs/`, `fragments/`,
+//! and the dataflow-cache `cache.db`), and `.cgx/HEAD.json`, which records the
+//! graph the last `cgx index` produced so a subsequent query knows which
 //! Layer-2 graph to load without re-indexing. (The architecture's longer-term
 //! `~/.cache/cgx/<repo-id>/` location is a later refinement; a repo-local `.cgx/`
 //! keeps Phase-1 self-contained and trivially inspectable.)
@@ -16,8 +17,9 @@ use crate::CliError;
 
 /// The repo-local index directory name.
 pub const CGX_DIR: &str = ".cgx";
-/// The SQLite store filename within [`CGX_DIR`].
-pub const DB_FILE: &str = "index.db";
+/// Files an older cgx wrote beside the object store: a full SQLite copy of every
+/// graph, kept only for parity checking. Nothing reads them any more.
+const RETIRED_FILES: [&str; 4] = ["index.db", "index.db-wal", "index.db-shm", "index.lock"];
 /// The current-index pointer filename within [`CGX_DIR`].
 pub const HEAD_FILE: &str = "HEAD.json";
 /// The self-ignoring gitignore filename within [`CGX_DIR`].
@@ -29,7 +31,7 @@ pub const GITIGNORE_FILE: &str = ".gitignore";
 ///
 /// Forward-compat (sparse-storage RFC §7, option c): when a user opts into the
 /// in-tree committable loose store, cgx will *rewrite* this file selectively
-/// (keep ignoring the rebuildable cache `index.db*`/`*.lock`, but un-ignore the
+/// (keep ignoring the rebuildable cache `cache.db*`/`*.lock`, but un-ignore the
 /// committable `objects/` + manifest via `!objects/` then `!objects/**`). Do not
 /// build that mode now — `*` is correct for the default posture.
 const GITIGNORE_BODY: &str = "*\n";
@@ -81,9 +83,18 @@ pub fn ensure_cgx_dir(repo_root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The store database path for a repository rooted at `repo_root`.
-pub fn db_path(repo_root: &Path) -> PathBuf {
-    cgx_dir(repo_root).join(DB_FILE)
+/// Delete the [`RETIRED_FILES`] an older cgx left in `.cgx/`, if present.
+pub fn remove_retired_files(repo_root: &Path) -> Result<(), CliError> {
+    for name in RETIRED_FILES {
+        let path = cgx_dir(repo_root).join(name);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(CliError::graph(format!("removing {path:?}: {e}")))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The current-index pointer path.
@@ -147,7 +158,7 @@ mod tests {
         ensure_cgx_dir(root).unwrap();
         // Simulate a future selective (in-tree-committable) form the user/cgx put there.
         let gi = gitignore_path(root);
-        let selective = "index.db\nindex.db-wal\n!objects/\n!objects/**\n";
+        let selective = "cache.db\ncache.db-wal\n!objects/\n!objects/**\n";
         std::fs::write(&gi, selective).unwrap();
 
         // A subsequent index must not clobber an existing .gitignore.
@@ -172,5 +183,22 @@ mod tests {
             std::fs::read_to_string(gitignore_path(root)).unwrap(),
             "*\n"
         );
+    }
+
+    #[test]
+    fn remove_retired_files_deletes_the_old_sqlite_copy_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        ensure_cgx_dir(root).unwrap();
+        let dir = cgx_dir(root);
+        for name in ["index.db", "index.db-wal", "cache.db"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        remove_retired_files(root).unwrap();
+        assert!(!dir.join("index.db").exists());
+        assert!(!dir.join("index.db-wal").exists());
+        assert!(dir.join("cache.db").exists(), "dataflow cache is kept");
+        // Idempotent when nothing is left to remove.
+        remove_retired_files(root).unwrap();
     }
 }

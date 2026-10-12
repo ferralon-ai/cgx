@@ -183,6 +183,63 @@ fn complete_compdb_promotes_overload_to_certain() {
     assert_eq!(c.missing_tus, 0);
 }
 
+/// A collapsed candidate group leaves no orphan candidate rows: the production
+/// object store, which refuses a non-canonical graph, accepts the overlaid graph.
+#[test]
+fn collapsed_group_persists_to_the_object_store() {
+    let (_tmp, aux, repo, scip_path) = fixture();
+    let compdb = repo.join("compile_commands.json");
+    write_compdb(&compdb, &repo, &["src/over.cpp", "src/main.cpp"]);
+    let mut store = cgx_store::object_store::ObjectStore::open(aux.path().join("store")).unwrap();
+    let opts = IndexOpts {
+        scip: Some(scip_path),
+        dataflow: false,
+        compdb: Some(compdb),
+        compdb_complete: false,
+        ..IndexOpts::default()
+    };
+    let outcome = index_path(&repo, &cgx_index::default_registry(), &mut store, &opts).unwrap();
+    assert!(outcome.stats.scip.expect("scip stats").upgraded_certain > 0);
+}
+
+/// With the dataflow layer on, a parameter node starts on the overload's
+/// definition line; the span-precise redirect still lands on the function.
+#[test]
+fn certain_redirect_lands_on_the_function_not_its_parameter() {
+    let (_tmp, _aux, repo, scip_path) = fixture();
+    let compdb = repo.join("compile_commands.json");
+    write_compdb(&compdb, &repo, &["src/over.cpp", "src/main.cpp"]);
+    let mut store = mem_store();
+    let opts = IndexOpts {
+        scip: Some(scip_path),
+        dataflow: true,
+        compdb: Some(compdb),
+        compdb_complete: false,
+        ..IndexOpts::default()
+    };
+    let outcome = index_path(&repo, &cgx_index::default_registry(), &mut store, &opts).unwrap();
+    let g = read_graph(&store, &outcome.graph_key);
+    let id = |fqn: &str, line: u32| {
+        g.nodes
+            .iter()
+            .find(|n| n.fqn == fqn && n.file.ends_with(".cpp") && n.line_start == line)
+            .unwrap_or_else(|| panic!("{fqn} node at line {line}"))
+            .id
+    };
+    let (run, pick_int) = (id("run", 1), id("pick", 1));
+    let targets: Vec<_> = g
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.kind == cgx_core::EdgeKind::Calls)
+        .map(|e| e.dst)
+        .collect();
+    assert!(!targets.is_empty(), "run -> pick call edges present");
+    assert!(
+        targets.iter().all(|&t| t == pick_int),
+        "run's call resolves to pick(int) {pick_int:?}, got {targets:?}"
+    );
+}
+
 #[test]
 fn partial_compdb_caps_overload_at_probable_with_diagnostic() {
     let (_tmp, _aux, repo, scip_path) = fixture();

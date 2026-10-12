@@ -648,11 +648,18 @@ exits when stdin closes.
 
 ### The `include_dirty` overlay (ADR-06)
 
-Every graph-reading tool accepts `include_dirty`, defaulting to **true**. On a
-call with `include_dirty: true` the server indexes the **working tree for that
-call**, so an agent's uncommitted edits are visible to `callers`/`paths`/… The
-overlay is per call and never persisted; a fresh in-memory store backs each
-acquisition.
+Every graph-reading tool accepts `include_dirty`, defaulting to **true**. Every
+call first brings the persistent `.cgx/` index current through the CLI's own
+auto-index trigger (`cgx_index::local::ensure_indexed`): built when missing,
+rebuilt when HEAD has moved, untouched otherwise, so a warm repeat call does no
+extract and no link. With `include_dirty: true` and a working tree
+content-identical to `HEAD`, the stored committed graph is served. Otherwise the
+server indexes the **working tree for that call** through an in-memory
+`OverlayStore` over `.cgx/`, so an agent's uncommitted edits are visible to
+`callers`/`paths`/…: unchanged files are Layer-1 cache hits, edited files are
+re-extracted, and the whole program is re-linked, because linking is
+whole-program. The overlay is per call and never persisted; its writes stay in
+memory and are dropped with it.
 
 The CLI has **no** counterpart flag — there is no `--include-dirty` on any
 subcommand. Its model is committed-only with auto-indexing: a query indexes the
@@ -896,15 +903,17 @@ be recovered; `dirty_files` is null where the surface never inspected the
 working tree. A surface that looked and found nothing reports `0` — the two are
 deliberately distinguishable.
 
-**`matches_head` is three-valued, and `null` is the common case over MCP.** It
-has a third null case: both trees are known, but the surface holds two views of
-the working tree that disagree about whether the graph it answered over *is*
-HEAD's tree. With MCP's default `include_dirty: true`, any indexed repository
-reaches it — `cgx index` writes `.cgx/`, after which working-tree enumeration
-(no ignore rules) and the dirty-file count (ignore rules applied) disagree. The
-verdict is then `unknown`, and the human line says `unknown` rather than
-`current`: a null must not render as the reassuring word. Treating
-`matches_head` as a boolean is wrong in the ordinary case, not the edge case.
+**`matches_head` is three-valued.** It has a third null case: both trees are
+known, but the surface holds two views of the working tree that disagree about
+whether the graph it answered over *is* HEAD's tree. Working-tree enumeration
+applies no ignore rules (it skips only `.git` and the root-level `.cgx/` store)
+while the dirty-file count applies git's, so with MCP's default
+`include_dirty: true` a gitignored or untracked source file — a generated file,
+a build directory — puts the two at odds. An indexed, git-clean repository with
+nothing ignored on disk does not reach it: it reports `matches_head: true`. In
+the null case the verdict is `unknown`, and the human line says `unknown` rather
+than `current`: a null must not render as the reassuring word. Treating
+`matches_head` as a boolean is wrong.
 
 ### Which surfaces carry which
 

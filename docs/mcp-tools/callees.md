@@ -13,7 +13,7 @@ This is the forward counterpart of [`callers`](callers.md). Use `callees` when y
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
 | `symbol` | string | yes | — | Fully-qualified or short symbol name to expand as the call-graph root. The FQN is tried first, then the short name; if neither resolves the call returns an error. |
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters). |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters). |
 | `depth` | integer | no | `1` | Maximum traversal depth. `1` returns direct callees only. There is no unlimited-depth option via MCP, and `0` is not one: it bounds the walk at the seed and returns an empty result. Set a large integer to approximate unlimited, subject to the work budget. |
 | `max_results` | integer | no | `20` | Maximum results per page. Clamped to `[1, 200]`; values above 200 are silently capped and `0` is silently raised to 1, neither rejected. |
 | `cursor` | string | no | — | Pagination cursor from a prior response. Pass the `cursor` value returned in a previous result to fetch the next page. Omit or pass `null` for the first page. |
@@ -138,7 +138,7 @@ Three `certain` edges, each `conditional` because `dispatch` calls each logger o
 
 Contrast the [`callers`](callers.md#a-positive-answer) direction on the same symbol, which reports `over_under`: its inbound edges are cross-language closure calls resolved through a candidate set, and its frontier carries unresolved calls.
 
-`matches_head: null` is the ordinary value here, not a fault — the fixture was indexed before the call and `include_dirty` defaults to `true`. See [README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+The example above was captured with an earlier server whose overlay also enumerated the `.cgx/` store that `cgx index` writes, which is why a `git status`-clean fixture shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/` and serves the stored committed graph for a working tree content-identical to `HEAD`, so the same clean, indexed tree now reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`. See [README](README.md#matches_head-is-three-valued).
 
 ## Notes
 

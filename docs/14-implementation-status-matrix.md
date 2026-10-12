@@ -91,4 +91,4 @@ Cross-cutting and language-independent: which surfaces attach the approximation 
 | `--format dot` / `mermaid` / `d2` | — | — | Raw graph source; the emitters carry no prose lines, and freshness is deliberately not even computed for them. |
 | MCP errors | — | — | An error is not an answer. |
 
-Over MCP, `matches_head` is **three-valued**, and `null` is the ordinary case rather than an edge case: with the default `include_dirty: true`, any indexed repository reaches the indeterminate state, and the verdict renders as `unknown`. Treating it as a boolean is wrong in the common case. See [09 — Architecture](09-architecture.md) AR-13.
+Over MCP, `matches_head` is **three-valued**: with the default `include_dirty: true`, a gitignored or untracked source file on disk puts the working-tree enumeration and the dirty-file count at odds, and the verdict renders as `unknown`. An indexed, git-clean repository reports `true`. Treating it as a boolean is wrong. See [09 — Architecture](09-architecture.md) AR-13.

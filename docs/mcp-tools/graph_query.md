@@ -23,7 +23,7 @@ answer does not.
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
 | `query` | string | yes | — | Cypher-subset query expression. Executed. |
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters). |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters). |
 | `max_results` | integer | no | `20` | Page size. Clamped to `[1, 200]`; `0` clamps up to 1 and values above 200 clamp down, neither an error. |
 | `cursor` | string | no | — | Opaque 0-based decimal offset from a prior response's `cursor`. Pass `"0"` to request the first page explicitly. |
 | `include_dirty` | boolean | no | `true` | Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted. |
@@ -99,17 +99,17 @@ Response (`structuredContent`):
   },
   "columns": ["a.fqn", "b.fqn"],
   "cursor": null,
-  "dirty": true,
-  "dirty_files_analyzed": 3,
+  "dirty": false,
+  "dirty_files_analyzed": 0,
   "freshness": {
     "dirty_files": 0,
-    "dirty_files_base": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "head_tree": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "indexed_tree": "workdir:615bbb57f594774e2f6f9ef3783699ebc299e9ab",
-    "matches_head": null,
+    "dirty_files_base": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "head_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "indexed_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "matches_head": true,
     "stale": false
   },
-  "graph_version": "03575d1+dirty.6a49a1506e74",
+  "graph_version": "e2d14d3",
   "has_more": false,
   "rows": [
     ["rust_sample::conditions::dispatch", "rust_sample::conditions::log_info"],
@@ -122,9 +122,11 @@ Response (`structuredContent`):
 }
 ```
 
-`matches_head: null` is the expected value here, not a fault: the fixture was
-indexed before the call, and `include_dirty` defaults to `true`. See
-[README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+`matches_head: true` with `dirty: false`: the fixture is git-clean and nothing
+ignored or untracked sits beside the source, so with the default
+`include_dirty: true` the server served the stored committed graph. A stray
+ignored source file would make it `null` instead. See
+[README](README.md#matches_head-is-three-valued).
 
 ### Table channel — bound edges, and an honest `over`
 

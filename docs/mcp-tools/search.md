@@ -22,7 +22,7 @@ Results are sorted by FQN, with `(file, line)` as the tiebreak, and paginated.
 | `pattern` | string | see below | — | Name predicate over the whole FQN: case-insensitive substring by default, unanchored regex when `regex` is `true`. Must not be empty. |
 | `all` | boolean | see below | `false` | List every symbol. Mutually exclusive with `pattern`. |
 | `regex` | boolean | no | `false` | Treat `pattern` as an unanchored regex. |
-| `root` | string | yes | — | Repository root path. A `.cgx/` store is not required; the server indexes per call into an in-memory store. |
+| `root` | string | yes | — | Repository root path. A `.cgx/` store is not required in advance; the server builds and maintains it as the CLI does. |
 | `kind` | string | no | `"all"` | Narrow to one symbol kind. Enum: `function`, `method`, `field`, `type`, `module`, `all`. Narrower than the kinds that appear in results — see the notes. |
 | `max_results` | integer | no | `20` | Page size. Clamped to `[1, 200]` (`MAX_MAX_RESULTS`, `crates/cgx-mcp/src/tools.rs:28`); `0` clamps up to 1. |
 | `cursor` | string | no | — | Opaque pagination cursor: a decimal offset string. Unparseable values are an `invalid_params` error. |
@@ -92,17 +92,17 @@ verbatim.
 ```json
 {
   "cursor": null,
-  "dirty": true,
-  "dirty_files_analyzed": 3,
+  "dirty": false,
+  "dirty_files_analyzed": 0,
   "freshness": {
     "dirty_files": 0,
-    "dirty_files_base": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "head_tree": "03575d152162321e280ec0c5d56a7657c4a9b47a",
-    "indexed_tree": "workdir:615bbb57f594774e2f6f9ef3783699ebc299e9ab",
-    "matches_head": null,
+    "dirty_files_base": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "head_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "indexed_tree": "e2d14d3aa40621db63842ded08be8d262f81693b",
+    "matches_head": true,
     "stale": false
   },
-  "graph_version": "03575d1+dirty.6a49a1506e74",
+  "graph_version": "e2d14d3",
   "has_more": false,
   "results": [
     {
@@ -199,12 +199,13 @@ sends an empty string from silently dumping the index.
 ### `matches_head` is three-valued
 
 `freshness.matches_head` is `true`, `false`, or `null` — never treat it as a
-boolean. The example above shows `null` on a `git status`-clean fixture, which is
-the ordinary case: once `cgx index` has written `.cgx/`, the overlay enumeration
-(no ignore rules) sees those files while git's dirty count (ignore rules applied)
-does not, and the two views disagree about whether the graph is `HEAD`'s tree
-(`crates/cgx-mcp/src/session.rs:196`). `null` is the third honest answer, and the
-envelope's verdict word for it is `unknown`.
+boolean. The example above shows `true` on a `git status`-clean fixture. `null`
+arises when an ignored or untracked source file is on disk: the overlay
+enumeration (no ignore rules beyond skipping `.git` and the root `.cgx/`) sees it
+while git's dirty count (ignore rules applied) does not, and the two views
+disagree about whether the graph is `HEAD`'s tree
+(`crates/cgx-mcp/src/session.rs:195-200`). `null` is the third honest answer, and
+the envelope's verdict word for it is `unknown`.
 
 `dirty_files: 0` (inspected, nothing diverged) and `dirty_files: null` (never
 inspected — what `include_dirty: false` produces) are deliberately different

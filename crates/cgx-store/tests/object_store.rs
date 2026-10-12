@@ -194,41 +194,6 @@ fn same_graph_into_two_fresh_stores_yields_identical_objects() {
 }
 
 /// The write path encodes shards and the candidate list from borrowed records.
-/// Every stored object must still be exactly the owned encoding a reader decodes,
-/// or object OIDs would shift with no change to the graph.
-#[test]
-fn borrowed_shard_and_candidate_writes_match_owned_encoding() {
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct OwnedShard {
-        nodes: Vec<NodeRecord>,
-        edges: Vec<EdgeRecord>,
-    }
-
-    let root = TempDir::new().unwrap();
-    let g = common::sample_graph();
-    store(&root)
-        .put_graph(&TreeOid::new("t1"), Some("rev"), &g)
-        .unwrap();
-    let manifest = read_manifest(&root, "t1");
-
-    let (mut nodes, mut edges) = (0, 0);
-    for entry in &manifest.shards {
-        let bytes = fs::read(entry.oid.object_path(&objects_dir(&root))).unwrap();
-        let shard: OwnedShard = decode(&bytes).unwrap();
-        nodes += shard.nodes.len();
-        edges += shard.edges.len();
-        assert_eq!(encode(&shard).unwrap(), bytes, "shard {}", entry.fn_key);
-        assert_eq!(ObjectOid::of_bytes(&bytes), entry.oid);
-    }
-    assert_eq!((nodes, edges), (g.nodes.len(), g.edges.len()));
-
-    let coid = manifest.candidates.expect("sample graph has candidates");
-    let bytes = fs::read(coid.object_path(&objects_dir(&root))).unwrap();
-    let mut owned = g.candidates.clone();
-    owned.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
-    assert_eq!(encode(&owned).unwrap(), bytes);
-}
-
 #[test]
 fn re_put_of_same_graph_is_a_noop_at_the_object_level() {
     let root = TempDir::new().unwrap();
@@ -295,6 +260,134 @@ fn read_rejects_manifest_with_newer_store_format() {
 
 // --- 3. manifest + candidate canonical ordering -------------------------------
 
+/// Write `bytes` as an object and point `key`'s ref at it as its manifest.
+fn plant_manifest(root: &TempDir, key: &str, bytes: &[u8]) {
+    let moid = ObjectOid::of_bytes(bytes);
+    let opath = moid.object_path(&objects_dir(root));
+    fs::create_dir_all(opath.parent().unwrap()).unwrap();
+    fs::write(&opath, bytes).unwrap();
+    let ref_path = root
+        .path()
+        .join(".cgx")
+        .join("refs")
+        .join(ObjectOid::of_bytes(key.as_bytes()).0);
+    fs::write(&ref_path, format!("{}\n{key}\n", moid.0)).unwrap();
+}
+
+/// A manifest from an older store format (here: the format-1 shape, with its
+/// trailing candidates field) is not mis-decoded as the current one: it reads as
+/// corrupt, which the CLI answers by re-indexing once.
+#[test]
+fn read_reports_older_store_format_as_corrupt() {
+    #[derive(serde::Serialize)]
+    struct ManifestV1 {
+        store_format: u32,
+        graph_key: String,
+        created_rev: Option<String>,
+        shards: Vec<cgx_store::manifest::ShardEntry>,
+        candidates: Option<ObjectOid>,
+    }
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    let current = read_manifest(&root, "t1");
+    let v1 = ManifestV1 {
+        store_format: 1,
+        graph_key: current.graph_key,
+        created_rev: current.created_rev,
+        shards: current.shards,
+        candidates: None,
+    };
+    plant_manifest(&root, "t1", &encode(&v1).unwrap());
+
+    let err = s.read_graph(&tree).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt { .. }), "got {err:?}");
+    // The next put rewrites the graph in the current format.
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    assert_eq!(s.read_graph(&tree).unwrap(), common::sample_graph());
+}
+
+/// Objects whose hash checks out but whose bytes do not decode (a manifest or a
+/// shard) read as corrupt, never as a codec error the CLI would not recover from.
+#[test]
+fn undecodable_manifest_or_shard_reads_as_corrupt() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+
+    plant_manifest(&root, "t1", &[0xff; 3]);
+    let err = s.read_graph(&tree).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt { .. }), "manifest: got {err:?}");
+
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    let mut m = read_manifest(&root, "t1");
+    let junk = [0xffu8; 5];
+    plant_orphan_object(&root, &junk);
+    m.shards[0].oid = ObjectOid::of_bytes(&junk);
+    plant_manifest(&root, "t1", &encode(&m).unwrap());
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, m.shards[0].oid.0),
+        other => panic!("shard: expected Corrupt, got {other:?}"),
+    }
+}
+
+/// The point of stable keys: inserting a node renumbers every later dense id, but
+/// a shard names other shards' nodes by stable key, so no unchanged function's
+/// object moves.
+#[test]
+fn inserting_a_function_leaves_every_other_shard_unchanged() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let before = LinkedGraph::new(
+        vec![
+            func_node(0, "app::a", 10),
+            func_node(1, "app::c", 30),
+            func_node(2, "app::d", 40),
+        ],
+        vec![call_edge(0, 0, 1), call_edge(1, 1, 2), call_edge(2, 2, 0)],
+        vec![],
+    );
+    // `app::b` lands between a and c: c and d shift from ids 1, 2 to 2, 3.
+    let mut b = func_node(1, "app::b", 20);
+    b.line_start = 1;
+    let mut nodes = vec![func_node(0, "app::a", 10), b];
+    for (id, fqn, end) in [(2, "app::c", 30), (3, "app::d", 40)] {
+        let mut n = func_node(id, fqn, end);
+        n.line_start = id;
+        nodes.push(n);
+    }
+    let after = LinkedGraph::new(
+        nodes,
+        vec![call_edge(0, 0, 2), call_edge(1, 2, 3), call_edge(2, 3, 0)],
+        vec![],
+    );
+    s.put_graph(&TreeOid::new("t1"), None, &before).unwrap();
+    s.put_graph(&TreeOid::new("t2"), None, &after).unwrap();
+
+    for f in ["app::a", "app::c", "app::d"] {
+        assert_eq!(shard_oid(&root, "t1", f), shard_oid(&root, "t2", f), "{f}");
+    }
+    assert_eq!(s.read_graph(&TreeOid::new("t2")).unwrap(), after);
+}
+
+/// Same-FQN nodes (overloads, re-definitions) are told apart by dup-ordinal, and
+/// an edge into the second one resolves to it, not the first.
+#[test]
+fn duplicate_fqns_round_trip_by_dup_ordinal() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let mut dup = func_node(2, "app::f", 50);
+    dup.line_start = 40;
+    let g = LinkedGraph::new(
+        vec![func_node(0, "app::caller", 10), func_node(1, "app::f", 20), dup],
+        vec![call_edge(0, 0, 2), call_edge(1, 1, 2)],
+        vec![],
+    );
+    s.put_graph(&TreeOid::new("t1"), None, &g).unwrap();
+    assert_eq!(s.read_graph(&TreeOid::new("t1")).unwrap(), g);
+}
+
 #[test]
 fn manifest_shard_list_is_sorted_and_stable() {
     let root = TempDir::new().unwrap();
@@ -310,33 +403,35 @@ fn manifest_shard_list_is_sorted_and_stable() {
 }
 
 #[test]
-fn candidates_are_reconstructed_in_group_rank_dst_order() {
+fn non_canonical_candidates_are_rejected_not_reordered() {
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
 
-    // Two callables so there is a candidate set; candidates supplied scrambled.
+    // A two-way candidate set at one call site; rows supplied out of order.
     let nodes = vec![
         func_node(0, "app::caller", 10),
         func_node(1, "app::target_a", 20),
         func_node(2, "app::target_b", 30),
     ];
-    let edges = vec![call_edge(0, 0, 1), call_edge(1, 0, 2)];
-    let scrambled = vec![
-        Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
+    let grouped = |id, dst| EdgeRecord {
+        candidate_group: Some(0),
+        ..call_edge(id, 0, dst)
+    };
+    let edges = vec![grouped(0, 1), grouped(1, 2)];
+    let sorted = vec![
         Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
+        Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
     ];
-    let g = LinkedGraph::new(nodes, edges, scrambled);
-    s.put_graph(&TreeOid::new("t1"), None, &g).unwrap();
+    let scrambled: Vec<Candidate> = sorted.iter().rev().cloned().collect();
 
-    let back = s.read_graph(&TreeOid::new("t1")).unwrap();
-    assert_eq!(
-        back.candidates,
-        vec![
-            Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
-            Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
-        ],
-        "candidates must come back sorted by (group, rank, dst)"
-    );
+    let bad = LinkedGraph::new(nodes.clone(), edges.clone(), scrambled);
+    let err = s.put_graph(&TreeOid::new("t1"), None, &bad).unwrap_err();
+    assert!(matches!(err, StoreError::NonCanonical { .. }), "got {err:?}");
+    assert!(!s.graph_for(&TreeOid::new("t1")).unwrap(), "nothing is written");
+
+    let good = LinkedGraph::new(nodes, edges, sorted);
+    s.put_graph(&TreeOid::new("t1"), None, &good).unwrap();
+    assert_eq!(s.read_graph(&TreeOid::new("t1")).unwrap(), good);
 }
 
 // --- 4. per-function dedup ----------------------------------------------------

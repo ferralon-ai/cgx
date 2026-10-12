@@ -46,8 +46,12 @@ fn own_effects_survive_the_round_trip() {
     store.put_graph(&tree, None, &g).unwrap();
     let back = store.read_graph(&tree).unwrap();
 
-    // node1 in the sample graph carries io.file + nondeterministic.
-    let n1 = back.nodes.iter().find(|n| n.id.0 == 1).expect("node 1");
+    // Conn::commit in the sample graph carries io.file + nondeterministic.
+    let n1 = back
+        .nodes
+        .iter()
+        .find(|n| n.fqn == "app::db::Conn::commit")
+        .expect("commit node");
     assert!(n1.own_effects.contains(Effect::IoFile));
     assert!(n1.own_effects.contains(Effect::Nondeterministic));
     assert_eq!(n1.own_effects.len(), 2);
@@ -496,7 +500,7 @@ fn unchanged_cache_reindex_leaves_db_bytes_identical() {
 // ---- Property: round-trip identity over arbitrary graphs --------------------
 
 use cgx_core::{
-    Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId, NodeRecord,
+    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId, NodeRecord,
     SymbolKind, Tier, Visibility,
 };
 use proptest::prelude::*;
@@ -527,34 +531,77 @@ prop_compose! {
 }
 
 prop_compose! {
+    /// A graph in the canonical form the linker emits: nodes sorted by (file,
+    /// line, fqn) with ids by position (random FQNs make duplicates likely), edges
+    /// sorted by (src, dst, kind, stmt, group) with ids by position, and candidate
+    /// groups — edges of one src sharing a stmt — numbered by first appearance,
+    /// with one candidate row per member edge.
     fn arb_graph()(n in 1usize..12)(
-        nodes in (0..n).map(|i| arb_node(i as u32)).collect::<Vec<_>>(),
-        edge_specs in proptest::collection::vec((0u32..n as u32, 0u32..n as u32), 0..20),
+        mut nodes in (0..n).map(|i| arb_node(i as u32)).collect::<Vec<_>>(),
+        edge_specs in proptest::collection::vec(
+            (0u32..n as u32, 0u32..n as u32, any::<bool>(), proptest::option::of(0u32..3), any::<bool>()),
+            0..20,
+        ),
     ) -> LinkedGraph {
-        let edges = edge_specs
+        cgx_core::sort::sort_nodes(&mut nodes);
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.id = NodeId(i as u32);
+        }
+        // Provisional group key: (src, stmt) for the edges flagged as grouped.
+        let mut edges: Vec<(Option<(u32, u32)>, EdgeRecord)> = edge_specs
             .into_iter()
-            .enumerate()
-            .map(|(i, (src, dst))| EdgeRecord {
-                id: EdgeId(i as u32),
-                src: NodeId(src),
-                dst: NodeId(dst),
-                kind: EdgeKind::Calls,
-                condition: EdgeCondition::Always,
-                confidence: Confidence::Probable,
-                tier: Tier::NameSyntactic,
-                rule: "name-arity".into(),
-                site_id: None,
-                stmt_index: None,
-                cut_markers: CutMarkers::new(),
-                implicit: None,
-                candidate_group: None,
-                established_by: None,
-                cfg_condition: None,
-                macro_origin: None,
-                transform: None,
+            .map(|(src, dst, virt, stmt, grouped)| {
+                let group = (grouped && stmt.is_some()).then(|| (src, stmt.unwrap()));
+                let edge = EdgeRecord {
+                    id: EdgeId(0),
+                    src: NodeId(src),
+                    dst: NodeId(dst),
+                    kind: if virt { EdgeKind::CallsVirtual } else { EdgeKind::Calls },
+                    condition: EdgeCondition::Always,
+                    confidence: Confidence::Probable,
+                    tier: Tier::NameSyntactic,
+                    rule: "name-arity".into(),
+                    site_id: None,
+                    stmt_index: stmt,
+                    cut_markers: CutMarkers::new(),
+                    implicit: None,
+                    candidate_group: None,
+                    established_by: None,
+                    cfg_condition: None,
+                    macro_origin: None,
+                    transform: None,
+                };
+                (group, edge)
             })
             .collect();
-        LinkedGraph::new(nodes, edges, vec![])
+        // A candidate set names each target once (the linker dedups its dsts).
+        let mut seen = std::collections::HashSet::new();
+        edges.retain(|(g, e)| g.is_none_or(|g| seen.insert((g, e.dst))));
+        let key = |g: Option<u32>, e: &EdgeRecord| {
+            (e.src.0, e.dst.0, e.kind as u8, e.stmt_index.unwrap_or(u32::MAX), g.unwrap_or(u32::MAX))
+        };
+        // Order with provisional groups placed by first appearance, number them,
+        // then sort by the final numbers (a fixed point, as in the linker).
+        edges.sort_by_key(|(_, e)| key(None, e));
+        let mut numbers: std::collections::HashMap<(u32, u32), u32> = Default::default();
+        for (g, e) in &mut edges {
+            if let Some(g) = g {
+                let next = numbers.len() as u32;
+                e.candidate_group = Some(*numbers.entry(*g).or_insert(next));
+            }
+        }
+        let mut edges: Vec<EdgeRecord> = edges.into_iter().map(|(_, e)| e).collect();
+        edges.sort_by_key(|e| key(e.candidate_group, e));
+        let mut candidates = Vec::new();
+        for (i, e) in edges.iter_mut().enumerate() {
+            e.id = EdgeId(i as u32);
+            if let Some(g) = e.candidate_group {
+                let rank = candidates.iter().filter(|c: &&Candidate| c.candidate_group == g).count();
+                candidates.push(Candidate { candidate_group: g, dst: e.dst, rank: rank as u32 });
+            }
+        }
+        candidates.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+        LinkedGraph::new(nodes, edges, candidates)
     }
 }
 

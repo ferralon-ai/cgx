@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use cgx_store::manifest::Manifest;
+use cgx_store::manifest::{Manifest, ManifestHeader, CURRENT_STORE_FORMAT};
 use cgx_store::durable::{self, Batch};
 use cgx_store::ObjectOid;
 
@@ -214,8 +214,20 @@ fn build_committable_tree(git: &Git, cgx_dir: &Path) -> Result<BuiltTree, Transp
             if !manifest_oid.is_empty() {
                 closure.insert(manifest_oid.clone());
                 let manifest_path = ObjectOid(manifest_oid).object_path(&objects_dir);
-                let manifest: Manifest = cgx_core::codec::decode(&fs::read(&manifest_path)?)
-                    .map_err(TransportError::codec)?;
+                let bytes = fs::read(&manifest_path)?;
+                // Postcard is not self-describing: only a manifest of this binary's
+                // format can be walked for the objects it names.
+                let header: ManifestHeader =
+                    cgx_core::codec::decode(&bytes).map_err(TransportError::codec)?;
+                if header.store_format != CURRENT_STORE_FORMAT {
+                    return Err(TransportError::Codec(format!(
+                        "manifest store_format {} is not this cgx's ({CURRENT_STORE_FORMAT}) \
+                         — run `cgx index` before pushing",
+                        header.store_format
+                    )));
+                }
+                let manifest: Manifest =
+                    cgx_core::codec::decode(&bytes).map_err(TransportError::codec)?;
                 for oid in manifest.referenced_oids() {
                     closure.insert(oid.0.clone());
                 }

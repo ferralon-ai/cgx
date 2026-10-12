@@ -37,7 +37,7 @@
 use crate::durable::{self, Batch};
 use crate::error::{Result, StoreError};
 use crate::lock::WriteLock;
-use crate::manifest::{Manifest, ShardEntry, CURRENT_STORE_FORMAT};
+use crate::manifest::{Manifest, ManifestHeader, ShardEntry, CURRENT_STORE_FORMAT};
 use crate::oid::ObjectOid;
 use crate::store::{FactStore, FnSummaryRow, FragmentInput, SqliteStore};
 use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
@@ -437,17 +437,25 @@ impl ObjectStore {
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let manifest = decode::<Manifest>(&self.read_object(&ObjectOid(manifest_oid))?)?;
+        let oid = ObjectOid(manifest_oid);
+        let bytes = self.read_object(&oid)?;
+        let corrupt = || StoreError::Corrupt { oid: oid.0.clone() };
+        let header = decode::<ManifestHeader>(&bytes).map_err(|_| corrupt())?;
         // Compat gate: a committed manifest from a newer cgx may carry a schema this
         // binary cannot decode faithfully (postcard is not self-describing). Reject
-        // loudly — naming both versions — rather than silently mis-decode (D-3).
-        if manifest.store_format > CURRENT_STORE_FORMAT {
+        // loudly — naming both versions — rather than silently mis-decode (D-3). An
+        // older one is local index state this binary no longer reads: report it as
+        // corrupt so the caller re-indexes.
+        if header.store_format > CURRENT_STORE_FORMAT {
             return Err(StoreError::StoreFormat {
-                found: manifest.store_format,
+                found: header.store_format,
                 expected: CURRENT_STORE_FORMAT,
             });
         }
-        Ok(Some(manifest))
+        if header.store_format < CURRENT_STORE_FORMAT {
+            return Err(corrupt());
+        }
+        Ok(Some(decode::<Manifest>(&bytes).map_err(|_| corrupt())?))
     }
 
     /// Read the object `oid` and verify its bytes hash to it. A missing object or
@@ -676,7 +684,7 @@ impl FactStore for ObjectStore {
             let corrupt = || StoreError::Corrupt {
                 oid: entry.oid.0.clone(),
             };
-            let shard = decode::<Shard>(&bytes)?;
+            let shard = decode::<Shard>(&bytes).map_err(|_| corrupt())?;
             // The re-densify below relies on each shard's nodes being canonical.
             if !shard.nodes.is_sorted_by(|a, b| a.sort_key() <= b.sort_key()) {
                 return Err(corrupt());
@@ -826,9 +834,22 @@ impl FactStore for ObjectStore {
                     continue;
                 };
                 let manifest_oid = contents.lines().next().unwrap_or_default().trim().to_owned();
-                let manifest =
-                    decode::<Manifest>(&self.read_object(&ObjectOid(manifest_oid.clone()))?)?;
-                live.insert(manifest_oid);
+                live.insert(manifest_oid.clone());
+                // A missing, corrupt or older-format manifest reads as corrupt and is
+                // rebuilt by the next index run, so what it names is not kept. One
+                // from a newer cgx may name objects this binary cannot see: keep
+                // everything rather than guess.
+                let Ok(bytes) = self.read_object(&ObjectOid(manifest_oid)) else {
+                    continue;
+                };
+                match decode::<ManifestHeader>(&bytes) {
+                    Ok(h) if h.store_format > CURRENT_STORE_FORMAT => return Ok(removed),
+                    Ok(h) if h.store_format == CURRENT_STORE_FORMAT => {}
+                    _ => continue,
+                }
+                let Ok(manifest) = decode::<Manifest>(&bytes) else {
+                    continue;
+                };
                 for oid in manifest.referenced_oids() {
                     live.insert(oid.0.clone());
                 }

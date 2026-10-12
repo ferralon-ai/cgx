@@ -20,8 +20,8 @@
 use crate::store_loc::{cgx_dir, db_path};
 use cgx_store::store::{FnSummaryRow, FragmentInput};
 use cgx_store::{
-    BlobOid, BlobSet, CachedFragment, FactStore, LinkedGraph, ObjectStore, PruneStats, Result,
-    SqliteStore, TreeOid,
+    CachedFragment, FactStore, FragmentKey, FragmentKeySet, LinkedGraph, ObjectStore, PruneStats,
+    Result, SqliteStore, TreeOid,
 };
 use std::path::Path;
 
@@ -51,8 +51,8 @@ impl ShadowStore {
 impl FactStore for ShadowStore {
     // ---- reads: object store only (no SQL on the query path) ------------------
 
-    fn fragment(&self, blob: &BlobOid) -> Result<Option<CachedFragment>> {
-        self.objects.fragment(blob)
+    fn fragment(&self, key: &FragmentKey) -> Result<Option<CachedFragment>> {
+        self.objects.fragment(key)
     }
 
     fn graph_for(&self, tree: &TreeOid) -> Result<bool> {
@@ -80,7 +80,7 @@ impl FactStore for ShadowStore {
         self.objects.put_graph(tree, created_rev, g)
     }
 
-    fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats> {
+    fn prune(&mut self, live: &FragmentKeySet, aggressive: bool) -> Result<PruneStats> {
         let stats = self.sqlite.prune(live, aggressive)?;
         self.objects.prune(live, aggressive)?;
         Ok(stats)

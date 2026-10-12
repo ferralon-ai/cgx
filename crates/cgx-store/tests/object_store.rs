@@ -559,9 +559,9 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
     use cgx_store::FragmentInput;
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let blob = cgx_store::BlobOid::new("blob-aaaa");
+    let blob = cgx_store::FragmentKey::new("blob-aaaa");
     let input = FragmentInput {
-        blob: &blob,
+        key: &blob,
         lang: "rust",
         frontend_version: 3,
         bytes: b"canonical-fragment-bytes",
@@ -576,17 +576,17 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
     // Re-put of the unchanged blob is a true no-op (IX-1).
     s.put_fragments(&[input]).unwrap();
     assert_eq!(s.fragment(&blob).unwrap().unwrap(), got);
-    assert!(s.fragment(&cgx_store::BlobOid::new("absent")).unwrap().is_none());
+    assert!(s.fragment(&cgx_store::FragmentKey::new("absent")).unwrap().is_none());
 }
 
 #[test]
 fn put_with_a_different_frontend_version_replaces_the_fragment() {
-    use cgx_store::{BlobOid, FragmentInput};
+    use cgx_store::{FragmentInput, FragmentKey};
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let blob = BlobOid::new("blob-versioned");
-    let v1 = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
-    let v2 = FragmentInput { blob: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+    let blob = FragmentKey::new("blob-versioned");
+    let v1 = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { key: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
 
     s.put_fragments(&[v1]).unwrap();
     s.put_fragments(&[v2]).unwrap();
@@ -603,18 +603,18 @@ fn put_with_a_different_frontend_version_replaces_the_fragment() {
 
 #[test]
 fn prune_drops_only_fragments_absent_from_the_live_set() {
-    use cgx_store::{BlobOid, FragmentInput};
+    use cgx_store::{FragmentInput, FragmentKey};
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let live_blob = BlobOid::new("blob-live");
-    let dead_blob = BlobOid::new("blob-dead");
+    let live_blob = FragmentKey::new("blob-live");
+    let dead_blob = FragmentKey::new("blob-dead");
     s.put_fragments(&[
-        FragmentInput { blob: &live_blob, lang: "rust", frontend_version: 1, bytes: b"live" },
-        FragmentInput { blob: &dead_blob, lang: "rust", frontend_version: 1, bytes: b"dead" },
+        FragmentInput { key: &live_blob, lang: "rust", frontend_version: 1, bytes: b"live" },
+        FragmentInput { key: &dead_blob, lang: "rust", frontend_version: 1, bytes: b"dead" },
     ])
     .unwrap();
 
-    let mut live = cgx_store::BlobSet::new();
+    let mut live = cgx_store::FragmentKeySet::new();
     live.insert(live_blob.clone());
     let stats = s.prune(&live, false).unwrap();
 
@@ -626,11 +626,11 @@ fn prune_drops_only_fragments_absent_from_the_live_set() {
 
 #[test]
 fn a_fragment_failing_its_checksum_is_a_miss_and_is_rewritten() {
-    use cgx_store::{BlobOid, FragmentInput};
+    use cgx_store::{FragmentInput, FragmentKey};
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let blob = BlobOid::new("blob-torn");
-    let input = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"facts" };
+    let blob = FragmentKey::new("blob-torn");
+    let input = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"facts" };
     s.put_fragments(&[input]).unwrap();
 
     let path = ObjectOid(blob.0.clone()).object_path(&root.path().join(".cgx").join("fragments"));

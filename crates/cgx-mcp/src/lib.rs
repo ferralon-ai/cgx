@@ -37,10 +37,13 @@
 //!
 //! Every graph-reading tool accepts `include_dirty` (default `true`, the inverse
 //! of the CLI's `--include-dirty`, which defaults to `false`). On a call with
-//! `include_dirty: true` the server indexes the **working tree** for that call so
-//! an agent's uncommitted edits are visible to `callers`/`paths`/… The overlay is
-//! **per call** and **never persisted** (a fresh in-memory store backs each
-//! acquisition). When the tree differs from `HEAD`, `graph_version` becomes
+//! `include_dirty: true` the server answers over the **working tree** for that
+//! call so an agent's uncommitted edits are visible to `callers`/`paths`/… Both
+//! modes read the repository's persistent `.cgx/` index, auto-built and kept at
+//! `HEAD` exactly as the CLI keeps it. The overlay is **per call** and **never
+//! persisted**: edited files are re-extracted into memory on top of the stored
+//! fragments, and nothing the overlay produces is written to `.cgx/`. When the
+//! tree differs from `HEAD`, `graph_version` becomes
 //! `"<tree-oid>+dirty.<overlay-digest>"` and the response reports `dirty: true`
 //! plus `dirty_files_analyzed` — so an agent (and a cache keyed on
 //! `(query, graph_version)`) can tell the post-edit base from the committed one.

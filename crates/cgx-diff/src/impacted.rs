@@ -101,9 +101,9 @@ pub struct Answer {
 /// Answer an `impacted-tests` request.
 ///
 /// `store` is caller-supplied: the CLI passes the on-disk `.cgx/` store (a warm
-/// Layer-1 blob cache, so unchanged files re-extract nothing), MCP passes
-/// `SqliteStore::open_in_memory()` to preserve the ADR-06 never-persist
-/// invariant at the cost of a cold cache per call.
+/// Layer-1 blob cache, so unchanged files re-extract nothing), MCP passes an
+/// `OverlayStore` over that same store, which keeps the warm cache but holds
+/// every write in memory, preserving the ADR-06 never-persist invariant.
 ///
 /// It must **not** be routed through `index_repo`: that prunes the store to a
 /// single graph and would delete the other side of the diff.

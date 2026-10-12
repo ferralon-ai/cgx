@@ -6,14 +6,26 @@
 //!
 //! ## `include_dirty` (ADR-06, default true for MCP)
 //!
-//! - **`include_dirty: false`** — index the committed `HEAD` tree
-//!   ([`cgx_index::index_path`]). `graph_version` is the short HEAD tree OID.
-//!   This mirrors the CLI's committed-state default.
-//! - **`include_dirty: true`** — index the working directory
-//!   ([`cgx_index::index_workdir`]), so uncommitted edits are visible to the
-//!   query. The overlay is **per call** and **never persisted**: a fresh
-//!   in-memory store backs each acquisition, and nothing is written to the
-//!   on-disk index. When the tree actually differs from `HEAD`, `graph_version`
+//! Both modes read the repository's persistent `.cgx/` index — the one `cgx
+//! index` writes and every CLI query reads — and bring it up to date first with
+//! the CLI's own auto-index trigger ([`cgx_index::local::ensure_indexed`]): it is
+//! built when missing and rebuilt when `HEAD` has moved, so a call over an
+//! unchanged committed tree re-uses the stored graph and extracts and links
+//! nothing.
+//!
+//! - **`include_dirty: false`** — answer over the stored graph of the committed
+//!   `HEAD` tree. `graph_version` is the short HEAD tree OID. This mirrors the
+//!   CLI's committed-state default.
+//! - **`include_dirty: true`** — answer over the working directory, so
+//!   uncommitted edits are visible to the query. When the working tree is
+//!   content-identical to `HEAD` this is the stored committed graph. Otherwise the
+//!   working directory is indexed ([`cgx_index::index_workdir`]) through an
+//!   [`OverlayStore`] over `.cgx/`: unchanged files are Layer-1 cache hits, edited
+//!   files are re-extracted, and the whole graph is re-linked, because linking is
+//!   whole-program. The overlay is **per call** and **never persisted**: its
+//!   fragments and graph live in memory and are dropped when the call ends, and
+//!   nothing it produces is written to `.cgx/`. When the tree actually differs
+//!   from `HEAD`, `graph_version`
 //!   becomes `"<short-tree-oid>+dirty.<overlay-digest>"` where `overlay-digest`
 //!   is a deterministic hash of the sorted *path → content* differences between
 //!   the committed tree and the working tree — so a cache keyed on
@@ -21,11 +33,11 @@
 //!   no such difference reports the committed `graph_version` (no spurious
 //!   `+dirty`). That is **not** the same as "a tree git calls clean": the
 //!   difference is computed from [`cgx_index::Repo::enumerate_workdir`], which
-//!   applies no ignore rules, so an untracked or ignored file — cgx's own `.cgx/`
-//!   on any repo that has been indexed, most commonly — makes the overlay
-//!   non-empty and the `graph_version` `+dirty` on a `git status`-clean checkout.
-//!   That is honest: the ignored file *is* part of what the answer was computed
-//!   over. It is also why `freshness.matches_head` is three-valued (see
+//!   applies no ignore rules (it skips only `.git/` and cgx's own `.cgx/`), so an
+//!   untracked or ignored file — a build directory, most commonly — makes the
+//!   overlay non-empty and the `graph_version` `+dirty` on a `git status`-clean
+//!   checkout. That is honest: the ignored file *is* part of what the answer was
+//!   computed over. It is also why `freshness.matches_head` is three-valued (see
 //!   [`acquire`]).
 //!
 //! Because a working-directory blob OID is content-addressed exactly as git would
@@ -40,11 +52,10 @@
 //! while `index_workdir` had genuinely built a smaller graph: same cache key,
 //! different answer.
 
-use cgx_index::{
-    default_registry, index_path, index_workdir, manifest_digest, IndexOpts, Repo, SourceFile,
-};
+use cgx_index::local::{auto_index_opts, ensure_indexed, load_current, open_store};
+use cgx_index::{default_registry, index_workdir, manifest_digest, IndexError, Repo, SourceFile};
 use cgx_query::{FreshnessEnvelope, GraphView};
-use cgx_store::{FactStore, SqliteStore, TreeOid};
+use cgx_store::{LinkedGraph, OverlayStore, TreeOid};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -98,25 +109,13 @@ pub struct GraphSession {
 /// Acquire a graph for one tool call.
 ///
 /// `root` is the repository root the tool named. `include_dirty` selects the
-/// committed tree (false) or the working-directory overlay (true). Each call uses
-/// a fresh in-memory store, so the overlay is never persisted (ADR-06 invariant).
+/// committed tree (false) or the working-directory overlay (true). The persistent
+/// `.cgx/` index is brought current first, exactly as a CLI query does; the
+/// overlay itself is never persisted (ADR-06 invariant).
 pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolError> {
-    let registry = default_registry();
-    let mut store = SqliteStore::open_in_memory()
-        .map_err(|e| ToolError::index(format!("opening in-memory store: {e}")))?;
-
-    // v0.3 SC6: dataflow is part of the standard index (on by default), so MCP
-    // tools answer `:DATA_FLOW`/`flows-*` against a fresh auto-index. The
-    // `[index] data_flow = false` cgx.toml key opts back out (mirrors the CLI).
-    let opts = IndexOpts {
-        dataflow: dataflow_default(root),
-        ..IndexOpts::default()
-    };
-
     if !include_dirty {
-        let outcome = index_path(root, &registry, &mut store, &opts)
-            .map_err(|e| ToolError::index(format!("indexing committed tree: {e}")))?;
-        let view = load_view(&store, &TreeOid::new(outcome.graph_key.clone()))?;
+        ensure_indexed(root).map_err(|e| index_error("indexing committed tree", e))?;
+        let (graph_key, graph) = load_committed(root)?;
         // `HEAD` is resolved independently rather than reusing the graph key, so
         // `matches_head` is derived from two separately established facts instead
         // of being true by construction. The working tree was never inspected under
@@ -125,24 +124,24 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
             .ok()
             .and_then(|r| r.head_tree_oid().ok());
         return Ok(GraphSession {
-            view,
-            graph_version: short_oid(&outcome.graph_key),
+            view: into_view(graph),
+            graph_version: short_oid(&graph_key),
             dirty: false,
             dirty_files_analyzed: 0,
-            freshness: FreshnessEnvelope::new(Some(outcome.graph_key), head_tree, None),
+            freshness: FreshnessEnvelope::new(Some(graph_key), head_tree, None),
         });
     }
 
-    // include_dirty: index the working directory (committed + uncommitted).
+    // include_dirty: the working directory (committed + uncommitted).
     let repo = Repo::discover(root).map_err(|e| ToolError::index(e.to_string()))?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| ToolError::index("repository has no working directory"))?
         .to_path_buf();
 
-    // Compute the overlay difference from HEAD, before we consume the store for
-    // indexing. `tree_blob_oids` is the *same* committed-tree view the envelope's
-    // count is measured against (and it reads no blob content, unlike
+    // Compute the overlay difference from HEAD before indexing anything.
+    // `tree_blob_oids` is the *same* committed-tree view the envelope's count is
+    // measured against (and it reads no blob content, unlike
     // `enumerate_tree`), so the two numbers below can never be derived from
     // contradictory pictures of what `HEAD` contains.
     let head_tree_oid = repo
@@ -156,9 +155,19 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .map_err(|e| ToolError::index(e.to_string()))?;
     let overlay = overlay_difference(&committed, &working);
 
-    let outcome = index_workdir(root, &workdir, &registry, &mut store, &opts)
-        .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
-    let view = load_view(&store, &TreeOid::new(outcome.graph_key.clone()))?;
+    ensure_indexed(root).map_err(|e| index_error("indexing committed tree", e))?;
+    let (view, workdir_key) = if overlay.is_empty() {
+        // Nothing on disk differs from HEAD's tree, so the working-tree graph *is*
+        // the committed graph: serve the stored one rather than rebuild it.
+        let (graph_key, graph) = load_committed(root)?;
+        if graph_key == head_tree_oid {
+            (into_view(graph), None)
+        } else {
+            index_overlay(root, &workdir)?
+        }
+    } else {
+        index_overlay(root, &workdir)?
+    };
 
     // The envelope's divergence count comes from the *same* function the CLI uses,
     // so `freshness.dirty_files` answers the same question on both surfaces. It is
@@ -205,10 +214,9 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     // `indexed_tree` must name — unless the working tree is established to be
     // content-identical to HEAD's tree, in which case naming HEAD's tree is the
     // honest description of the same graph.
-    let indexed_tree = if matches_head == Some(true) {
-        head_tree_oid.clone()
-    } else {
-        outcome.graph_key.clone()
+    let indexed_tree = match workdir_key {
+        Some(key) if matches_head != Some(true) => key,
+        _ => head_tree_oid.clone(),
     };
     let freshness = match matches_head {
         // The `workdir:` key is never HEAD's tree OID, so `new` derives exactly the
@@ -246,39 +254,45 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
     }
 }
 
-/// The effective on-by-default dataflow setting for `root` (v0.3 SC6). Dataflow
-/// ships ON; only a `[index] data_flow = false` key in a `cgx.toml` at the repo
-/// root disables it. Minimal section-scoped line scan — cgx carries no `toml`
-/// dependency by design.
-fn dataflow_default(root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(root.join("cgx.toml")) else {
-        return true;
-    };
-    let mut in_index = false;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_index = line == "[index]";
-            continue;
-        }
-        if !in_index {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "data_flow" {
-                return value.trim() != "false";
-            }
-        }
-    }
-    true
+/// Index the working directory through an [`OverlayStore`] over the persistent
+/// `.cgx/` store and return its graph with the `workdir:` key it was built under.
+/// Unchanged files are Layer-1 cache hits against `.cgx/`; every fragment and
+/// graph this run produces stays in the overlay and is dropped with it (ADR-06).
+fn index_overlay(root: &Path, workdir: &Path) -> Result<(GraphView, Option<String>), ToolError> {
+    let base = open_store(root).map_err(|e| ToolError::index(e.to_string()))?;
+    let mut overlay = OverlayStore::new(&base);
+    let outcome = index_workdir(
+        root,
+        workdir,
+        &default_registry(),
+        &mut overlay,
+        &auto_index_opts(root),
+    )
+    .map_err(|e| ToolError::index(format!("indexing working directory: {e}")))?;
+    let graph = overlay
+        .take_graph(&TreeOid::new(outcome.graph_key.clone()))
+        .ok_or_else(|| ToolError::index("reading graph: working-tree graph was not stored"))?;
+    Ok((into_view(graph), Some(outcome.graph_key)))
 }
 
-/// Read a stored graph back into a queryable [`GraphView`].
-fn load_view(store: &impl FactStore, tree: &TreeOid) -> Result<GraphView, ToolError> {
-    let graph = store
-        .read_graph(tree)
-        .map_err(|e| ToolError::index(format!("reading graph: {e}")))?;
-    Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
+/// The stored graph of the committed tree the `.cgx/` pointer names, with its
+/// key. A missing or corrupt graph is rebuilt once, as the CLI does.
+fn load_committed(root: &Path) -> Result<(String, LinkedGraph), ToolError> {
+    load_current(root, true).map_err(|e| index_error("indexing committed tree", e))
+}
+
+fn into_view(graph: LinkedGraph) -> GraphView {
+    GraphView::new(graph.nodes, graph.edges, graph.candidates)
+}
+
+/// Map a local-index failure to a tool error. A failed index run reads
+/// `"<what>: <pipeline error>"`; anything else (the store, the pointer) carries
+/// its own message, which names the operation and path.
+pub(crate) fn index_error(what: &str, e: IndexError) -> ToolError {
+    match e {
+        IndexError::Build(inner) => ToolError::index(format!("{what}: {inner}")),
+        other => ToolError::index(other.to_string()),
+    }
 }
 
 /// Every way the working tree differs from the committed tree, one deterministic

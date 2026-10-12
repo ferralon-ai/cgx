@@ -158,6 +158,10 @@ fn rust_loop_and_conditional_edge_labels() {
 }
 
 // ---- TypeScript ----
+//
+// The TS root is the `package.json` `name` verbatim (PR-T, #132): the fixture's
+// `package.json` declares `"name": "ts-sample"`, so canonical FQNs root at
+// `ts-sample` (hyphen preserved), not the old dir-mangled `ts_sample`.
 
 #[test]
 fn ts_cross_file_import_resolves_probable() {
@@ -166,8 +170,8 @@ fn ts_cross_file_import_resolves_probable() {
     // imports.ts: doubleViaImport -> direct::add (probable).
     let e = idx
         .edges_between(
-            "ts_sample::imports::doubleViaImport",
-            "ts_sample::direct::add",
+            "ts-sample::imports::doubleViaImport",
+            "ts-sample::direct::add",
         )
         .next()
         .expect("cross-file TS import edge missing");
@@ -176,8 +180,8 @@ fn ts_cross_file_import_resolves_probable() {
 
     // makeDogSpeak -> virtual_dispatch::makeSpeak (probable, cross-file).
     assert!(idx.has_edge(
-        "ts_sample::imports::makeDogSpeak",
-        "ts_sample::virtual_dispatch::makeSpeak"
+        "ts-sample::imports::makeDogSpeak",
+        "ts-sample::virtual_dispatch::makeSpeak"
     ));
 }
 
@@ -188,8 +192,8 @@ fn ts_async_await_emits_calls_async() {
     // async_calls.ts: fetchData awaits httpGet -> calls:async.
     assert!(idx
         .edges_between(
-            "ts_sample::async_calls::fetchData",
-            "ts_sample::async_calls::httpGet"
+            "ts-sample::async_calls::fetchData",
+            "ts-sample::async_calls::httpGet"
         )
         .any(|e| e.kind == EdgeKind::CallsAsync));
 }
@@ -201,8 +205,8 @@ fn ts_try_catch_emits_exception_edge() {
     // errors.ts: tryParse logs the parse error in a catch block -> exception.
     assert!(idx
         .edges_between(
-            "ts_sample::errors::tryParse",
-            "ts_sample::errors::logParseError"
+            "ts-sample::errors::tryParse",
+            "ts-sample::errors::logParseError"
         )
         .any(|e| e.condition == EdgeCondition::Exception));
 }

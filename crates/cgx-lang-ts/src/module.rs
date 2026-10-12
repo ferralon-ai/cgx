@@ -1,27 +1,78 @@
 //! Module-path derivation from a repo-relative TypeScript/JavaScript file path.
 //!
-//! TypeScript/JS use `package.json`-based module names. For the fixtures we
-//! derive a conventional `ts_sample::module_stem` path from the file's location,
-//! mirroring the WP-02 golden YAML naming convention.
+//! The canonical TS/JS module root is the **`package.json` `name`**, taken
+//! **verbatim** (a scoped `@scope/pkg` keeps its `@` and `/`; a hyphenated name
+//! like `ts-sample` keeps its hyphen — no identifier mangling). The nearest
+//! ancestor `package.json` is resolved pipeline-side (a per-file `extract`
+//! cannot read sibling files) and reaches us as `FileCtx::manifest`; when it is
+//! present we derive the prefix with [`module_path_from_manifest`].
 //!
-//! Mapping rules:
-//! - Strip `src/` prefix; the enclosing `package.json` name becomes the root
-//!   (default: `ts_sample`).
+//! When no `package.json` is resolved (`FileCtx::manifest == None`) we fall back
+//! to [`module_path_for`], a **non-canonical best-effort** derivation that roots
+//! at the directory before `src/` (mangled to an identifier). A repo with no
+//! `package.json` has no declared name to be canonical to.
+//!
+//! Subpath mapping (both paths, below the package root / `src/` boundary):
 //! - Each directory segment becomes a `::` segment.
-//! - `index.ts`/`index.js` map to the directory root (no extra segment).
-//! - Extension `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts` is stripped.
+//! - A trailing `index.ts`/`index.js` contributes no segment (it is the
+//!   directory's module root).
+//! - Extension `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` is
+//!   stripped.
 //!
 //! [`FileCtx`]: cgx_frontend::FileCtx
 
-/// Default package name when the file is inside `src/` with no explicit
-/// package directory. Matches the WP-02 TypeScript fixture package (`ts-sample`
-/// → `ts_sample`).
+/// Default package name used by the non-canonical fallback when the file is
+/// inside `src/` with no explicit package directory. Matches the WP-02
+/// TypeScript fixture package (`ts-sample` → `ts_sample`).
 const DEFAULT_PACKAGE: &str = "ts_sample";
 
-/// Derive the `::`-separated module path prefix for a repo-relative TS/JS file.
+/// Derive the canonical `::`-separated module prefix from the resolved
+/// `package.json` `name` and the file's subpath below the package directory.
 ///
-/// The returned string never has a trailing `::`; a top-level `src/index.ts`
-/// yields just the package name. Path separators are normalized to `/`.
+/// `name` is used **verbatim** as the root segment — it is never run through
+/// [`to_pkg_ident`], so `@acme/utils` keeps its `@` and `/`, and `ts-sample`
+/// keeps its hyphen. `root_dir` is the repo-relative directory of the owning
+/// `package.json` (the boundary); the file's segments below it form the
+/// remaining `::` segments, with a leading `src/` boundary and a trailing
+/// `index` contributing nothing. The returned string never has a trailing `::`.
+pub fn module_path_from_manifest(rel_path: &str, name: &str, root_dir: &str) -> String {
+    let norm = rel_path.replace('\\', "/");
+    let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+
+    let root_norm = root_dir.replace('\\', "/");
+    let root_segments: Vec<&str> = root_norm.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Strip the owning package.json's directory prefix. The resolver always
+    // picks an ancestor, so this normally matches; if it somehow does not, fall
+    // back to the whole path rather than panicking or mis-slicing.
+    let below: &[&str] = if segments.len() >= root_segments.len()
+        && segments[..root_segments.len()] == root_segments[..]
+    {
+        &segments[root_segments.len()..]
+    } else {
+        &segments[..]
+    };
+
+    // Drop a leading `src` boundary segment, mirroring the dir-before-`src/`
+    // convention of the non-canonical fallback (`src/foo.ts` → `::foo`).
+    let below = if below.first() == Some(&"src") {
+        &below[1..]
+    } else {
+        below
+    };
+
+    let mut out = name.to_string();
+    append_subpath(&mut out, below);
+    out
+}
+
+/// Non-canonical fallback: derive the `::`-separated module prefix for a
+/// repo-relative TS/JS file when no `package.json` is resolved.
+///
+/// Roots at the directory immediately before `src/` (mangled to an identifier
+/// via [`to_pkg_ident`]), defaulting to [`DEFAULT_PACKAGE`]. The returned string
+/// never has a trailing `::`; a top-level `src/index.ts` yields just the package
+/// name. Path separators are normalized to `/`.
 pub fn module_path_for(rel_path: &str) -> String {
     let norm = rel_path.replace('\\', "/");
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
@@ -45,6 +96,13 @@ pub fn module_path_for(rel_path: &str) -> String {
     };
 
     let mut out = pkg_name;
+    append_subpath(&mut out, mod_segments);
+    out
+}
+
+/// Append the `::`-joined subpath segments to `out`, stripping TS/JS extensions,
+/// skipping a trailing `index` stem, and skipping empty stems.
+fn append_subpath(out: &mut String, mod_segments: &[&str]) {
     let n = mod_segments.len();
     for (i, seg) in mod_segments.iter().enumerate() {
         let is_last = i + 1 == n;
@@ -60,7 +118,6 @@ pub fn module_path_for(rel_path: &str) -> String {
         out.push_str("::");
         out.push_str(stem);
     }
-    out
 }
 
 /// Strip a TypeScript/JavaScript file extension from a segment.
@@ -113,5 +170,75 @@ mod tests {
     #[test]
     fn tsx_extension_stripped() {
         assert_eq!(module_path_for("src/App.tsx"), "ts_sample::App");
+    }
+
+    // -- canonical package.json-name root (module_path_from_manifest) --
+
+    #[test]
+    fn scoped_name_preserved_verbatim() {
+        // `@` and `/` of a scoped name survive; no `-`/`.`→`_` mangling.
+        assert_eq!(
+            module_path_from_manifest(
+                "packages/utils/src/components/Button.tsx",
+                "@acme/utils",
+                "packages/utils",
+            ),
+            "@acme/utils::components::Button"
+        );
+    }
+
+    #[test]
+    fn scoped_index_contributes_no_segment() {
+        assert_eq!(
+            module_path_from_manifest(
+                "packages/web/utils/src/index.ts",
+                "@acme/web-utils",
+                "packages/web/utils",
+            ),
+            "@acme/web-utils"
+        );
+    }
+
+    #[test]
+    fn monorepo_same_leaf_resolves_to_distinct_roots() {
+        // Before this PR both rooted at `utils` (dir-before-`src/`); the
+        // package.json name now disambiguates them.
+        let web = module_path_from_manifest(
+            "packages/web/utils/src/service.ts",
+            "@acme/web-utils",
+            "packages/web/utils",
+        );
+        let api = module_path_from_manifest(
+            "services/api/utils/src/service.ts",
+            "@acme/api-utils",
+            "services/api/utils",
+        );
+        assert_eq!(web, "@acme/web-utils::service");
+        assert_eq!(api, "@acme/api-utils::service");
+        assert_ne!(web, api);
+    }
+
+    #[test]
+    fn hyphenated_name_kept_verbatim() {
+        // Unscoped names are also verbatim — no `to_pkg_ident` on the root.
+        assert_eq!(
+            module_path_from_manifest("src/errors.ts", "ts-sample", ""),
+            "ts-sample::errors"
+        );
+    }
+
+    #[test]
+    fn manifest_extension_stripped() {
+        assert_eq!(
+            module_path_from_manifest("pkg/src/util.mts", "@acme/utils", "pkg"),
+            "@acme/utils::util"
+        );
+    }
+
+    #[test]
+    fn no_package_json_fallback_unchanged() {
+        // The non-canonical dir-before-`src/` fallback is untouched.
+        assert_eq!(module_path_for("src/errors.ts"), "ts_sample::errors");
+        assert_eq!(module_path_for("ts-sample/src/x.ts"), "ts_sample::x");
     }
 }

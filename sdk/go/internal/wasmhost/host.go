@@ -100,7 +100,7 @@ func New(ctx context.Context, cfg transport.Config, opts Options) (*Host, error)
 		recycle = DefaultExtractorRecycle
 	}
 	h.pool = newPool(size, recycle, func(ctx context.Context) (extractor, error) {
-		in, err := newInstance(ctx, eng, "", opts.Stderr, &h.ext)
+		in, err := newInstance(ctx, eng, roleExtract, "", opts.Stderr, &h.ext)
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +126,7 @@ func (h *Host) sessionInstance(ctx context.Context) (*instance, error) {
 	if err := os.Mkdir(h.dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
-	in, err := newInstance(ctx, h.eng, h.dir, h.opts.Stderr, &h.sess)
+	in, err := newInstance(ctx, h.eng, roleSession, h.dir, h.opts.Stderr, &h.sess)
 	if err != nil {
 		return nil, err
 	}

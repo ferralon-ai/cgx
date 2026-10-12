@@ -41,6 +41,11 @@ const (
 	ModeWorktree = "worktree"
 )
 
+// IndexFinishOpts is cgx_index_finish's JSON options entry.
+type IndexFinishOpts struct {
+	CompdbComplete bool `json:"compdb_complete,omitempty"`
+}
+
 // IndexBeginOpts is the first entry of cgx_index_begin's frame. Head mode
 // sets GraphKey; worktree mode sets HeadTree and Committed, the number of
 // trailing (path, oid) pairs that are HEAD's tree rather than working files.

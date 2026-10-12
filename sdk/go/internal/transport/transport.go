@@ -35,10 +35,26 @@ type Transport interface {
 
 // IndexRequest selects what Index builds.
 type IndexRequest struct {
-	Mode     string // abi.ModeHead or abi.ModeWorktree
-	Force    bool   // re-index even when the persisted graph is fresh
-	SCIP     string // optional SCIP index path
-	Dataflow *bool  // overrides the cgx.toml default when non-nil
+	Mode     string    // abi.ModeHead or abi.ModeWorktree
+	Force    bool      // re-index even when the persisted graph is fresh
+	SCIP     string    // optional SCIP index path
+	SCIPData *SCIPData // optional SCIP index as bytes; exclusive with SCIP
+	Dataflow *bool     // overrides the cgx.toml default when non-nil
+}
+
+// Rebuilds reports whether the request always rebuilds: SCIP and an explicit
+// dataflow choice do, as the engine's own index does.
+func (r IndexRequest) Rebuilds() bool {
+	return r.Force || r.SCIP != "" || r.SCIPData != nil || r.Dataflow != nil
+}
+
+// SCIPData is a SCIP overlay supplied as bytes (cgx.SCIPInput).
+type SCIPData struct {
+	Index                   []byte
+	CompileCommands         []byte // nil: none
+	CompileCommandsDir      string // "": the source root
+	CompileCommandsComplete bool
+	SourceRoot              string // "": the repository directory
 }
 
 // IndexReport is what an index did: cgx_index_finish's response and the
@@ -65,6 +81,28 @@ type IndexStats struct {
 	Unresolved                  uint64 `json:"unresolved"`
 	DataflowFunctionsRecomputed uint64 `json:"dataflow_functions_recomputed"`
 	DataflowFunctionsReused     uint64 `json:"dataflow_functions_reused"`
+	// SCIP is the SCIP overlay's counters; nil when the index had none.
+	SCIP *SCIPStats `json:"scip,omitempty"`
+}
+
+// SCIPStats is what a SCIP overlay changed.
+type SCIPStats struct {
+	UpgradedCertain  uint64 `json:"upgraded_certain"`
+	UpgradedProbable uint64 `json:"upgraded_probable"`
+	// CappedPartialCompdb counts resolutions to a unique definition held at
+	// probable because the compile-commands database was not known complete.
+	CappedPartialCompdb uint64 `json:"capped_partial_compdb"`
+	// Compdb is the compile-commands completeness check; scip-clang only.
+	Compdb *CompdbStats `json:"compdb,omitempty"`
+}
+
+// CompdbStats is the scip-clang compile-commands completeness verdict.
+type CompdbStats struct {
+	Completeness  string   `json:"completeness"` // complete, partial or not_applicable
+	DiscoveredTUs uint64   `json:"discovered_tus"`
+	CoveredTUs    uint64   `json:"covered_tus"`
+	MissingTUs    uint64   `json:"missing_tus"`
+	MissingSample []string `json:"missing_sample"`
 }
 
 // UpToDateReport is the report for an index that found nothing to do.

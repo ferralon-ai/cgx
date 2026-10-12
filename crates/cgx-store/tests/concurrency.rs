@@ -2,7 +2,7 @@
 //! holding the write lock blocks this process's writer until it releases, while a
 //! reader proceeds throughout (WAL MVCC).
 
-use cgx_store::{BlobOid, FactStore, FragmentInput, SqliteStore, StoreError};
+use cgx_store::{FactStore, FragmentInput, FragmentKey, SqliteStore, StoreError};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -41,10 +41,10 @@ fn writer_in_one_process_blocks_writer_in_another_then_reader_still_reads() {
     // Seed the store so the file and a fragment exist before the child opens it.
     {
         let mut store = SqliteStore::open(&db).unwrap();
-        let blob = BlobOid::new("seed");
+        let blob = FragmentKey::new("seed");
         store
             .put_fragments(&[FragmentInput {
-                blob: &blob,
+                key: &blob,
                 lang: "rust",
                 frontend_version: 1,
                 bytes: b"seed-bytes",
@@ -69,7 +69,7 @@ fn writer_in_one_process_blocks_writer_in_another_then_reader_still_reads() {
     let store = SqliteStore::open(&db).unwrap();
 
     // A reader proceeds despite the held write lock (WAL MVCC, no advisory lock).
-    let frag = store.fragment(&BlobOid::new("seed")).unwrap();
+    let frag = store.fragment(&FragmentKey::new("seed")).unwrap();
     assert!(frag.is_some(), "reads must not block on a held write lock");
 
     // This process trying to take the write lock must time out while the child

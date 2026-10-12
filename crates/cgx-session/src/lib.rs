@@ -34,8 +34,9 @@ pub mod store_loc;
 pub use error::{ErrorKind, Result, SessionError};
 pub use ops::{EXPORT_EDGES, RESOLVE, SESSION_OPS};
 pub use session::{
-    extract, BeginOpts, BeginResponse, ExtractMeta, IndexReport, Mode, OpenRequest, OpenResponse,
-    OpenState, PlanMiss, PlanSummary, ReportStats, Resident, Session, StoreOpener, Submitted,
+    extract, BeginOpts, BeginResponse, CompdbSummary, ExtractMeta, IndexReport, Mode, OpenRequest,
+    OpenResponse, OpenState, PlanMiss, PlanSummary, ReportStats, Resident, ScipInput, ScipReport,
+    Session, StoreOpener, Submitted, MAX_COMPDB_BYTES, MAX_SCIP_BYTES,
 };
 
 /// The wasm ABI version (see the crate docs).

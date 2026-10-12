@@ -652,6 +652,46 @@ fn sql_flag_defers_with_clear_message_exit_2() {
     );
 }
 
+/// An index written under an older store format (here: the live manifest
+/// re-stamped `store_format = 1`, as a pre-upgrade binary left it) is not decoded
+/// as the current format: the next auto-indexing query rebuilds it.
+#[test]
+fn query_rebuilds_an_index_from_an_older_store_format() {
+    use cgx_store::manifest::CURRENT_STORE_FORMAT;
+    use cgx_store::ObjectOid;
+
+    let (_tmp, repo) = fixture_repo();
+    index(&repo);
+    let cgx = repo.join(".cgx");
+    let objects = cgx.join("objects");
+    let mut refs = std::fs::read_dir(cgx.join("refs")).unwrap().flatten();
+    let ref_path = refs.next().expect("a graph ref").path();
+    let contents = std::fs::read_to_string(&ref_path).unwrap();
+    let (moid, rest) = contents.split_once('\n').unwrap();
+    let mut bytes = std::fs::read(ObjectOid(moid.to_owned()).object_path(&objects)).unwrap();
+    // `store_format` is the leading field; a small u32 is a one-byte varint.
+    assert_eq!(u32::from(bytes[0]), CURRENT_STORE_FORMAT);
+    bytes[0] = 1;
+    let stale = ObjectOid::of_bytes(&bytes);
+    let stale_path = stale.object_path(&objects);
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, &bytes).unwrap();
+    std::fs::write(&ref_path, format!("{}\n{rest}", stale.0)).unwrap();
+
+    let (_out, stderr, code) = run_cgx_full(
+        &repo,
+        &["query", "--no-auto-index", "MATCH (a)-[:CALLS]->(b) RETURN a.name"],
+    );
+    assert_ne!(code, 0, "a stale-format index is not served: {stderr}");
+
+    let (out, stderr, code) = run_cgx_full(
+        &repo,
+        &["query", "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name"],
+    );
+    assert_eq!(code, 0, "query rebuilds the stale index: {out} {stderr}");
+    assert!(out.contains("fixture::alpha"), "rebuilt graph answers: {out}");
+}
+
 /// A graph object torn by a crash (here: truncated in place) must not be served:
 /// the next auto-indexing query detects it and rebuilds instead of failing.
 #[test]

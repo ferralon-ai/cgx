@@ -458,6 +458,12 @@ impl ObjectStore {
         Ok(Some(decode::<Manifest>(&bytes).map_err(|_| corrupt())?))
     }
 
+    /// Use `hasher` in place of [`sha1_stable_key`], to force collisions.
+    #[cfg(test)]
+    fn set_stable_key(&mut self, hasher: fn(&str, u32) -> u64) {
+        self.stable_key = hasher;
+    }
+
     /// Read the object `oid` and verify its bytes hash to it. A missing object or
     /// a mismatch is [`StoreError::Corrupt`]. The bad file is left in place: readers
     /// do not hold the write lock, and the next [`write_object`](Self::write_object)
@@ -951,3 +957,152 @@ fn read_dir_if_exists(dir: &Path) -> Result<Option<Vec<fs::DirEntry>>> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn node(id: u32, fqn: &str, line: u32) -> NodeRecord {
+        NodeRecord {
+            id: NodeId(id),
+            kind: SymbolKind::Function,
+            fqn: fqn.into(),
+            file: "src/lib.rs".into(),
+            line_start: line,
+            line_end: line + 1,
+            lang: "rust".into(),
+            visibility: Visibility::Public,
+            is_abstract: false,
+            entrypoint_kind: None,
+            signature: None,
+            own_effects: EffectSet::new(),
+            transitive_effects: EffectSet::new(),
+            unresolved_calls: 0,
+        }
+    }
+
+    fn edge(id: u32, src: u32, dst: u32, group: Option<u32>) -> EdgeRecord {
+        EdgeRecord {
+            id: EdgeId(id),
+            src: NodeId(src),
+            dst: NodeId(dst),
+            kind: EdgeKind::Calls,
+            condition: EdgeCondition::Always,
+            confidence: Confidence::Possible,
+            tier: Tier::ScopeGraph,
+            rule: "call".into(),
+            site_id: None,
+            stmt_index: Some(id),
+            cut_markers: CutMarkers::new(),
+            implicit: None,
+            candidate_group: group,
+            established_by: None,
+            cfg_condition: None,
+            macro_origin: None,
+            transform: None,
+        }
+    }
+
+    /// Two callers, each with a candidate set, so shard-local group ordinals
+    /// differ from the global ones.
+    fn graph() -> LinkedGraph {
+        let cand = |g, dst, rank| Candidate {
+            candidate_group: g,
+            dst: NodeId(dst),
+            rank,
+        };
+        LinkedGraph::new(
+            vec![
+                node(0, "app::a", 1),
+                node(1, "app::b", 2),
+                node(2, "app::x", 3),
+                node(3, "app::y", 4),
+            ],
+            vec![
+                edge(0, 0, 2, Some(0)),
+                edge(1, 0, 3, Some(0)),
+                edge(2, 1, 2, Some(1)),
+                edge(3, 1, 3, Some(1)),
+            ],
+            vec![cand(0, 2, 0), cand(0, 3, 1), cand(1, 2, 0), cand(1, 3, 1)],
+        )
+    }
+
+    fn collide(_: &str, _: u32) -> u64 {
+        7
+    }
+
+    /// Every shard object must be exactly the owned encoding a reader decodes, or
+    /// object OIDs would shift with no change to the graph.
+    #[test]
+    fn borrowed_shard_writes_match_owned_encoding() {
+        let root = TempDir::new().unwrap();
+        let mut s = ObjectStore::open(root.path()).unwrap();
+        let tree = TreeOid::new("t1");
+        let g = graph();
+        s.put_graph(&tree, None, &g).unwrap();
+        let manifest = s.resolve_manifest(tree.as_str()).unwrap().unwrap();
+        let (mut nodes, mut edges, mut cands) = (0, 0, 0);
+        for entry in &manifest.shards {
+            let bytes = s.read_object(&entry.oid).unwrap();
+            let shard: Shard = decode(&bytes).unwrap();
+            nodes += shard.nodes.len();
+            edges += shard.edges.len();
+            cands += shard.candidates.len();
+            // Each caller's only group is its shard-local group 0.
+            assert!(shard.edges.iter().all(|e| e.candidate_group.is_none_or(|g| g == 0)));
+            assert_eq!(encode(&shard).unwrap(), bytes, "shard {}", entry.fn_key);
+        }
+        assert_eq!((nodes, edges, cands), (4, 4, 4));
+        assert_eq!(s.read_graph(&tree).unwrap(), g);
+    }
+
+    #[test]
+    fn stable_key_collision_fails_the_write_naming_both_fqns() {
+        let root = TempDir::new().unwrap();
+        let mut s = ObjectStore::open(root.path()).unwrap();
+        s.set_stable_key(collide);
+        let tree = TreeOid::new("t1");
+        match s.put_graph(&tree, None, &graph()) {
+            Err(StoreError::StableKeyCollision { first, second }) => {
+                assert_eq!((first.as_str(), second.as_str()), ("app::a", "app::b"));
+            }
+            other => panic!("expected a collision, got {other:?}"),
+        }
+        assert!(!s.graph_for(&tree).unwrap(), "nothing is written");
+    }
+
+    #[test]
+    fn stable_key_collision_fails_the_read() {
+        let root = TempDir::new().unwrap();
+        let mut s = ObjectStore::open(root.path()).unwrap();
+        let tree = TreeOid::new("t1");
+        s.put_graph(&tree, None, &graph()).unwrap();
+        s.set_stable_key(collide);
+        let err = s.read_graph(&tree).unwrap_err();
+        assert!(matches!(err, StoreError::StableKeyCollision { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn stable_key_depends_on_fqn_and_dup_ordinal_only() {
+        assert_eq!(sha1_stable_key("app::f", 0), sha1_stable_key("app::f", 0));
+        assert_ne!(sha1_stable_key("app::f", 0), sha1_stable_key("app::f", 1));
+        assert_ne!(sha1_stable_key("app::f", 0), sha1_stable_key("app::g", 0));
+    }
+
+    #[test]
+    fn non_canonical_graphs_are_rejected() {
+        let mut swapped_nodes = graph();
+        swapped_nodes.nodes.swap(0, 1);
+        let mut unnumbered_group = graph();
+        for e in &mut unnumbered_group.edges {
+            e.candidate_group = e.candidate_group.map(|g| 1 - g);
+        }
+        let mut edgeless_group = graph();
+        edgeless_group.candidates[3].candidate_group = 2;
+        for g in [swapped_nodes, unnumbered_group, edgeless_group] {
+            let err = check_canonical(&g).unwrap_err();
+            assert!(matches!(err, StoreError::NonCanonical { .. }), "got {err:?}");
+        }
+    }
+}

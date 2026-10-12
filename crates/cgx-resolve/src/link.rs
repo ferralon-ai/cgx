@@ -186,7 +186,10 @@ fn build_nodes(
     }
 
     // Canonical node order: (file, line_start, fqn). Assign dense ids by position.
+    // Whole-graph sorts tick per comparison: they neither allocate nor call out,
+    // so on wasm they would otherwise run without a yield point.
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.0.file.as_str(), a.0.line_start, a.0.fqn.as_str()).cmp(&(
             b.0.file.as_str(),
             b.0.line_start,
@@ -228,7 +231,10 @@ fn sort_nodes_canonical(
     if nodes.is_sorted_by(|a, b| key(a) <= key(b)) {
         return None;
     }
-    nodes.sort_by(|a, b| key(a).cmp(&key(b)));
+    nodes.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        key(a).cmp(&key(b))
+    });
     let mut remap = vec![NodeId(0); nodes.len()];
     for (i, n) in nodes.iter_mut().enumerate() {
         remap[n.node.id.index()] = NodeId(i as u32);
@@ -287,7 +293,11 @@ fn enclosing_def<'a>(
             .get(sid.index())
             .and_then(|s| s.owner_fqn.as_ref())
         {
-            if let Some(def) = defs.iter().find(|d| &d.fqn == owner) {
+            // Linear in the file's defs, per ref: tick (see `resolve_local`).
+            if let Some(def) = defs.iter().find(|d| {
+                cgx_core::yield_hook::tick();
+                &d.fqn == owner
+            }) {
                 return Some(def);
             }
         }
@@ -858,6 +868,7 @@ fn resolve_data_flows(
     // in canonical (file, line, fqn) order. Symbol node ids are unchanged.
     let mut staged: Vec<ValueNodeStage> = value_nodes.into_values().collect();
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.file.as_str(), a.line, a.fqn.as_str()).cmp(&(b.file.as_str(), b.line, b.fqn.as_str()))
     });
     let mut value_fqn_to_node: std::collections::BTreeMap<String, NodeId> =
@@ -904,7 +915,10 @@ fn resolve_data_flows(
         let bytes = cgx_core::codec::encode(facts).unwrap_or_default();
         output.fn_summaries.push(((blob, fn_fqn.clone()), bytes));
     }
-    output.fn_summaries.sort();
+    output.fn_summaries.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
     output.ifds_stats = crate::graph::IfdsDataflowStats {
         summaries_computed: ifds.stats.summaries_computed,
         summary_edges_materialized: ifds.stats.summary_edges_materialized,
@@ -1423,9 +1437,15 @@ fn resolve_local<'a>(
     name: &str,
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
+        // A scan of every def in the file, per ref and ancestor scope: a file
+        // with tens of thousands of defs makes this seconds of allocation-free
+        // work, so it ticks per def visited.
         if let Some(def) = defs
             .iter()
-            .filter(|d| d.scope == sid && short_name(&d.fqn) == name)
+            .filter(|d| {
+                cgx_core::yield_hook::tick();
+                d.scope == sid && short_name(&d.fqn) == name
+            })
             .min_by(|a, b| a.fqn.cmp(&b.fqn))
         {
             return Some(def);
@@ -1448,6 +1468,7 @@ fn resolve_pinned_closure<'a>(
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
         let mut hits = defs.iter().filter(|d| {
+            cgx_core::yield_hook::tick();
             d.scope == sid && d.kind == SymbolKind::Lambda && short_name(&d.fqn) == name
         });
         if let Some(first) = hits.next() {
@@ -1739,7 +1760,10 @@ fn finalize(
     mut unresolved: Vec<UnresolvedRef>,
     narrowing: &std::collections::BTreeMap<NodeId, NarrowingCounts>,
 ) -> ResolvedGraph {
-    unresolved.sort();
+    unresolved.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
 
     // Stamp each caller's dangling-ref counts onto its node record, one field per
     // marker. Dangling refs leave *no edge*, so these counts are the only trace
@@ -1896,6 +1920,7 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
 
     fn node(id: u32, fqn: &str, file: &str) -> NodeWithProvenance {
         NodeWithProvenance {

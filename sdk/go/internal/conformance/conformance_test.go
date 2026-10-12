@@ -99,7 +99,9 @@ var fixtureSets = map[string][]string{
 	"python": {"python"},
 	"java":   {"java"},
 	"ts":     {"ts"},
-	"mixed":  {"rust-sample", "go", "python", "java", "ts"},
+	"c":      {"c"},
+	"cpp":    {"cpp"},
+	"mixed":  {"rust-sample", "go", "python", "java", "ts", "c", "cpp"},
 }
 
 // makeRepo copies the named fixtures into a fresh repository with one commit
@@ -249,8 +251,7 @@ func cases(t *testing.T, g *cgx.Graph) []toolCase {
 	t.Helper()
 	ctx := context.Background()
 	inbound := cgx.SymbolsRequestRank("inbound")
-	one := int64(1)
-	ranked, err := g.Symbols(ctx, cgx.SymbolsRequest{Rank: &inbound, MaxResults: &one})
+	ranked, err := g.Symbols(ctx, cgx.SymbolsRequest{Rank: &inbound, MaxResults: ptr(int64(20))})
 	if err != nil {
 		t.Fatalf("symbols: %v", err)
 	}
@@ -284,10 +285,28 @@ func cases(t *testing.T, g *cgx.Graph) []toolCase {
 		t.Logf("fixture has no call edges; symbol-anchored cases skipped")
 		return cs
 	}
-	top := ranked.Results[0].FQN
-	callers, err := g.Callers(ctx, cgx.CallersRequest{Symbol: top, Depth: ptr(int64(1))})
-	if err != nil {
-		t.Fatalf("callers of %s: %v", top, err)
+	// The most-called symbol whose FQN names one node. A C++ function declared
+	// in a header and defined out of line is two nodes under one FQN, which no
+	// symbol argument can name (TestCFamilyReachability pins that gap).
+	var top string
+	var callers *cgx.CallersResult
+	for _, s := range ranked.Results {
+		if s.InDegree == 0 {
+			break
+		}
+		out, err := g.Callers(ctx, cgx.CallersRequest{Symbol: s.FQN, Depth: ptr(int64(1))})
+		var te *cgx.ToolError
+		if errors.As(err, &te) && te.Kind == cgx.KindResolve {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("callers of %s: %v", s.FQN, err)
+		}
+		top, callers = s.FQN, out
+		break
+	}
+	if top == "" {
+		t.Fatalf("no called symbol among %d ranked resolves by FQN", len(ranked.Results))
 	}
 	add("callers", cgx.ToolCallers, map[string]any{"symbol": top})
 	add("callers-depth3-probable", cgx.ToolCallers, map[string]any{"symbol": top, "depth": 3, "confidence": "probable"})

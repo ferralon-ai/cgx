@@ -100,6 +100,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     } else {
         DataflowOutput::default()
     };
+    sort_nodes_canonical(&mut nodes, &mut edges, &mut candidates);
 
     let mut graph = finalize(nodes, edges, candidates, unresolved);
     graph.dataflow = dataflow;
@@ -184,6 +185,39 @@ fn build_nodes(
     (nodes, map)
 }
 
+/// Put every node, symbol and SSA value alike, into the canonical
+/// `(file, line_start, fqn)` order, reassign dense ids by position, and remap
+/// every edge endpoint and candidate dst. Value nodes are minted after the
+/// symbol nodes; leaving them as an appended suffix would make node order depend
+/// on a node's class rather than its content, and a store that drops ids could
+/// not rebuild it. The sort is stable and the symbol prefix is already in this
+/// order, so symbol nodes keep their relative order (candidate ranks hold).
+fn sort_nodes_canonical(
+    nodes: &mut [NodeWithProvenance],
+    edges: &mut [EdgeWithProvenance],
+    candidates: &mut [Candidate],
+) {
+    fn key(n: &NodeWithProvenance) -> (&str, u32, &str) {
+        cgx_core::sort::node_sort_key(&n.node)
+    }
+    if nodes.is_sorted_by(|a, b| key(a) <= key(b)) {
+        return;
+    }
+    nodes.sort_by(|a, b| key(a).cmp(&key(b)));
+    let mut remap = vec![NodeId(0); nodes.len()];
+    for (i, n) in nodes.iter_mut().enumerate() {
+        remap[n.node.id.index()] = NodeId(i as u32);
+        n.node.id = NodeId(i as u32);
+    }
+    for e in edges.iter_mut() {
+        e.edge.src = remap[e.edge.src.index()];
+        e.edge.dst = remap[e.edge.dst.index()];
+    }
+    for c in candidates.iter_mut() {
+        c.dst = remap[c.dst.index()];
+    }
+}
+
 fn node_records(nodes: &[NodeWithProvenance]) -> Vec<NodeRecord> {
     nodes.iter().map(|n| n.node.clone()).collect()
 }
@@ -258,6 +292,40 @@ fn resolve_ref(
     };
     let virtual_receiver = matches!(raw.kind, RefKind::CallVirtualReceiver);
 
+    // --- Step 0a: pinned closure call. The frontend proved the callee binding
+    // is immutable, unshadowed, and in scope, so the single closure definition
+    // it names is the only value that can reach the call: bind it lexically,
+    // like Step 1. If the definition cannot be found, or its FQN is shared with
+    // another node (two `const f` in sibling anonymous scopes both get the
+    // owner's FQN), fall through to the indirect placeholder rather than guess.
+    if raw.kind == RefKind::CallPinnedClosure && raw.name_path.len() == 1 {
+        if let Some(local) = resolve_pinned_closure(scopes, defs, raw.scope, last) {
+            let mut same_fqn = table
+                .defs_by_short(last)
+                .iter()
+                .filter(|d| d.fqn == local.fqn);
+            if let (Some(target), None) = (same_fqn.next(), same_fqn.next()) {
+                let id = target.node_id;
+                push_edge(
+                    edges,
+                    EdgeBuild {
+                        src: caller_id,
+                        dst: id,
+                        kind: edge_kind(raw.kind, false),
+                        confidence: Confidence::Certain,
+                        tier: Tier::ScopeGraph,
+                        rule: "scope-ref",
+                        raw,
+                        caller_fqn: &caller.fqn,
+                        span: &span,
+                        candidate_group: None,
+                    },
+                );
+                return;
+            }
+        }
+    }
+
     // --- Step 0: indirect call through a function value (closure / fn-pointer /
     // callback). These cannot be bound to a single target by name: the value that
     // flows to the call site is not named at the call (`f(x)` where `f` is a
@@ -270,7 +338,10 @@ fn resolve_ref(
     // candidate set over `Lambda` + free `Function` nodes. Arity-less sites encode
     // `indirect:?`. (DF-18 value-flow narrowing — which closure actually flows here
     // — is Phase 3 and explicitly out of scope.)
-    if matches!(raw.kind, RefKind::CallClosure | RefKind::CallCallback) {
+    if matches!(
+        raw.kind,
+        RefKind::CallClosure | RefKind::CallPinnedClosure | RefKind::CallCallback
+    ) {
         let arity_tag = raw.arity.map(|a| a.to_string()).unwrap_or_else(|| "?".to_owned());
         push_edge(
             edges,
@@ -516,6 +587,7 @@ fn resolve_data_flows(
     summary_budget: u64,
 ) -> DataflowOutput {
     let mut output = build_incremental_substrate(inputs, table, prior_cache);
+    let site_callees = summary_site_callees(inputs, def_to_node, nodes, edges);
 
     // Intern value nodes by synthetic FQN so repeated references to the same SSA
     // def share one node. A `BTreeMap` keeps minting order deterministic.
@@ -642,13 +714,20 @@ fn resolve_data_flows(
                         Some(fqn)
                     })
                     .collect();
+                let callee_fqn = ground_summary_callee(
+                    table,
+                    &site_callees,
+                    def_to_node.get(fn_fqn).copied(),
+                    df.span.line,
+                    df.callee_fqn.as_deref(),
+                );
                 fn_dataflow
                     .entry(fn_fqn.to_string())
                     .or_default()
                     .calls
                     .push(crate::ifds::CallSite {
                         result_fqn: derived_fqn.clone(),
-                        callee_fqn: ground_summary_callee(table, df.callee_fqn.as_deref()),
+                        callee_fqn,
                         args,
                         condition: df.edge_condition,
                         span: Span::new(file.path.clone(), df.span.line, df.span.col),
@@ -754,28 +833,164 @@ fn resolve_data_flows(
     output
 }
 
-/// Ground an opaque call's syntactic callee name to a resolved FQN for IFDS
-/// summary application. Unlike [`ground_callee`] (which falls back to the `"*"`
-/// wildcard for `summary_deps` over-invalidation), this returns `None` when the
-/// callee is not a single uniquely-resolvable callable — a virtual/unknown callee
-/// has no single summary to apply, so it stays an opaque cut.
-fn ground_summary_callee(table: &SymbolTable, callee_fqn: Option<&str>) -> Option<String> {
-    let name = callee_fqn?;
-    if let Some(def) = table.def_by_fqn(name) {
-        if def.kind.is_callable() {
-            return Some(def.fqn.clone());
+/// The pass-1 resolved callee of each call site an `OpaqueCall` dataflow fact
+/// names, keyed by `(caller, line, syntactic callee path)`.
+///
+/// A summary may be applied only where the call itself resolved to a single
+/// in-repo callable through scope or import binding (`scope-ref` /
+/// `import-ref`, outside any candidate set). Name-matched rules (`name-method`,
+/// `name-arity`, `indirect`) do not qualify: their target can stand in for an
+/// out-of-repo or virtual callee. The value is `None` when any call under the
+/// key is unresolved, resolved by another rule, or disagrees on the target.
+///
+/// The key carries the callee path rather than the column because frontends
+/// span a dataflow fact at the whole right-hand side (`await f(x)`, `(f(x))`,
+/// `&f(x)`) but a call ref at the call expression itself. Both sides spell the
+/// path as the ref's `name_path` joined with `::`.
+fn summary_site_callees<'a>(
+    inputs: &[FileInput<'a>],
+    def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    nodes: &[NodeWithProvenance],
+    edges: &[EdgeWithProvenance],
+) -> std::collections::HashMap<(NodeId, u32, &'a str), Option<String>> {
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Outcome {
+        Unresolved,
+        Unique(NodeId),
+        Conflict,
+    }
+    fn join(acc: Outcome, next: Outcome) -> Outcome {
+        match (acc, next) {
+            (Outcome::Unique(a), Outcome::Unique(b)) if a == b => acc,
+            _ => Outcome::Conflict,
         }
     }
-    let last = name.rsplit("::").next().unwrap_or(name);
-    let callables: Vec<&DefEntry> = table
-        .defs_by_short(last)
-        .iter()
-        .filter(|d| d.kind.is_callable())
-        .collect();
-    match callables.as_slice() {
-        [only] => Some(only.fqn.clone()),
-        _ => None,
+
+    // The keys the dataflow pass will ask for, and the lines that hold them.
+    let mut wanted: HashMap<(NodeId, u32), Vec<&'a str>> = HashMap::new();
+    let mut wanted_lines: HashSet<(usize, u32)> = HashSet::new();
+    for (file_idx, file) in inputs.iter().enumerate() {
+        let facts = file.facts;
+        for df in &facts.data_flows {
+            if !df.cut_markers.contains(&CutMarker::OpaqueCall) {
+                continue;
+            }
+            let Some(callee) = df.callee_fqn.as_deref() else {
+                continue;
+            };
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope)
+                .and_then(|d| def_to_node.get(d.fqn.as_str()))
+            else {
+                continue;
+            };
+            let callees = wanted.entry((*caller, df.span.line)).or_default();
+            if !callees.contains(&callee) {
+                callees.push(callee);
+            }
+            wanted_lines.insert((file_idx, df.span.line));
+        }
     }
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+
+    // Every call ref under a wanted key, by its exact site.
+    let mut sites: HashMap<(NodeId, u32, Option<u32>), (&'a str, Outcome)> = HashMap::new();
+    for (file_idx, file) in inputs.iter().enumerate() {
+        let facts = file.facts;
+        for raw in &facts.refs {
+            if matches!(raw.kind, RefKind::Reference | RefKind::Instantiate)
+                || !wanted_lines.contains(&(file_idx, raw.span.line))
+            {
+                continue;
+            }
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, raw.scope)
+                .and_then(|d| def_to_node.get(d.fqn.as_str()))
+            else {
+                continue;
+            };
+            let path = raw.name_path.join("::");
+            let Some(callee) = wanted
+                .get(&(*caller, raw.span.line))
+                .and_then(|callees| callees.iter().find(|c| **c == path))
+            else {
+                continue;
+            };
+            sites
+                .entry((*caller, raw.span.line, raw.span.col))
+                .and_modify(|(_, o)| *o = Outcome::Conflict)
+                .or_insert((*callee, Outcome::Unresolved));
+        }
+    }
+
+    // Fold each site's pass-1 call edges into its outcome.
+    for e in edges {
+        if !e.edge.kind.is_call() {
+            continue;
+        }
+        let span = &e.provenance.span;
+        let Some((_, outcome)) = sites.get_mut(&(e.edge.src, span.line, span.col)) else {
+            continue;
+        };
+        let admitted = matches!(e.edge.rule.as_str(), "scope-ref" | "import-ref")
+            && e.edge.candidate_group.is_none()
+            && nodes
+                .get(e.edge.dst.0 as usize)
+                .is_some_and(|n| n.node.kind.is_callable());
+        let next = if admitted {
+            Outcome::Unique(e.edge.dst)
+        } else {
+            Outcome::Conflict
+        };
+        *outcome = match *outcome {
+            Outcome::Unresolved => next,
+            acc => join(acc, next),
+        };
+    }
+
+    // Several calls under one key (same callee path on one line) must agree.
+    let mut by_key: HashMap<(NodeId, u32, &'a str), Outcome> = HashMap::new();
+    for ((caller, line, _), (callee, outcome)) in sites {
+        by_key
+            .entry((caller, line, callee))
+            .and_modify(|acc| *acc = join(*acc, outcome))
+            .or_insert(outcome);
+    }
+    by_key
+        .into_iter()
+        .map(|(key, outcome)| {
+            let fqn = match outcome {
+                Outcome::Unique(id) => nodes.get(id.0 as usize).map(|n| n.node.fqn.clone()),
+                _ => None,
+            };
+            (key, fqn)
+        })
+        .collect()
+}
+
+/// Ground an opaque call to the callee whose IFDS summary applies at it: the
+/// call's own pass-1 resolution ([`summary_site_callees`]), else a callee path
+/// that is exactly an in-repo callable's FQN. Anything else stays an opaque
+/// cut. A repo-wide short-name match is never enough: a call to an imported
+/// out-of-repo function or a builtin would take the summary of an unrelated
+/// in-repo function that shares its name.
+fn ground_summary_callee(
+    table: &SymbolTable,
+    site_callees: &std::collections::HashMap<(NodeId, u32, &str), Option<String>>,
+    caller: Option<NodeId>,
+    line: u32,
+    callee_fqn: Option<&str>,
+) -> Option<String> {
+    let name = callee_fqn?;
+    if let Some(Some(fqn)) = caller.and_then(|c| site_callees.get(&(c, line, name))) {
+        return Some(fqn.clone());
+    }
+    table
+        .def_by_fqn(name)
+        .filter(|def| def.kind.is_callable())
+        .map(|def| def.fqn.clone())
 }
 
 /// Build the v0.3 SC3 incremental-dataflow substrate: per-function content
@@ -1133,6 +1348,29 @@ fn resolve_local<'a>(
     None
 }
 
+/// Resolve a pinned closure call to its `Lambda` definition: the nearest
+/// enclosing scope that defines a `Lambda` named `name` must define exactly
+/// one. Unlike [`resolve_local`], non-`Lambda` defs of the same short name are
+/// passed over (a class member `C::f` is not a lexical binding of `f`), and two
+/// same-named lambdas in one scope (sibling blocks share a scope here) are
+/// ambiguous, so the call is left to the indirect fallback.
+fn resolve_pinned_closure<'a>(
+    scopes: &ScopeTree,
+    defs: &'a [SymbolDef],
+    scope: ScopeId,
+    name: &str,
+) -> Option<&'a SymbolDef> {
+    for sid in scopes.ancestors(scope) {
+        let mut hits = defs.iter().filter(|d| {
+            d.scope == sid && d.kind == SymbolKind::Lambda && short_name(&d.fqn) == name
+        });
+        if let Some(first) = hits.next() {
+            return if hits.next().is_none() { Some(first) } else { None };
+        }
+    }
+    None
+}
+
 /// Find the import binding for a head name visible at `scope` (the binding's
 /// scope must be an ancestor of, or equal to, the ref's scope), or a glob import.
 fn lookup_binding<'a>(
@@ -1201,7 +1439,7 @@ fn edge_kind(kind: RefKind, virtual_dispatch: bool) -> EdgeKind {
                 EdgeKind::Calls
             }
         }
-        RefKind::CallClosure => EdgeKind::CallsClosure,
+        RefKind::CallClosure | RefKind::CallPinnedClosure => EdgeKind::CallsClosure,
         RefKind::CallCallback => EdgeKind::CallsCallback,
         RefKind::CallAsync => EdgeKind::CallsAsync,
         RefKind::Spawn => EdgeKind::Spawns,
@@ -1445,12 +1683,29 @@ fn finalize(
     graph
 }
 
+/// Remove the edges at the positions in `drop`, keeping the survivors in their
+/// original relative order. Filters in place: the post-passes run on the
+/// full-size edge list, and a filtered copy would hold two edge buffers at once.
+pub(crate) fn remove_edges_at(
+    edges: &mut Vec<EdgeWithProvenance>,
+    drop: &std::collections::BTreeSet<usize>,
+) {
+    let mut drop = drop.iter().copied().peekable();
+    let mut i = 0usize;
+    edges.retain(|_| {
+        let keep = drop.next_if_eq(&i).is_none();
+        i += 1;
+        keep
+    });
+}
+
 /// Re-establish the canonical edge order, dense [`EdgeId`] assignment, and
 /// candidate-set order on an already-built [`ResolvedGraph`].
 ///
 /// This is the determinism contract (architecture §4): edges are sorted by
 /// `(src, dst, kind, stmt_index, candidate_group)` — matching
 /// [`cgx_core::sort::edge_sort_key`] — and assigned dense ids by position;
+/// candidate groups are numbered densely by first appearance in that order;
 /// candidates are sorted by `(group, rank, dst)`. Nodes are left untouched (the
 /// link step assigns their ids once at build time, before any post-pass runs).
 ///
@@ -1462,28 +1717,68 @@ fn finalize(
 pub fn canonicalize(graph: &mut ResolvedGraph) {
     // Edges: canonical order is (src, dst, kind, stmt_index, candidate_group),
     // matching cgx_core::sort::edge_sort_key. Assign dense ids by position.
-    graph.edges.sort_by(|a, b| {
-        let ka = (
-            a.edge.src.0,
-            a.edge.dst.0,
-            a.edge.kind as u8,
-            a.edge.stmt_index.unwrap_or(u32::MAX),
-            a.edge.candidate_group.unwrap_or(u32::MAX),
-        );
-        let kb = (
-            b.edge.src.0,
-            b.edge.dst.0,
-            b.edge.kind as u8,
-            b.edge.stmt_index.unwrap_or(u32::MAX),
-            b.edge.candidate_group.unwrap_or(u32::MAX),
-        );
-        ka.cmp(&kb)
-    });
+    // The key is not total, so the sort must be stable: ties keep their input
+    // order, which is part of the byte-identity contract. `sort_by_cached_key`
+    // is stable and sorts (key, u32 index) pairs, then permutes the edges in
+    // place, instead of a merge sort whose scratch buffer holds half the edges.
+    let sort = |edges: &mut Vec<EdgeWithProvenance>| {
+        edges.sort_by_cached_key(|e| {
+            (
+                e.edge.src.0,
+                e.edge.dst.0,
+                e.edge.kind as u8,
+                e.edge.stmt_index.unwrap_or(u32::MAX),
+                e.edge.candidate_group.unwrap_or(u32::MAX),
+            )
+        })
+    };
+    sort(&mut graph.edges);
+
+    // Candidate groups: renumber densely by first appearance in edge order, then
+    // re-sort. A group's edges share one src, so within a src this numbering is
+    // the order the groups first appear among that src's edges: a store can
+    // rebuild it from per-function shards that carry only shard-local group
+    // ordinals. One renumber + re-sort is a fixed point: the re-sort only reorders
+    // edges inside equal-(src, dst, kind, stmt) runs, by the new numbers, which
+    // cannot move a group's first edge ahead of an earlier-numbered group's.
+    let mut renumber: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut identity = true;
+    for e in &mut graph.edges {
+        if let Some(g) = e.edge.candidate_group.as_mut() {
+            let next = renumber.len() as u32;
+            let new = *renumber.entry(*g).or_insert(next);
+            identity &= new == *g;
+            *g = new;
+        }
+    }
+    // Rows of a group no edge carries (none are expected) keep distinct numbers
+    // above every edge group, in their old order.
+    let mut edgeless: Vec<u32> = graph
+        .candidates
+        .iter()
+        .map(|c| c.candidate_group)
+        .filter(|g| !renumber.contains_key(g))
+        .collect();
+    edgeless.sort_unstable();
+    edgeless.dedup();
+    for g in edgeless {
+        let next = renumber.len() as u32;
+        identity &= next == g;
+        renumber.insert(g, next);
+    }
+    if !identity {
+        for c in &mut graph.candidates {
+            c.candidate_group = renumber[&c.candidate_group];
+        }
+        sort(&mut graph.edges);
+    }
     for (i, e) in graph.edges.iter_mut().enumerate() {
         e.edge.id = EdgeId(i as u32);
     }
 
-    graph.candidates.sort_by(|a, b| {
-        (a.candidate_group, a.rank, a.dst.0).cmp(&(b.candidate_group, b.rank, b.dst.0))
-    });
+    // The key covers every field of a candidate, so equal keys are equal rows and
+    // an unstable (allocation-free) sort yields the same sequence.
+    graph
+        .candidates
+        .sort_unstable_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
 }

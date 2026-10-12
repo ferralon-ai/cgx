@@ -126,7 +126,8 @@ fn index_reports_stats_and_persists_pointer() {
         repo.join(".cgx/HEAD.json").exists(),
         "index pointer written"
     );
-    assert!(repo.join(".cgx/index.db").exists(), "store written");
+    assert!(repo.join(".cgx/refs").read_dir().unwrap().next().is_some(), "store written");
+    assert!(!repo.join(".cgx/index.db").exists(), "no SQLite graph copy");
 }
 
 #[test]
@@ -382,7 +383,7 @@ fn query_auto_indexes_when_no_store_exists() {
         "auto-indexed query answers correctly: {out}"
     );
     assert!(
-        repo.join(".cgx/HEAD.json").exists() && repo.join(".cgx/index.db").exists(),
+        repo.join(".cgx/HEAD.json").exists() && repo.join(".cgx/objects").exists(),
         "auto-index wrote .cgx/ like `cgx index` does"
     );
 }
@@ -1250,7 +1251,8 @@ fn index_accepts_no_dataflow_flag_and_succeeds() {
     let (out, code) = run_cgx(&repo, &["index", "--no-dataflow"]);
     assert_eq!(code, 0, "index --no-dataflow should succeed: {out}");
     assert!(out.contains("nodes"), "stats printed: {out}");
-    assert!(repo.join(".cgx/index.db").exists(), "store written");
+    assert!(repo.join(".cgx/refs").read_dir().unwrap().next().is_some(), "store written");
+    assert!(!repo.join(".cgx/index.db").exists(), "no SQLite graph copy");
 }
 
 #[test]

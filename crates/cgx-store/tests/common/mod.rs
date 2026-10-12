@@ -12,27 +12,6 @@ pub fn sample_graph() -> LinkedGraph {
     let nodes = vec![
         NodeRecord {
             id: NodeId(0),
-            kind: SymbolKind::Function,
-            fqn: "app::main".into(),
-            file: "src/main.rs".into(),
-            line_start: 1,
-            line_end: 10,
-            lang: "rust".into(),
-            visibility: Visibility::Public,
-            is_abstract: false,
-            entrypoint_kind: Some(EntrypointKind::Main),
-            signature: Some(Signature {
-                params: vec![],
-                return_type_text: None,
-                type_params: vec![],
-                receiver: None,
-            }),
-            own_effects: cgx_core::EffectSet::new(),
-            transitive_effects: cgx_core::EffectSet::new(),
-            unresolved_calls: 0,
-        },
-        NodeRecord {
-            id: NodeId(1),
             kind: SymbolKind::Method,
             fqn: "app::db::Conn::commit".into(),
             file: "src/db.rs".into(),
@@ -61,7 +40,7 @@ pub fn sample_graph() -> LinkedGraph {
             unresolved_calls: 0,
         },
         NodeRecord {
-            id: NodeId(2),
+            id: NodeId(1),
             kind: SymbolKind::Method,
             fqn: "app::db::Conn::rollback".into(),
             file: "src/db.rs".into(),
@@ -76,13 +55,34 @@ pub fn sample_graph() -> LinkedGraph {
             transitive_effects: cgx_core::EffectSet::new(),
             unresolved_calls: 0,
         },
+        NodeRecord {
+            id: NodeId(2),
+            kind: SymbolKind::Function,
+            fqn: "app::main".into(),
+            file: "src/main.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            lang: "rust".into(),
+            visibility: Visibility::Public,
+            is_abstract: false,
+            entrypoint_kind: Some(EntrypointKind::Main),
+            signature: Some(Signature {
+                params: vec![],
+                return_type_text: None,
+                type_params: vec![],
+                receiver: None,
+            }),
+            own_effects: cgx_core::EffectSet::new(),
+            transitive_effects: cgx_core::EffectSet::new(),
+            unresolved_calls: 0,
+        },
     ];
 
     let edges = vec![
         EdgeRecord {
             id: EdgeId(0),
-            src: NodeId(0),
-            dst: NodeId(1),
+            src: NodeId(2),
+            dst: NodeId(0),
             kind: EdgeKind::CallsVirtual,
             condition: EdgeCondition::Conditional,
             confidence: Confidence::Possible,
@@ -100,8 +100,8 @@ pub fn sample_graph() -> LinkedGraph {
         },
         EdgeRecord {
             id: EdgeId(1),
-            src: NodeId(0),
-            dst: NodeId(2),
+            src: NodeId(2),
+            dst: NodeId(1),
             kind: EdgeKind::CallsVirtual,
             condition: EdgeCondition::Exception,
             confidence: Confidence::Possible,
@@ -123,12 +123,12 @@ pub fn sample_graph() -> LinkedGraph {
     let candidates = vec![
         Candidate {
             candidate_group: 0,
-            dst: NodeId(1),
+            dst: NodeId(0),
             rank: 0,
         },
         Candidate {
             candidate_group: 0,
-            dst: NodeId(2),
+            dst: NodeId(1),
             rank: 1,
         },
     ];

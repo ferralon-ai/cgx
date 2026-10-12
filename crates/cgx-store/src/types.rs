@@ -11,14 +11,34 @@ use cgx_core::{Candidate, EdgeRecord, NodeRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// A git blob OID (hex sha1 or sha256). The content-addressed key of a Layer-1
-/// fragment: an unchanged blob re-puts to a no-op (architecture §3, IX-1).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BlobOid(pub String);
+use crate::oid::ObjectOid;
 
-impl BlobOid {
-    pub fn new(oid: impl Into<String>) -> Self {
-        BlobOid(oid.into())
+const FRAGMENT_KEY_DOMAIN: &[u8] = b"cgx-fragment-key/v1\0";
+
+/// The key of a Layer-1 fragment: lowercase-hex SHA-1 of the extraction
+/// identity, i.e. everything a frontend's output depends on besides the source
+/// bytes the blob OID already names (the repo-relative path and its resolved
+/// package/manifest context). Identical blobs at different paths therefore get
+/// distinct fragments, and an unchanged file re-puts to a no-op (IX-1).
+///
+/// The identity bytes are opaque here (the store never depends on the frontend
+/// crate); the indexer supplies them. Domain-separated so a key can never equal
+/// a bare git blob OID, which is what earlier stores keyed fragments by: such
+/// fragments read as misses rather than as hits for the wrong path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FragmentKey(pub String);
+
+impl FragmentKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        FragmentKey(key.into())
+    }
+
+    /// Derive the key for an extraction identity.
+    pub fn derive(identity: &[u8]) -> Self {
+        let mut bytes = Vec::with_capacity(FRAGMENT_KEY_DOMAIN.len() + identity.len());
+        bytes.extend_from_slice(FRAGMENT_KEY_DOMAIN);
+        bytes.extend_from_slice(identity);
+        FragmentKey(ObjectOid::of_bytes(&bytes).0)
     }
 
     pub fn as_str(&self) -> &str {
@@ -26,9 +46,9 @@ impl BlobOid {
     }
 }
 
-impl From<&str> for BlobOid {
+impl From<&str> for FragmentKey {
     fn from(s: &str) -> Self {
-        BlobOid(s.to_owned())
+        FragmentKey(s.to_owned())
     }
 }
 
@@ -61,20 +81,21 @@ impl From<&str> for TreeOid {
 /// rules change (architecture §3 `frontend_version`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFragment {
-    pub blob: BlobOid,
+    pub key: FragmentKey,
     pub lang: String,
     pub frontend_version: u32,
     pub fragment: Vec<u8>,
 }
 
-/// The set of blob OIDs reachable from live refs, supplied to [`crate::FactStore::prune`]
-/// (the result of the IX-5 `git rev-list --objects --all` cross-reference).
-pub type BlobSet = BTreeSet<BlobOid>;
+/// The fragment keys of every `(path, blob)` reachable from live refs, supplied to
+/// [`crate::FactStore::prune`] (derived from the IX-5 `git rev-list --objects --all`
+/// cross-reference).
+pub type FragmentKeySet = BTreeSet<FragmentKey>;
 
 /// What a [`crate::FactStore::prune`] removed (IX-5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PruneStats {
-    /// Layer-1 fragment rows deleted (blob OIDs not in the live set).
+    /// Layer-1 fragment rows deleted (keys not in the live set).
     pub fragments_removed: usize,
     /// Layer-2 graph rows deleted (graphs whose tree is no longer referenced).
     pub graphs_removed: usize,

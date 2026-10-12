@@ -22,4 +22,4 @@ mod extract;
 mod module;
 
 pub use extract::PythonFrontend;
-pub use module::module_path_for;
+pub use module::{module_path_for, module_path_for_root};

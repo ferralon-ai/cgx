@@ -113,6 +113,17 @@ fn resolve(path: &str, content: &[u8], dir: &str, all_paths: &[&str]) -> Option<
         });
     }
     if is_named(path, "pyproject.toml") || is_named(path, "setup.py") {
+        // A manifest *inside* an importable package is never an import root. A
+        // legacy per-subpackage `setup.py`/`pyproject.toml` (scipy's
+        // `scipy/sparse/setup.py`, Red-DiscordBot's `redbot/setup.py`) would
+        // otherwise be taken as the nearest-ancestor anchor and wrongly truncate
+        // the module path of files that belong to the outer package. Disqualify
+        // it here (return `None`): `manifest_for` then falls through to the next
+        // valid ancestor manifest if one exists, else to the no-manifest path.
+        // NOTE: package-dir remapping not honored (backlog B-25).
+        if dir_inside_importable_package(dir, all_paths) {
+            return None;
+        }
         return Some(ManifestInfo {
             kind: ManifestKind::PyProject,
             identity: None,
@@ -120,6 +131,28 @@ fn resolve(path: &str, content: &[u8], dir: &str, all_paths: &[&str]) -> Option<
         });
     }
     None
+}
+
+/// Whether `dir` sits inside an importable Python package — i.e. an `__init__.py`
+/// exists at `dir` itself or at any ancestor directory up to (and including) the
+/// repo root, in the source set. Such a dir is a sub-package, not an import root,
+/// so a manifest there must not anchor the Python module path.
+fn dir_inside_importable_package(dir: &str, all_paths: &[&str]) -> bool {
+    let mut cur = dir;
+    loop {
+        let init = if cur.is_empty() {
+            "__init__.py".to_string()
+        } else {
+            format!("{cur}/__init__.py")
+        };
+        if all_paths.iter().any(|p| *p == init) {
+            return true;
+        }
+        if cur.is_empty() {
+            return false;
+        }
+        cur = parent_dir(cur);
+    }
 }
 
 /// Whether `path`'s final segment is exactly `name` (the manifest at any depth).
@@ -329,6 +362,71 @@ mod tests {
             map.manifest_for("pkg/src/mod/__init__.py").unwrap().root_dir,
             "pkg/src"
         );
+    }
+
+    #[test]
+    fn nested_setup_py_inside_package_not_anchored() {
+        // scipy shape: a legacy per-subpackage setup.py sits inside an importable
+        // package (pkg/__init__.py, pkg/sub/__init__.py). It must NOT anchor; the
+        // file falls through to the repo-root-relative no-manifest path.
+        let map = ManifestMap::from_sources(&[
+            src("pkg/__init__.py", ""),
+            src("pkg/sub/__init__.py", ""),
+            src("pkg/sub/setup.py", ""),
+            src("pkg/sub/mod.py", ""),
+        ]);
+        assert!(
+            map.manifest_for("pkg/sub/mod.py").is_none(),
+            "nested setup.py inside a package must not be taken as an import root"
+        );
+    }
+
+    #[test]
+    fn redbot_root_setup_py_inside_package_not_anchored() {
+        // redbot shape: redbot/setup.py beside redbot/__init__.py. The setup.py is
+        // inside the importable `redbot` package, so files root at redbot::core::…
+        // (no-manifest path), not core::… .
+        let map = ManifestMap::from_sources(&[
+            src("redbot/__init__.py", ""),
+            src("redbot/setup.py", ""),
+            src("redbot/core/__init__.py", ""),
+            src("redbot/core/bot.py", ""),
+        ]);
+        assert!(
+            map.manifest_for("redbot/core/bot.py").is_none(),
+            "setup.py inside the redbot package must not re-root to core::"
+        );
+    }
+
+    #[test]
+    fn disqualified_nested_manifest_falls_back_to_outer_valid_root() {
+        // A valid top-level pyproject plus a disqualified nested setup.py inside an
+        // importable package: files resolve to the outer (valid) manifest root.
+        let map = ManifestMap::from_sources(&[
+            src("pyproject.toml", "[project]\nname = \"acme\"\n"),
+            src("acme/__init__.py", ""),
+            src("acme/setup.py", ""),
+            src("acme/mod.py", ""),
+        ]);
+        let info = map.manifest_for("acme/mod.py").unwrap();
+        assert_eq!(info.kind, ManifestKind::PyProject);
+        assert_eq!(
+            info.root_dir, "",
+            "disqualified nested setup.py must fall back to the top-level root"
+        );
+    }
+
+    #[test]
+    fn top_level_setup_py_without_init_still_anchors() {
+        // Legit flat-layout root: top-level setup.py with NO __init__.py at its dir
+        // still anchors there.
+        let map = ManifestMap::from_sources(&[
+            src("setup.py", ""),
+            src("acme/__init__.py", ""),
+        ]);
+        let info = map.manifest_for("acme/__init__.py").unwrap();
+        assert_eq!(info.kind, ManifestKind::PyProject);
+        assert_eq!(info.root_dir, "");
     }
 
     #[test]

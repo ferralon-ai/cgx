@@ -53,7 +53,10 @@ impl PythonFrontend {
 /// v4: `FileFacts` gained `module` and `type_facts`; v3 fragments no longer decode.
 /// v5: module-level `Bind` facts; `super(X, self)` naming another class and
 /// class-factory bases with non-literal arguments are no longer `Super` / `Call`.
-const PYTHON_FRAGMENT_VERSION: u32 = 5;
+/// v6: `AttrStore` facts for attribute stores through non-receiver names;
+/// nested callables see enclosing methods' receivers; PEP 695 type parameters
+/// are `TypeExpr::Unknown`.
+const PYTHON_FRAGMENT_VERSION: u32 = 6;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {

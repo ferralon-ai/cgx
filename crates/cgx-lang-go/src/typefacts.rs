@@ -10,7 +10,9 @@
 //! any binding inside a `func` literal, including the literal's own
 //! parameters) is `Opaque`. The blank identifier `_` binds
 //! nothing. Each call with at least one argument and a name-path callee gets a
-//! `CallArgs` fact keyed by the call's `(line, col)`.
+//! `CallArgs` fact keyed by the call's `(line, col)`. A type parameter in
+//! scope (a generic function's or a generic receiver's) is
+//! `TypeExpr::Unknown`, never a same-named type.
 
 use cgx_frontend::{CallArg, LiteralKind, Name, ParamKind, TypeExpr, TypeFact, ValueSource};
 use smallvec::SmallVec;
@@ -49,7 +51,50 @@ pub(crate) fn collect(src: &[u8], decl: Node<'_>, fqn: &str) -> Vec<TypeFact> {
     if let Some(body) = decl.child_by_field_name("body") {
         c.walk(body, false);
     }
+    let tparams = type_params(src, decl);
+    for f in &mut c.out {
+        f.erase_type_names(&tparams);
+    }
     c.out
+}
+
+/// The type-parameter names in scope in `decl`: a generic function's own
+/// (`func f[T any]`) or a generic receiver's (`func (b *Box[K]) m()`).
+fn type_params(src: &[u8], decl: Node<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(list) = decl.child_by_field_name("type_parameters") {
+        let mut lc = list.walk();
+        for d in list.named_children(&mut lc) {
+            let mut nc = d.walk();
+            out.extend(
+                d.children_by_field_name("name", &mut nc)
+                    .map(|n| text(src, n)),
+            );
+        }
+    }
+    let mut stack: Vec<Node<'_>> = decl.child_by_field_name("receiver").into_iter().collect();
+    while let Some(n) = stack.pop() {
+        if let Some(args) = n
+            .child_by_field_name("type_arguments")
+            .filter(|_| n.kind() == "generic_type")
+        {
+            let mut ac = args.walk();
+            for a in args.named_children(&mut ac) {
+                let id = if a.kind() == "type_elem" {
+                    a.named_child(0)
+                } else {
+                    Some(a)
+                };
+                if let Some(id) = id.filter(|i| i.kind() == "type_identifier") {
+                    out.push(text(src, id));
+                }
+            }
+            continue;
+        }
+        let mut cc = n.walk();
+        stack.extend(n.named_children(&mut cc));
+    }
+    out
 }
 
 /// Normalize a Go type node: `T` / `pkg.T` → `Named`, `G[A]` → `Generic`, a

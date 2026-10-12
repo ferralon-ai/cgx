@@ -148,9 +148,7 @@ impl ApproximationContract {
         scope: Option<NegativeScope>,
         modeled_graph: &'static str,
     ) -> Self {
-        let over = reasons
-            .iter()
-            .any(|r| r.direction == ReasonDirection::Over);
+        let over = reasons.iter().any(|r| r.direction == ReasonDirection::Over);
         let under = reasons
             .iter()
             .any(|r| r.direction == ReasonDirection::Under);
@@ -247,7 +245,10 @@ fn cut_reason(marker: CutMarker, count: usize) -> ApproxReason {
             "reflective-dispatch",
             "reflective/string-computed dispatch not resolved",
         ),
-        CutMarker::ViaFfi => ("foreign-function", "calls crossing an FFI boundary not modeled"),
+        CutMarker::ViaFfi => (
+            "foreign-function",
+            "calls crossing an FFI boundary not modeled",
+        ),
         CutMarker::ViaDi => (
             "dependency-injection",
             "dependency-injection dispatch not resolved",
@@ -355,8 +356,10 @@ fn receiver_narrowed_reason(count: u64) -> ApproxReason {
         detail: format!(
             "{count} virtual call site(s) were bound by receiver typing (self/cls/super, class \
              heads, annotations, constructors, fields); targets outside the inferred type are \
-             excluded and are reachable only if a typing assumption fails (monkey-patching, \
-             untruthful annotations, attributes set outside the class family)"
+             excluded and are reachable only if a typing assumption fails (monkey-patching or \
+             methods assigned from outside the class family, untruthful annotations, \
+             attributes set dynamically, a metaclass that makes a constructor return another \
+             class)"
         ),
     }
 }
@@ -525,11 +528,17 @@ impl FrontierFacts {
             reasons.push(cut_reason(marker, count));
         }
         if self.below_floor > 0 {
-            reasons.push(below_floor_reason(walker.filter.min_confidence, self.below_floor));
+            reasons.push(below_floor_reason(
+                walker.filter.min_confidence,
+                self.below_floor,
+            ));
         }
         if self.dropped_max_candidates > 0 {
             if let Some(max) = walker.filter.max_candidates {
-                reasons.push(dropped_max_candidates_reason(max, self.dropped_max_candidates));
+                reasons.push(dropped_max_candidates_reason(
+                    max,
+                    self.dropped_max_candidates,
+                ));
             }
         }
         if self.depth_truncated {
@@ -712,10 +721,9 @@ pub fn for_neighbors(
     results: &[NeighborResult],
 ) -> ApproximationContract {
     let mut reasons = Vec::new();
-    if results
-        .iter()
-        .any(|r| r.min_confidence_on_path == Confidence::Possible || r.via.candidate_group.is_some())
-    {
+    if results.iter().any(|r| {
+        r.min_confidence_on_path == Confidence::Possible || r.via.candidate_group.is_some()
+    }) {
         reasons.push(over_candidate_reason());
     }
     reasons.extend(scan_frontier(view, walker, &[root], dir).into_reasons(walker));
@@ -748,7 +756,9 @@ pub fn for_reaches(
             ApproximationContract::assemble(reasons, None)
         }
         None => {
-            reasons.extend(scan_frontier(view, walker, &[from], Direction::Forward).into_reasons(walker));
+            reasons.extend(
+                scan_frontier(view, walker, &[from], Direction::Forward).into_reasons(walker),
+            );
             ApproximationContract::assemble(reasons, Some(scope_of(walker, Direction::Forward)))
         }
     }
@@ -784,7 +794,8 @@ pub fn for_paths(
 ) -> ApproximationContract {
     let mut reasons = path_set_reasons(result);
     let scope = if result.is_empty() {
-        reasons.extend(scan_frontier(view, walker, &[from], Direction::Forward).into_reasons(walker));
+        reasons
+            .extend(scan_frontier(view, walker, &[from], Direction::Forward).into_reasons(walker));
         Some(scope_of(walker, Direction::Forward))
     } else {
         None
@@ -873,8 +884,8 @@ mod tests {
     use crate::{callees, paths as query_paths, reaches, unused, GraphView};
     use cgx_core::edge::EdgeRecord;
     use cgx_core::{
-        Candidate, CutMarker, CutMarkers, EdgeCondition, EdgeId, EntrypointKind, NodeId, NodeRecord,
-        SymbolKind, Tier, Visibility,
+        Candidate, CutMarker, CutMarkers, EdgeCondition, EdgeId, EntrypointKind, NodeId,
+        NodeRecord, SymbolKind, Tier, Visibility,
     };
 
     fn node(id: u32, fqn: &str, line: u32, entry: Option<EntrypointKind>) -> NodeRecord {
@@ -981,7 +992,11 @@ mod tests {
     #[test]
     fn cut_on_frontier_makes_under_with_reason_code() {
         // a -> b (certain), b -> c via an unresolved (dynamic) cut edge.
-        let nodes = vec![node(0, "a", 10, None), node(1, "b", 20, None), node(2, "c", 30, None)];
+        let nodes = vec![
+            node(0, "a", 10, None),
+            node(1, "b", 20, None),
+            node(2, "c", 30, None),
+        ];
         let edges = vec![
             edge(0, 0, 1, Confidence::Certain, &[], None),
             edge(1, 1, 2, Confidence::Certain, &[CutMarker::Dynamic], None),
@@ -1010,7 +1025,9 @@ mod tests {
         let c = for_reaches(&view, &w, NodeId(0), &result);
         assert_eq!(c.direction, ApproxDirection::Under);
         assert!(
-            c.reasons.iter().any(|r| r.code == "unresolved-external-calls"),
+            c.reasons
+                .iter()
+                .any(|r| r.code == "unresolved-external-calls"),
             "dangling refs on the touched frontier must surface: {c:?}"
         );
         assert!(c.scope.is_some());
@@ -1069,7 +1086,11 @@ mod tests {
     #[test]
     fn negative_reaches_carries_scope_and_frontier_caveat() {
         // a -> b (certain) with an unresolved cut on b; c is unreachable from a.
-        let nodes = vec![node(0, "a", 10, None), node(1, "b", 20, None), node(2, "c", 30, None)];
+        let nodes = vec![
+            node(0, "a", 10, None),
+            node(1, "b", 20, None),
+            node(2, "c", 30, None),
+        ];
         let edges = vec![
             edge(0, 0, 1, Confidence::Certain, &[], None),
             edge(1, 1, 1, Confidence::Certain, &[CutMarker::Unresolved], None),
@@ -1132,9 +1153,21 @@ mod tests {
             edge(3, 0, 4, Confidence::Certain, &[], None),
         ];
         let candidates = vec![
-            Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
-            Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
-            Candidate { candidate_group: 0, dst: NodeId(3), rank: 2 },
+            Candidate {
+                candidate_group: 0,
+                dst: NodeId(1),
+                rank: 0,
+            },
+            Candidate {
+                candidate_group: 0,
+                dst: NodeId(2),
+                rank: 1,
+            },
+            Candidate {
+                candidate_group: 0,
+                dst: NodeId(3),
+                rank: 2,
+            },
         ];
         GraphView::new(nodes, edges, candidates)
     }
@@ -1160,7 +1193,11 @@ mod tests {
         let w = fanout_walker(Some(2));
         let results = callees(&view, NodeId(0), &w);
         let names: Vec<&str> = results.iter().map(|r| r.node.fqn.as_str()).collect();
-        assert_eq!(names, vec!["e"], "the 3-way set is dropped, the singleton kept");
+        assert_eq!(
+            names,
+            vec!["e"],
+            "the 3-way set is dropped, the singleton kept"
+        );
 
         let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
         let reason = c
@@ -1213,7 +1250,13 @@ mod tests {
         let results = callees(&view, NodeId(0), &w);
         // Only `e` (certain) passes the floor; the possible candidate set is below
         // it and never reaches the fan-out clause.
-        assert_eq!(results.iter().map(|r| r.node.fqn.as_str()).collect::<Vec<_>>(), vec!["e"]);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.node.fqn.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e"]
+        );
         let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
         assert!(c.reasons.iter().any(|r| r.code == "below-confidence-floor"));
         assert!(
@@ -1231,7 +1274,14 @@ mod tests {
             node(1, "b", 20, None),
             node(2, "c", 30, None),
         ];
-        let edges = vec![edge(0, 0, 1, Confidence::Certain, &[CutMarker::Reflective], None)];
+        let edges = vec![edge(
+            0,
+            0,
+            1,
+            Confidence::Certain,
+            &[CutMarker::Reflective],
+            None,
+        )];
         let view = GraphView::new(nodes, edges, Vec::<Candidate>::new());
         let w = PathWalker::default();
         let roots = crate::engine::entrypoint_roots(&view, &[]);

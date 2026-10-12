@@ -51,7 +51,9 @@ impl GoFrontend {
 /// v2: FQN root is now the go.mod import path (module path + package subdir)
 /// instead of the leaf directory name, so v1 fragments may carry stale roots.
 /// v3: `FileFacts` gained `module` and `type_facts`; v2 fragments no longer decode.
-const GO_FRAGMENT_VERSION: u32 = 3;
+/// v4: type parameters (a generic function's, a generic receiver's) are
+/// `TypeExpr::Unknown` in receiver-typing facts.
+const GO_FRAGMENT_VERSION: u32 = 4;
 
 impl LanguageFrontend for GoFrontend {
     fn lang(&self) -> Lang {

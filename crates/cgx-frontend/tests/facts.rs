@@ -413,6 +413,12 @@ fn type_fact_encodings_are_pinned() {
             field: "x".into(),
             ty: named,
         },
+        TypeFact::AttrStore {
+            func: "f".into(),
+            base: ValueSource::Var("o".into()),
+            field: "x".into(),
+            src: ValueSource::Null,
+        },
     ];
     let got = [
         ("TypeExpr", pinned_hex(&type_exprs)),
@@ -430,7 +436,7 @@ fn type_fact_encodings_are_pinned() {
         ("ValueSource", "09000176010302020161014203030407050706070708"),
         ("AnonRoot", "050001010202016101420304"),
         ("BaseExpr", "03000301020161014202"),
-        ("TypeFact", "08000166017001020301030101660176070201660178080301430102040166ac0204016d0201050166010202016101420101016b0706016603070143017800020161014201"),
+        ("TypeFact", "09000166017001020301030101660176070201660178080301430102040166ac0204016d0201050166010202016101420101016b070601660307014301780002016101420108016600016f017807"),
     ];
     for ((name, got), (_, want)) in got.iter().zip(want) {
         assert_eq!(got, want, "{name} encoding changed");

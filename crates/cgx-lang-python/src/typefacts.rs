@@ -11,11 +11,15 @@
 //!
 //! Field stores (`FieldBind`) are writes through `self`, `cls`, or the first
 //! positional parameter of a callable defined directly in a class body,
-//! whatever its name.
+//! whatever its name, including from a nested callable that does not shadow
+//! or rebind that name. Every other attribute store (`o.f = …`, `a.b.f = …`,
+//! module-level stores) is an `AttrStore`.
 //!
 //! Annotations are normalized into [`TypeExpr`] from the syntax tree, never
 //! from text: `Optional[X]` and `X | None` drop the `None` member, string
-//! annotations are re-parsed, and `Any` becomes `Unknown`.
+//! annotations are re-parsed, and `Any` becomes `Unknown`, as does a PEP 695
+//! type parameter of the callable or of an enclosing function or class; a
+//! call to such a type parameter is `Opaque`.
 
 use cgx_frontend::{
     AnonRoot, BaseExpr, LiteralKind, Name, ParamKind, TypeExpr, TypeFact, ValueSource,
@@ -35,26 +39,131 @@ pub(crate) fn collect(src: &[u8], decl: Node<'_>, fqn: &str, in_class: bool) -> 
         receivers: vec!["self".to_owned(), "cls".to_owned()],
         literal_calls_only: false,
         out: Vec::new(),
+        via: Vec::new(),
+        type_params: type_params_in_scope(src, decl),
     };
     if let Some(params) = decl.child_by_field_name("parameters") {
         c.params(params);
     }
-    if in_class {
-        let first = c.out.iter().find_map(|t| match t {
-            TypeFact::Param {
-                name,
-                index: Some(0),
-                kind: ParamKind::Positional,
-                ..
-            } => Some(name.clone()),
+    let own_params: Vec<String> = c
+        .out
+        .iter()
+        .filter_map(|t| match t {
+            TypeFact::Param { name, .. } => Some(name.clone()),
             _ => None,
-        });
-        c.receivers.extend(first);
+        })
+        .collect();
+    if in_class {
+        c.receivers.extend(first_positional(&c.out));
     }
+    // A nested callable sees the receiver of every enclosing method, unless
+    // it declares a parameter of that name.
+    let inherited: Vec<String> = enclosing_receivers(src, decl)
+        .into_iter()
+        .filter(|r| !own_params.contains(r) && !c.receivers.contains(r))
+        .collect();
+    c.receivers.extend(inherited.iter().cloned());
     if let Some(body) = decl.child_by_field_name("body") {
         c.walk(body);
     }
+    // An inherited receiver the callable rebinds is not the receiver here: its
+    // stores are ordinary attribute stores.
+    let rebound: Vec<String> = inherited
+        .into_iter()
+        .filter(|r| {
+            c.out
+                .iter()
+                .any(|t| matches!(t, TypeFact::Bind { var, .. } if var == r))
+        })
+        .collect();
+    for (i, via) in std::mem::take(&mut c.via) {
+        if rebound.contains(&via) {
+            if let TypeFact::FieldBind { func, field, src } = c.out[i].clone() {
+                c.out[i] = TypeFact::AttrStore {
+                    func,
+                    base: ValueSource::Var(via),
+                    field,
+                    src,
+                };
+            }
+        }
+    }
+    for f in &mut c.out {
+        f.erase_type_names(&c.type_params);
+    }
     c.out
+}
+
+/// The name of the first positional parameter among `Param` facts.
+fn first_positional(facts: &[TypeFact]) -> Option<String> {
+    facts.iter().find_map(|t| match t {
+        TypeFact::Param {
+            name,
+            index: Some(0),
+            kind: ParamKind::Positional,
+            ..
+        } => Some(name.clone()),
+        _ => None,
+    })
+}
+
+/// The first positional parameter of every method (a callable defined
+/// directly in a class body) that lexically encloses `decl`.
+fn enclosing_receivers(src: &[u8], decl: Node<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = decl.parent();
+    while let Some(n) = cur {
+        if n.kind() == "function_definition" && defined_in_class(n) {
+            if let Some(params) = n.child_by_field_name("parameters") {
+                let mut c = Collector {
+                    src,
+                    fqn: "",
+                    receivers: Vec::new(),
+                    literal_calls_only: false,
+                    out: Vec::new(),
+                    via: Vec::new(),
+                    type_params: Vec::new(),
+                };
+                c.params(params);
+                out.extend(first_positional(&c.out));
+            }
+        }
+        cur = n.parent();
+    }
+    out
+}
+
+/// Whether a `function_definition` (possibly decorated) sits directly in a
+/// class body.
+fn defined_in_class(f: Node<'_>) -> bool {
+    let mut p = f.parent();
+    if p.is_some_and(|n| n.kind() == "decorated_definition") {
+        p = p.and_then(|n| n.parent());
+    }
+    p.filter(|n| n.kind() == "block")
+        .and_then(|b| b.parent())
+        .is_some_and(|c| c.kind() == "class_definition")
+}
+
+/// PEP 695 type-parameter names declared by `decl` and every enclosing
+/// function or class.
+fn type_params_in_scope(src: &[u8], decl: Node<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Some(decl);
+    while let Some(n) = cur {
+        if matches!(n.kind(), "function_definition" | "class_definition") {
+            if let Some(list) = n.child_by_field_name("type_parameters") {
+                let mut lc = list.walk();
+                for tp in list.named_children(&mut lc) {
+                    if let Some(id) = first_identifier(tp) {
+                        out.push(text(src, id));
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    out
 }
 
 /// Module-level `Bind` facts of a file, attributed to the module path itself
@@ -68,11 +177,13 @@ pub(crate) fn collect_module(src: &[u8], root: Node<'_>, module: &str) -> Vec<Ty
         receivers: Vec::new(),
         literal_calls_only: true,
         out: Vec::new(),
+        via: Vec::new(),
+        type_params: Vec::new(),
     };
     c.walk(root);
     c.out
         .into_iter()
-        .filter(|f| matches!(f, TypeFact::Bind { .. }))
+        .filter(|f| matches!(f, TypeFact::Bind { .. } | TypeFact::AttrStore { .. }))
         .collect()
 }
 
@@ -183,7 +294,9 @@ fn classify_root(
                     AnonRoot::Call(SmallVec::from_vec(vec!["super".to_owned()]))
                 }
             }
+            // Calling a type parameter constructs an unknown class.
             Some(f) => match name_path(src, f) {
+                Some(path) if type_params_in_scope(src, n).contains(&path[0]) => AnonRoot::Other,
                 Some(path) => AnonRoot::Call(path),
                 None => AnonRoot::Other,
             },
@@ -224,6 +337,11 @@ struct Collector<'a> {
     /// Core)`) can produce a subclass of them.
     literal_calls_only: bool,
     out: Vec<TypeFact>,
+    /// `(index in out, receiver name)` of every `FieldBind`.
+    via: Vec<(usize, String)>,
+    /// PEP 695 type parameters in scope: calling one constructs an unknown
+    /// class.
+    type_params: Vec<String>,
 }
 
 impl Collector<'_> {
@@ -301,24 +419,40 @@ impl Collector<'_> {
         });
     }
 
-    fn field_bind(&mut self, field: String, src: ValueSource) {
-        self.out.push(TypeFact::FieldBind {
-            func: self.fqn.to_owned(),
-            field,
-            src,
-        });
-    }
-
-    /// The field name of a `<receiver>.<attr>` target; `None` for any other
-    /// target.
-    fn self_field(&self, target: Node<'_>) -> Option<String> {
-        if target.kind() != "attribute" {
-            return None;
+    /// A store to the attribute target `target` (an `attribute` node): a
+    /// `FieldBind` through a receiver name, an `AttrStore` otherwise.
+    fn attr_store(&mut self, target: Node<'_>, src: ValueSource) {
+        let (Some(obj), Some(attr)) = (
+            target.child_by_field_name("object"),
+            target.child_by_field_name("attribute"),
+        ) else {
+            return;
+        };
+        let field = self.text(attr);
+        let func = self.fqn.to_owned();
+        if obj.kind() != "identifier" {
+            let base = ValueSource::Opaque;
+            self.out.push(TypeFact::AttrStore {
+                func,
+                base,
+                field,
+                src,
+            });
+            return;
         }
-        let obj = target.child_by_field_name("object")?;
-        let attr = target.child_by_field_name("attribute")?;
-        (obj.kind() == "identifier" && self.receivers.contains(&self.text(obj)))
-            .then(|| self.text(attr))
+        let name = self.text(obj);
+        if self.receivers.contains(&name) {
+            self.via.push((self.out.len(), name));
+            self.out.push(TypeFact::FieldBind { func, field, src });
+        } else {
+            let base = ValueSource::Var(name);
+            self.out.push(TypeFact::AttrStore {
+                func,
+                base,
+                field,
+                src,
+            });
+        }
     }
 
     /// Every name a parameter list (`parameters` / `lambda_parameters`) binds
@@ -376,11 +510,7 @@ impl Collector<'_> {
                 let t = self.text(node);
                 self.bind(t, ValueSource::Opaque);
             }
-            "attribute" => {
-                if let Some(f) = self.self_field(node) {
-                    self.field_bind(f, ValueSource::Opaque);
-                }
-            }
+            "attribute" => self.attr_store(node, ValueSource::Opaque),
             "subscript" => {}
             _ => {
                 let mut cur = node.walk();
@@ -592,8 +722,8 @@ impl Collector<'_> {
             if left.kind() == "identifier" {
                 let name = self.text(left);
                 self.bind(name, declared);
-            } else if let Some(f) = self.self_field(left) {
-                self.field_bind(f, declared);
+            } else if left.kind() == "attribute" {
+                self.attr_store(left, declared);
             }
             return;
         }
@@ -602,9 +732,9 @@ impl Collector<'_> {
             let name = self.text(left);
             let src = self.source(right);
             self.bind(name, src);
-        } else if let Some(f) = self.self_field(left) {
+        } else if left.kind() == "attribute" {
             let src = self.source(right);
-            self.field_bind(f, src);
+            self.attr_store(left, src);
         } else {
             self.opaque_targets(left);
         }
@@ -678,6 +808,7 @@ impl Collector<'_> {
                 .child_by_field_name("function")
                 .and_then(|f| name_path(self.src, f))
             {
+                Some(path) if self.type_params.contains(&path[0]) => ValueSource::Opaque,
                 Some(path) if !self.literal_calls_only || literal_args(self.src, value) => {
                     ValueSource::Call(path)
                 }

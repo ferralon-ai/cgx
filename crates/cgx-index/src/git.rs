@@ -96,8 +96,8 @@ impl Repo {
 
     /// Enumerate source files from `root` on disk (a working directory or linked
     /// worktree), computing each file's git blob OID from its current content
-    /// (IX-6 worktree awareness, IX-3 dirty handling). `.git` is skipped. Results
-    /// are sorted by repo-relative path.
+    /// (IX-6 worktree awareness, IX-3 dirty handling). `.git` is skipped, and so is
+    /// cgx's own `.cgx/` index at `root`. Results are sorted by repo-relative path.
     pub fn enumerate_workdir(&self, root: impl AsRef<Path>) -> Result<Vec<SourceFile>> {
         let root = root.as_ref();
         let hash_kind = self.inner.object_hash();
@@ -378,7 +378,9 @@ fn walk_dir(
         })?;
         let path = entry.path();
         let file_name = entry.file_name();
-        if file_name == ".git" {
+        // `.cgx/` at the root is cgx's own index store, never source: walking it
+        // would make every indexed repo's working tree read as dirty.
+        if file_name == ".git" || (file_name == crate::local::CGX_DIR && dir == root) {
             continue;
         }
         let file_type = entry.file_type().map_err(|source| IndexError::Io {
@@ -410,4 +412,35 @@ fn walk_dir(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Repo;
+
+    #[test]
+    fn the_root_index_directory_is_not_part_of_the_working_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        for path in ["src/lib.rs", ".cgx/HEAD.json", ".cgx/objects/ab/cdef", "vendor/.cgx/kept.rs"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let repo = Repo::discover(root).unwrap();
+        let paths: Vec<String> = repo
+            .enumerate_workdir(root)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel_path)
+            .collect();
+        assert_eq!(paths, ["src/lib.rs", "vendor/.cgx/kept.rs"]);
+    }
 }

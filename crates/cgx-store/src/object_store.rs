@@ -438,6 +438,10 @@ pub struct ObjectStore {
     cache: DataflowCache,
     /// The stable-key function; [`sha1_stable_key`] outside tests.
     stable_key: fn(&str, u32) -> u64,
+    /// Tests only: `put_graph` stops at the yield point before this shard, as a
+    /// cancelled wasm guest exits there.
+    #[cfg(test)]
+    stop_at_shard: Option<usize>,
 }
 
 impl ObjectStore {
@@ -461,6 +465,8 @@ impl ObjectStore {
             lock_path: root.join("objects.lock"),
             cache,
             stable_key: sha1_stable_key,
+            #[cfg(test)]
+            stop_at_shard: None,
         })
     }
 
@@ -692,6 +698,15 @@ impl FactStore for ObjectStore {
         let mut batch = Batch::new();
         let mut shard_entries = Vec::with_capacity(shards.len());
         for (fn_key, mut shard) in shards {
+            // One yield per shard bounds how long a cancel waits during the
+            // write (on wasm; a no-op natively). The guest may exit here, which
+            // leaves only unreferenced objects: the manifest and the ref below
+            // are written after every shard.
+            cgx_core::yield_hook::yield_now();
+            #[cfg(test)]
+            if self.stop_at_shard == Some(shard_entries.len()) {
+                return Err(std::io::Error::other("stopped at a yield point").into());
+            }
             shard
                 .candidates
                 .sort_unstable_by_key(|c| (c.group, c.rank, c.dst));
@@ -1105,6 +1120,48 @@ mod tests {
         }
         assert_eq!((nodes, edges, cands), (4, 4, 4));
         assert_eq!(s.read_graph(&tree).unwrap(), g);
+    }
+
+    /// A write stopped at a shard's yield point (where a cancelled wasm guest
+    /// exits) leaves the store as it was: the previous graph reads back whole,
+    /// the new tree has no graph, and the leftover objects do not disturb a
+    /// later complete write of the same graph.
+    #[test]
+    fn put_graph_stopped_mid_write_publishes_nothing() {
+        let root = TempDir::new().unwrap();
+        let mut s = ObjectStore::open(root.path()).unwrap();
+        let (old_tree, new_tree) = (TreeOid::new("t1"), TreeOid::new("t2"));
+        let old = graph();
+        s.put_graph(&old_tree, None, &old).unwrap();
+        let objects_before = ObjectStore::all_object_oids(&s.objects_dir).unwrap().len();
+
+        // A different graph: more nodes, so more shards than the stop point.
+        let mut nodes: Vec<NodeRecord> = (0..6).map(|i| node(i, &format!("app::f{i}"), i + 1)).collect();
+        nodes.sort_by(|a, b| a.fqn.cmp(&b.fqn));
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.id = NodeId(i as u32);
+        }
+        let new = LinkedGraph::new(nodes, vec![edge(0, 0, 1, None), edge(1, 2, 3, None)], vec![]);
+
+        for stop in [0, 1, 3] {
+            s.stop_at_shard = Some(stop);
+            let err = s.put_graph(&new_tree, None, &new).unwrap_err();
+            assert!(matches!(err, StoreError::Io(_)), "stop {stop}: {err:?}");
+
+            let reopened = ObjectStore::open(root.path()).unwrap();
+            assert!(!reopened.graph_for(&new_tree).unwrap(), "stop {stop}: new tree published");
+            assert!(reopened.graph_for(&old_tree).unwrap());
+            assert_eq!(reopened.read_graph(&old_tree).unwrap(), old, "stop {stop}");
+            assert_eq!(reopened.read_graph(&new_tree).unwrap(), LinkedGraph::default());
+            let objects = ObjectStore::all_object_oids(&s.objects_dir).unwrap().len();
+            assert_eq!(objects - objects_before, stop, "stop {stop}: shards written before the stop");
+        }
+
+        s.stop_at_shard = None;
+        s.put_graph(&new_tree, None, &new).unwrap();
+        let reopened = ObjectStore::open(root.path()).unwrap();
+        assert_eq!(reopened.read_graph(&new_tree).unwrap(), new);
+        assert_eq!(reopened.read_graph(&old_tree).unwrap(), old);
     }
 
     #[test]

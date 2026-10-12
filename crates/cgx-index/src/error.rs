@@ -34,6 +34,19 @@ pub enum IndexError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
+    /// The repository has no persistent index (no `.cgx/HEAD.json`).
+    #[error("no index found at {0:?}; run `cgx index` first")]
+    NoIndex(std::path::PathBuf),
+
+    /// The index run itself failed; the inner error is the pipeline's.
+    #[error("indexing failed: {0}")]
+    Build(Box<IndexError>),
+
+    /// Reading, writing or maintaining the repo-local `.cgx/` index failed; the
+    /// message names the operation and path.
+    #[error("{0}")]
+    Local(String),
+
     /// Reading or parsing a `.scip` index supplied via `--scip` failed.
     #[error("scip error: {0}")]
     Scip(String),

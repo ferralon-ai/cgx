@@ -24,7 +24,7 @@ use cgx_query::{
     reaches, search_symbols, unused, ApproximationContract, Direction, EdgeFilter, EdgeRec,
     FreshnessEnvelope, GraphView, PathSet, PathWalker, RankBy, SearchMatch, Subgraph,
 };
-use cgx_store::{FactStore, ObjectStore, StoreError, TreeOid};
+use cgx_store::{FactStore, ObjectStore, TreeOid};
 
 use cgx_cli::assertions::{evaluate, AssertionSpec, ResultFacts};
 use cgx_cli::exit::ExitCode;
@@ -36,8 +36,9 @@ use cgx_cli::output::{
 };
 use cgx_cli::pack;
 use cgx_cli::pattern::parse_symbol;
-use cgx_cli::store_loc::{
-    cgx_dir, ensure_cgx_dir, read_pointer, remove_retired_files, write_pointer, IndexPointer,
+use cgx_index::local::{
+    cgx_dir, dataflow_default, ensure_cgx_dir, ensure_indexed, index_repo, load_current,
+    open_store, read_pointer,
 };
 use cgx_cli::CliError;
 
@@ -969,7 +970,7 @@ fn run_index(
     // `[index] data_flow = false` cgx.toml key are escape hatches; either one
     // disables it. The library `IndexOpts::default()` stays base (dataflow off) —
     // the on-by-default decision lives here at the application boundary.
-    let dataflow = resolve_dataflow_default(&repo_root) && !no_dataflow;
+    let dataflow = dataflow_default(&repo_root) && !no_dataflow;
     let env_on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
     let receiver_narrowing = receiver_narrowing || env_on("CGX_RECEIVER_NARROWING");
     let outcome = index_repo(
@@ -1077,114 +1078,6 @@ fn run_index(
         );
     }
     Ok(())
-}
-
-/// Index the committed `HEAD` tree of `repo_root` to `.cgx/` and persist the
-/// current-index pointer — the shared core of the explicit `cgx index` subcommand
-/// and the auto-index trigger ([`ensure_indexed`]). Deterministic and idempotent:
-/// a re-index of an unchanged tree extracts 0 blobs (IX-1) and rewrites an
-/// identical pointer.
-fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<cgx_index::IndexOutcome, CliError> {
-    let registry = default_registry();
-    let mut store = open_store(repo_root)?;
-    let outcome = index_path(repo_root, &registry, &mut store, opts)
-        .map_err(|e| CliError::graph(format!("indexing failed: {e}")))?;
-    // Blast-radius fix (sparse-storage RFC P1): GC every superseded Layer-2 graph,
-    // keeping only the one we just wrote. No read path needs historical graphs on
-    // the normal index path; the `diff` path uses its own session and never lands
-    // here. Bounded (retain exactly 1) and deterministic (delete-by-key).
-    let keep = cgx_store::TreeOid::new(outcome.graph_key.clone());
-    store
-        .prune_graphs_except(&[&keep])
-        .map_err(|e| CliError::graph(format!("pruning stale graphs: {e}")))?;
-    remove_retired_files(repo_root)?;
-    write_pointer(
-        repo_root,
-        &IndexPointer {
-            graph_key: outcome.graph_key.clone(),
-            total_files: Some(outcome.stats.blobs_indexed + outcome.stats.blobs_unsupported),
-            unsupported_files: Some(outcome.stats.blobs_unsupported),
-        },
-    )?;
-    Ok(outcome)
-}
-
-/// Ensure `repo_root` has a current, fresh `.cgx/` index before a query reads it
-/// (audit row #23). Auto-indexes the committed `HEAD` tree when no pointer exists,
-/// or when the pointer's tree OID differs from the current `HEAD` tree OID (a
-/// cheap staleness check). A no-op when the index is already current. With
-/// `--no-auto-index` the caller skips this entirely, so a missing index takes the
-/// usual exit-3 path.
-///
-/// Idempotent: the underlying pipeline performs zero extraction on an unchanged
-/// tree (IX-1), so a second query over the same committed state re-links cached
-/// facts without re-parsing.
-fn ensure_indexed(repo_root: &Path) -> Result<(), CliError> {
-    // Not a git repo / no HEAD → `None`: we then fall back to "index iff the
-    // pointer is missing" (no staleness check is possible without a tree OID).
-    let current_tree = cgx_index::Repo::discover(repo_root)
-        .and_then(|r| r.head_tree_oid())
-        .ok();
-
-    let opts = auto_index_opts(repo_root);
-    match read_pointer(repo_root) {
-        Ok(ptr) => match &current_tree {
-            // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
-            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &opts).map(|_| ()),
-            // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
-            _ => Ok(()),
-        },
-        // No index yet: build one.
-        Err(_) => index_repo(repo_root, &opts).map(|_| ()),
-    }
-}
-
-/// The options an automatic (query-triggered) index runs with. v0.3 SC6: an
-/// auto-built index is a STANDARD index — dataflow ON by default, so a fresh
-/// `cgx flows-*`/`:DATA_FLOW` works with no prior explicit `index`. The
-/// `[index] data_flow = false` cgx.toml key opts back out.
-fn auto_index_opts(repo_root: &Path) -> IndexOpts {
-    IndexOpts {
-        dataflow: resolve_dataflow_default(repo_root),
-        ..IndexOpts::default()
-    }
-}
-
-/// The effective on-by-default dataflow setting for `repo_root` (v0.3 SC6).
-/// Dataflow ships ON; the only off-switch at config level is the
-/// `[index] data_flow = false` key in a `cgx.toml` at the repo root. Any other
-/// value (or a missing key/file) leaves dataflow enabled. Parsed with a minimal
-/// line scan — cgx carries no `toml` dependency by design (cf. `cargo_pkg.rs`).
-fn resolve_dataflow_default(repo_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(repo_root.join("cgx.toml")) else {
-        return true;
-    };
-    !cgx_toml_data_flow_is_false(&text)
-}
-
-/// Whether a `cgx.toml`'s `[index]` table sets `data_flow = false`. A minimal
-/// scanner: find the `[index]` section header, then the first `data_flow = …`
-/// assignment within it, and test for a literal `false`. Section-scoped so a
-/// `data_flow` key under another table is ignored.
-fn cgx_toml_data_flow_is_false(text: &str) -> bool {
-    let mut in_index = false;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_index = line == "[index]";
-            continue;
-        }
-        if !in_index {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "data_flow" {
-            return value.trim() == "false";
-        }
-    }
-    false
 }
 
 /// Direction selector for the shared callers/callees path.
@@ -3083,11 +2976,6 @@ fn resolve_repo(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
         .map_err(|e| CliError::usage(format!("path {raw:?} is not accessible: {e}")))
 }
 
-fn open_store(repo_root: &Path) -> Result<ObjectStore, CliError> {
-    ObjectStore::open(cgx_dir(repo_root))
-        .map_err(|e| CliError::graph(format!("opening store at {repo_root:?}: {e}")))
-}
-
 /// Resolve the query's repo root, auto-index it unless opted out, and load the
 /// current Layer-2 graph — the shared entry every query subcommand uses so the
 /// auto-index trigger (audit row #23) and the IF-4 exit mapping live in one place.
@@ -3133,16 +3021,7 @@ fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
 /// `rebuild_if_corrupt`, a graph whose objects fail verification is treated as not
 /// indexed: it is re-indexed once and read again.
 fn load_view(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<GraphView, CliError> {
-    let ptr = read_pointer(repo_root)?;
-    let store = open_store(repo_root)?;
-    let graph = match store.read_graph(&TreeOid::new(ptr.graph_key.clone())) {
-        Err(StoreError::Corrupt { .. }) if rebuild_if_corrupt => {
-            drop(store);
-            index_repo(repo_root, &auto_index_opts(repo_root))?;
-            return load_view(repo_root, false);
-        }
-        r => r.map_err(|e| CliError::graph(format!("reading graph {}: {e}", ptr.graph_key)))?,
-    };
+    let (_, graph) = load_current(repo_root, rebuild_if_corrupt)?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 

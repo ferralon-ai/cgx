@@ -6,7 +6,7 @@
 
 mod common;
 
-use cgx_store::{BlobOid, FactStore, FragmentInput, SqliteStore, TreeOid, SCHEMA_VERSION};
+use cgx_store::{FactStore, FragmentInput, FragmentKey, SqliteStore, TreeOid, SCHEMA_VERSION};
 use common::sample_graph;
 use rusqlite::Connection;
 
@@ -36,11 +36,11 @@ fn v2_store_opened_by_v3_clears_and_reindexes_not_hard_errors() {
     // Build a populated store (a blob_facts cache row + a Layer-2 graph).
     {
         let mut store = SqliteStore::open(&db).expect("open fresh store");
-        let blob = BlobOid::new("blob-keepme");
+        let blob = FragmentKey::new("blob-keepme");
         let bytes = b"cached-fragment-bytes";
         store
             .put_fragments(&[FragmentInput {
-                blob: &blob,
+                key: &blob,
                 lang: "rust",
                 frontend_version: 1,
                 bytes,

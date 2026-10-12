@@ -6,7 +6,9 @@ use crate::lock::WriteLock;
 use crate::schema::{
     META_SCHEMA_VERSION, META_VIEW_SCHEMA_VERSION, SCHEMA_DDL, SCHEMA_VERSION, VIEW_SCHEMA_VERSION,
 };
-use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
+use crate::types::{
+    CachedFragment, FragmentKey, FragmentKeySet, LinkedGraph, PruneStats, TreeOid,
+};
 use cgx_core::codec::{decode, encode};
 use cgx_core::{EdgeRecord, NodeRecord};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -20,11 +22,11 @@ pub type FnSummaryRow = ((String, String), Vec<u8>);
 /// The Phase-1 persistence contract (architecture §3 interface sketch). WP-08
 /// (index) and WP-09 (query) build on exactly this surface.
 pub trait FactStore {
-    /// Fetch a cached Layer-1 fragment by blob OID, or `None` if not stored.
-    fn fragment(&self, blob: &BlobOid) -> Result<Option<CachedFragment>>;
+    /// Fetch a cached Layer-1 fragment by key, or `None` if not stored.
+    fn fragment(&self, key: &FragmentKey) -> Result<Option<CachedFragment>>;
 
-    /// Store a batch of Layer-1 fragments. Re-putting an unchanged blob OID is a
-    /// no-op (content-addressed incrementality, IX-1): identical `(blob, bytes)`
+    /// Store a batch of Layer-1 fragments. Re-putting an unchanged key is a
+    /// no-op (content-addressed incrementality, IX-1): identical `(key, bytes)`
     /// leaves the row and its bytes unchanged. Each fragment's `bytes` is the
     /// canonical postcard encoding the indexer produced; the store keeps it
     /// verbatim.
@@ -50,10 +52,10 @@ pub trait FactStore {
     /// postcard `data`). A tree with no linked graph yields an empty [`LinkedGraph`].
     fn read_graph(&self, tree: &TreeOid) -> Result<LinkedGraph>;
 
-    /// Remove Layer-1 fragments whose blob OID is not in `live`, and Layer-2
+    /// Remove Layer-1 fragments whose key is not in `live`, and Layer-2
     /// graphs whose tree is no longer referenced (IX-5). With `aggressive`, also
     /// `VACUUM`s to reclaim disk.
-    fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats>;
+    fn prune(&mut self, live: &FragmentKeySet, aggressive: bool) -> Result<PruneStats>;
 
     /// Garbage-collect every Layer-2 graph except the ones in `keep` (their tree
     /// OIDs), returning the number of graph rows removed. Deletes from `graphs`;
@@ -93,7 +95,7 @@ pub trait FactStore {
 /// One fragment to store: the content-addressed key plus the canonical bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct FragmentInput<'a> {
-    pub blob: &'a BlobOid,
+    pub key: &'a FragmentKey,
     pub lang: &'a str,
     pub frontend_version: u32,
     pub bytes: &'a [u8],
@@ -324,12 +326,12 @@ fn lock_path_for(db_path: &Path) -> PathBuf {
 }
 
 impl FactStore for SqliteStore {
-    fn fragment(&self, blob: &BlobOid) -> Result<Option<CachedFragment>> {
+    fn fragment(&self, key: &FragmentKey) -> Result<Option<CachedFragment>> {
         let row = self
             .conn
             .query_row(
                 "SELECT lang, frontend_version, fragment FROM blob_facts WHERE blob_oid = ?1",
-                params![blob.as_str()],
+                params![key.as_str()],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -340,7 +342,7 @@ impl FactStore for SqliteStore {
             )
             .optional()?;
         Ok(row.map(|(lang, fv, fragment)| CachedFragment {
-            blob: blob.clone(),
+            key: key.clone(),
             lang,
             frontend_version: fv as u32,
             fragment,
@@ -350,17 +352,22 @@ impl FactStore for SqliteStore {
     fn put_fragments(&mut self, batch: &[FragmentInput<'_>]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            // INSERT-or-ignore makes an unchanged blob a true no-op (IX-1): the
-            // existing row and its bytes are left untouched. A blob OID is
-            // content-addressed, so a present key already holds the right bytes.
+            // Write-once per (key, frontend version): a key is content addressed,
+            // so an unchanged file re-puts to a true no-op (IX-1). A row written
+            // by a different frontend version is replaced. The `blob_oid` column
+            // holds the fragment key.
             let mut stmt = tx.prepare(
                 "INSERT INTO blob_facts(blob_oid, lang, frontend_version, fragment)
                  VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(blob_oid) DO NOTHING",
+                 ON CONFLICT(blob_oid) DO UPDATE SET
+                     lang = excluded.lang,
+                     frontend_version = excluded.frontend_version,
+                     fragment = excluded.fragment
+                 WHERE blob_facts.frontend_version <> excluded.frontend_version",
             )?;
             for f in batch {
                 stmt.execute(params![
-                    f.blob.as_str(),
+                    f.key.as_str(),
                     f.lang,
                     f.frontend_version as i64,
                     f.bytes,
@@ -531,11 +538,11 @@ impl FactStore for SqliteStore {
         })
     }
 
-    fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats> {
+    fn prune(&mut self, live: &FragmentKeySet, aggressive: bool) -> Result<PruneStats> {
         let mut stats = PruneStats::default();
         let tx = self.conn.transaction()?;
         {
-            // Collect stored blob OIDs, delete those not in the live set.
+            // Collect stored keys, delete those not in the live set.
             let stored: Vec<String> = {
                 let mut stmt = tx.prepare("SELECT blob_oid FROM blob_facts")?;
                 let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -543,7 +550,7 @@ impl FactStore for SqliteStore {
             };
             let mut del = tx.prepare("DELETE FROM blob_facts WHERE blob_oid = ?1")?;
             for oid in stored {
-                if !live.contains(&BlobOid(oid.clone())) {
+                if !live.contains(&FragmentKey(oid.clone())) {
                     del.execute(params![oid])?;
                     stats.fragments_removed += 1;
                 }

@@ -153,3 +153,174 @@ fn determinism_holds_for_typescript_too() {
     let b = read_graph(&store_b, &id_b);
     assert_eq!(a, b);
 }
+
+#[test]
+fn stale_frontend_version_fragment_is_reextracted_and_overwritten() {
+    use cgx_core::codec::encode;
+    use cgx_frontend::RelPath;
+    use cgx_store::{FactStore, FragmentInput};
+
+    let (_tmp, repo) = init_empty_repo();
+    write_file(&repo, "src/lib.rs", "pub fn f() -> i32 { 1 }\n");
+    commit_all(&repo, "one file");
+
+    let blob = fragment_key(&repo, "src/lib.rs");
+
+    let registry = default_registry();
+    let current = registry
+        .frontend_for(&RelPath::new("src/lib.rs"))
+        .fragment_version();
+    let mut store = mem_store();
+    // Garbage bytes under an older version: reading them would be a decode error.
+    store
+        .put_fragments(&[FragmentInput {
+            key: &blob,
+            lang: "rust",
+            frontend_version: current - 1,
+            bytes: &encode(&"not a FileFacts").unwrap(),
+        }])
+        .unwrap();
+
+    let first = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(first.stats.blobs_extracted, 1, "{:?}", first.stats);
+    assert_eq!(first.stats.blobs_stale, 1, "{:?}", first.stats);
+    assert_eq!(first.stats.blobs_cached, 0, "{:?}", first.stats);
+    assert_eq!(
+        store.fragment(&blob).unwrap().unwrap().frontend_version,
+        current,
+        "the stale fragment is overwritten at the current version"
+    );
+
+    let second = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(second.stats.blobs_cached, 1, "{:?}", second.stats);
+    assert_eq!(second.stats.blobs_extracted, 0, "{:?}", second.stats);
+    assert_eq!(second.stats.blobs_stale, 0, "{:?}", second.stats);
+}
+
+/// Node FQNs whose `file` is `path`, sorted.
+fn fqns_in(g: &cgx_store::LinkedGraph, path: &str) -> Vec<String> {
+    let mut v: Vec<String> = g
+        .nodes
+        .iter()
+        .filter(|n| n.file == path)
+        .map(|n| n.fqn.clone())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn identical_blobs_at_different_paths_keep_their_own_fqns_when_warm() {
+    let (_tmp, repo) = init_empty_repo();
+    let body = "def fmt(x):\n    return helper(x)\n\ndef helper(x):\n    return x\n";
+    write_file(&repo, "pkg/nb/formats.py", body);
+    write_file(&repo, "pkg/nn/formats.py", body);
+    write_file(&repo, "pkg/other.py", "def g():\n    return 1\n");
+    commit_all(&repo, "two identical blobs at two paths");
+
+    let registry = default_registry();
+    let mut store = mem_store();
+    index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+
+    // An unrelated edit forces a warm re-index of a new tree.
+    write_file(&repo, "pkg/other.py", "def g():\n    return 2\n");
+    commit_all(&repo, "unrelated edit");
+    let warm = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(warm.stats.blobs_extracted, 1, "{:?}", warm.stats);
+    assert_eq!(warm.stats.blobs_cached, 2, "{:?}", warm.stats);
+
+    let g = read_graph(&store, &warm.graph_key);
+    for (path, own, other) in [
+        ("pkg/nb/formats.py", "::nb::", "::nn::"),
+        ("pkg/nn/formats.py", "::nn::", "::nb::"),
+    ] {
+        let fqns = fqns_in(&g, path);
+        assert!(!fqns.is_empty(), "no nodes for {path}");
+        for fqn in &fqns {
+            assert!(
+                fqn.contains(own) && !fqn.contains(other),
+                "{path} carries a foreign FQN {fqn}: {fqns:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn package_rename_invalidates_unchanged_blob_fragment() {
+    let (_tmp, repo) = init_empty_repo();
+    let manifest = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
+    write_file(&repo, "Cargo.toml", &manifest("alpha"));
+    write_file(&repo, "src/lib.rs", "pub fn f() -> i32 { 1 }\n");
+    commit_all(&repo, "alpha");
+
+    let registry = default_registry();
+    let mut store = mem_store();
+    let first = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    let fqns = fqns_in(&read_graph(&store, &first.graph_key), "src/lib.rs");
+    assert!(fqns.iter().any(|f| f.starts_with("alpha::")), "{fqns:?}");
+
+    // Only the manifest changes; src/lib.rs keeps its blob OID.
+    write_file(&repo, "Cargo.toml", &manifest("beta"));
+    commit_all(&repo, "rename crate");
+    let second = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    let fqns = fqns_in(&read_graph(&store, &second.graph_key), "src/lib.rs");
+    assert!(!fqns.is_empty());
+    assert!(
+        fqns.iter().all(|f| !f.starts_with("alpha::")),
+        "stale crate root survived the rename: {fqns:?}"
+    );
+    assert!(fqns.iter().any(|f| f.starts_with("beta::")), "{fqns:?}");
+}
+
+/// The fragment key the pipeline derives for `rel` in a repo with no build
+/// manifest (no package, no manifest context).
+fn fragment_key(repo: &std::path::Path, rel: &str) -> cgx_store::FragmentKey {
+    let ctx = cgx_frontend::FileCtx::new(rel, hash_object(repo, rel));
+    cgx_store::FragmentKey::derive(&ctx.cache_identity())
+}
+
+fn hash_object(repo: &std::path::Path, rel: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["hash-object", rel])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn legacy_blob_oid_keyed_fragment_reads_as_miss() {
+    use cgx_core::codec::encode;
+    use cgx_frontend::{FileFacts, RelPath};
+    use cgx_store::{FactStore, FragmentInput, FragmentKey};
+
+    let (_tmp, repo) = init_empty_repo();
+    write_file(&repo, "src/lib.rs", "pub fn f() -> i32 { 1 }\n");
+    commit_all(&repo, "one file");
+
+    // A store written before fragments were path-keyed holds this blob's facts
+    // under the bare blob OID, at the current frontend version. Here those facts
+    // are empty, so a wrong hit would drop `f` from the graph.
+    let registry = default_registry();
+    let current = registry
+        .frontend_for(&RelPath::new("src/lib.rs"))
+        .fragment_version();
+    let legacy = FragmentKey::new(hash_object(&repo, "src/lib.rs"));
+    let mut store = mem_store();
+    store
+        .put_fragments(&[FragmentInput {
+            key: &legacy,
+            lang: "rust",
+            frontend_version: current,
+            bytes: &encode(&FileFacts::default()).unwrap(),
+        }])
+        .unwrap();
+
+    let run = index_path(&repo, &registry, &mut store, &Default::default()).unwrap();
+    assert_eq!(run.stats.blobs_extracted, 1, "{:?}", run.stats);
+    assert_eq!(run.stats.blobs_cached, 0, "{:?}", run.stats);
+    assert_eq!(run.stats.blobs_stale, 0, "{:?}", run.stats);
+    let fqns = fqns_in(&read_graph(&store, &run.graph_key), "src/lib.rs");
+    assert!(!fqns.is_empty(), "the legacy fragment was read as a hit");
+}

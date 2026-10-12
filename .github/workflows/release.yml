@@ -21,6 +21,17 @@
 #   - The release binary is built FROM S, so the shipped tarball's LICENSE is
 #     the dated one, not the `TBD` one on main.
 #
+# Floating minor alias (vMAJOR.MINOR): after a release is published, a
+# LIGHTWEIGHT tag `vX.Y` is force-moved onto the same leaf S, so a consumer who
+# references `vX.Y` always resolves to the newest patch on that line
+# (actions/checkout@v4 model). MONOTONIC: the alias advances only when THIS
+# version is the highest patch on its minor (read from the remote), so a hotfix
+# cut from an older base never drags the alias backward. Moving a tag ref to an
+# already-published commit pushes no new commit, so it neither trips the
+# workflow-file push protection nor (being a GITHUB_TOKEN tag push) re-triggers
+# this workflow. Note the trigger glob below matches only three-field tags
+# (vX.Y.Z), so the alias can never itself enter this workflow.
+#
 # Change Date basis (publication, not authorship): Change Date = publication
 # date + 4 years. For a forward tag-push, the publication date is the tag's own
 # date (annotated tagger date if present, else the cleave commit's author date —
@@ -45,7 +56,11 @@ name: release
 on:
   push:
     tags:
-      - "v*"
+      # Release cuts only: vMAJOR.MINOR.PATCH (three dot-separated fields). The
+      # floating minor alias (vMAJOR.MINOR — two fields) is force-moved by the
+      # final step with GITHUB_TOKEN, whose pushes never start a run; this glob
+      # is a second guard so a hand-pushed `v0.3` cannot even enter the workflow.
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       version:
@@ -106,10 +121,11 @@ jobs:
             fi
           fi
 
-          case "${TAG}" in
-            v*) ;;
-            *) echo "::error::version/tag must start with 'v' (got '${TAG}')" >&2; exit 1 ;;
-          esac
+          # Release version must be vMAJOR.MINOR.PATCH. The two-field form is the
+          # floating alias, minted by the final step, never a release cut.
+          if ! printf '%s' "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version/tag must be vMAJOR.MINOR.PATCH (got '${TAG}')" >&2; exit 1
+          fi
           case "${PUB_DAY}" in
             [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
             *) echo "::error::publication date must be YYYY-MM-DD (got '${PUB_DAY}')" >&2; exit 1 ;;
@@ -342,3 +358,34 @@ jobs:
               --title "${TAG}" \
               --notes-file "${BODY_FILE}"
           fi
+
+      - name: Float the minor alias (vMAJOR.MINOR) to this leaf
+        env:
+          TAG: ${{ steps.params.outputs.tag }}
+          BUILD_SHA: ${{ steps.build_ref.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Point the lightweight minor alias `vX.Y` at this release's leaf so a
+          # consumer referencing `vX.Y` always resolves the newest patch on that
+          # line. MONOTONIC: only advance the alias when THIS version is the
+          # highest patch released on its minor — a hotfix cut from an older base
+          # (a lower patch than one already released on the same minor) must never
+          # drag the alias backward. The highest patch is read from the remote,
+          # because a backfill checkout does not carry every tag locally.
+          MINOR="${TAG%.*}"                              # v0.3.2 -> v0.3
+          esc="${MINOR//./\\.}"                          # v0\.3 (exact 3-field match below)
+          HIGHEST="$(git ls-remote --tags --refs origin "refs/tags/${MINOR}.*" \
+            | awk -F/ '{print $NF}' \
+            | grep -E "^${esc}\.[0-9]+$" \
+            | sort -V | tail -n1)"
+          if [ "${HIGHEST}" != "${TAG}" ]; then
+            echo "::notice::${TAG} is not the highest patch on ${MINOR} (highest released is ${HIGHEST}); leaving ${MINOR} unmoved."
+            exit 0
+          fi
+          # BUILD_SHA is the leaf: the freshly-minted stamp, or (on an
+          # idempotent re-run) the commit the already-stamped tag names. Moving a
+          # tag ref onto an already-published commit pushes no new commit — no
+          # workflow-file push protection, no re-trigger.
+          git tag -f "${MINOR}" "${BUILD_SHA}"
+          git push --force origin "refs/tags/${MINOR}"
+          echo "floated ${MINOR} -> ${BUILD_SHA} (== ${TAG})"

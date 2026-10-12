@@ -83,7 +83,9 @@ pub enum RefKind {
     /// A method/dispatch call on a receiver whose type is unknown to the
     /// frontend (`x.m(...)`) — the resolver decides `calls` vs `calls:virtual`.
     CallVirtualReceiver,
-    /// Invocation of a closure/lambda bound in scope.
+    /// Invocation of a closure/lambda bound in scope, where the value reaching
+    /// the call is not pinned (the binding may be rebound or shadowed). The
+    /// resolver fans it out to the signature-compatible function values.
     CallClosure,
     /// Invocation via a function-value argument (callback).
     CallCallback,
@@ -95,6 +97,14 @@ pub enum RefKind {
     Reference,
     /// A construction/allocation of a type (`new T`, `T { .. }`).
     Instantiate,
+    /// Invocation of a closure through a binding the frontend has proved
+    /// refers to exactly one closure definition: the binding cannot be rebound
+    /// (TypeScript `const f = () => …`), nothing shadows it between the call
+    /// and the declaration, and the call is inside the declaration's block. The
+    /// resolver binds it lexically to that definition; if it cannot find it, it
+    /// falls back to the [`RefKind::CallClosure`] treatment. Frontends that
+    /// cannot prove all three emit `CallClosure` instead.
+    CallPinnedClosure,
 }
 
 /// A raw, unresolved reference site (architecture §5 `RawRef`).

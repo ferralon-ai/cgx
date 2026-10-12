@@ -394,9 +394,12 @@ impl<'a> Builder<'a> {
         self.note_module_def(&name, ctx, node);
         self.record_fn_entrypoints(&name, &fqn, ctx);
         self.note_class_method(&name, &fqn, ctx, node);
-        self.facts
-            .type_facts
-            .extend(crate::typefacts::collect(self.src, node, &fqn, ctx.in_class));
+        self.facts.type_facts.extend(crate::typefacts::collect(
+            self.src,
+            node,
+            &fqn,
+            ctx.in_class,
+        ));
 
         // Recurse into the body for nested defs and call refs. The body is not a
         // class body, so nested functions are `Function`s. A body opens a fresh

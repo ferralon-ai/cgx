@@ -464,6 +464,38 @@ fn backward_counts_are_narrowed_sites_minus_those_that_kept_the_def() {
     assert!(off.nodes.iter().all(|n| n.narrowing == Default::default()));
 }
 
+/// The backward and forward counters stay on their own nodes when dataflow
+/// interleaves SSA value nodes into the canonical node order and renumbers the
+/// symbol nodes.
+#[test]
+fn narrowing_counts_follow_their_nodes_when_dataflow_renumbers_them() {
+    let (_t, repo) = init_empty_repo();
+    for (path, text) in MAIN_FILES {
+        write_file(&repo, path, text);
+    }
+    commit_all(&repo, "receiver fixture");
+    let registry = cgx_index::default_registry();
+    let mut store = mem_store();
+    let opts = IndexOpts {
+        receiver_narrowing: true,
+        dataflow: true,
+        ..IndexOpts::default()
+    };
+    let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
+    let idx = GraphIndex::new(&read_graph(&store, &outcome.graph_key));
+    assert!(
+        idx.nodes
+            .iter()
+            .any(|n| n.kind == SymbolKind::Variable && n.lang.is_empty()),
+        "the fixture must produce value nodes for this test to mean anything"
+    );
+
+    let (_o, plain) = index(true);
+    for n in &plain.nodes {
+        assert_eq!(node(&idx, &n.fqn).narrowing, n.narrowing, "{}", n.fqn);
+    }
+}
+
 /// I7 (in-test half): with the flag off nothing is narrowed or counted.
 #[test]
 fn flag_off_produces_no_narrowing() {

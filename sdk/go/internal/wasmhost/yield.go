@@ -43,3 +43,16 @@ func hostYield(ctx context.Context) int32 {
 	}
 	return 0
 }
+
+// importsYield reports whether the compiled module imports cgx_host.yield.
+// Modules built before the import existed do not, and must be refused: the
+// session instance runs without termination checks and would be impossible
+// to cancel.
+func importsYield(m wazero.CompiledModule) bool {
+	for _, f := range m.ImportedFunctions() {
+		if mod, name, ok := f.Import(); ok && mod == hostModule && name == yieldImport {
+			return true
+		}
+	}
+	return false
+}

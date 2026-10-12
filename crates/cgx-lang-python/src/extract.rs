@@ -26,15 +26,15 @@ use cgx_core::provenance::Span;
 use cgx_core::transform::Transform;
 use cgx_frontend::{
     CutHint, DataFlowFact, EffectFact, EntrypointHint, ExportFact, FileCtx, FileFacts,
-    FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, Name, RawRef,
-    RefKind, RelPath, RelationKind, ScopeId, SymbolDef,
+    FrontendError, ImplRelation, ImportFact, ImportedName, Lang, LanguageFrontend, ManifestKind,
+    Name, RawRef, RefKind, RelPath, RelationKind, ScopeId, SymbolDef,
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 use crate::effects::effects_of_call;
-use crate::module::module_path_for;
+use crate::module::module_path_for_root;
 
 /// The Python language adapter. Stateless; one instance handles every `.py` file.
 #[derive(Debug, Default, Clone)]
@@ -47,7 +47,10 @@ impl PythonFrontend {
 }
 
 /// Version of the Python extraction rules; bumping invalidates cached fragments.
-const PYTHON_FRAGMENT_VERSION: u32 = 2;
+/// v3: FQN root is now the importable dotted module path below a src/pyproject-aware
+/// import root instead of the literal first path segment, so v2 fragments may carry
+/// stale roots (notably the former `src`-as-root collision).
+const PYTHON_FRAGMENT_VERSION: u32 = 3;
 
 impl LanguageFrontend for PythonFrontend {
     fn lang(&self) -> Lang {
@@ -76,7 +79,18 @@ impl LanguageFrontend for PythonFrontend {
             None => return Ok(FileFacts::empty()),
         };
 
-        let module_prefix = module_path_for(ctx.path.as_str());
+        // Canonical root = importable dotted path, segmented below the src-aware
+        // import root. The pipeline resolves the anchor (it needs sibling files)
+        // and hands it in as the PyProject manifest's `root_dir`; a Python
+        // pyproject declares no identity string, so only the anchor is used. No
+        // Python manifest ⇒ `None` ⇒ repo-root segmentation with a leading-`src/`
+        // strip.
+        let import_root = ctx
+            .manifest
+            .as_ref()
+            .filter(|m| m.kind == ManifestKind::PyProject)
+            .map(|m| m.root_dir.as_str());
+        let module_prefix = module_path_for_root(ctx.path.as_str(), import_root);
         let mut builder = Builder::new(src, ctx.path.as_str());
         let root_ctx = Ctx::root(module_prefix);
 

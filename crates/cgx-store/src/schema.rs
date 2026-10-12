@@ -68,7 +68,7 @@ pub const VIEW_SET: &[&str] = &[
 pub const SCHEMA_DDL: &str = r#"
 -- ---- Layer 1: per-blob fragments (shared across branches & worktrees) --------
 CREATE TABLE IF NOT EXISTS blob_facts (
-    blob_oid         TEXT PRIMARY KEY,   -- git blob OID (content-addressed key)
+    blob_oid         TEXT PRIMARY KEY,   -- fragment key (cgx_store::FragmentKey)
     lang             TEXT NOT NULL,
     frontend_version INTEGER NOT NULL,
     fragment         BLOB NOT NULL,      -- canonical postcard bytes (opaque here)

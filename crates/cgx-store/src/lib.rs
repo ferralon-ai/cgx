@@ -4,9 +4,10 @@
 //! WAL) for the two-layer graph model of architecture §3.
 //!
 //! - **Layer 1 — per-blob fragments.** A file's facts are stored as canonical
-//!   postcard bytes keyed by its git blob OID ([`BlobOid`]). Re-putting an
-//!   unchanged blob is a no-op ([`FactStore::put_fragments`]): content-addressed
-//!   keying is what makes re-indexing an untouched file free (IX-1).
+//!   postcard bytes keyed by its blob OID plus path context ([`FragmentKey`]).
+//!   Re-putting an unchanged file is a no-op ([`FactStore::put_fragments`]):
+//!   content-addressed keying is what makes re-indexing an untouched file free
+//!   (IX-1).
 //! - **Layer 2 — per-tree linked graphs.** A [`LinkedGraph`] (nodes + edges +
 //!   candidate sets) is materialized per tree OID into the `nodes`/`edges`/
 //!   `candidates` tables and read back byte-identically.
@@ -49,4 +50,6 @@ pub use object_store::ObjectStore;
 pub use oid::ObjectOid;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};
 pub use store::{FactStore, FragmentInput, SqliteStore};
-pub use types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
+pub use types::{
+    CachedFragment, FragmentKey, FragmentKeySet, LinkedGraph, PruneStats, TreeOid,
+};

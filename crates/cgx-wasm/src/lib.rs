@@ -38,6 +38,13 @@
 //! `.cgx` mounted) runs everything but `cgx_extract`; **extractor** instances
 //! (no filesystem) run only `cgx_extract`. A panic or allocation failure prints
 //! to stderr and traps; the host discards a trapped instance.
+//!
+//! ## Imports
+//!
+//! Beyond WASI, the module imports `cgx_host.yield() -> i32`: the engine calls
+//! it at a bounded cadence so the host can collect garbage and cancel a call
+//! (see the wasm-only `host_yield` module). A non-zero result means the call
+//! was cancelled; the module exits with status 125.
 
 #![deny(unsafe_code)]
 
@@ -70,9 +77,17 @@ pub extern "C" fn _initialize() {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
         std::process::abort();
     }
+    cgx_core::yield_hook::install(host_yield::yield_now);
     // SAFETY: provided by wasm-ld; runs each constructor once, guarded above.
     unsafe { __wasm_call_ctors() }
 }
+
+#[cfg(target_family = "wasm")]
+pub mod host_yield;
+
+#[cfg(target_family = "wasm")]
+#[global_allocator]
+static ALLOC: host_yield::YieldingAlloc = host_yield::YieldingAlloc;
 
 /// Set once `_initialize` has run the module's constructors. Ops refuse to run
 /// before that: without the constructors, registrations made at load time (the

@@ -553,6 +553,7 @@ fn resolve_data_flows(
     summary_budget: u64,
 ) -> DataflowOutput {
     let mut output = build_incremental_substrate(inputs, table, prior_cache);
+    let site_callees = summary_site_callees(inputs, def_to_node, nodes, edges);
 
     // Intern value nodes by synthetic FQN so repeated references to the same SSA
     // def share one node. A `BTreeMap` keeps minting order deterministic.
@@ -679,13 +680,20 @@ fn resolve_data_flows(
                         Some(fqn)
                     })
                     .collect();
+                let callee_fqn = ground_summary_callee(
+                    table,
+                    &site_callees,
+                    def_to_node.get(fn_fqn).copied(),
+                    df.span.line,
+                    df.callee_fqn.as_deref(),
+                );
                 fn_dataflow
                     .entry(fn_fqn.to_string())
                     .or_default()
                     .calls
                     .push(crate::ifds::CallSite {
                         result_fqn: derived_fqn.clone(),
-                        callee_fqn: ground_summary_callee(table, df.callee_fqn.as_deref()),
+                        callee_fqn,
                         args,
                         condition: df.edge_condition,
                         span: Span::new(file.path.clone(), df.span.line, df.span.col),
@@ -791,28 +799,164 @@ fn resolve_data_flows(
     output
 }
 
-/// Ground an opaque call's syntactic callee name to a resolved FQN for IFDS
-/// summary application. Unlike [`ground_callee`] (which falls back to the `"*"`
-/// wildcard for `summary_deps` over-invalidation), this returns `None` when the
-/// callee is not a single uniquely-resolvable callable — a virtual/unknown callee
-/// has no single summary to apply, so it stays an opaque cut.
-fn ground_summary_callee(table: &SymbolTable, callee_fqn: Option<&str>) -> Option<String> {
-    let name = callee_fqn?;
-    if let Some(def) = table.def_by_fqn(name) {
-        if def.kind.is_callable() {
-            return Some(def.fqn.clone());
+/// The pass-1 resolved callee of each call site an `OpaqueCall` dataflow fact
+/// names, keyed by `(caller, line, syntactic callee path)`.
+///
+/// A summary may be applied only where the call itself resolved to a single
+/// in-repo callable through scope or import binding (`scope-ref` /
+/// `import-ref`, outside any candidate set). Name-matched rules (`name-method`,
+/// `name-arity`, `indirect`) do not qualify: their target can stand in for an
+/// out-of-repo or virtual callee. The value is `None` when any call under the
+/// key is unresolved, resolved by another rule, or disagrees on the target.
+///
+/// The key carries the callee path rather than the column because frontends
+/// span a dataflow fact at the whole right-hand side (`await f(x)`, `(f(x))`,
+/// `&f(x)`) but a call ref at the call expression itself. Both sides spell the
+/// path as the ref's `name_path` joined with `::`.
+fn summary_site_callees<'a>(
+    inputs: &[FileInput<'a>],
+    def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    nodes: &[NodeWithProvenance],
+    edges: &[EdgeWithProvenance],
+) -> std::collections::HashMap<(NodeId, u32, &'a str), Option<String>> {
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Outcome {
+        Unresolved,
+        Unique(NodeId),
+        Conflict,
+    }
+    fn join(acc: Outcome, next: Outcome) -> Outcome {
+        match (acc, next) {
+            (Outcome::Unique(a), Outcome::Unique(b)) if a == b => acc,
+            _ => Outcome::Conflict,
         }
     }
-    let last = name.rsplit("::").next().unwrap_or(name);
-    let callables: Vec<&DefEntry> = table
-        .defs_by_short(last)
-        .iter()
-        .filter(|d| d.kind.is_callable())
-        .collect();
-    match callables.as_slice() {
-        [only] => Some(only.fqn.clone()),
-        _ => None,
+
+    // The keys the dataflow pass will ask for, and the lines that hold them.
+    let mut wanted: HashMap<(NodeId, u32), Vec<&'a str>> = HashMap::new();
+    let mut wanted_lines: HashSet<(usize, u32)> = HashSet::new();
+    for (file_idx, file) in inputs.iter().enumerate() {
+        let facts = file.facts;
+        for df in &facts.data_flows {
+            if !df.cut_markers.contains(&CutMarker::OpaqueCall) {
+                continue;
+            }
+            let Some(callee) = df.callee_fqn.as_deref() else {
+                continue;
+            };
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope)
+                .and_then(|d| def_to_node.get(d.fqn.as_str()))
+            else {
+                continue;
+            };
+            let callees = wanted.entry((*caller, df.span.line)).or_default();
+            if !callees.contains(&callee) {
+                callees.push(callee);
+            }
+            wanted_lines.insert((file_idx, df.span.line));
+        }
     }
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+
+    // Every call ref under a wanted key, by its exact site.
+    let mut sites: HashMap<(NodeId, u32, Option<u32>), (&'a str, Outcome)> = HashMap::new();
+    for (file_idx, file) in inputs.iter().enumerate() {
+        let facts = file.facts;
+        for raw in &facts.refs {
+            if matches!(raw.kind, RefKind::Reference | RefKind::Instantiate)
+                || !wanted_lines.contains(&(file_idx, raw.span.line))
+            {
+                continue;
+            }
+            let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, raw.scope)
+                .and_then(|d| def_to_node.get(d.fqn.as_str()))
+            else {
+                continue;
+            };
+            let path = raw.name_path.join("::");
+            let Some(callee) = wanted
+                .get(&(*caller, raw.span.line))
+                .and_then(|callees| callees.iter().find(|c| **c == path))
+            else {
+                continue;
+            };
+            sites
+                .entry((*caller, raw.span.line, raw.span.col))
+                .and_modify(|(_, o)| *o = Outcome::Conflict)
+                .or_insert((*callee, Outcome::Unresolved));
+        }
+    }
+
+    // Fold each site's pass-1 call edges into its outcome.
+    for e in edges {
+        if !e.edge.kind.is_call() {
+            continue;
+        }
+        let span = &e.provenance.span;
+        let Some((_, outcome)) = sites.get_mut(&(e.edge.src, span.line, span.col)) else {
+            continue;
+        };
+        let admitted = matches!(e.edge.rule.as_str(), "scope-ref" | "import-ref")
+            && e.edge.candidate_group.is_none()
+            && nodes
+                .get(e.edge.dst.0 as usize)
+                .is_some_and(|n| n.node.kind.is_callable());
+        let next = if admitted {
+            Outcome::Unique(e.edge.dst)
+        } else {
+            Outcome::Conflict
+        };
+        *outcome = match *outcome {
+            Outcome::Unresolved => next,
+            acc => join(acc, next),
+        };
+    }
+
+    // Several calls under one key (same callee path on one line) must agree.
+    let mut by_key: HashMap<(NodeId, u32, &'a str), Outcome> = HashMap::new();
+    for ((caller, line, _), (callee, outcome)) in sites {
+        by_key
+            .entry((caller, line, callee))
+            .and_modify(|acc| *acc = join(*acc, outcome))
+            .or_insert(outcome);
+    }
+    by_key
+        .into_iter()
+        .map(|(key, outcome)| {
+            let fqn = match outcome {
+                Outcome::Unique(id) => nodes.get(id.0 as usize).map(|n| n.node.fqn.clone()),
+                _ => None,
+            };
+            (key, fqn)
+        })
+        .collect()
+}
+
+/// Ground an opaque call to the callee whose IFDS summary applies at it: the
+/// call's own pass-1 resolution ([`summary_site_callees`]), else a callee path
+/// that is exactly an in-repo callable's FQN. Anything else stays an opaque
+/// cut. A repo-wide short-name match is never enough: a call to an imported
+/// out-of-repo function or a builtin would take the summary of an unrelated
+/// in-repo function that shares its name.
+fn ground_summary_callee(
+    table: &SymbolTable,
+    site_callees: &std::collections::HashMap<(NodeId, u32, &str), Option<String>>,
+    caller: Option<NodeId>,
+    line: u32,
+    callee_fqn: Option<&str>,
+) -> Option<String> {
+    let name = callee_fqn?;
+    if let Some(Some(fqn)) = caller.and_then(|c| site_callees.get(&(c, line, name))) {
+        return Some(fqn.clone());
+    }
+    table
+        .def_by_fqn(name)
+        .filter(|def| def.kind.is_callable())
+        .map(|def| def.fqn.clone())
 }
 
 /// Build the v0.3 SC3 incremental-dataflow substrate: per-function content

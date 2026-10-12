@@ -511,6 +511,7 @@ dependencies = [
 name = "cgx-wasm"
 version = "0.3.0"
 dependencies = [
+ "cgx-core",
  "cgx-index",
  "cgx-mcp",
  "cgx-session",

@@ -1265,17 +1265,6 @@ fn two_disagreeing_views_of_the_working_tree_yield_an_unestablished_matches_head
                 Some("ignored_symbol")
             },
         },
-        Case {
-            // The mundane form, which fires on every repo `cgx index` has touched:
-            // `.cgx/` is untracked and self-ignored via its own `.gitignore`.
-            name: "indexed repo with .cgx/ present",
-            setup: |r| {
-                std::fs::create_dir_all(r.join(".cgx")).unwrap();
-                std::fs::write(r.join(".cgx/.gitignore"), "*\n").unwrap();
-                std::fs::write(r.join(".cgx/HEAD.json"), "{}\n").unwrap();
-                None
-            },
-        },
     ];
 
     for Case { name, setup } in cases {

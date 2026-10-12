@@ -64,6 +64,26 @@ A `*Graph` is safe for concurrent use. Operations take turns on the engine; one
 waiting its turn gives up when its context is done, and `Close` aborts the one
 in progress.
 
+## Cancellation
+
+An operation whose context is done (or that `Close` aborts) returns the
+context's error. With the native transport the session process is stopped.
+With the wasm engine the call stops at the engine's next yield point: the
+extractors are compiled with wazero's termination checks, and the session
+module calls back into the host (`cgx_host.yield`) every few thousand
+allocations and every few tens of thousands of iterations of its
+allocation-free loops, and once per object it writes. Cancellation latency is
+bounded by that cadence, typically a few milliseconds. The same yield points
+let the Go runtime stop the world for garbage collection while the engine
+runs, so other goroutines are not held up by a long index.
+
+A cancelled `Index` never leaves the store half-written. Objects are written
+to temporary files and renamed into place, and the ref and `HEAD.json` that
+name a graph are written last, so the store opens to the graph it held before
+the index (or to none, on a first index). Objects the cancelled index already
+wrote are left in place; they are content-addressed, and the next index reuses
+them.
+
 ## SCIP overlays
 
 `Index` takes a SCIP index from rust-analyzer or scip-clang, either as a path

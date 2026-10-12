@@ -296,7 +296,10 @@ impl ModuleIndex {
                 let Some(n) = path.first() else {
                     return Resolved::NotFound;
                 };
-                if ms.iter().any(|m| self.may_serve(d, m, n, spec, &mut Vec::new())) {
+                if ms
+                    .iter()
+                    .any(|m| self.may_serve(d, m, n, spec, &mut Vec::new()))
+                {
                     return Resolved::NotFound;
                 }
                 let key = (spec.path.clone(), n.clone(), ms.join(","));
@@ -332,7 +335,9 @@ impl ModuleIndex {
         };
         if provides(name)
             || provides("__getattr__")
-            || self.values.contains_key(&(module.to_owned(), name.to_owned()))
+            || self
+                .values
+                .contains_key(&(module.to_owned(), name.to_owned()))
         {
             return true;
         }

@@ -9,9 +9,9 @@
 //! (guarded by [`WriteLock`], analogous to the SQLite `tx.commit()`).
 //!
 //! Layer-1 fragments are stored as their own objects under `.cgx/fragments/`, keyed
-//! by blob OID (IX-1: a re-put of an unchanged blob is a no-op). Because their name
-//! is not the hash of their bytes, each carries a SHA-1 trailer; a fragment whose
-//! trailer does not match reads as a cache miss.
+//! by [`FragmentKey`] (IX-1: a re-put of an unchanged file is a no-op). Because
+//! their name is not the hash of their bytes, each carries a SHA-1 trailer; a
+//! fragment whose trailer does not match reads as a cache miss.
 //!
 //! The three dataflow caches (`fn_intraproc_cache`, `summary_deps`, `fn_summaries`)
 //! are **not** content-addressed — they want keyed upsert/delete — so they are
@@ -40,7 +40,9 @@ use crate::lock::WriteLock;
 use crate::manifest::{Manifest, ShardEntry, CURRENT_STORE_FORMAT};
 use crate::oid::ObjectOid;
 use crate::store::{FactStore, FnSummaryRow, FragmentInput, SqliteStore};
-use crate::types::{BlobOid, BlobSet, CachedFragment, LinkedGraph, PruneStats, TreeOid};
+use crate::types::{
+    CachedFragment, FragmentKey, FragmentKeySet, LinkedGraph, PruneStats, TreeOid,
+};
 use cgx_core::codec::{decode, encode};
 use cgx_core::{Candidate, EdgeRecord, NodeRecord};
 use serde::{Deserialize, Serialize};
@@ -69,7 +71,7 @@ struct ShardRef<'a> {
 }
 
 /// A stored Layer-1 fragment object: the frontend metadata plus the canonical
-/// postcard fragment bytes, keyed on disk by blob OID.
+/// postcard fragment bytes, keyed on disk by [`FragmentKey`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredFragment {
     lang: String,
@@ -224,8 +226,8 @@ fn owning_key<'a>(fqn: &'a str, callables: &BTreeSet<&str>) -> &'a str {
 }
 
 impl FactStore for ObjectStore {
-    fn fragment(&self, blob: &BlobOid) -> Result<Option<CachedFragment>> {
-        let path = ObjectOid(blob.0.clone()).object_path(&self.fragments_dir);
+    fn fragment(&self, key: &FragmentKey) -> Result<Option<CachedFragment>> {
+        let path = ObjectOid(key.0.clone()).object_path(&self.fragments_dir);
         let Some(bytes) = read_bytes_if_exists(&path)? else {
             return Ok(None);
         };
@@ -233,7 +235,7 @@ impl FactStore for ObjectStore {
             return Ok(None);
         };
         Ok(Some(CachedFragment {
-            blob: blob.clone(),
+            key: key.clone(),
             lang: sf.lang,
             frontend_version: sf.frontend_version,
             fragment: sf.bytes,
@@ -243,8 +245,8 @@ impl FactStore for ObjectStore {
     fn put_fragments(&mut self, batch: &[FragmentInput<'_>]) -> Result<()> {
         let _lock = WriteLock::acquire(&self.lock_path)?;
         for f in batch {
-            let path = ObjectOid(f.blob.0.clone()).object_path(&self.fragments_dir);
-            // Write-once per (blob OID, frontend version): an unchanged blob
+            let path = ObjectOid(f.key.0.clone()).object_path(&self.fragments_dir);
+            // Write-once per (key, frontend version): an unchanged file
             // re-puts to a true no-op (IX-1). An object written by a different
             // frontend version is replaced, so only the header is compared.
             // An existing file that fails its checksum is rewritten.
@@ -379,13 +381,13 @@ impl FactStore for ObjectStore {
         })
     }
 
-    fn prune(&mut self, live: &BlobSet, aggressive: bool) -> Result<PruneStats> {
+    fn prune(&mut self, live: &FragmentKeySet, aggressive: bool) -> Result<PruneStats> {
         let _lock = WriteLock::acquire(&self.lock_path)?;
         let mut stats = PruneStats::default();
         for (oid, path) in Self::all_object_oids(&self.fragments_dir)? {
-            // A fragment object's OID *is* its blob OID (fragments are keyed by
-            // blob OID, not by their postcard-bytes hash).
-            if !live.contains(&BlobOid(oid.0.clone())) {
+            // A fragment object's OID *is* its fragment key, not the hash of its
+            // postcard bytes.
+            if !live.contains(&FragmentKey(oid.0.clone())) {
                 fs::remove_file(&path)?;
                 stats.fragments_removed += 1;
             }

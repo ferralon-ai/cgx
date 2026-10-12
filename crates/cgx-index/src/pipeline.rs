@@ -5,8 +5,10 @@
 //!
 //! 1. **Enumerate** source files from a git tree or a working directory
 //!    ([`crate::git`]).
-//! 2. **Extract, blob-OID-cached.** For each file, consult the store's Layer-1
-//!    fragment cache keyed by blob OID. A *hit* (the blob was indexed before, on
+//! 2. **Extract, fragment-cached.** For each file, consult the store's Layer-1
+//!    fragment cache keyed by [`FragmentKey`]: the blob OID plus the path context
+//!    the frontend's output depends on (the whole [`FileCtx`]). A *hit* (the same
+//!    blob at the same path and package/manifest context was indexed before, on
 //!    any branch or worktree) reuses the cached [`FileFacts`] with **no
 //!    re-extraction** — the branch-aware incremental win (IX-1). A *miss* runs
 //!    the registry frontend, encodes the canonical fragment, and batches it for a
@@ -35,7 +37,7 @@ use cgx_resolve::{
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
-use cgx_store::{BlobOid, FactStore, FragmentInput, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, FragmentInput, FragmentKey, LinkedGraph, TreeOid};
 
 pub use compdb::CompdbReport;
 pub use scip_relabel::ScipStats;
@@ -153,16 +155,24 @@ pub(crate) fn extract_and_link<S: FactStore>(
     // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
     // this stays single-threaded; only the CPU-bound extraction is parallelized.
     let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<&SourceFile> = Vec::new();
+    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
     for src in sources {
         let rel = RelPath::new(src.rel_path.clone());
         if !registry.has_adapter_for(&rel) {
             stats.blobs_unsupported += 1;
             continue;
         }
-        let blob = BlobOid::new(src.blob_oid.clone());
+        // The key is derived from the exact context `extract` will see, so an
+        // identical blob at another path (or under another package/manifest)
+        // never reuses this file's path-derived FQNs.
+        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+        let manifest = manifest_map.manifest_for(&src.rel_path);
+        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+            .with_package(package)
+            .with_manifest(manifest);
+        let key = FragmentKey::derive(&ctx.cache_identity());
         let want = registry.frontend_for(&rel).fragment_version();
-        match store.fragment(&blob)? {
+        match store.fragment(&key)? {
             Some(cached) if cached.frontend_version == want => {
                 let facts: FileFacts = decode(&cached.fragment)?;
                 stats.blobs_cached += 1;
@@ -178,24 +188,20 @@ pub(crate) fn extract_and_link<S: FactStore>(
             // and let the store overwrite it.
             Some(_) => {
                 stats.blobs_stale += 1;
-                misses.push(src);
+                misses.push((src, ctx, key));
             }
-            None => misses.push(src),
+            None => misses.push((src, ctx, key)),
         }
     }
 
     // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the blob-OID independence that makes Layer-1 cacheable
-    // (IX-1) is exactly what makes it embarrassingly parallel (IX-2 step 3).
-    let extracted: Vec<(PreparedFile, u32, Vec<u8>)> = misses
-        .par_iter()
-        .map(|src| {
+    // store/git access — the (content, context) purity that makes Layer-1
+    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
+    // step 3).
+    let extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = misses
+        .into_par_iter()
+        .map(|(src, ctx, key)| {
             let rel = RelPath::new(src.rel_path.clone());
-            let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
-            let manifest = manifest_map.manifest_for(&src.rel_path);
-            let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
-                .with_package(package)
-                .with_manifest(manifest);
             let facts = registry.extract(&src.content, &ctx)?;
             let bytes = encode(&facts)?;
             let version = registry.frontend_for(&rel).fragment_version();
@@ -206,6 +212,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
                     lang: registry.lang_for(&rel).tag().to_string(),
                     facts,
                 },
+                key,
                 version,
                 bytes,
             ))
@@ -215,15 +222,10 @@ pub(crate) fn extract_and_link<S: FactStore>(
 
     // Batch-write the freshly extracted fragments in one transaction.
     if !extracted.is_empty() {
-        let blob_oids: Vec<BlobOid> = extracted
-            .iter()
-            .map(|(p, ..)| BlobOid::new(p.blob_oid.clone()))
-            .collect();
         let batch: Vec<FragmentInput<'_>> = extracted
             .iter()
-            .zip(&blob_oids)
-            .map(|((p, version, bytes), blob)| FragmentInput {
-                blob,
+            .map(|(p, key, version, bytes)| FragmentInput {
+                key,
                 lang: &p.lang,
                 frontend_version: *version,
                 bytes,

@@ -5,8 +5,8 @@ mod common;
 
 use cgx_core::codec::encode;
 use cgx_store::{
-    BlobOid, BlobSet, FactStore, FragmentInput, LinkedGraph, SqliteStore, TreeOid, SCHEMA_VERSION,
-    VIEW_SCHEMA_VERSION, VIEW_SET,
+    FactStore, FragmentInput, FragmentKey, FragmentKeySet, LinkedGraph, SqliteStore, TreeOid,
+    SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET,
 };
 use common::sample_graph;
 
@@ -14,9 +14,9 @@ fn open() -> SqliteStore {
     SqliteStore::open_in_memory().expect("open in-memory store")
 }
 
-fn frag<'a>(blob: &'a BlobOid, bytes: &'a [u8]) -> FragmentInput<'a> {
+fn frag<'a>(key: &'a FragmentKey, bytes: &'a [u8]) -> FragmentInput<'a> {
     FragmentInput {
-        blob,
+        key,
         lang: "rust",
         frontend_version: 1,
         bytes,
@@ -117,7 +117,7 @@ fn re_putting_same_tree_replaces_rows_without_appending() {
 #[test]
 fn fragment_put_and_get_round_trips_bytes() {
     let mut store = open();
-    let blob = BlobOid::new("blob-1");
+    let blob = FragmentKey::new("blob-1");
     let bytes = encode(&sample_graph().nodes[0]).unwrap();
 
     store.put_fragments(&[frag(&blob, &bytes)]).unwrap();
@@ -131,13 +131,13 @@ fn fragment_put_and_get_round_trips_bytes() {
 #[test]
 fn fragment_absent_returns_none() {
     let store = open();
-    assert!(store.fragment(&BlobOid::new("nope")).unwrap().is_none());
+    assert!(store.fragment(&FragmentKey::new("nope")).unwrap().is_none());
 }
 
 #[test]
 fn re_putting_unchanged_blob_is_a_no_op() {
     let mut store = open();
-    let blob = BlobOid::new("blob-stable");
+    let blob = FragmentKey::new("blob-stable");
     let bytes = b"canonical-fragment-bytes".to_vec();
 
     store.put_fragments(&[frag(&blob, &bytes)]).unwrap();
@@ -153,7 +153,7 @@ fn re_put_does_not_overwrite_existing_bytes_for_same_oid() {
     // A blob OID is content-addressed: the first stored bytes are authoritative.
     // A no-op ON CONFLICT means a second put with different bytes is ignored.
     let mut store = open();
-    let blob = BlobOid::new("blob-cad");
+    let blob = FragmentKey::new("blob-cad");
     store.put_fragments(&[frag(&blob, b"original")]).unwrap();
     store.put_fragments(&[frag(&blob, b"different")]).unwrap();
     assert_eq!(
@@ -165,9 +165,9 @@ fn re_put_does_not_overwrite_existing_bytes_for_same_oid() {
 #[test]
 fn put_with_a_different_frontend_version_replaces_the_fragment() {
     let mut store = open();
-    let blob = BlobOid::new("blob-versioned");
-    let v1 = FragmentInput { blob: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
-    let v2 = FragmentInput { blob: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+    let blob = FragmentKey::new("blob-versioned");
+    let v1 = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { key: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
 
     store.put_fragments(&[v1]).unwrap();
     store.put_fragments(&[v2]).unwrap();
@@ -275,13 +275,13 @@ fn round_trip_then_re_encode_is_byte_identical() {
 #[test]
 fn prune_removes_orphaned_blobs_and_keeps_live_ones() {
     let mut store = open();
-    let live_blob = BlobOid::new("live");
-    let dead_blob = BlobOid::new("dead");
+    let live_blob = FragmentKey::new("live");
+    let dead_blob = FragmentKey::new("dead");
     store
         .put_fragments(&[frag(&live_blob, b"a"), frag(&dead_blob, b"b")])
         .unwrap();
 
-    let mut live: BlobSet = BlobSet::new();
+    let mut live: FragmentKeySet = FragmentKeySet::new();
     live.insert(live_blob.clone());
 
     let stats = store.prune(&live, false).unwrap();
@@ -297,10 +297,10 @@ fn prune_aggressive_compacts() {
     // page reclaim, but the flag and the operation must succeed on a file db.
     let tmp = tempfile::tempdir().unwrap();
     let mut store = SqliteStore::open(tmp.path().join("index.db")).unwrap();
-    let blob = BlobOid::new("x");
+    let blob = FragmentKey::new("x");
     store.put_fragments(&[frag(&blob, b"payload")]).unwrap();
 
-    let mut live = BlobSet::new();
+    let mut live = FragmentKeySet::new();
     live.insert(blob);
     let stats = store.prune(&live, true).unwrap();
     assert!(stats.compacted);
@@ -309,10 +309,10 @@ fn prune_aggressive_compacts() {
 #[test]
 fn shared_blob_survives_when_still_live() {
     let mut store = open();
-    let shared = BlobOid::new("shared");
+    let shared = FragmentKey::new("shared");
     store.put_fragments(&[frag(&shared, b"s")]).unwrap();
 
-    let mut live = BlobSet::new();
+    let mut live = FragmentKeySet::new();
     live.insert(shared.clone());
     store.prune(&live, false).unwrap();
     assert!(store.fragment(&shared).unwrap().is_some());

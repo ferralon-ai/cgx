@@ -17,6 +17,10 @@ pub enum StoreError {
     /// understands. Rejected rather than mis-decoded (the postcard wire format is
     /// not self-describing). Carries `(found, expected)`.
     StoreFormat { found: u32, expected: u32 },
+    /// An object reachable from a ref is missing, or its bytes do not hash to its
+    /// OID (a torn write that survived a crash). The bad file has been removed; the
+    /// graph must be rebuilt by re-indexing.
+    Corrupt { oid: String },
     /// The advisory write lock could not be acquired within the timeout (IX-7).
     LockTimeout,
     /// An I/O error opening the index directory or lockfile.
@@ -36,6 +40,10 @@ impl core::fmt::Display for StoreError {
                 f,
                 "committed store_format {found} is newer than this cgx understands \
                  (supports up to {expected}); upgrade cgx to read this graph"
+            ),
+            StoreError::Corrupt { oid } => write!(
+                f,
+                "index object {oid} is missing or corrupt; re-index to rebuild it"
             ),
             StoreError::LockTimeout => write!(f, "could not acquire index write lock within timeout"),
             StoreError::Io(e) => write!(f, "io error: {e}"),

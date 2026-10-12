@@ -40,10 +40,10 @@ mod git;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write as _;
 use std::path::Path;
 
 use cgx_store::manifest::Manifest;
+use cgx_store::durable::{self, Batch};
 use cgx_store::ObjectOid;
 
 use crate::git::{Git, TreeEntry, ZERO_OID};
@@ -129,6 +129,11 @@ pub fn pull(repo_root: &Path, remote: &str) -> Result<PullOutcome, TransportErro
     let mut objects_materialized = 0usize;
     let mut graph_keys = 0usize;
 
+    // Objects land first as one durability batch; the pointers that name them
+    // (`refs/*`, `HEAD.json`) are written only after the batch is durable.
+    let objects_dir = cgx_dir.join("objects");
+    let mut batch = Batch::new();
+    let mut pointers = Vec::new();
     for (path, blob_oid) in git.ls_tree_r(CGX_REF)? {
         let bytes = git.cat_file_blob(&blob_oid)?;
 
@@ -143,11 +148,17 @@ pub fn pull(repo_root: &Path, remote: &str) -> Result<PullOutcome, TransportErro
                 });
             }
             objects_materialized += 1;
-        } else if path.starts_with("refs/") {
+            batch.write(&objects_dir.join(rest), &bytes)?;
+            continue;
+        }
+        if path.starts_with("refs/") {
             graph_keys += 1;
         }
-
-        atomic_write(&cgx_dir.join(&path), &bytes)?;
+        pointers.push((path, bytes));
+    }
+    batch.commit(&objects_dir)?;
+    for (path, bytes) in pointers {
+        durable::write_durable(&cgx_dir.join(&path), &bytes)?;
     }
 
     Ok(PullOutcome {
@@ -325,27 +336,4 @@ fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>, TransportError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Write `bytes` to `path` via temp → `fsync` → atomic `rename`, creating parent
-/// directories. Mirrors the store's own write discipline so a torn object never
-/// occupies its final name.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), TransportError> {
-    let parent = path
-        .parent()
-        .expect("materialized path has a parent under .cgx");
-    fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .expect("materialized path has a file name")
-        .to_str()
-        .expect("materialized file name is utf-8");
-    let tmp = parent.join(format!("{file_name}.cgx-tmp"));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
 }

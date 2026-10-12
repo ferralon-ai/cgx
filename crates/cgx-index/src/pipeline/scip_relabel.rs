@@ -165,12 +165,16 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             .map(|n| (n.node.fqn.clone(), n.node.id))
             .collect();
 
-        // (file, 1-based line) → node, for span-precise overload redirect. On a
-        // span collision (two nodes starting on one line) the last wins; the
-        // redirect only consults this for a SCIP-confirmed unique def site.
+        // (file, 1-based line) → function or method node, for span-precise
+        // overload redirect. Only call targets are indexed: a parameter or
+        // local starts on its function's definition line and would otherwise
+        // shadow it. On a remaining collision (two callables starting on one
+        // line) the last wins; the redirect only consults this for a
+        // SCIP-confirmed unique def site.
         let node_by_loc: BTreeMap<(String, u32), NodeId> = graph
             .nodes
             .iter()
+            .filter(|n| matches!(n.node.kind, SymbolKind::Function | SymbolKind::Method))
             .map(|n| ((n.node.file.clone(), n.node.line_start), n.node.id))
             .collect();
 

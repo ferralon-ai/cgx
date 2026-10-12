@@ -15,6 +15,7 @@ use cgx_frontend::facts::{
     DataFlowFact, ImplRelation, RawRef, RefKind, RelationKind, ScopeId, ScopeTree, SymbolDef,
 };
 
+use crate::chunked::ChunkedVec;
 use crate::graph::{DataflowOutput, ResolvedGraph, UnresolvedRef};
 use crate::input::{FileInput, LinkOpts};
 use crate::receiver::{Ledger, Narrowed, ReceiverIndex, Site};
@@ -38,7 +39,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     let table = SymbolTable::build(&node_records(&nodes), &files);
 
     // --- Pass A/B: resolve every reference. ---
-    let mut edges: Vec<EdgeWithProvenance> = Vec::new();
+    let mut edges: ChunkedVec<EdgeWithProvenance> = ChunkedVec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut unresolved: Vec<UnresolvedRef> = Vec::new();
     let mut next_group: u32 = 0;
@@ -218,7 +219,7 @@ fn build_nodes(
 /// order and no id moved, so callers holding other id-keyed state can follow.
 fn sort_nodes_canonical(
     nodes: &mut [NodeWithProvenance],
-    edges: &mut [EdgeWithProvenance],
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     candidates: &mut [Candidate],
 ) -> Option<Vec<NodeId>> {
     fn key(n: &NodeWithProvenance) -> (&str, u32, &str) {
@@ -306,7 +307,7 @@ fn resolve_ref(
     bindings: &[ImportBinding],
     table: &SymbolTable,
     opts: &LinkOpts,
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     candidates: &mut Vec<Candidate>,
     unresolved: &mut Vec<UnresolvedRef>,
     next_group: &mut u32,
@@ -605,7 +606,7 @@ fn resolve_impl_relation(
     rel: &ImplRelation,
     def_to_node: &std::collections::BTreeMap<String, NodeId>,
     table: &SymbolTable,
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
 ) {
     let (src, dst, kind) = match rel.kind {
         RelationKind::Implements | RelationKind::Inherits => {
@@ -665,7 +666,7 @@ fn resolve_data_flows(
     def_to_node: &std::collections::BTreeMap<String, NodeId>,
     table: &SymbolTable,
     nodes: &mut Vec<NodeWithProvenance>,
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     prior_cache: &std::collections::HashMap<(String, String), String>,
     summary_budget: u64,
 ) -> DataflowOutput {
@@ -934,7 +935,7 @@ fn summary_site_callees<'a>(
     inputs: &[FileInput<'a>],
     def_to_node: &std::collections::BTreeMap<String, NodeId>,
     nodes: &[NodeWithProvenance],
-    edges: &[EdgeWithProvenance],
+    edges: &ChunkedVec<EdgeWithProvenance>,
 ) -> std::collections::HashMap<(NodeId, u32, &'a str), Option<String>> {
     use std::collections::{HashMap, HashSet};
 
@@ -1273,7 +1274,7 @@ fn intern_param_node(
 /// Push one resolved `DerivesFrom` edge: directed derived → source (docs/04
 /// DF-3.1), tagged with the transform and a confidence per design §1.3.
 fn push_data_flow_edge(
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     derived: NodeId,
     source: NodeId,
     pe: &PendingDataFlowEdge,
@@ -1375,7 +1376,7 @@ fn resolve_trait_method(table: &SymbolTable, name_path: &[String]) -> Option<Nod
 /// are stated directly in source (`impl Trait for T`), so they are not
 /// over-approximations. No site_id, no candidate group.
 fn push_structural_edge(
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     src: NodeId,
     dst: NodeId,
     kind: EdgeKind,
@@ -1547,7 +1548,7 @@ struct EdgeBuild<'a> {
     candidate_group: Option<u32>,
 }
 
-fn push_edge(edges: &mut Vec<EdgeWithProvenance>, b: EdgeBuild<'_>) {
+fn push_edge(edges: &mut ChunkedVec<EdgeWithProvenance>, b: EdgeBuild<'_>) {
     let site_id = if b.kind.is_call() {
         Some(SiteId::derive(
             b.caller_fqn,
@@ -1609,7 +1610,7 @@ pub(crate) fn canonicalize_candidate_dsts(dsts: &mut Vec<NodeId>) -> Confidence 
 /// (multiple) or `probable` (single). Records the candidate table rows.
 #[allow(clippy::too_many_arguments)]
 fn emit_candidate_set(
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     candidates: &mut Vec<Candidate>,
     next_group: &mut u32,
     hits: &[&DefEntry],
@@ -1733,7 +1734,7 @@ fn emit_candidate_set(
 /// dangling refs themselves.
 fn finalize(
     mut nodes: Vec<NodeWithProvenance>,
-    edges: Vec<EdgeWithProvenance>,
+    edges: ChunkedVec<EdgeWithProvenance>,
     candidates: Vec<Candidate>,
     mut unresolved: Vec<UnresolvedRef>,
     narrowing: &std::collections::BTreeMap<NodeId, NarrowingCounts>,
@@ -1795,7 +1796,7 @@ fn finalize(
 /// original relative order. Filters in place: the post-passes run on the
 /// full-size edge list, and a filtered copy would hold two edge buffers at once.
 pub(crate) fn remove_edges_at(
-    edges: &mut Vec<EdgeWithProvenance>,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
     drop: &std::collections::BTreeSet<usize>,
 ) {
     let mut drop = drop.iter().copied().peekable();
@@ -1829,7 +1830,7 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     // order, which is part of the byte-identity contract. `sort_by_cached_key`
     // is stable and sorts (key, u32 index) pairs, then permutes the edges in
     // place, instead of a merge sort whose scratch buffer holds half the edges.
-    let sort = |edges: &mut Vec<EdgeWithProvenance>| {
+    let sort = |edges: &mut ChunkedVec<EdgeWithProvenance>| {
         edges.sort_by_cached_key(|e| {
             (
                 e.edge.src.0,
@@ -1952,7 +1953,13 @@ mod tests {
             dangle("m::b", "m.py", 12, CutMarker::UntypedReceiver),
         ];
         let total = unresolved.len() as u32;
-        let g = finalize(nodes, vec![], vec![], unresolved, &BTreeMap::new());
+        let g = finalize(
+            nodes,
+            ChunkedVec::new(),
+            vec![],
+            unresolved,
+            &BTreeMap::new(),
+        );
 
         let (u, e, n) = counts(&g, "m::a");
         assert_eq!((u, e, n.visible_dropped_out), (1, 2, 1));
@@ -1981,7 +1988,13 @@ mod tests {
                 ..dangle("m::dup", "m.py", line, CutMarker::Unresolved)
             })
             .collect();
-        let g = finalize(nodes, vec![], vec![], unresolved, &BTreeMap::new());
+        let g = finalize(
+            nodes,
+            ChunkedVec::new(),
+            vec![],
+            unresolved,
+            &BTreeMap::new(),
+        );
         let per_node: Vec<u32> = g.nodes.iter().map(|n| n.node.unresolved_calls).collect();
         assert_eq!(per_node, vec![0, 2]);
     }
@@ -2008,7 +2021,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let g = finalize(nodes, vec![], vec![], unresolved, &narrowing);
+        let g = finalize(nodes, ChunkedVec::new(), vec![], unresolved, &narrowing);
 
         let (_, _, a) = counts(&g, "m::a");
         assert_eq!(

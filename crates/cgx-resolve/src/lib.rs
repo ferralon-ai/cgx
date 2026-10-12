@@ -66,6 +66,7 @@
 #![warn(missing_debug_implementations)]
 
 mod cha;
+mod chunked;
 mod effects;
 mod graph;
 mod graph_alg;
@@ -79,6 +80,7 @@ mod summary;
 mod symtab;
 
 pub use cha::{run_cha, ChaStats, CHA_SUPERNODE_CAP};
+pub use chunked::ChunkedVec;
 pub use effects::{run_effect_closure, EffectStats};
 pub use graph::{
     propagate_dirty, DataflowOutput, DataflowStats, IfdsDataflowStats, ResolvedGraph,

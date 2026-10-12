@@ -103,7 +103,17 @@ fn e1_free_fn_direct_call_upgrades_to_certain() {
     // single import binding). The call site is at line 5, col 9 (1-based).
     let mut graph = ResolvedGraph {
         nodes: vec![node(0, "fixture_crate::caller", "src/lib.rs", 4), node(1, "fixture_crate::add", "src/lib.rs", 1)],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 5, 9, Confidence::Probable, Tier::ScopeGraph, "import-ref")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            5,
+            9,
+            Confidence::Probable,
+            Tier::ScopeGraph,
+            "import-ref",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -149,7 +159,17 @@ fn e2_trait_member_call_caps_at_probable_not_certain() {
             node(0, "fixture_crate::caller", "src/lib.rs", 4),
             node(1, "fixture_crate::Shape::area", "src/lib.rs", 1),
         ],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 6, 11, Confidence::Possible, Tier::ScopeGraph, "name-method")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            6,
+            11,
+            Confidence::Possible,
+            Tier::ScopeGraph,
+            "name-method",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -203,7 +223,17 @@ fn existing_certain_scope_graph_edge_is_never_downgraded() {
             node(0, "fixture_crate::caller", "src/lib.rs", 4),
             node(1, "fixture_crate::Shape::area", "src/lib.rs", 1),
         ],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 6, 11, Confidence::Certain, Tier::ScopeGraph, "scope-ref")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            6,
+            11,
+            Confidence::Certain,
+            Tier::ScopeGraph,
+            "scope-ref",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -239,7 +269,17 @@ fn double_def_site_collision_18772_caps_at_probable() {
             node(0, "fixture_crate::caller", "src/lib.rs", 9),
             node(1, "fixture_crate::helper", "src/lib.rs", 1),
         ],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 10, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            10,
+            5,
+            Confidence::Possible,
+            Tier::NameSyntactic,
+            "name-arity",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -287,7 +327,17 @@ fn cross_crate_ref_emits_scip_dep_edge() {
     let mut graph = ResolvedGraph {
         nodes: vec![node(0, "fixture_crate::caller", "src/lib.rs", 4), node(1, "fixture_crate::add", "src/lib.rs", 1)],
         // One in-tree def (add) so the pass infers `fixture_crate` as local.
-        edges: vec![call_edge(0, 1, "src/lib.rs", 6, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            6,
+            5,
+            Confidence::Possible,
+            Tier::NameSyntactic,
+            "name-arity",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -336,7 +386,17 @@ fn dst_redirect_and_group_collapse_recanonicalizes() {
             node(1, "fixture_crate::wrong_target", "src/lib.rs", 1),
             node(2, "fixture_crate::right_target", "src/lib.rs", 5),
         ],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 10, 5, Confidence::Possible, Tier::NameSyntactic, "name-arity")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            10,
+            5,
+            Confidence::Possible,
+            Tier::NameSyntactic,
+            "name-arity",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()
@@ -375,7 +435,17 @@ fn no_scip_occurrence_leaves_edge_untouched() {
     // the edge at all.
     let mut graph = ResolvedGraph {
         nodes: vec![node(0, "fixture_crate::caller", "src/lib.rs", 4), node(1, "fixture_crate::add", "src/lib.rs", 1)],
-        edges: vec![call_edge(0, 1, "src/lib.rs", 5, 9, Confidence::Probable, Tier::ScopeGraph, "import-ref")],
+        edges: vec![call_edge(
+            0,
+            1,
+            "src/lib.rs",
+            5,
+            9,
+            Confidence::Probable,
+            Tier::ScopeGraph,
+            "import-ref",
+        )]
+        .into(),
         candidates: vec![],
         unresolved: vec![],
         ..Default::default()

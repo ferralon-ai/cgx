@@ -136,7 +136,10 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
         .unwrap_or(0);
 
     let mut new_candidates: Vec<Candidate> = Vec::new();
-    let mut new_edges: Vec<EdgeWithProvenance> = Vec::new();
+    // Each replacement set is kept as its compact destination list and expanded
+    // into edges only after the placeholders are removed, so the expanded edges
+    // never exist in a second buffer alongside the graph's.
+    let mut replacements: Vec<Replacement> = Vec::new();
     let mut drop_edge_idx: BTreeSet<usize> = BTreeSet::new();
 
     for site in &sites {
@@ -177,30 +180,55 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
             None
         };
 
-        let proto = graph.edges[site.edge_index].clone();
-        for (rank, dst) in dsts.iter().enumerate() {
-            if let Some(g) = group {
+        if let Some(g) = group {
+            for (rank, dst) in dsts.iter().enumerate() {
                 new_candidates.push(Candidate {
                     candidate_group: g,
                     dst: *dst,
                     rank: rank as u32,
                 });
             }
-            new_edges.push(build_sig_edge(&proto, *dst, confidence, group, over_cap));
         }
+        replacements.push(Replacement {
+            proto: graph.edges[site.edge_index].clone(),
+            dsts,
+            confidence,
+            group,
+            over_cap,
+        });
     }
 
-    if new_edges.is_empty() && drop_edge_idx.is_empty() {
+    if replacements.is_empty() && drop_edge_idx.is_empty() {
         return stats;
     }
 
     crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
-    graph.edges.reserve_exact(new_edges.len());
-    graph.edges.extend(new_edges);
+    for r in &replacements {
+        for dst in &r.dsts {
+            graph.edges.push(build_sig_edge(
+                &r.proto,
+                *dst,
+                r.confidence,
+                r.group,
+                r.over_cap,
+            ));
+        }
+    }
     graph.candidates.extend(new_candidates);
 
     crate::canonicalize(graph);
     stats
+}
+
+/// The signature-compatible replacement for one placeholder: the placeholder
+/// edge (the template every replacement edge copies) and the canonical
+/// destination set.
+struct Replacement {
+    proto: EdgeWithProvenance,
+    dsts: Vec<NodeId>,
+    confidence: Confidence,
+    group: Option<u32>,
+    over_cap: bool,
 }
 
 /// One indirect-call placeholder site: its single edge index and the syntactic

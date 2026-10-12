@@ -31,7 +31,7 @@
 //! | `cgx_index_plan` | frame `[content per manifest index]` | frame `[summary, (u32le index ‖ ctx)…]` |
 //! | `cgx_extract` | frame `[ctx, content]` | frame `[{lang, fragment_version}, facts]` |
 //! | `cgx_index_submit` | frame `[(u32le index ‖ u32le fragment_version ‖ facts)…]` | `{}` |
-//! | `cgx_index_finish` | frame `[opts, scip?]` | JSON index report |
+//! | `cgx_index_finish` | frame `[opts, scip?, source_root?, compdb?, compdb_dir?]` | JSON index report |
 //! | `cgx_query` | JSON `{tool, args}` | JSON result |
 //!
 //! Instances take one of two roles: a **session** instance (one per graph, with
@@ -44,7 +44,7 @@
 use std::cell::RefCell;
 
 use cgx_session::store_loc::cgx_dir;
-use cgx_session::{BeginOpts, OpenRequest, Session, SessionError, Submitted};
+use cgx_session::{BeginOpts, OpenRequest, ScipInput, Session, SessionError, Submitted};
 use cgx_store::ObjectStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -140,10 +140,29 @@ fn parse_json<'a, T: Deserialize<'a>>(what: &str, bytes: &'a [u8]) -> Result<T, 
         .map_err(|e| SessionError::invalid_params(format!("{what}: {e}")))
 }
 
-/// No fields in ABI 1; an unknown field is rejected rather than ignored.
-#[derive(Debug, Deserialize)]
+/// `cgx_index_finish` options. An unknown field is rejected rather than ignored.
+///
+/// The frame's optional entries trail `opts` in order — `scip` (the SCIP
+/// index), `source_root` (the repository's host path, the frame the compdb's
+/// paths are written in; empty for the session root), `compdb` (a scip-clang
+/// index's `compile_commands.json`) and `compdb_dir` (the base for compdb
+/// entries without `directory`; default `source_root`). Paths are UTF-8.
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FinishOpts {}
+struct FinishOpts {
+    /// `cgx index --compdb-complete`: trust the compdb without checking.
+    #[serde(default)]
+    compdb_complete: bool,
+}
+
+fn frame_path<'a>(what: &str, bytes: &'a [u8]) -> Result<Option<&'a std::path::Path>, SessionError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    std::str::from_utf8(bytes)
+        .map(|s| Some(std::path::Path::new(s)))
+        .map_err(|_| SessionError::invalid_params(format!("cgx_index_finish: {what} is not UTF-8")))
+}
 
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
@@ -234,16 +253,27 @@ fn dispatch(state: &mut State, op: Op, req: &[u8]) -> Result<Vec<u8>, SessionErr
         }
         Op::IndexFinish => {
             let frame = decode_frame(req)?;
-            let (opts, scip) = match &frame[..] {
-                [opts] => (*opts, None),
-                [opts, scip] => (*opts, Some(*scip)),
-                _ => {
+            if frame.is_empty() || frame.len() > 5 {
+                return Err(SessionError::invalid_params(
+                    "cgx_index_finish: frame must be [opts, scip?, source_root?, compdb?, compdb_dir?]",
+                ));
+            }
+            let opts: FinishOpts = parse_json("cgx_index_finish options", frame[0])?;
+            let scip = match frame.get(1) {
+                Some(&scip) => Some(ScipInput {
+                    scip,
+                    source_root: frame_path("source_root", frame.get(2).copied().unwrap_or_default())?,
+                    compdb: frame.get(3).copied(),
+                    compdb_dir: frame_path("compdb_dir", frame.get(4).copied().unwrap_or_default())?,
+                    compdb_complete: opts.compdb_complete,
+                }),
+                None if opts.compdb_complete => {
                     return Err(SessionError::invalid_params(
-                        "cgx_index_finish: frame must be [opts] or [opts, scip]",
+                        "cgx_index_finish: compdb_complete without a SCIP index",
                     ))
                 }
+                None => None,
             };
-            let _: FinishOpts = parse_json("cgx_index_finish options", opts)?;
             Ok(json_body(&session.index_finish(scip)?))
         }
         Op::Query => {
@@ -425,7 +455,7 @@ mod tests {
     /// Every language fixture in one repository, each under its own directory.
     fn mixed_repo(dir: &Path) -> PathBuf {
         let repo = dir.join("repo");
-        for f in ["rust-sample", "go", "python", "java", "ts"] {
+        for f in ["rust-sample", "go", "python", "java", "ts", "c", "cpp"] {
             copy_dir(&fixtures_root().join(f), &repo.join(f));
         }
         git(&repo, &["init", "-q", "-b", "main"]);

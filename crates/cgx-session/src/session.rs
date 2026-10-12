@@ -23,8 +23,8 @@ use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry};
 use cgx_index::{
     apply_cha, apply_effects, apply_rta, apply_scip_bytes, apply_sig, default_registry,
     extract_one, is_manifest_path, link_prepared, plan, probe_fragments, put_extracted,
-    workdir_key, ExtractedFile, IndexOpts, IndexStats, PlannedFile, PreparedFile, ScipOverlay,
-    SourceFile,
+    workdir_key, CompdbInput, CompdbReport, ExtractedFile, IndexOpts, IndexStats, PlannedFile,
+    PreparedFile, ScipOverlay, ScipStats, SourceFile,
 };
 use cgx_mcp::session::overlay_difference;
 use cgx_mcp::tools::{SessionProvider, SessionRef};
@@ -179,6 +179,58 @@ pub struct ReportStats {
     pub unresolved: usize,
     pub dataflow_functions_recomputed: usize,
     pub dataflow_functions_reused: usize,
+    /// The SCIP overlay's counters; absent when the index had none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scip: Option<ScipReport>,
+}
+
+/// What a SCIP overlay changed, and for a scip-clang index how complete its
+/// compdb was found to be.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScipReport {
+    /// Call edges upgraded to `certain`.
+    pub upgraded_certain: usize,
+    /// Call edges upgraded to `probable`.
+    pub upgraded_probable: usize,
+    /// Resolutions to a unique definition capped at `probable` because the
+    /// compdb was not known complete.
+    pub capped_partial_compdb: usize,
+    /// The compdb check; present for a scip-clang index only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compdb: Option<CompdbSummary>,
+}
+
+/// The scip-clang compdb-completeness verdict and its evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompdbSummary {
+    /// `complete`, `partial`, or `not_applicable` (no C++ translation units).
+    pub completeness: &'static str,
+    pub discovered_tus: usize,
+    pub covered_tus: usize,
+    pub missing_tus: usize,
+    /// A bounded sample of the missing translation units.
+    pub missing_sample: Vec<String>,
+}
+
+impl ScipReport {
+    fn new(scip: &ScipStats, compdb: Option<&CompdbReport>) -> Self {
+        ScipReport {
+            upgraded_certain: scip.upgraded_certain,
+            upgraded_probable: scip.upgraded_probable,
+            capped_partial_compdb: scip.capped_partial_compdb,
+            compdb: compdb.map(|c| CompdbSummary {
+                completeness: match c.completeness {
+                    cgx_index::CompdbCompleteness::Complete => "complete",
+                    cgx_index::CompdbCompleteness::Partial => "partial",
+                    cgx_index::CompdbCompleteness::NotApplicable => "not_applicable",
+                },
+                discovered_tus: c.discovered_tus,
+                covered_tus: c.covered_tus,
+                missing_tus: c.missing_tus,
+                missing_sample: c.missing_sample.clone(),
+            }),
+        }
+    }
 }
 
 impl From<&IndexStats> for ReportStats {
@@ -193,6 +245,7 @@ impl From<&IndexStats> for ReportStats {
             unresolved: s.unresolved,
             dataflow_functions_recomputed: s.dataflow.functions_recomputed,
             dataflow_functions_reused: s.dataflow.functions_reused,
+            scip: s.scip.as_ref().map(|scip| ScipReport::new(scip, s.compdb.as_ref())),
         }
     }
 }
@@ -249,10 +302,60 @@ pub(crate) struct Target {
     pub(crate) dataflow: bool,
 }
 
+/// The largest SCIP index an index accepts, in bytes.
+pub const MAX_SCIP_BYTES: usize = 256 << 20;
+/// The largest `compile_commands.json` an index accepts, in bytes.
+pub const MAX_COMPDB_BYTES: usize = 64 << 20;
+
+/// A SCIP index to overlay on one index, as bytes: what `cgx index --scip`
+/// (with `--compdb` and `--compdb-complete`) reads from files. Both drivers take
+/// it — the wasm host in `cgx_index_finish`, the native server in `index` — and
+/// it reaches the same [`apply_scip_bytes`] pass the CLI's path form uses.
+#[derive(Debug, Clone, Copy)]
+pub struct ScipInput<'a> {
+    /// The `.scip` index (rust-analyzer or scip-clang); at most
+    /// [`MAX_SCIP_BYTES`].
+    pub scip: &'a [u8],
+    /// The `compile_commands.json` behind a scip-clang index; at most
+    /// [`MAX_COMPDB_BYTES`]. Ignored for a rust-analyzer index and under
+    /// `compdb_complete`. Absent, a scip-clang overlay caps at `probable`.
+    pub compdb: Option<&'a [u8]>,
+    /// The base for a compdb entry that omits `directory` (the compdb file's own
+    /// directory, for a compdb read from disk). Defaults to `source_root`.
+    pub compdb_dir: Option<&'a Path>,
+    /// Trust the compdb as covering every translation unit without checking.
+    pub compdb_complete: bool,
+    /// The absolute directory the indexed paths are relative to, in the frame
+    /// the compdb's paths are written in. Defaults to the session root; a wasm
+    /// host passes the repository's host path, since the guest sees it at `/`.
+    pub source_root: Option<&'a Path>,
+}
+
+impl ScipInput<'_> {
+    /// Reject an input over the size bounds.
+    pub fn check(&self) -> Result<()> {
+        if self.scip.len() > MAX_SCIP_BYTES {
+            return Err(SessionError::invalid_params(format!(
+                "SCIP index is {} bytes; the limit is {MAX_SCIP_BYTES}",
+                self.scip.len()
+            )));
+        }
+        if let Some(compdb) = self.compdb {
+            if compdb.len() > MAX_COMPDB_BYTES {
+                return Err(SessionError::invalid_params(format!(
+                    "compile_commands.json is {} bytes; the limit is {MAX_COMPDB_BYTES}",
+                    compdb.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A SCIP overlay for one index, with the source set whose paths anchor the
 /// scip-clang compdb-completeness check (only paths are read).
 pub(crate) struct ScipRun<'a> {
-    pub(crate) overlay: ScipOverlay<'a>,
+    pub(crate) input: ScipInput<'a>,
     pub(crate) sources: &'a [SourceFile],
 }
 
@@ -598,7 +701,10 @@ impl<S: FactStore> Session<S> {
     /// `head` mode — store the graph, drop superseded graphs and advance the
     /// pointer. The graph becomes resident. The host holds the store's write lock
     /// around this call.
-    pub fn index_finish(&mut self, scip: Option<&[u8]>) -> Result<IndexReport> {
+    pub fn index_finish(&mut self, scip: Option<ScipInput<'_>>) -> Result<IndexReport> {
+        if let Some(input) = &scip {
+            input.check()?;
+        }
         let pending = self
             .pending
             .take()
@@ -622,12 +728,8 @@ impl<S: FactStore> Session<S> {
             ..IndexOpts::default()
         };
         let graph = link_prepared(prepared, &mut planned.store, &opts, &mut planned.stats)?;
-        let scip = scip.map(|bytes| ScipRun {
-            overlay: ScipOverlay {
-                scip: bytes,
-                compdb: None,
-                compdb_complete: false,
-            },
+        let scip = scip.map(|input| ScipRun {
+            input,
             sources: &pending.sources,
         });
         self.complete(&mut planned.store, graph, planned.stats, scip, target)
@@ -643,8 +745,17 @@ impl<S: FactStore> Session<S> {
         scip: Option<ScipRun<'_>>,
         target: Target,
     ) -> Result<IndexReport> {
-        if let Some(run) = scip {
-            apply_scip_bytes(&mut graph, &mut stats, run.sources, &self.root, &run.overlay)?;
+        if let Some(ScipRun { input, sources }) = scip {
+            let source_root = input.source_root.unwrap_or(&self.root);
+            let overlay = ScipOverlay {
+                scip: input.scip,
+                compdb: input.compdb.map(|bytes| CompdbInput {
+                    bytes,
+                    dir: input.compdb_dir.unwrap_or(source_root),
+                }),
+                compdb_complete: input.compdb_complete,
+            };
+            apply_scip_bytes(&mut graph, &mut stats, sources, source_root, &overlay)?;
         }
         apply_cha(&mut graph, &mut stats);
         apply_rta(&mut graph, &mut stats);

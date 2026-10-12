@@ -115,7 +115,9 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     // graph (so we read a stable view). Sites are visited in `collect`'s
     // deterministic order; group ids are assigned in that same order.
     let mut new_candidates: Vec<Candidate> = Vec::new();
-    let mut new_edges: Vec<EdgeWithProvenance> = Vec::new();
+    // Replacement sets stay as compact destination lists until the replaced
+    // edges are removed, so the expanded edges never sit in a second buffer.
+    let mut replacements: Vec<Replacement> = Vec::new();
     let mut drop_edge_idx: BTreeSet<usize> = BTreeSet::new();
 
     for site in &sites {
@@ -151,17 +153,22 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
             drop_edge_idx.insert(*idx);
         }
 
-        let proto = graph.edges[site.edge_indices[0]].clone();
-        for (rank, dst) in dsts.iter().enumerate() {
-            if let Some(g) = group {
+        if let Some(g) = group {
+            for (rank, dst) in dsts.iter().enumerate() {
                 new_candidates.push(Candidate {
                     candidate_group: g,
                     dst: *dst,
                     rank: rank as u32,
                 });
             }
-            new_edges.push(build_cha_edge(&proto, *dst, confidence, group, over_cap));
         }
+        replacements.push(Replacement {
+            proto: graph.edges[site.edge_indices[0]].clone(),
+            dsts,
+            confidence,
+            group,
+            over_cap,
+        });
     }
 
     if drop_edge_idx.is_empty() {
@@ -175,8 +182,17 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
         .filter_map(|i| graph.edges[*i].edge.candidate_group)
         .collect();
     crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
-    graph.edges.reserve_exact(new_edges.len());
-    graph.edges.extend(new_edges);
+    for r in &replacements {
+        for dst in &r.dsts {
+            graph.edges.push(build_cha_edge(
+                &r.proto,
+                *dst,
+                r.confidence,
+                r.group,
+                r.over_cap,
+            ));
+        }
+    }
 
     graph
         .candidates
@@ -185,6 +201,16 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
 
     crate::canonicalize(graph);
     stats
+}
+
+/// The trait-scoped replacement for one call site: the site's first edge (the
+/// template every replacement edge copies) and the canonical destination set.
+struct Replacement {
+    proto: EdgeWithProvenance,
+    dsts: Vec<NodeId>,
+    confidence: Confidence,
+    group: Option<u32>,
+    over_cap: bool,
 }
 
 /// One name-scoped virtual-dispatch call site: the indices of its `CallsVirtual`

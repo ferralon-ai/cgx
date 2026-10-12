@@ -195,7 +195,7 @@ fn closure_is_independent_of_node_order() {
     set_own(&mut g1, "m::c", &[Effect::IoNet]);
     let mut g2 = g1.clone();
     g2.nodes.reverse();
-    g2.edges.reverse();
+    g2.edges = g2.edges.iter().rev().cloned().collect();
 
     run_effect_closure(&mut g1);
     run_effect_closure(&mut g2);

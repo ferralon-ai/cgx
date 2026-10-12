@@ -4,6 +4,8 @@ use cgx_core::cut::CutMarker;
 use cgx_core::provenance::Span;
 use cgx_core::{Candidate, EdgeRecord, EdgeWithProvenance, NodeRecord, NodeWithProvenance};
 
+use crate::chunked::ChunkedVec;
+
 /// A reference the resolver could not bind to any definition (LS-6 honesty).
 ///
 /// No edge is emitted for it — the call is left dangling — but it is recorded
@@ -42,7 +44,7 @@ pub struct ResolvedGraph {
     /// Symbol nodes with provenance, in canonical sort order.
     pub nodes: Vec<NodeWithProvenance>,
     /// Call/structural edges with provenance, in canonical sort order.
-    pub edges: Vec<EdgeWithProvenance>,
+    pub edges: ChunkedVec<EdgeWithProvenance>,
     /// Candidate-set members for over-approximated calls (GM-2.1).
     pub candidates: Vec<Candidate>,
     /// References that resolved to no target, recorded honestly (LS-6).
@@ -169,12 +171,13 @@ impl ResolvedGraph {
     /// (architecture §3 `edges.rule`); the indexer persists fragments separately.
     pub fn into_linked(self) -> (Vec<NodeRecord>, Vec<EdgeRecord>, Vec<Candidate>) {
         let mut nodes: Vec<NodeRecord> = self.nodes.into_iter().map(|n| n.node).collect();
-        let mut edges: Vec<EdgeRecord> = self.edges.into_iter().map(|e| e.edge).collect();
-        // These collects reuse the source allocations, which were sized for the
-        // larger provenance-carrying records plus growth slack. Release the
-        // excess before the graph is held through the store write.
+        // The node collect reuses the source allocation, which was sized for the
+        // larger provenance-carrying records. Release the excess before the
+        // graph is held through the store write.
         nodes.shrink_to_fit();
-        edges.shrink_to_fit();
+        // Allocated once at the exact length; each source chunk is freed as soon
+        // as it has been drained.
+        let edges: Vec<EdgeRecord> = self.edges.into_iter().map(|e| e.edge).collect();
         (nodes, edges, self.candidates)
     }
 

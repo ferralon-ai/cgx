@@ -202,7 +202,11 @@ impl SymbolTable {
             if let Some(members) = self.by_module_prefix.get(prefix.as_str()) {
                 let hits: Vec<&DefEntry> = members
                     .iter()
-                    .filter(|d| short_name(&d.fqn) == name)
+                    .filter(|d| {
+                        // A module's members can number tens of thousands.
+                        cgx_core::yield_hook::tick();
+                        short_name(&d.fqn) == name
+                    })
                     .collect();
                 match hits.len() {
                     0 => {}
@@ -216,6 +220,7 @@ impl SymbolTable {
                 let mut hits: Vec<&DefEntry> = Vec::new();
                 for mod_fqn in self.by_module_last.get(last).into_iter().flatten() {
                     for d in self.by_module_prefix.get(mod_fqn).into_iter().flatten() {
+                        cgx_core::yield_hook::tick();
                         if short_name(&d.fqn) == name {
                             hits.push(d);
                         }

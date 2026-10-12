@@ -84,6 +84,7 @@ pub extern "C" fn _initialize() {
 
 #[cfg(target_family = "wasm")]
 pub mod host_yield;
+pub mod memcmp;
 
 #[cfg(target_family = "wasm")]
 #[global_allocator]

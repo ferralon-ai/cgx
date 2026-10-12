@@ -38,6 +38,7 @@ pub mod lock;
 pub mod manifest;
 pub mod object_store;
 pub mod oid;
+pub mod overlay;
 pub mod schema;
 pub mod store;
 pub mod types;
@@ -48,6 +49,7 @@ pub use error::{Result, StoreError};
 pub use lock::WriteLock;
 pub use object_store::ObjectStore;
 pub use oid::ObjectOid;
+pub use overlay::OverlayStore;
 pub use schema::{SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET};
 pub use store::{FactStore, FragmentInput, SqliteStore};
 pub use types::{

@@ -118,7 +118,10 @@ carries no `scope`.
 
 | Code | Meaning |
 |------|---------|
-| `impacted-unresolved-external-calls` | N calls on the searched frontier resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one inside an unexpanded macro. A test reaching the change only through such a call is absent. |
+| `impacted-unresolved-external-calls` | N calls on the searched frontier resolved to no in-repo target — an external or unindexed callee (no SCIP), or a call site the frontend does not model as an edge, such as one inside an unexpanded macro. A test reaching the change only through such a call is absent. When receiver narrowing is enabled, N also counts calls on receivers of out-of-repo types. |
+| `impacted-untyped-receiver-dropped` | N untyped-receiver call sites outside the walked region were left with no target by the import-visibility rule, which is not sound for duck typing; an in-repo target may exist. A test reaching the change only through such a site is absent. Emitted when receiver narrowing is enabled. |
+| `impacted-receiver-narrowed-away` | N same-name virtual call sites were bound by receiver typing (or by argument/return/fixture typing) to targets other than the walked symbols. They could reach the change only if a typing assumption fails or a caller of the typed function is outside the indexed repo; a test reaching the change only through such a site is absent. Emitted when receiver narrowing is enabled. |
+| `impacted-residual-narrowed-away` | N same-name untyped-receiver call sites excluded the walked symbols because their classes are not import-visible to the caller; not sound for duck typing. A test reaching the change only through such a site is absent. Emitted when receiver narrowing is enabled. |
 | `impacted-test-recognition-incomplete-rust` | A call inside an assertion macro (`assert!`, `assert_eq!`, …) is an unexpanded macro argument and yields no call edge, so a `#[test]` whose only use of the changed symbol is inside one is absent. Plus test attributes whose last path segment is irregular — `#[proptest]`, `#[quickcheck]`, `#[test_case]`; doc-tests have no node identity at all. Recognised: any attribute whose last `::` segment is `test` or ends `_test`, and `#[rstest]`. |
 | `impacted-test-recognition-incomplete-go` | `FuzzXxx` is not recognised as a test; `t.Run` subtest closures carry no call edge and are recovered by containment only. |
 | `impacted-test-recognition-incomplete-java` | TestNG **class-level** `@Test` is not read — the annotation sits on the type and every public method inherits it, and cgx reads method-level annotations only. Nor is JUnit 4's experimental `@Theory`. Recognised: method-level `@Test`, `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate`. |
@@ -128,7 +131,7 @@ carries no `scope`.
 | `impacted-removed-symbols-not-walked` | N symbols were deleted at head; tests that exercised them are absent, because there is no head-side node to walk back from. |
 | `below-confidence-floor` | N edges below the `confidence` floor were excluded from the search. |
 | `depth-limit` | The search stopped at the `depth` bound. |
-| `unresolved-call`, `dynamic-dispatch`, `reflective-dispatch`, `foreign-function`, `dependency-injection`, `unexpanded-macro`, `opaque-dataflow`, `truncated-access-path`, `summary-budget` | A modeling cut on the searched frontier, each with a site count. Shared with the other traversal tools. |
+| `unresolved-call`, `dynamic-dispatch`, `reflective-dispatch`, `foreign-function`, `dependency-injection`, `unexpanded-macro`, `opaque-dataflow`, `truncated-access-path`, `summary-budget`, `external-receiver`, `untyped-receiver` | A modeling cut on the searched frontier, each with a site count. Shared with the other traversal tools. The last two are emitted when receiver narrowing is enabled. |
 
 **Over-approximation** — a reported test may not exercise the change:
 

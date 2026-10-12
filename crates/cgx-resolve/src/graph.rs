@@ -19,7 +19,11 @@ pub struct UnresolvedRef {
     pub name_path: Vec<String>,
     /// Where the unresolved reference is.
     pub span: Span,
-    /// Always [`CutMarker::Unresolved`]; carried for symmetry with edge markers.
+    /// Why the reference left no edge: [`CutMarker::Unresolved`] (no definition
+    /// found), [`CutMarker::External`] (receiver proven out-of-repo), or
+    /// [`CutMarker::UntypedReceiver`] (receiver type unknown and the residual
+    /// policy found no import-visible target). `finalize` counts each marker into
+    /// its own field on the caller's node record.
     pub marker: CutMarker,
 }
 

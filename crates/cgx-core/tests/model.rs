@@ -131,6 +131,19 @@ fn unexpanded_macro_marker_exists() {
     assert!(m.contains(CutMarker::UnexpandedMacro));
 }
 
+#[test]
+fn receiver_markers_are_appended_after_the_dataflow_markers() {
+    assert_eq!(CutMarker::ALL.len(), 11);
+    assert_eq!(CutMarker::External as u8, 9);
+    assert_eq!(CutMarker::UntypedReceiver as u8, 10);
+    let m = CutMarkers::from_iter_canonical([CutMarker::UntypedReceiver, CutMarker::Unresolved]);
+    let order: Vec<_> = m.iter().collect();
+    assert_eq!(
+        order,
+        vec![CutMarker::Unresolved, CutMarker::UntypedReceiver]
+    );
+}
+
 // --- Patterns (architecture §4) ---
 
 fn node(fqn: &str) -> NodeRecord {
@@ -149,6 +162,8 @@ fn node(fqn: &str) -> NodeRecord {
         own_effects: cgx_core::EffectSet::new(),
         transitive_effects: cgx_core::EffectSet::new(),
         unresolved_calls: 0,
+        external_calls: 0,
+        narrowing: Default::default(),
     }
 }
 

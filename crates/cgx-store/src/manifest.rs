@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// 2: shards carry no dense ids (node ids by position, edge `src` shard-local, edge
 /// `dst` and candidate `dst` as stable keys, candidate groups shard-local) and hold
-/// their own candidate rows; the manifest has no candidates object.
+/// their own candidate rows; the manifest has no candidates object. `NodeRecord`
+/// carries `external_calls` and `narrowing`.
 pub const CURRENT_STORE_FORMAT: u32 = 2;
 
 /// One shard entry: the owning-function key and the OID of the object holding that

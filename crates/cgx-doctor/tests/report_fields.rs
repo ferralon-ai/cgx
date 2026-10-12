@@ -437,3 +437,106 @@ fn render_json_round_trips() {
     let json2 = render_json(&rep2).unwrap();
     assert_eq!(json, json2, "JSON round-trip must be byte-identical");
 }
+
+// ---------------------------------------------------------------------------
+// Dangling call sites and receiver narrowing (node counters)
+// ---------------------------------------------------------------------------
+
+fn graph_with_node_counters() -> LinkedGraph {
+    let mut graph = common::GraphBuilder::new()
+        .func("a")
+        .func("b")
+        .func("c")
+        .calls("a", "b")
+        .calls("a", "c")
+        .build();
+    for n in &mut graph.nodes {
+        match n.fqn.as_str() {
+            "a" => {
+                n.unresolved_calls = 1;
+                n.external_calls = 2;
+                n.narrowing.visible_dropped_out = 1;
+                n.narrowing.typed_out = 3;
+                n.narrowing.visible_out = 2;
+            }
+            "b" => {
+                n.external_calls = 1;
+                n.narrowing.interproc_out = 1;
+                n.narrowing.typed_away_in = 9;
+            }
+            _ => {}
+        }
+    }
+    graph
+}
+
+#[test]
+fn dangling_and_narrowing_totals_sum_the_node_counters() {
+    let rep = cgx_doctor::report::compute(&graph_with_node_counters());
+    assert_eq!(rep.dangling.unresolved, 1);
+    assert_eq!(rep.dangling.external, 3);
+    assert_eq!(rep.dangling.untyped_dropped, 1);
+    assert_eq!(rep.dangling.total(), 5);
+    // 5 dangling / (2 call edges + 5 dangling).
+    let rate = rep.dangling_rate.expect("call sites exist");
+    assert!((rate - 5.0 / 7.0).abs() < 1e-9, "dangling_rate = {rate}");
+    assert_eq!(rep.narrowing.typed_sites, 3);
+    assert_eq!(rep.narrowing.interproc_sites, 1);
+    assert_eq!(rep.narrowing.visible_sites, 2);
+    // The edge-based rate the anomaly thresholds read is unchanged.
+    assert_eq!(rep.total_refs, 2);
+    assert_eq!(rep.unresolved_rate, Some(0.0));
+}
+
+#[test]
+fn dangling_rate_is_none_without_call_sites() {
+    let graph = common::GraphBuilder::new().func("a").build();
+    let rep = cgx_doctor::report::compute(&graph);
+    assert_eq!(rep.dangling.total(), 0);
+    assert_eq!(rep.dangling_rate, None);
+}
+
+#[test]
+fn render_text_reports_call_sites_not_followed_and_narrowing() {
+    let rep = cgx_doctor::report::compute(&graph_with_node_counters());
+    let text = render_text(&rep);
+    assert!(
+        text.contains("call sites not followed (no edge):"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  out-of-repo receiver:        3\n"),
+        "{text}"
+    );
+    assert!(text.contains("receiver narrowing:"), "{text}");
+    assert!(
+        text.contains("  typed sites:                 3\n"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("not sound for duck typing").count(),
+        2,
+        "both import-visibility lines carry the caveat: {text}"
+    );
+    let json = render_json(&rep).unwrap();
+    assert!(
+        json.contains("\"dangling\":{\"unresolved\":1,\"external\":3,\"untyped_dropped\":1}"),
+        "{json}"
+    );
+}
+
+#[test]
+fn render_text_omits_the_import_visibility_caveats_when_nothing_was_narrowed() {
+    let graph = common::GraphBuilder::new()
+        .func("a")
+        .func("b")
+        .calls("a", "b")
+        .build();
+    let text = render_text(&cgx_doctor::report::compute(&graph));
+    assert!(
+        text.contains("call sites not followed (no edge):"),
+        "{text}"
+    );
+    assert!(text.contains("receiver narrowing:  none\n"), "{text}");
+    assert!(!text.contains("duck typing"), "{text}");
+}

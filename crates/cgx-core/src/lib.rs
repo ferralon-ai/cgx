@@ -59,8 +59,8 @@ pub use effect::{Effect, EffectSet};
 pub use id::{EdgeId, NodeId, NodeSortKey, SiteId, ValueId};
 pub use locality::{locality_tier, LocalityTier};
 pub use node::{
-    CallSite, EntrypointKind, NodeFlavor, NodeRecord, NodeWithProvenance, SymbolKind, ValueNode,
-    Visibility,
+    CallSite, EntrypointKind, NarrowingCounts, NodeFlavor, NodeRecord, NodeWithProvenance,
+    SymbolKind, ValueNode, Visibility,
 };
 pub use pattern::{PatternKind, SymbolPattern};
 pub use provenance::{Provenance, Span};

@@ -7,8 +7,8 @@ mod common;
 
 use cgx_core::codec::{decode, encode};
 use cgx_core::{
-    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId,
-    NodeRecord, SymbolKind, Tier, Visibility,
+    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord,
+    NarrowingCounts, NodeId, NodeRecord, SymbolKind, Tier, Visibility,
 };
 use cgx_store::manifest::{Manifest, CURRENT_STORE_FORMAT};
 use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, SqliteStore, StoreError, TreeOid};
@@ -91,6 +91,8 @@ fn func_node(id: u32, fqn: &str, line_end: u32) -> NodeRecord {
         own_effects: cgx_core::EffectSet::new(),
         transitive_effects: cgx_core::EffectSet::new(),
         unresolved_calls: 0,
+        external_calls: 0,
+        narrowing: Default::default(),
     }
 }
 
@@ -129,6 +131,29 @@ fn read_graph_round_trips_byte_identically() {
     let back = s.read_graph(&tree).unwrap();
 
     assert_eq!(back, g, "read_graph must reconstruct the exact LinkedGraph");
+}
+
+#[test]
+fn receiver_narrowing_counters_round_trip() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    let mut g = common::sample_graph();
+    g.nodes[0].external_calls = 3;
+    g.nodes[0].narrowing = NarrowingCounts {
+        typed_out: 1,
+        interproc_out: 2,
+        visible_out: 3,
+        visible_dropped_out: 4,
+        typed_away_in: 5,
+        interproc_away_in: 6,
+        visible_away_in: 7,
+    };
+
+    s.put_graph(&tree, Some("rev1"), &g).unwrap();
+    let back = s.read_graph(&tree).unwrap();
+
+    assert_eq!(back, g, "shards must carry external_calls and narrowing");
 }
 
 #[test]

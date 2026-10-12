@@ -139,6 +139,45 @@ pub struct NodeRecord {
     /// existing postcard rows (which predate this field) decode as 0.
     #[serde(default)]
     pub unresolved_calls: u32,
+    /// Call sites in this body whose receiver was proven out-of-repo (a literal,
+    /// an out-of-repo module, an out-of-repo type): no edge,
+    /// [`CutMarker::External`](crate::CutMarker::External).
+    #[serde(default)]
+    pub external_calls: u32,
+    /// Receiver-narrowing counts the approximation contract reads (forward: sites
+    /// in this body; backward: same-name sites elsewhere that excluded this
+    /// symbol).
+    #[serde(default)]
+    pub narrowing: NarrowingCounts,
+}
+
+/// Per-symbol receiver-narrowing counters (all zero unless receiver narrowing
+/// ran). The `*_out` fields count call sites in this symbol's body; the
+/// `*_away_in` fields count same-name call sites elsewhere whose narrowed target
+/// set excluded this symbol, so a backward walk can say what it may have lost.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct NarrowingCounts {
+    /// Sites in this body bound by receiver typing to at least one in-repo target.
+    pub typed_out: u32,
+    /// Sites in this body whose receiver typing used interprocedural facts
+    /// (argument, return or fixture types).
+    pub interproc_out: u32,
+    /// Untyped-receiver sites in this body bound by the import-visibility rule to
+    /// at least one import-visible target.
+    pub visible_out: u32,
+    /// Untyped-receiver sites in this body the import-visibility rule left with no
+    /// target: no edge, [`CutMarker::UntypedReceiver`](crate::CutMarker::UntypedReceiver).
+    pub visible_dropped_out: u32,
+    /// Same-name sites elsewhere that receiver typing bound without this symbol.
+    pub typed_away_in: u32,
+    /// Same-name sites elsewhere that interprocedural receiver typing bound
+    /// without this symbol.
+    pub interproc_away_in: u32,
+    /// Same-name untyped-receiver sites elsewhere that the import-visibility rule
+    /// bound or dropped without this symbol.
+    pub visible_away_in: u32,
 }
 
 /// A call-site node record (GM-1.4 / ADR-01). Subordinate node kind.

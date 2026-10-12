@@ -133,6 +133,8 @@ mod tests {
             own_effects: EffectSet::new(),
             transitive_effects: EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 

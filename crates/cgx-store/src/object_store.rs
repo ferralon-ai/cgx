@@ -47,8 +47,8 @@ use cgx_core::codec::{decode, encode};
 use cgx_core::sort::node_sort_key;
 use cgx_core::{
     Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, EffectSet,
-    EntrypointKind, EstablishedBy, ImplicitKind, NodeId, NodeRecord, Signature, SiteId, SymbolKind,
-    Tier, Transform, Visibility,
+    EntrypointKind, EstablishedBy, ImplicitKind, NarrowingCounts, NodeId, NodeRecord, Signature,
+    SiteId, SymbolKind, Tier, Transform, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -89,6 +89,8 @@ struct StoredNode {
     own_effects: EffectSet,
     transitive_effects: EffectSet,
     unresolved_calls: u32,
+    external_calls: u32,
+    narrowing: NarrowingCounts,
 }
 
 /// [`EdgeRecord`] without its id, with a shard-local `src`, a stable-key `dst` and
@@ -147,6 +149,8 @@ struct StoredNodeRef<'a> {
     own_effects: &'a EffectSet,
     transitive_effects: &'a EffectSet,
     unresolved_calls: u32,
+    external_calls: u32,
+    narrowing: &'a NarrowingCounts,
 }
 
 impl<'a> From<&'a NodeRecord> for StoredNodeRef<'a> {
@@ -165,6 +169,8 @@ impl<'a> From<&'a NodeRecord> for StoredNodeRef<'a> {
             own_effects: &n.own_effects,
             transitive_effects: &n.transitive_effects,
             unresolved_calls: n.unresolved_calls,
+            external_calls: n.external_calls,
+            narrowing: &n.narrowing,
         }
     }
 }
@@ -191,6 +197,8 @@ impl StoredNode {
             own_effects: self.own_effects,
             transitive_effects: self.transitive_effects,
             unresolved_calls: self.unresolved_calls,
+            external_calls: self.external_calls,
+            narrowing: self.narrowing,
         }
     }
 }
@@ -980,6 +988,8 @@ mod tests {
             own_effects: EffectSet::new(),
             transitive_effects: EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 

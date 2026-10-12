@@ -67,6 +67,46 @@ pub fn render_text(rep: &DoctorReport) -> String {
     }
     out.push('\n');
 
+    // --- Call sites that left no edge (node counters, not edge markers) ---
+    let d = &rep.dangling;
+    out.push_str("call sites not followed (no edge):\n");
+    out.push_str(&format!("  no definition:          {:>6}\n", d.unresolved));
+    out.push_str(&format!("  out-of-repo receiver:   {:>6}\n", d.external));
+    // The import-visibility lines only appear when that rule actually dropped or
+    // bounded something: on an index built without receiver narrowing they would
+    // be a caveat about a rule that never ran.
+    if d.untyped_dropped > 0 {
+        out.push_str(&format!(
+            "  untyped, no visible:    {:>6}   (import-visibility rule; not sound for duck typing)\n",
+            d.untyped_dropped
+        ));
+    }
+    if let Some(rate) = rep.dangling_rate {
+        out.push_str(&format!(
+            "  {:.1}% unfollowed (of call edges + unfollowed sites)\n",
+            100.0 * rate
+        ));
+    }
+    let nt = &rep.narrowing;
+    if nt.typed_sites + nt.interproc_sites + nt.visible_sites == 0 {
+        out.push_str("receiver narrowing:  none\n");
+    } else {
+        out.push_str("receiver narrowing:\n");
+        out.push_str(&format!(
+            "  typed sites:            {:>6}\n",
+            nt.typed_sites
+        ));
+        out.push_str(&format!(
+            "  interprocedural sites:  {:>6}\n",
+            nt.interproc_sites
+        ));
+        out.push_str(&format!(
+            "  import-visible sites:   {:>6}   (not sound for duck typing)\n",
+            nt.visible_sites
+        ));
+    }
+    out.push('\n');
+
     // --- Unsupported files ---
     out.push_str("file coverage:\n");
     if let Some(total) = rep.total_files {

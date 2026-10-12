@@ -804,8 +804,12 @@ single statement attached to the answer:
   — `over-approx-candidate-set`, `dynamic-dispatch`, `reflective-dispatch`,
   `unexpanded-macro`, `unresolved-call`, `foreign-function`, `depth-limit`,
   `below-confidence-floor`, `truncated-path-cap`, `truncated-step-budget`,
-  `summary-budget`, `file-level-granularity`, `bounded-rev-range`, and others —
-  derived from what the resolution and the walk *actually did*, never from a
+  `summary-budget`, `file-level-granularity`, `bounded-rev-range`, and others
+  (when receiver narrowing is enabled, also `external-receiver`,
+  `untyped-receiver`, `external-receiver-calls`, `receiver-narrowed`,
+  `receiver-narrowed-interproc` and `residual-import-visible` on forward walks,
+  and `receiver-narrowed-away`, `receiver-narrowed-away-interproc` and
+  `residual-narrowed-away` on backward `callers` walks) — derived from what the resolution and the walk *actually did*, never from a
   static per-language table.
 - **Scope.** For a *negative* answer — no path, no callers, a `unused` list — a
   `NegativeScope` states what was searched (edge kinds, confidence floor, depth

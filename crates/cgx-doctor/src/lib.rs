@@ -40,7 +40,10 @@ pub mod render;
 pub mod report;
 
 pub use render::{render_json, render_text};
-pub use report::{AnomalyKind, ConfidenceBreakdown, CutMarkerCount, DoctorReport, TrustLevel};
+pub use report::{
+    AnomalyKind, ConfidenceBreakdown, CutMarkerCount, DanglingCounts, DoctorReport,
+    NarrowingTotals, TrustLevel,
+};
 
 use cgx_store::{FactStore, TreeOid};
 

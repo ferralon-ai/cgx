@@ -268,6 +268,14 @@ fn cut_reason(marker: CutMarker, count: usize) -> ApproxReason {
             "summary-budget",
             "interprocedural dataflow summary budget exhausted",
         ),
+        CutMarker::External => (
+            "external-receiver",
+            "call on an out-of-repo receiver type not modeled",
+        ),
+        CutMarker::UntypedReceiver => (
+            "untyped-receiver",
+            "call on a receiver of unknown type not modeled",
+        ),
     };
     ApproxReason {
         direction: ReasonDirection::Under,
@@ -325,6 +333,105 @@ fn dangling_refs_reason(count: u64) -> ApproxReason {
     }
 }
 
+/// Calls on receivers proven to be of out-of-repo types: no edge, so the walk
+/// could not follow them. Read from `NodeRecord.external_calls`.
+fn external_receiver_calls_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "external-receiver-calls",
+        detail: format!(
+            "{count} call(s) on receivers of out-of-repo types (builtin, stdlib or library) \
+             have no in-repo target and could not be followed"
+        ),
+    }
+}
+
+/// Virtual call sites in the walked region whose targets receiver typing
+/// narrowed. Read from `NarrowingCounts::typed_out`.
+fn receiver_narrowed_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "receiver-narrowed",
+        detail: format!(
+            "{count} virtual call site(s) were bound by receiver typing (self/cls/super, class \
+             heads, annotations, constructors, fields); targets outside the inferred type are \
+             excluded and are reachable only if a typing assumption fails (monkey-patching, \
+             untruthful annotations, attributes set outside the class family)"
+        ),
+    }
+}
+
+/// As [`receiver_narrowed_reason`], for typing that used interprocedural facts.
+/// Read from `NarrowingCounts::interproc_out`.
+fn receiver_narrowed_interproc_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "receiver-narrowed-interproc",
+        detail: format!(
+            "{count} site(s) were bound using argument/return/fixture typing, which assumes \
+             every caller of the typed function is in the indexed repo"
+        ),
+    }
+}
+
+/// Untyped-receiver sites the import-visibility rule bounded (`bounded`) or left
+/// with no target (`dropped`). Read from `NarrowingCounts::visible_out` and
+/// `visible_dropped_out`.
+fn residual_import_visible_reason(bounded: u64, dropped: u64) -> ApproxReason {
+    let total = bounded + dropped;
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "residual-import-visible",
+        detail: format!(
+            "{total} untyped-receiver call site(s) were limited to methods of classes the \
+             caller's file defines or imports, plus their subclasses ({dropped} left with no \
+             target); this rule is not sound for duck typing: an object can reach a module \
+             that never imports its class"
+        ),
+    }
+}
+
+/// Same-name call sites elsewhere that receiver typing bound to targets other
+/// than the searched symbols. Read from `NarrowingCounts::typed_away_in`.
+fn receiver_narrowed_away_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "receiver-narrowed-away",
+        detail: format!(
+            "{count} same-name virtual call site(s) were bound by receiver typing to other \
+             targets; they could reach the searched symbols only if a typing assumption fails"
+        ),
+    }
+}
+
+/// As [`receiver_narrowed_away_reason`], for interprocedural typing. Read from
+/// `NarrowingCounts::interproc_away_in`.
+fn receiver_narrowed_away_interproc_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "receiver-narrowed-away-interproc",
+        detail: format!(
+            "{count} same-name virtual call site(s) were bound by argument/return/fixture typing \
+             to other targets; they could reach the searched symbols only if a typing assumption \
+             fails or a caller of the typed function is outside the indexed repo"
+        ),
+    }
+}
+
+/// Same-name untyped-receiver sites elsewhere whose import-visibility bound
+/// excluded the searched symbols. Read from `NarrowingCounts::visible_away_in`.
+fn residual_narrowed_away_reason(count: u64) -> ApproxReason {
+    ApproxReason {
+        direction: ReasonDirection::Under,
+        code: "residual-narrowed-away",
+        detail: format!(
+            "{count} same-name untyped-receiver call site(s) excluded the searched symbols \
+             because their classes are not import-visible to the caller; not sound for duck \
+             typing"
+        ),
+    }
+}
+
 fn truncation_reason(reason: TruncationReason) -> ApproxReason {
     let (code, detail) = match reason {
         TruncationReason::StepBudget => (
@@ -353,6 +460,21 @@ struct FrontierFacts {
     /// walk-invisible blind spot; without this a negative over an external call
     /// would be claimed clean.
     dangling_refs: u64,
+    /// Forward call-scope walks only: calls on out-of-repo receivers
+    /// (`NodeRecord.external_calls`), which also left no edge.
+    external_calls: u64,
+    /// Forward call-scope walks only: receiver-narrowing counts for sites in the
+    /// touched bodies (`NarrowingCounts::*_out`).
+    typed_out: u64,
+    interproc_out: u64,
+    visible_out: u64,
+    visible_dropped_out: u64,
+    /// Backward call-scope walks only: same-name sites elsewhere whose narrowed
+    /// target set excluded a touched node (`NarrowingCounts::*_away_in`). Those
+    /// sites have no edge into the touched region, so the walk cannot see them.
+    typed_away_in: u64,
+    interproc_away_in: u64,
+    visible_away_in: u64,
     /// Per-marker count of cut-marked edges incident (in the walk direction) to a
     /// reached node — the blind spots on the search frontier.
     cut_counts: BTreeMap<CutMarker, usize>,
@@ -372,6 +494,32 @@ impl FrontierFacts {
         let mut reasons = Vec::new();
         if self.dangling_refs > 0 {
             reasons.push(dangling_refs_reason(self.dangling_refs));
+        }
+        if self.external_calls > 0 {
+            reasons.push(external_receiver_calls_reason(self.external_calls));
+        }
+        if self.typed_out > 0 {
+            reasons.push(receiver_narrowed_reason(self.typed_out));
+        }
+        if self.interproc_out > 0 {
+            reasons.push(receiver_narrowed_interproc_reason(self.interproc_out));
+        }
+        if self.visible_out + self.visible_dropped_out > 0 {
+            reasons.push(residual_import_visible_reason(
+                self.visible_out,
+                self.visible_dropped_out,
+            ));
+        }
+        if self.typed_away_in > 0 {
+            reasons.push(receiver_narrowed_away_reason(self.typed_away_in));
+        }
+        if self.interproc_away_in > 0 {
+            reasons.push(receiver_narrowed_away_interproc_reason(
+                self.interproc_away_in,
+            ));
+        }
+        if self.visible_away_in > 0 {
+            reasons.push(residual_narrowed_away_reason(self.visible_away_in));
         }
         for (marker, count) in self.cut_counts {
             reasons.push(cut_reason(marker, count));
@@ -394,8 +542,9 @@ impl FrontierFacts {
 }
 
 /// Scan the subgraph reached from `roots` in direction `dir` under `walker`,
-/// collecting the incompleteness facts on its frontier: dangling-ref counts on
-/// the touched nodes (calls that left no edge), cut-marked and below-floor
+/// collecting the incompleteness facts on its frontier: dangling-ref and
+/// receiver-narrowing counts on the touched nodes (calls that left no edge or
+/// whose targets were narrowed), cut-marked and below-floor
 /// incident edges, and depth-horizon truncation. Edge/node work is O(touched);
 /// the visited/depth arrays are O(total nodes), the same allocation profile as
 /// every walk in this crate. Deterministic (touched list in BFS order; never
@@ -461,12 +610,34 @@ fn scan_frontier(
         .as_ref()
         .is_none_or(|ks| ks.iter().all(|k| k.is_call()));
     let count_dangling = dir == Direction::Forward && is_call_scope;
+    // The receiver-narrowing `*_away_in` counts are the backward mirror: sites
+    // elsewhere that *would* have had an edge into a touched node before
+    // narrowing excluded it. Only a callers-direction call-scope walk can have
+    // lost them.
+    let count_backward = dir == Direction::Backward && is_call_scope;
 
     let mut facts = FrontierFacts::default();
     for &node in &touched {
         let node_ix = node.index();
+        let record = view.node(node);
+        // A narrowed site on a node at the depth horizon could only lose a
+        // neighbor one hop *beyond* the bound, which the answer never claimed
+        // to cover, so the narrowing counters skip horizon nodes.
+        let inside_horizon = walker.max_depth != Some(depth_of[node_ix]);
         if count_dangling {
-            facts.dangling_refs += u64::from(view.node(node).unresolved_calls);
+            facts.dangling_refs += u64::from(record.unresolved_calls);
+        }
+        if count_dangling && inside_horizon {
+            facts.external_calls += u64::from(record.external_calls);
+            facts.typed_out += u64::from(record.narrowing.typed_out);
+            facts.interproc_out += u64::from(record.narrowing.interproc_out);
+            facts.visible_out += u64::from(record.narrowing.visible_out);
+            facts.visible_dropped_out += u64::from(record.narrowing.visible_dropped_out);
+        }
+        if count_backward && inside_horizon {
+            facts.typed_away_in += u64::from(record.narrowing.typed_away_in);
+            facts.interproc_away_in += u64::from(record.narrowing.interproc_away_in);
+            facts.visible_away_in += u64::from(record.narrowing.visible_away_in);
         }
         for er in view.neighbors(node, dir, &scan_filter) {
             for marker in er.edge.cut_markers.iter() {
@@ -722,6 +893,8 @@ mod tests {
             own_effects: cgx_core::EffectSet::new(),
             transitive_effects: cgx_core::EffectSet::new(),
             unresolved_calls: 0,
+            external_calls: 0,
+            narrowing: Default::default(),
         }
     }
 
@@ -1144,5 +1317,293 @@ mod tests {
                 "{name}: for_history diverged from the call-graph fold"
             );
         }
+    }
+
+    // --- receiver narrowing: node counters on the frontier ------------------
+
+    const FORWARD_NARROWING_CODES: [&str; 4] = [
+        "external-receiver-calls",
+        "receiver-narrowed",
+        "receiver-narrowed-interproc",
+        "residual-import-visible",
+    ];
+    const BACKWARD_NARROWING_CODES: [&str; 3] = [
+        "receiver-narrowed-away",
+        "receiver-narrowed-away-interproc",
+        "residual-narrowed-away",
+    ];
+
+    fn every_narrowing_counter(mut n: NodeRecord) -> NodeRecord {
+        n.external_calls = 1;
+        n.narrowing = cgx_core::NarrowingCounts {
+            typed_out: 2,
+            interproc_out: 3,
+            visible_out: 4,
+            visible_dropped_out: 5,
+            typed_away_in: 6,
+            interproc_away_in: 7,
+            visible_away_in: 8,
+        };
+        n
+    }
+
+    fn reason<'c>(c: &'c ApproximationContract, code: &str) -> Option<&'c ApproxReason> {
+        c.reasons.iter().find(|r| r.code == code)
+    }
+
+    fn narrowing_codes(c: &ApproximationContract) -> Vec<&'static str> {
+        c.reasons
+            .iter()
+            .map(|r| r.code)
+            .filter(|code| {
+                FORWARD_NARROWING_CODES.contains(code) || BACKWARD_NARROWING_CODES.contains(code)
+            })
+            .collect()
+    }
+
+    /// A `callers` answer that may have lost callers to receiver narrowing must
+    /// say so — including the negative case, where "no callers" would otherwise
+    /// read as a clean, scoped negative.
+    #[test]
+    fn callers_of_a_symbol_with_narrowed_away_sites_says_so() {
+        let mut x = node(1, "x", 20, None);
+        x.narrowing.typed_away_in = 3;
+
+        // Negative: nothing calls `x` by an edge.
+        let view = GraphView::new(
+            vec![node(0, "w", 10, None), x.clone()],
+            Vec::new(),
+            Vec::<Candidate>::new(),
+        );
+        let w = walker(None, Confidence::Possible);
+        let results = crate::callers(&view, NodeId(1), &w);
+        assert!(results.is_empty());
+        let c = for_neighbors(&view, &w, NodeId(1), Direction::Backward, &results);
+        assert_eq!(c.direction, ApproxDirection::Under);
+        let r = reason(&c, "receiver-narrowed-away").expect("reason present");
+        assert_eq!(r.direction, ReasonDirection::Under);
+        assert!(r.detail.starts_with("3 same-name"), "{}", r.detail);
+        assert!(c.scope.is_some(), "a negative keeps its scope");
+
+        // Positive: `w -> x` is found, and the answer still says it may be short.
+        let view = GraphView::new(
+            vec![node(0, "w", 10, None), x],
+            vec![edge(0, 0, 1, Confidence::Certain, &[], None)],
+            Vec::<Candidate>::new(),
+        );
+        let results = crate::callers(&view, NodeId(1), &w);
+        assert_eq!(results.len(), 1);
+        let c = for_neighbors(&view, &w, NodeId(1), Direction::Backward, &results);
+        assert_eq!(c.direction, ApproxDirection::Under);
+        assert!(reason(&c, "receiver-narrowed-away").is_some());
+    }
+
+    #[test]
+    fn callees_does_not_carry_the_backward_narrowing_reasons() {
+        let x = every_narrowing_counter(node(0, "x", 10, None));
+        let view = GraphView::new(vec![x], Vec::new(), Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+        let results = callees(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        assert_eq!(narrowing_codes(&c), FORWARD_NARROWING_CODES.to_vec());
+
+        // And the mirror: a callers walk carries only the backward ones.
+        let results = crate::callers(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Backward, &results);
+        assert_eq!(narrowing_codes(&c), BACKWARD_NARROWING_CODES.to_vec());
+    }
+
+    #[test]
+    fn forward_narrowed_sites_qualify_callees_and_a_negative_reaches() {
+        let mut a = node(0, "a", 10, None);
+        a.narrowing.typed_out = 2;
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let view = GraphView::new(nodes, Vec::new(), Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+
+        let results = callees(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        let r = reason(&c, "receiver-narrowed").expect("callees carries it");
+        assert!(
+            r.detail.starts_with("2 virtual call site(s)"),
+            "{}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("monkey-patching"),
+            "assumptions are stated"
+        );
+
+        let result = reaches(&view, NodeId(0), NodeId(1), &w);
+        assert!(!result.reachable);
+        let c = for_reaches(&view, &w, NodeId(0), &result);
+        assert_eq!(c.direction, ApproxDirection::Under);
+        assert!(reason(&c, "receiver-narrowed").is_some());
+        assert!(c.scope.is_some());
+    }
+
+    /// The import-visibility rule is not sound for duck typing, and both reasons
+    /// it feeds must say so where they are used.
+    #[test]
+    fn import_visibility_reasons_state_they_are_not_sound_for_duck_typing() {
+        let mut a = node(0, "a", 10, None);
+        a.narrowing.visible_out = 3;
+        a.narrowing.visible_dropped_out = 1;
+        a.narrowing.visible_away_in = 2;
+        let view = GraphView::new(vec![a], Vec::new(), Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+
+        let results = callees(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        let r = reason(&c, "residual-import-visible").expect("forward reason");
+        assert!(
+            r.detail.starts_with("4 untyped-receiver call site(s)"),
+            "{}",
+            r.detail
+        );
+        assert!(r.detail.contains("(1 left with no target)"), "{}", r.detail);
+        assert!(r.detail.contains("not sound for duck typing"));
+
+        let results = crate::callers(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Backward, &results);
+        let r = reason(&c, "residual-narrowed-away").expect("backward reason");
+        assert!(r.detail.starts_with("2 same-name"), "{}", r.detail);
+        assert!(r.detail.contains("not sound for duck typing"));
+    }
+
+    #[test]
+    fn external_receiver_calls_are_distinct_from_unresolved_external_calls() {
+        let mut a = node(0, "a", 10, None);
+        a.external_calls = 1;
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let view = GraphView::new(nodes, Vec::new(), Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+        let result = reaches(&view, NodeId(0), NodeId(1), &w);
+        let c = for_reaches(&view, &w, NodeId(0), &result);
+        assert_eq!(c.direction, ApproxDirection::Under);
+        let r = reason(&c, "external-receiver-calls").expect("reason present");
+        assert!(r.detail.starts_with("1 call(s)"), "{}", r.detail);
+        assert!(reason(&c, "unresolved-external-calls").is_none());
+    }
+
+    #[test]
+    fn kind_filter_silences_the_narrowing_facts_only_outside_the_call_family() {
+        let cases: &[(Option<&[EdgeKind]>, bool)] = &[
+            (None, true),
+            (Some(&[EdgeKind::Calls]), true),
+            (Some(&[EdgeKind::CallsVirtual]), true),
+            (Some(&[EdgeKind::DerivesFrom]), false),
+            (Some(&[EdgeKind::Calls, EdgeKind::DerivesFrom]), false),
+        ];
+        let x = every_narrowing_counter(node(0, "x", 10, None));
+        let view = GraphView::new(vec![x], Vec::new(), Vec::<Candidate>::new());
+        for (kinds, expect) in cases {
+            let mut filter = EdgeFilter::default();
+            if let Some(ks) = kinds {
+                filter = filter.with_kinds(ks.to_vec());
+            }
+            let w = PathWalker {
+                filter,
+                max_depth: None,
+                max_paths: None,
+                max_steps: None,
+            };
+            for (dir, codes) in [
+                (Direction::Forward, FORWARD_NARROWING_CODES.to_vec()),
+                (Direction::Backward, BACKWARD_NARROWING_CODES.to_vec()),
+            ] {
+                let c = for_neighbors(&view, &w, NodeId(0), dir, &[]);
+                let want = if *expect { codes } else { Vec::new() };
+                assert_eq!(narrowing_codes(&c), want, "kinds {kinds:?}, {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_counters_on_depth_horizon_nodes_are_not_reported() {
+        // w -> x at depth 1. With `max_depth = 1`, `x` sits on the horizon:
+        // its narrowed sites could only lose neighbors beyond the bound.
+        let w_node = every_narrowing_counter(node(0, "w", 10, None));
+        let x_node = every_narrowing_counter(node(1, "x", 20, None));
+        let view = GraphView::new(
+            vec![w_node, x_node],
+            vec![edge(0, 0, 1, Confidence::Certain, &[], None)],
+            Vec::<Candidate>::new(),
+        );
+        let w = walker(Some(1), Confidence::Possible);
+
+        // Forward from `w`: only `w` (depth 0) contributes.
+        let results = callees(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        let r = reason(&c, "receiver-narrowed").expect("w's own sites count");
+        assert!(r.detail.starts_with("2 virtual"), "{}", r.detail);
+
+        // Backward from `x`: only `x` (depth 0) contributes, not `w` (depth 1).
+        let results = crate::callers(&view, NodeId(1), &w);
+        let c = for_neighbors(&view, &w, NodeId(1), Direction::Backward, &results);
+        let r = reason(&c, "receiver-narrowed-away").expect("x's own sites count");
+        assert!(r.detail.starts_with("6 same-name"), "{}", r.detail);
+
+        // Unbounded, both nodes contribute.
+        let w = walker(None, Confidence::Possible);
+        let results = crate::callers(&view, NodeId(1), &w);
+        let c = for_neighbors(&view, &w, NodeId(1), Direction::Backward, &results);
+        let r = reason(&c, "receiver-narrowed-away").expect("both count");
+        assert!(r.detail.starts_with("12 same-name"), "{}", r.detail);
+    }
+
+    #[test]
+    fn positive_reaches_with_a_witness_carries_no_narrowing_reason() {
+        let a = every_narrowing_counter(node(0, "a", 10, None));
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let edges = vec![edge(0, 0, 1, Confidence::Certain, &[], None)];
+        let view = GraphView::new(nodes, edges, Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+        let result = reaches(&view, NodeId(0), NodeId(1), &w);
+        assert!(result.reachable);
+        let c = for_reaches(&view, &w, NodeId(0), &result);
+        assert_eq!(c.direction, ApproxDirection::Exact);
+        assert!(narrowing_codes(&c).is_empty());
+    }
+
+    #[test]
+    fn narrowing_reasons_follow_dangling_refs_and_precede_cut_markers() {
+        let mut a = every_narrowing_counter(node(0, "a", 10, None));
+        a.unresolved_calls = 1;
+        let nodes = vec![a, node(1, "b", 20, None)];
+        let edges = vec![edge(
+            0,
+            0,
+            1,
+            Confidence::Certain,
+            &[CutMarker::Dynamic],
+            None,
+        )];
+        let view = GraphView::new(nodes, edges, Vec::<Candidate>::new());
+        let w = walker(None, Confidence::Possible);
+        let results = callees(&view, NodeId(0), &w);
+        let c = for_neighbors(&view, &w, NodeId(0), Direction::Forward, &results);
+        let codes: Vec<_> = c.reasons.iter().map(|r| r.code).collect();
+        let mut want = vec!["unresolved-external-calls"];
+        want.extend(FORWARD_NARROWING_CODES);
+        want.push("dynamic-dispatch");
+        assert_eq!(codes, want);
+    }
+
+    #[test]
+    fn receiver_cut_markers_have_their_own_codes_and_serde_tokens() {
+        assert_eq!(
+            serde_json::to_string(&CutMarker::External).unwrap(),
+            "\"external\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CutMarker::UntypedReceiver).unwrap(),
+            "\"untyped-receiver\""
+        );
+        assert_eq!(cut_reason(CutMarker::External, 1).code, "external-receiver");
+        assert_eq!(
+            cut_reason(CutMarker::UntypedReceiver, 1).code,
+            "untyped-receiver"
+        );
     }
 }

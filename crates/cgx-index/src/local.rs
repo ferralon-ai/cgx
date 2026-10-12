@@ -15,8 +15,8 @@
 //! `.cgx/` at once. Store writes are serialized by the store's advisory write
 //! lock and are write-once per content address, so two runs over the same tree
 //! write the same objects. The pointer is replaced by an atomic rename. A graph
-//! whose objects fail verification reads as corrupt, and [`load_current`]
-//! answers that by re-indexing rather than by serving it.
+//! that a concurrent run pruned or tore reads as missing or corrupt, and
+//! [`load_current`] answers that by re-indexing rather than by serving it.
 
 use std::path::{Path, PathBuf};
 
@@ -200,13 +200,23 @@ pub fn ensure_indexed(repo_root: &Path) -> Result<()> {
 
 /// Read the current Layer-2 graph named by the pointer, with its key.
 ///
-/// With `rebuild_if_corrupt`, a graph whose objects fail verification is treated
-/// as not indexed: it is re-indexed once and read again.
+/// With `rebuild_if_corrupt`, a graph whose objects fail verification — or whose
+/// ref is gone although the pointer names it, which is what a concurrent index of
+/// another tree leaves behind once it prunes — is treated as not indexed: it is
+/// re-indexed once and read again. Without it, either case is an error; an empty
+/// graph is never served in place of a missing one.
 pub fn load_current(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<(String, LinkedGraph)> {
     let ptr = read_pointer(repo_root)?;
     let store = open_store(repo_root)?;
     let tree = TreeOid::new(ptr.graph_key.clone());
-    match store.read_graph(&tree) {
+    let read = match store.graph_for(&tree) {
+        Ok(true) => store.read_graph(&tree),
+        Ok(false) => Err(StoreError::Corrupt {
+            oid: ptr.graph_key.clone(),
+        }),
+        Err(e) => Err(e),
+    };
+    match read {
         Err(StoreError::Corrupt { .. }) if rebuild_if_corrupt => {
             drop(store);
             index_repo(repo_root, &auto_index_opts(repo_root))?;
@@ -334,5 +344,25 @@ mod tests {
         assert!(dir.join("cache.db").exists(), "dataflow cache is kept");
         // Idempotent when nothing is left to remove.
         remove_retired_files(root).unwrap();
+    }
+
+    #[test]
+    fn a_pointer_to_a_missing_graph_is_never_served_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pointer(
+            root,
+            &IndexPointer {
+                graph_key: "deadbeef".into(),
+                total_files: None,
+                unsupported_files: None,
+            },
+        )
+        .unwrap();
+        let err = load_current(root, false).unwrap_err();
+        assert!(
+            err.to_string().starts_with("reading graph deadbeef"),
+            "{err}"
+        );
     }
 }

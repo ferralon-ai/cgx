@@ -3015,8 +3015,8 @@ fn view_at_ref(repo_root: &Path, at: &str) -> Result<GraphView, CliError> {
 }
 
 /// Load the current Layer-2 graph into a queryable [`GraphView`]. With
-/// `rebuild_if_corrupt`, a graph whose objects fail verification is treated as not
-/// indexed: it is re-indexed once and read again.
+/// `rebuild_if_corrupt`, a graph whose objects fail verification, or whose ref is
+/// gone, is treated as not indexed: it is re-indexed once and read again.
 fn load_view(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<GraphView, CliError> {
     let (_, graph) = load_current(repo_root, rebuild_if_corrupt)?;
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))

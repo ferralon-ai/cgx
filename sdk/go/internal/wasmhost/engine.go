@@ -103,6 +103,10 @@ func newEngine(ctx context.Context, module []byte, cacheDir string, limit uint32
 		rt.Close(ctx)
 		return nil, err
 	}
+	if err := instantiateHost(ctx, rt); err != nil {
+		rt.Close(ctx)
+		return nil, err
+	}
 	start := time.Now()
 	compiled, err := rt.CompileModule(ctx, module)
 	if err != nil {

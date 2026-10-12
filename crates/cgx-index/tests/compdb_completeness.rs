@@ -135,6 +135,7 @@ fn index_pick_edges(
         dataflow: false,
         compdb,
         compdb_complete,
+        ..IndexOpts::default()
     };
     let outcome = index_path(repo, &registry, &mut store, &opts).unwrap();
     let g = read_graph(&store, &outcome.graph_key);

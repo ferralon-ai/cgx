@@ -33,6 +33,7 @@ pub(crate) fn collect(src: &[u8], decl: Node<'_>, fqn: &str, in_class: bool) -> 
         src,
         fqn,
         receivers: vec!["self".to_owned(), "cls".to_owned()],
+        literal_calls_only: false,
         out: Vec::new(),
     };
     if let Some(params) = decl.child_by_field_name("parameters") {
@@ -54,6 +55,25 @@ pub(crate) fn collect(src: &[u8], decl: Node<'_>, fqn: &str, in_class: bool) -> 
         c.walk(body);
     }
     c.out
+}
+
+/// Module-level `Bind` facts of a file, attributed to the module path itself
+/// (`func` = `module`): every binding site of a module-level name, with the
+/// same binding forms as a callable body. Lets the resolver tell a class alias
+/// (`Compat = Real`) from a factory result (`Base = declarative_base()`).
+pub(crate) fn collect_module(src: &[u8], root: Node<'_>, module: &str) -> Vec<TypeFact> {
+    let mut c = Collector {
+        src,
+        fqn: module,
+        receivers: Vec::new(),
+        literal_calls_only: true,
+        out: Vec::new(),
+    };
+    c.walk(root);
+    c.out
+        .into_iter()
+        .filter(|f| matches!(f, TypeFact::Bind { .. }))
+        .collect()
 }
 
 /// The `ClassBases` payload of a `class_definition`: its `superclasses` in
@@ -89,16 +109,35 @@ pub(crate) fn class_bases(src: &[u8], class: Node<'_>) -> Vec<BaseExpr> {
                 }),
                 None => BaseExpr::Unknown,
             },
+            // A factory whose arguments may name classes (`with_metaclass(M,
+            // Base)`) can splice them into the bases: only an all-literal
+            // call is a `Call` base.
             "call" => match n
                 .child_by_field_name("function")
                 .and_then(|f| name_path(src, f))
             {
-                Some(path) => BaseExpr::Call(path),
-                None => BaseExpr::Unknown,
+                Some(path) if literal_args(src, n) => BaseExpr::Call(path),
+                _ => BaseExpr::Unknown,
             },
             _ => BaseExpr::Unknown,
         })
         .collect()
+}
+
+/// Whether every argument of `call` (positional or keyword value) is a literal.
+fn literal_args(src: &[u8], call: Node<'_>) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return true;
+    };
+    let mut cur = args.walk();
+    let kids: Vec<Node<'_>> = args.named_children(&mut cur).collect();
+    kids.into_iter().filter(|a| a.kind() != "comment").all(|a| {
+        let v = match a.kind() {
+            "keyword_argument" => a.child_by_field_name("value"),
+            _ => Some(a),
+        };
+        v.is_some_and(|v| literal_kind(src, v).is_some() || v.kind() == "none")
+    })
 }
 
 /// Classify the root of a call's `function` operand when it is an attribute
@@ -106,7 +145,14 @@ pub(crate) fn class_bases(src: &[u8], class: Node<'_>) -> Vec<BaseExpr> {
 /// [`TypeFact::AnonReceiver`], where `depth` counts the attribute segments.
 /// `None` for a non-attribute callee or a chain rooted at an identifier (the
 /// ordinary named-receiver case).
-pub(crate) fn anon_root(src: &[u8], func: Node<'_>) -> Option<(AnonRoot, u8)> {
+/// `enclosing_class` is the short name of the class whose body (possibly
+/// through nested functions) contains the call: `super(X, self)` is the
+/// zero-argument `super()` only when `X` is that class.
+pub(crate) fn anon_root(
+    src: &[u8],
+    func: Node<'_>,
+    enclosing_class: &dyn Fn() -> Option<String>,
+) -> Option<(AnonRoot, u8)> {
     if func.kind() != "attribute" {
         return None;
     }
@@ -116,17 +162,27 @@ pub(crate) fn anon_root(src: &[u8], func: Node<'_>) -> Option<(AnonRoot, u8)> {
         depth = depth.saturating_add(1);
         cur = cur.child_by_field_name("object")?;
     }
-    classify_root(src, cur).map(|root| (root, depth))
+    classify_root(src, cur, enclosing_class).map(|root| (root, depth))
 }
 
-fn classify_root(src: &[u8], n: Node<'_>) -> Option<AnonRoot> {
+fn classify_root(
+    src: &[u8],
+    n: Node<'_>,
+    enclosing_class: &dyn Fn() -> Option<String>,
+) -> Option<AnonRoot> {
     if let Some(kind) = literal_kind(src, n) {
         return Some(AnonRoot::Literal(kind));
     }
     Some(match n.kind() {
         "identifier" => return None,
         "call" => match n.child_by_field_name("function") {
-            Some(f) if f.kind() == "identifier" && text(src, f) == "super" => AnonRoot::Super,
+            Some(f) if f.kind() == "identifier" && text(src, f) == "super" => {
+                if super_of(src, n, enclosing_class) {
+                    AnonRoot::Super
+                } else {
+                    AnonRoot::Call(SmallVec::from_vec(vec!["super".to_owned()]))
+                }
+            }
             Some(f) => match name_path(src, f) {
                 Some(path) => AnonRoot::Call(path),
                 None => AnonRoot::Other,
@@ -135,11 +191,27 @@ fn classify_root(src: &[u8], n: Node<'_>) -> Option<AnonRoot> {
         },
         "subscript" => AnonRoot::Subscript,
         "parenthesized_expression" => match n.named_child(0) {
-            Some(inner) => return classify_root(src, inner),
+            Some(inner) => return classify_root(src, inner, enclosing_class),
             None => AnonRoot::Other,
         },
         _ => AnonRoot::Other,
     })
+}
+
+/// Whether a `super(...)` call means the enclosing class's `super()`: no
+/// arguments, or a first argument naming the enclosing class itself.
+fn super_of(src: &[u8], call: Node<'_>, enclosing_class: &dyn Fn() -> Option<String>) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return true;
+    };
+    let mut cur = args.walk();
+    let first = args
+        .named_children(&mut cur)
+        .find(|a| a.kind() != "comment");
+    match first {
+        None => true,
+        Some(a) => a.kind() == "identifier" && Some(text(src, a)) == enclosing_class(),
+    }
 }
 
 struct Collector<'a> {
@@ -147,6 +219,10 @@ struct Collector<'a> {
     fqn: &'a str,
     /// Names whose attribute stores are field binds.
     receivers: Vec<String>,
+    /// Whether a call with a non-literal argument is `Opaque` rather than
+    /// `Call`: at module level a factory given classes (`with_metaclass(M,
+    /// Core)`) can produce a subclass of them.
+    literal_calls_only: bool,
     out: Vec<TypeFact>,
 }
 
@@ -602,8 +678,10 @@ impl Collector<'_> {
                 .child_by_field_name("function")
                 .and_then(|f| name_path(self.src, f))
             {
-                Some(path) => ValueSource::Call(path),
-                None => ValueSource::Opaque,
+                Some(path) if !self.literal_calls_only || literal_args(self.src, value) => {
+                    ValueSource::Call(path)
+                }
+                _ => ValueSource::Opaque,
             },
             "parenthesized_expression" => value
                 .named_child(0)

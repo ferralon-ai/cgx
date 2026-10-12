@@ -24,16 +24,23 @@ pub struct DeterminismArgs {
     /// current directory).
     #[arg(long)]
     repo: Option<PathBuf>,
+    /// Index with receiver narrowing on (`cgx index --receiver-narrowing`).
+    #[arg(long)]
+    receiver_narrowing: bool,
 }
 
 pub fn run(args: DeterminismArgs) -> Result<()> {
     let repo_root = resolve_repo_root(args.repo)?;
+    let opts = cgx_index::IndexOpts {
+        receiver_narrowing: args.receiver_narrowing,
+        ..Default::default()
+    };
     println!("xtask determinism: indexing {} twice into fresh stores", repo_root.display());
 
     let dir = tempfile::tempdir().context("creating temp dir for determinism stores")?;
 
-    let run_a = index_once(&repo_root, &dir.path().join("objects_a")).context("run-1")?;
-    let run_b = index_once(&repo_root, &dir.path().join("objects_b")).context("run-2")?;
+    let run_a = index_once(&repo_root, &opts, &dir.path().join("objects_a")).context("run-1")?;
+    let run_b = index_once(&repo_root, &opts, &dir.path().join("objects_b")).context("run-2")?;
     let (data_a, rep_a, objs_a) = (run_a.rows, run_a.report, run_a.objects);
     let (data_b, rep_b, objs_b) = (run_b.rows, run_b.report, run_b.objects);
 
@@ -208,10 +215,10 @@ struct IndexRun {
 }
 
 /// Index `repo_root` once into a fresh [`ObjectStore`] rooted at `root`.
-fn index_once(repo_root: &Path, root: &Path) -> Result<IndexRun> {
+fn index_once(repo_root: &Path, opts: &cgx_index::IndexOpts, root: &Path) -> Result<IndexRun> {
     let mut store = ObjectStore::open(root).with_context(|| format!("opening object store {root:?}"))?;
     let registry = cgx_index::default_registry();
-    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, &Default::default())
+    let outcome = cgx_index::index_path(repo_root, &registry, &mut store, opts)
         .context("indexing repo into object store")?;
     let tree = TreeOid::new(outcome.graph_key.clone());
 

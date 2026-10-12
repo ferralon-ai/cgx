@@ -63,6 +63,13 @@ pub struct IndexOpts {
     /// CI assertion that the backing compdb is complete (`--compdb-complete`).
     /// Overrides the coverage self-check to `Complete` for a scip-clang index.
     pub compdb_complete: bool,
+    /// Narrow virtual call sites by receiver kind (`cgx index
+    /// --receiver-narrowing`). Off by default. See
+    /// `cgx_resolve::LinkOpts::receiver_narrowing`.
+    pub receiver_narrowing: bool,
+    /// Print one stderr line per narrowed virtual site. Ignored unless
+    /// `receiver_narrowing` is on.
+    pub narrowing_trace: bool,
 }
 
 /// Counters describing what an index run did. The incremental win is observable
@@ -114,6 +121,9 @@ pub struct IndexStats {
     /// interproc edges materialized, SCCs that hit the work-budget cap. Zeroed
     /// unless the run used `--dataflow`.
     pub ifds: IfdsDataflowStats,
+    /// Receiver-narrowing counters. Zeroed unless the run used
+    /// `--receiver-narrowing`.
+    pub precision: cgx_resolve::PrecisionStats,
 }
 
 /// One file's resolved contribution, carrying owned facts so the link step can
@@ -264,9 +274,12 @@ pub(crate) fn extract_and_link<S: FactStore>(
     let link_opts = LinkOpts {
         dataflow: opts.dataflow,
         prior_fn_cache,
+        receiver_narrowing: opts.receiver_narrowing,
+        narrowing_trace: opts.narrowing_trace,
         ..LinkOpts::default()
     };
     let graph = link(&inputs, &link_opts);
+    stats.precision = graph.precision;
     stats.nodes = graph.nodes.len();
     stats.edges = graph.edges.len();
     stats.unresolved = graph.unresolved.len();

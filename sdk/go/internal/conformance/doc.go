@@ -11,7 +11,10 @@
 //  5. a cancelled index returns the context's error and leaves the pointer
 //     consistent;
 //  6. a too-small linear-memory ceiling is reported as ErrMemoryLimit (wasm);
-//  7. the working-directory walk keys the graph as the native walk does.
+//  7. the working-directory walk keys the graph as the native walk does;
+//  8. the engine yields often enough that no garbage collection during
+//     an index exceeds a bound, and a cancel during the store write returns
+//     promptly and leaves no graph named (wasm).
 //
 // Absent engines are skipped unless CGX_REQUIRE_WASM=1 or CGX_REQUIRE_NATIVE=1.
 package conformance

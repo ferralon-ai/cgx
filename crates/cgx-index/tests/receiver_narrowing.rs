@@ -2282,7 +2282,9 @@ fn suffix_matches_that_lack_the_member_are_out_of_repo() {
     assert_eq!(o.stats.precision.unknown_bases, 0);
     assert_eq!(o.stats.precision.floating_classes, 0);
     assert_eq!(o.stats.precision.unknown_base.fallback, 0);
-    assert_eq!(o.stats.precision.spec_shadowed, 2);
+    // The two bases (`pydantic.BaseModel`, `typing.Generic`) plus the
+    // parameter annotation `typing.Any` in `pkg/sub/typing.py`.
+    assert_eq!(o.stats.precision.spec_shadowed, 3);
     assert_eq!(dangling_sum(&on), o.stats.unresolved);
 }
 

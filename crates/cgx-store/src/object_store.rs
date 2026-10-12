@@ -321,7 +321,7 @@ fn stable_keys<'a>(
 
 /// Check that `g` is in the canonical form `cgx_resolve::canonicalize` produces,
 /// which is what lets a reader rebuild every dense id from shard positions.
-fn check_canonical(g: &LinkedGraph) -> Result<()> {
+pub(crate) fn check_canonical(g: &LinkedGraph) -> Result<()> {
     let bad = |reason: String| Err(StoreError::NonCanonical { reason });
     for (i, n) in g.nodes.iter().enumerate() {
         if n.id.index() != i {

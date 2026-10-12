@@ -465,8 +465,8 @@ func TestSCIPAndDataflowAlwaysRebuild(t *testing.T) {
 		t.Fatalf("SCIP index of a fresh graph = %+v, %v; want a rebuild", r, err)
 	}
 	out, _ := h.Call(ctx, "last_finish", nil)
-	if string(out) != `{"entries":2}` {
-		t.Fatalf("finish frame = %s, want the SCIP entry", out)
+	if string(out) != `{"entries":3}` {
+		t.Fatalf("finish frame = %s, want options, SCIP and source root", out)
 	}
 	off := false
 	if r, err := h.Index(ctx, transport.IndexRequest{Mode: abi.ModeHead, Dataflow: &off}); err != nil || r.UpToDate {

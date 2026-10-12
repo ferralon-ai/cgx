@@ -160,6 +160,13 @@ func (g *Graph) index(ctx context.Context, opts ...IndexOption) (*IndexReport, e
 		}
 		req.SCIP = p
 	}
+	if in := ic.scipBytes; in != nil {
+		d, err := scipData(in, ic.scip != "")
+		if err != nil {
+			return nil, err
+		}
+		req.SCIPData = d
+	}
 	if ic.worktree {
 		req.Mode = abi.ModeWorktree
 	}
@@ -249,3 +256,36 @@ func (g *Graph) Close() error {
 
 // Ptr returns a pointer to v, for the optional fields of request types.
 func Ptr[T any](v T) *T { return &v }
+
+// scipData validates in and makes its directories absolute.
+func scipData(in *SCIPInput, withPath bool) (*transport.SCIPData, error) {
+	switch {
+	case withPath:
+		return nil, errors.New("cgx: SCIP and SCIPBytes are exclusive")
+	case len(in.Index) == 0:
+		return nil, errors.New("cgx: SCIPBytes: empty Index")
+	case len(in.Index) > MaxSCIPBytes:
+		return nil, fmt.Errorf("cgx: SCIPBytes: Index is %d bytes; the limit is %d", len(in.Index), MaxSCIPBytes)
+	case len(in.CompileCommands) > MaxCompileCommandsBytes:
+		return nil, fmt.Errorf("cgx: SCIPBytes: CompileCommands is %d bytes; the limit is %d", len(in.CompileCommands), MaxCompileCommandsBytes)
+	}
+	d := &transport.SCIPData{
+		Index:                   in.Index,
+		CompileCommands:         in.CompileCommands,
+		CompileCommandsComplete: in.CompileCommandsComplete,
+	}
+	for _, f := range []struct {
+		from string
+		to   *string
+	}{{in.CompileCommandsDir, &d.CompileCommandsDir}, {in.SourceRoot, &d.SourceRoot}} {
+		if f.from == "" {
+			continue
+		}
+		p, err := filepath.Abs(f.from)
+		if err != nil {
+			return nil, err
+		}
+		*f.to = p
+	}
+	return d, nil
+}

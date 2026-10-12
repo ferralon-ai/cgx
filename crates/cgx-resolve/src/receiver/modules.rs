@@ -3,10 +3,13 @@
 //! Every file's canonical module path (`FileFacts::module`) forms the module
 //! set. An import spec is in-repo when some module equals it or ends with it on
 //! a `::` boundary (a sys.path root below the repo root, such as a `tests/`
-//! directory); otherwise it is out of repo. Names resolve exactly: a module's
-//! own defs, its submodules, then its explicit imports and its glob imports
-//! (package re-exports), cycle-guarded. There is no global short-name fallback:
-//! a name with no lexical, import or glob resolution is `NotFound`.
+//! directory); otherwise it is out of repo. A suffix match that cannot serve
+//! the imported member is not the import's target (the import, or the
+//! attribute access on it, would fail), so when no suffix match can, the
+//! member is out of repo. Names resolve exactly: a module's own defs, its
+//! submodules, then its explicit imports and its glob imports (package
+//! re-exports), cycle-guarded. There is no global short-name fallback: a name
+//! with no lexical, import or glob resolution is `NotFound`.
 //!
 //! A module-level value resolves through its binding sites: an alias of a
 //! class (`Compat = Real`) is that class, the result of an out-of-repo call
@@ -62,6 +65,9 @@ pub(crate) struct ModuleIndex {
     values: BTreeMap<(String, String), Vec<ValueSource>>,
     /// Distinct import specs that match several in-repo modules by suffix.
     pub(crate) spec_ambiguous: usize,
+    /// `(spec, member, suffix matches)` for each import spec member resolved
+    /// out of repo because no in-repo suffix match of the spec can serve it.
+    pub(crate) shadowed: RefCell<BTreeSet<(String, String, String)>>,
     memo: RefCell<HashMap<(Target, Vec<String>), Resolved>>,
 }
 
@@ -99,9 +105,7 @@ impl ModuleIndex {
         idx.files = inputs.iter().map(file_scope).collect();
         let mut ambiguous = BTreeSet::new();
         for fs in &idx.files {
-            let targets = fs.bindings.values().flatten().map(|t| match t {
-                Target::Module(s) | Target::Member(s, _) | Target::ModuleOrMember(s, _) => s,
-            });
+            let targets = fs.bindings.values().flatten().map(Target::spec);
             for s in targets.chain(&fs.globs) {
                 if matches!(idx.in_repo(s), InRepo::Suffix(ref v) if v.len() > 1) {
                     ambiguous.insert(&s.path);
@@ -283,14 +287,72 @@ impl ModuleIndex {
             InRepo::Exact(m) => self.resolve_in(d, m, path, seen),
             InRepo::Suffix(ms) => {
                 let mut acc = None;
-                for m in ms {
+                for m in &ms {
                     join_found(&mut acc, self.resolve_in(d, m, path, seen));
                 }
-                acc.unwrap_or(Resolved::NotFound)
+                if let Some(r) = acc {
+                    return r;
+                }
+                let Some(n) = path.first() else {
+                    return Resolved::NotFound;
+                };
+                if ms.iter().any(|m| self.may_serve(d, m, n, spec, &mut Vec::new())) {
+                    return Resolved::NotFound;
+                }
+                let key = (spec.path.clone(), n.clone(), ms.join(","));
+                self.shadowed.borrow_mut().insert(key);
+                Resolved::External
             }
             InRepo::Missing => Resolved::NotFound,
             InRepo::External => Resolved::External,
         }
+    }
+
+    /// Whether in-repo `module` could provide `name` if it were the target of
+    /// the non-relative import `spec`: it defines or binds `name` at module
+    /// level, has such a submodule or a module-level `__getattr__`, or has a
+    /// glob import that could provide it. An import or glob of `spec` itself
+    /// does not count: were `module` that target, it would be importing its
+    /// own partially initialised self, which does not have `name` yet.
+    fn may_serve<'m>(
+        &'m self,
+        d: &Defs<'_>,
+        module: &'m str,
+        name: &str,
+        spec: &Spec,
+        visited: &mut Vec<&'m str>,
+    ) -> bool {
+        if visited.contains(&module) {
+            return false;
+        }
+        visited.push(module);
+        let provides = |n: &str| {
+            let fqn = format!("{module}::{n}");
+            d.table.def_by_fqn(&fqn).is_some() || self.modules.contains_key(&fqn)
+        };
+        if provides(name)
+            || provides("__getattr__")
+            || self.values.contains_key(&(module.to_owned(), name.to_owned()))
+        {
+            return true;
+        }
+        for &f in self.modules.get(module).map(Vec::as_slice).unwrap_or(&[]) {
+            let fs = &self.files[f];
+            let bound = fs.bindings.get(name).into_iter().flatten();
+            if bound.map(Target::spec).any(|s| s != spec) {
+                return true;
+            }
+            for g in fs.globs.iter().filter(|g| *g != spec) {
+                let serves = match self.in_repo(g) {
+                    InRepo::Exact(m) => self.may_serve(d, m, name, spec, visited),
+                    InRepo::Suffix(_) | InRepo::Missing | InRepo::External => true,
+                };
+                if serves {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// `path` inside in-repo `module`: its def, its submodule, its explicit

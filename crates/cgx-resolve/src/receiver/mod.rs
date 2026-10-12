@@ -147,11 +147,18 @@ impl<'a> ReceiverIndex<'a> {
         let (typed, untyped) = types.fields.attr_stores();
         ix.lattice.add_attr_stores(typed, untyped);
         ix.types = types;
+        // After the type environment, which also resolves specs through `modules`.
+        if ledger.tracing() {
+            for (spec, member, hits) in ix.modules.shadowed.borrow().iter() {
+                stats::trace("spec:shadowed", spec, 0, std::slice::from_ref(member), hits);
+            }
+        }
         let s = ledger.stats_mut();
         s.fqn_collisions = ix.lattice.fqn_collisions;
         s.open_nonclass_bases = ix.lattice.open_nonclass_bases;
         s.unknown_bases = ix.lattice.unknown_bases;
         s.spec_ambiguous = ix.modules.spec_ambiguous;
+        s.spec_shadowed = ix.modules.shadowed.borrow().len();
         s.floating_classes = ix.lattice.floating_classes;
         ix
     }

@@ -493,6 +493,38 @@ fn backward_counts_are_narrowed_sites_minus_those_that_kept_the_def() {
     assert!(off.nodes.iter().all(|n| n.narrowing == Default::default()));
 }
 
+/// The backward and forward counters stay on their own nodes when dataflow
+/// interleaves SSA value nodes into the canonical node order and renumbers the
+/// symbol nodes.
+#[test]
+fn narrowing_counts_follow_their_nodes_when_dataflow_renumbers_them() {
+    let (_t, repo) = init_empty_repo();
+    for (path, text) in MAIN_FILES {
+        write_file(&repo, path, text);
+    }
+    commit_all(&repo, "receiver fixture");
+    let registry = cgx_index::default_registry();
+    let mut store = mem_store();
+    let opts = IndexOpts {
+        receiver_narrowing: true,
+        dataflow: true,
+        ..IndexOpts::default()
+    };
+    let outcome = index_path(&repo, &registry, &mut store, &opts).unwrap();
+    let idx = GraphIndex::new(&read_graph(&store, &outcome.graph_key));
+    assert!(
+        idx.nodes
+            .iter()
+            .any(|n| n.kind == SymbolKind::Variable && n.lang.is_empty()),
+        "the fixture must produce value nodes for this test to mean anything"
+    );
+
+    let (_o, plain) = index(true);
+    for n in &plain.nodes {
+        assert_eq!(node(&idx, &n.fqn).narrowing, n.narrowing, "{}", n.fqn);
+    }
+}
+
 /// I7 (in-test half): with the flag off nothing is narrowed or counted.
 #[test]
 fn flag_off_produces_no_narrowing() {
@@ -2149,4 +2181,158 @@ fn untyped_constructor_results_keep_the_legacy_set() {
         assert_eq!(callees(&on, &caller), callees(&off, &caller), "{f}");
         assert!(callees(&on, &caller).contains("pkg::ctor::B::m"), "{f}");
     }
+}
+
+/// In-repo modules named like out-of-repo packages (`pkg/sub/pydantic.py`,
+/// `pkg/sub/typing.py`) that a top-level import matches only by suffix.
+const SHADOW_FILES: &[(&str, &str)] = &[
+    ("pkg/__init__.py", ""),
+    ("pkg/sub/__init__.py", ""),
+    (
+        "pkg/sub/pydantic.py",
+        "from pkg.sub.typing import helper\n\n\ndef serialize(o):\n    return helper(o)\n",
+    ),
+    (
+        "pkg/sub/typing.py",
+        "from typing import Any\n\n\ndef helper(o: Any):\n    return o\n",
+    ),
+    (
+        "pkg/sub/requests.py",
+        "class Session:\n    def ping(self):\n        return 0\n",
+    ),
+    (
+        "pkg/models.py",
+        r#"
+from typing import Any, Generic, TypeVar
+
+from pydantic import BaseModel
+from requests import Session
+
+T = TypeVar("T")
+
+
+class M(BaseModel):
+    def check(self):
+        return self.m()
+
+    def m(self):
+        return 1
+
+    def dump(self):
+        return self.model_dump()
+
+    def init(self):
+        return super().__init__()
+
+
+class G(Generic[T]):
+    def run(self):
+        return self.m()
+
+    def m(self):
+        return 2
+
+
+class R(Session):
+    def go(self):
+        return self.ping()
+
+
+class Unrelated:
+    def m(self):
+        return 3
+
+    def model_dump(self):
+        return 4
+
+    def ping(self):
+        return 5
+
+    def __init__(self):
+        pass
+"#,
+    ),
+];
+
+/// A top-level import that matches an in-repo module only by suffix, where no
+/// match can serve the imported member, is out of repo: the base is an
+/// out-of-repo method provider, not an unknown one.
+#[test]
+fn suffix_matches_that_lack_the_member_are_out_of_repo() {
+    let (_o, off) = index_files(SHADOW_FILES, false);
+    let (o, on) = index_files(SHADOW_FILES, true);
+    assert_eq!(callees(&on, "pkg::models::M::check"), set(&["pkg::models::M::m"]));
+    assert_eq!(callees(&on, "pkg::models::G::run"), set(&["pkg::models::G::m"]));
+    for caller in ["pkg::models::M::dump", "pkg::models::M::init"] {
+        assert!(!callees(&off, caller).is_empty(), "{caller}");
+        assert!(callees(&on, caller).is_empty(), "{caller}");
+        assert_eq!(node(&on, caller).external_calls, 1, "{caller}");
+    }
+    // A suffix match that serves the member stays in repo.
+    assert_eq!(
+        callees(&on, "pkg::models::R::go"),
+        set(&["pkg::sub::requests::Session::ping"])
+    );
+    assert_eq!(o.stats.precision.unknown_bases, 0);
+    assert_eq!(o.stats.precision.floating_classes, 0);
+    assert_eq!(o.stats.precision.unknown_base.fallback, 0);
+    assert_eq!(o.stats.precision.spec_shadowed, 2);
+    assert_eq!(dangling_sum(&on), o.stats.unresolved);
+}
+
+/// Suffix matches that could serve the member keep the base unknown: a
+/// module-level `__getattr__`, a glob import nothing resolves, and an explicit
+/// import of the member from elsewhere.
+const SHADOW_KEEP_FILES: &[(&str, &str)] = &[
+    ("pkg/__init__.py", ""),
+    ("pkg/sub/__init__.py", ""),
+    ("pkg/sub/attrs.py", "def __getattr__(name):\n    return object\n"),
+    ("pkg/sub/marshmallow.py", "from .impl_missing import *\n"),
+    ("pkg/sub/loaders.py", "def load():\n    return 1\n"),
+    ("pkg/sub/yaml.py", "from pkg.sub.loaders import Loader\n"),
+    (
+        "pkg/shadowed.py",
+        r#"
+import attrs
+from marshmallow import Schema
+from yaml import Loader
+
+
+class A(attrs.Base):
+    def go(self):
+        return self.m()
+
+
+class S(Schema):
+    def go(self):
+        return self.m()
+
+
+class L(Loader):
+    def go(self):
+        return self.m()
+
+
+class Unrelated:
+    def m(self):
+        return 3
+"#,
+    ),
+];
+
+#[test]
+fn suffix_matches_that_may_serve_the_member_stay_unknown() {
+    let (_o, off) = index_files(SHADOW_KEEP_FILES, false);
+    let (o, on) = index_files(SHADOW_KEEP_FILES, true);
+    for caller in [
+        "pkg::shadowed::A::go",
+        "pkg::shadowed::S::go",
+        "pkg::shadowed::L::go",
+    ] {
+        assert!(callees(&off, caller).contains("pkg::shadowed::Unrelated::m"));
+        assert_eq!(callees(&on, caller), callees(&off, caller), "{caller}");
+        assert_eq!(node(&on, caller).external_calls, 0, "{caller}");
+    }
+    assert_eq!(o.stats.precision.unknown_bases, 3);
+    assert_eq!(o.stats.precision.spec_shadowed, 0);
 }

@@ -58,6 +58,10 @@ pub struct PrecisionStats {
     pub fqn_collisions: usize,
     /// Import specifiers that match several in-repo modules by suffix.
     pub spec_ambiguous: usize,
+    /// Distinct `(import spec, member)` pairs that class-base linking
+    /// resolved out of repo because no in-repo module matching the spec by
+    /// suffix can serve the member.
+    pub spec_shadowed: usize,
     /// Classes with an unresolvable base, and their in-repo subclasses: they
     /// join every cone and `super()` lookup that names one of their methods.
     pub floating_classes: usize,
@@ -85,12 +89,13 @@ impl PrecisionStats {
     }
 
     /// Scalar counters for reporting, in a fixed order.
-    pub fn counts(&self) -> [(&'static str, usize); 5] {
+    pub fn counts(&self) -> [(&'static str, usize); 6] {
         [
             ("open:nonclass-base", self.open_nonclass_bases),
             ("unknown-base", self.unknown_bases),
             ("fqn-collisions", self.fqn_collisions),
             ("spec-ambiguous", self.spec_ambiguous),
+            ("spec-shadowed", self.spec_shadowed),
             ("floating-classes", self.floating_classes),
         ]
     }

@@ -7,8 +7,8 @@ mod common;
 
 use cgx_core::codec::{decode, encode};
 use cgx_core::{
-    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId,
-    NodeRecord, SymbolKind, Tier, Visibility,
+    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord,
+    NarrowingCounts, NodeId, NodeRecord, SymbolKind, Tier, Visibility,
 };
 use cgx_store::manifest::{Manifest, CURRENT_STORE_FORMAT};
 use cgx_store::{FactStore, LinkedGraph, ObjectOid, ObjectStore, SqliteStore, StoreError, TreeOid};
@@ -134,6 +134,29 @@ fn read_graph_round_trips_byte_identically() {
 }
 
 #[test]
+fn receiver_narrowing_counters_round_trip() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    let mut g = common::sample_graph();
+    g.nodes[0].external_calls = 3;
+    g.nodes[0].narrowing = NarrowingCounts {
+        typed_out: 1,
+        interproc_out: 2,
+        visible_out: 3,
+        visible_dropped_out: 4,
+        typed_away_in: 5,
+        interproc_away_in: 6,
+        visible_away_in: 7,
+    };
+
+    s.put_graph(&tree, Some("rev1"), &g).unwrap();
+    let back = s.read_graph(&tree).unwrap();
+
+    assert_eq!(back, g, "shards must carry external_calls and narrowing");
+}
+
+#[test]
 fn absent_tree_reads_as_empty_graph() {
     let root = TempDir::new().unwrap();
     let s = store(&root);
@@ -195,6 +218,7 @@ fn same_graph_into_two_fresh_stores_yields_identical_objects() {
     }
 }
 
+/// The write path encodes shards and the candidate list from borrowed records.
 #[test]
 fn re_put_of_same_graph_is_a_noop_at_the_object_level() {
     let root = TempDir::new().unwrap();
@@ -226,15 +250,21 @@ fn manifest_is_stamped_with_current_store_format() {
     assert_eq!(read_manifest(&root, "t1").store_format, CURRENT_STORE_FORMAT);
 }
 
-/// Forge a manifest for `t1` stamped with `store_format`, write it as a new
-/// object, and repoint the ref at it — simulating a graph committed by a
-/// different cgx.
-fn forge_store_format(root: &TempDir, store_format: u32) {
-    let mut forged = read_manifest(root, "t1");
-    forged.store_format = store_format;
+#[test]
+fn read_rejects_manifest_with_newer_store_format() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph())
+        .unwrap();
+
+    // Forge a manifest claiming a future format, write it as a new object, and
+    // repoint the ref at it — simulating a graph committed by a newer cgx.
+    let mut forged = read_manifest(&root, "t1");
+    forged.store_format = CURRENT_STORE_FORMAT + 1;
     let bytes = encode(&forged).unwrap();
     let moid = ObjectOid::of_bytes(&bytes);
-    let opath = moid.object_path(&objects_dir(root));
+    let opath = moid.object_path(&objects_dir(&root));
     fs::create_dir_all(opath.parent().unwrap()).unwrap();
     fs::write(&opath, &bytes).unwrap();
     let ref_path = root
@@ -243,47 +273,145 @@ fn forge_store_format(root: &TempDir, store_format: u32) {
         .join("refs")
         .join(ObjectOid::of_bytes("t1".as_bytes()).0);
     fs::write(&ref_path, format!("{}\nt1\n", moid.0)).unwrap();
-}
-
-#[test]
-fn read_rejects_manifest_with_newer_store_format() {
-    let root = TempDir::new().unwrap();
-    let mut s = store(&root);
-    let tree = TreeOid::new("t1");
-    s.put_graph(&tree, Some("rev"), &common::sample_graph())
-        .unwrap();
-    forge_store_format(&root, CURRENT_STORE_FORMAT + 1);
 
     match s.read_graph(&tree) {
-        Err(e @ StoreError::StoreFormat { found, expected }) => {
+        Err(StoreError::StoreFormat { found, expected }) => {
             assert_eq!(found, CURRENT_STORE_FORMAT + 1);
             assert_eq!(expected, CURRENT_STORE_FORMAT);
-            assert!(e.to_string().contains("upgrade cgx"), "{e}");
-        }
-        other => panic!("expected StoreFormat rejection, got {other:?}"),
-    }
-}
-
-#[test]
-fn read_rejects_manifest_with_older_store_format() {
-    let root = TempDir::new().unwrap();
-    let mut s = store(&root);
-    let tree = TreeOid::new("t1");
-    s.put_graph(&tree, Some("rev"), &common::sample_graph())
-        .unwrap();
-    forge_store_format(&root, CURRENT_STORE_FORMAT - 1);
-
-    match s.read_graph(&tree) {
-        Err(e @ StoreError::StoreFormat { found, expected }) => {
-            assert_eq!(found, CURRENT_STORE_FORMAT - 1);
-            assert_eq!(expected, CURRENT_STORE_FORMAT);
-            assert!(e.to_string().contains("rebuild the index"), "{e}");
         }
         other => panic!("expected StoreFormat rejection, got {other:?}"),
     }
 }
 
 // --- 3. manifest + candidate canonical ordering -------------------------------
+
+/// Write `bytes` as an object and point `key`'s ref at it as its manifest.
+fn plant_manifest(root: &TempDir, key: &str, bytes: &[u8]) {
+    let moid = ObjectOid::of_bytes(bytes);
+    let opath = moid.object_path(&objects_dir(root));
+    fs::create_dir_all(opath.parent().unwrap()).unwrap();
+    fs::write(&opath, bytes).unwrap();
+    let ref_path = root
+        .path()
+        .join(".cgx")
+        .join("refs")
+        .join(ObjectOid::of_bytes(key.as_bytes()).0);
+    fs::write(&ref_path, format!("{}\n{key}\n", moid.0)).unwrap();
+}
+
+/// A manifest from an older store format (here: the format-1 shape, with its
+/// trailing candidates field) is not mis-decoded as the current one: it reads as
+/// corrupt, which the CLI answers by re-indexing once.
+#[test]
+fn read_reports_older_store_format_as_corrupt() {
+    #[derive(serde::Serialize)]
+    struct ManifestV1 {
+        store_format: u32,
+        graph_key: String,
+        created_rev: Option<String>,
+        shards: Vec<cgx_store::manifest::ShardEntry>,
+        candidates: Option<ObjectOid>,
+    }
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    let current = read_manifest(&root, "t1");
+    let v1 = ManifestV1 {
+        store_format: 1,
+        graph_key: current.graph_key,
+        created_rev: current.created_rev,
+        shards: current.shards,
+        candidates: None,
+    };
+    plant_manifest(&root, "t1", &encode(&v1).unwrap());
+
+    let err = s.read_graph(&tree).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt { .. }), "got {err:?}");
+    // The next put rewrites the graph in the current format.
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    assert_eq!(s.read_graph(&tree).unwrap(), common::sample_graph());
+}
+
+/// Objects whose hash checks out but whose bytes do not decode (a manifest or a
+/// shard) read as corrupt, never as a codec error the CLI would not recover from.
+#[test]
+fn undecodable_manifest_or_shard_reads_as_corrupt() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+
+    plant_manifest(&root, "t1", &[0xff; 3]);
+    let err = s.read_graph(&tree).unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt { .. }), "manifest: got {err:?}");
+
+    s.put_graph(&tree, Some("rev"), &common::sample_graph()).unwrap();
+    let mut m = read_manifest(&root, "t1");
+    let junk = [0xffu8; 5];
+    plant_orphan_object(&root, &junk);
+    m.shards[0].oid = ObjectOid::of_bytes(&junk);
+    plant_manifest(&root, "t1", &encode(&m).unwrap());
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, m.shards[0].oid.0),
+        other => panic!("shard: expected Corrupt, got {other:?}"),
+    }
+}
+
+/// The point of stable keys: inserting a node renumbers every later dense id, but
+/// a shard names other shards' nodes by stable key, so no unchanged function's
+/// object moves.
+#[test]
+fn inserting_a_function_leaves_every_other_shard_unchanged() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let before = LinkedGraph::new(
+        vec![
+            func_node(0, "app::a", 10),
+            func_node(1, "app::c", 30),
+            func_node(2, "app::d", 40),
+        ],
+        vec![call_edge(0, 0, 1), call_edge(1, 1, 2), call_edge(2, 2, 0)],
+        vec![],
+    );
+    // `app::b` lands between a and c: c and d shift from ids 1, 2 to 2, 3.
+    let mut b = func_node(1, "app::b", 20);
+    b.line_start = 1;
+    let mut nodes = vec![func_node(0, "app::a", 10), b];
+    for (id, fqn, end) in [(2, "app::c", 30), (3, "app::d", 40)] {
+        let mut n = func_node(id, fqn, end);
+        n.line_start = id;
+        nodes.push(n);
+    }
+    let after = LinkedGraph::new(
+        nodes,
+        vec![call_edge(0, 0, 2), call_edge(1, 2, 3), call_edge(2, 3, 0)],
+        vec![],
+    );
+    s.put_graph(&TreeOid::new("t1"), None, &before).unwrap();
+    s.put_graph(&TreeOid::new("t2"), None, &after).unwrap();
+
+    for f in ["app::a", "app::c", "app::d"] {
+        assert_eq!(shard_oid(&root, "t1", f), shard_oid(&root, "t2", f), "{f}");
+    }
+    assert_eq!(s.read_graph(&TreeOid::new("t2")).unwrap(), after);
+}
+
+/// Same-FQN nodes (overloads, re-definitions) are told apart by dup-ordinal, and
+/// an edge into the second one resolves to it, not the first.
+#[test]
+fn duplicate_fqns_round_trip_by_dup_ordinal() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let mut dup = func_node(2, "app::f", 50);
+    dup.line_start = 40;
+    let g = LinkedGraph::new(
+        vec![func_node(0, "app::caller", 10), func_node(1, "app::f", 20), dup],
+        vec![call_edge(0, 0, 2), call_edge(1, 1, 2)],
+        vec![],
+    );
+    s.put_graph(&TreeOid::new("t1"), None, &g).unwrap();
+    assert_eq!(s.read_graph(&TreeOid::new("t1")).unwrap(), g);
+}
 
 #[test]
 fn manifest_shard_list_is_sorted_and_stable() {
@@ -300,33 +428,35 @@ fn manifest_shard_list_is_sorted_and_stable() {
 }
 
 #[test]
-fn candidates_are_reconstructed_in_group_rank_dst_order() {
+fn non_canonical_candidates_are_rejected_not_reordered() {
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
 
-    // Two callables so there is a candidate set; candidates supplied scrambled.
+    // A two-way candidate set at one call site; rows supplied out of order.
     let nodes = vec![
         func_node(0, "app::caller", 10),
         func_node(1, "app::target_a", 20),
         func_node(2, "app::target_b", 30),
     ];
-    let edges = vec![call_edge(0, 0, 1), call_edge(1, 0, 2)];
-    let scrambled = vec![
-        Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
+    let grouped = |id, dst| EdgeRecord {
+        candidate_group: Some(0),
+        ..call_edge(id, 0, dst)
+    };
+    let edges = vec![grouped(0, 1), grouped(1, 2)];
+    let sorted = vec![
         Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
+        Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
     ];
-    let g = LinkedGraph::new(nodes, edges, scrambled);
-    s.put_graph(&TreeOid::new("t1"), None, &g).unwrap();
+    let scrambled: Vec<Candidate> = sorted.iter().rev().cloned().collect();
 
-    let back = s.read_graph(&TreeOid::new("t1")).unwrap();
-    assert_eq!(
-        back.candidates,
-        vec![
-            Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 },
-            Candidate { candidate_group: 0, dst: NodeId(2), rank: 1 },
-        ],
-        "candidates must come back sorted by (group, rank, dst)"
-    );
+    let bad = LinkedGraph::new(nodes.clone(), edges.clone(), scrambled);
+    let err = s.put_graph(&TreeOid::new("t1"), None, &bad).unwrap_err();
+    assert!(matches!(err, StoreError::NonCanonical { .. }), "got {err:?}");
+    assert!(!s.graph_for(&TreeOid::new("t1")).unwrap(), "nothing is written");
+
+    let good = LinkedGraph::new(nodes, edges, sorted);
+    s.put_graph(&TreeOid::new("t1"), None, &good).unwrap();
+    assert_eq!(s.read_graph(&TreeOid::new("t1")).unwrap(), good);
 }
 
 // --- 4. per-function dedup ----------------------------------------------------
@@ -477,6 +607,71 @@ fn a_normal_put_leaves_no_tmp_sidecars() {
     assert_eq!(tmp_count, 0, "no partial object left under a final name");
 }
 
+#[test]
+fn torn_object_reads_as_corrupt_and_the_next_put_heals_it() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    let g = common::sample_graph();
+    s.put_graph(&tree, Some("rev"), &g).unwrap();
+
+    // Simulate a write torn by power loss: the shard's final name exists but its
+    // bytes are truncated.
+    let manifest = read_manifest(&root, "t1");
+    let torn = manifest.shards[0].oid.clone();
+    let path = torn.object_path(&objects_dir(&root));
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, torn.0),
+        other => panic!("a torn object must read as Corrupt, got {other:?}"),
+    }
+
+    // Re-putting the same graph must not trust the torn file at its OID path.
+    s.put_graph(&tree, Some("rev"), &g).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes, "torn object rewritten");
+    assert_eq!(s.read_graph(&tree).unwrap(), g);
+}
+
+#[test]
+fn missing_object_behind_a_live_ref_reads_as_corrupt() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, None, &common::sample_graph()).unwrap();
+
+    let manifest = read_manifest(&root, "t1");
+    let gone = manifest.shards.last().unwrap().oid.clone();
+    fs::remove_file(gone.object_path(&objects_dir(&root))).unwrap();
+
+    match s.read_graph(&tree) {
+        Err(StoreError::Corrupt { oid }) => assert_eq!(oid, gone.0),
+        other => panic!("a missing object must read as Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn prune_graphs_except_sweeps_stale_tmp_files() {
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let tree = TreeOid::new("t1");
+    s.put_graph(&tree, None, &common::sample_graph()).unwrap();
+    plant_tmp_object(&root, b"partial-bytes");
+    let refs_tmp = root.path().join(".cgx").join("refs").join("abc.tmp");
+    fs::write(&refs_tmp, b"partial-ref").unwrap();
+    let frag_tmp = root.path().join(".cgx").join("fragments").join("zz");
+    fs::create_dir_all(&frag_tmp).unwrap();
+    fs::write(frag_tmp.join("beef.tmp"), b"partial-fragment").unwrap();
+
+    s.prune_graphs_except(&[&tree]).unwrap();
+
+    assert!(!objects_dir(&root).join("zz").join("deadbeef.tmp").exists());
+    assert!(!refs_tmp.exists());
+    assert!(!frag_tmp.join("beef.tmp").exists());
+    assert_eq!(s.read_graph(&tree).unwrap(), common::sample_graph());
+}
+
 // --- Layer-1 fragments --------------------------------------------------------
 
 #[test]
@@ -484,9 +679,9 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
     use cgx_store::FragmentInput;
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let blob = cgx_store::BlobOid::new("blob-aaaa");
+    let blob = cgx_store::FragmentKey::new("blob-aaaa");
     let input = FragmentInput {
-        blob: &blob,
+        key: &blob,
         lang: "rust",
         frontend_version: 3,
         bytes: b"canonical-fragment-bytes",
@@ -501,23 +696,45 @@ fn fragments_round_trip_and_re_put_is_a_noop() {
     // Re-put of the unchanged blob is a true no-op (IX-1).
     s.put_fragments(&[input]).unwrap();
     assert_eq!(s.fragment(&blob).unwrap().unwrap(), got);
-    assert!(s.fragment(&cgx_store::BlobOid::new("absent")).unwrap().is_none());
+    assert!(s.fragment(&cgx_store::FragmentKey::new("absent")).unwrap().is_none());
+}
+
+#[test]
+fn put_with_a_different_frontend_version_replaces_the_fragment() {
+    use cgx_store::{FragmentInput, FragmentKey};
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let blob = FragmentKey::new("blob-versioned");
+    let v1 = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { key: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+
+    s.put_fragments(&[v1]).unwrap();
+    s.put_fragments(&[v2]).unwrap();
+    let got = s.fragment(&blob).unwrap().unwrap();
+    assert_eq!(got.frontend_version, 2);
+    assert_eq!(got.lang, "go");
+    assert_eq!(got.fragment, b"new");
+
+    // Re-putting the same version is still a no-op: the stored bytes win.
+    let v2_other = FragmentInput { bytes: b"ignored", ..v2 };
+    s.put_fragments(&[v2_other]).unwrap();
+    assert_eq!(s.fragment(&blob).unwrap().unwrap().fragment, b"new");
 }
 
 #[test]
 fn prune_drops_only_fragments_absent_from_the_live_set() {
-    use cgx_store::{BlobOid, FragmentInput};
+    use cgx_store::{FragmentInput, FragmentKey};
     let root = TempDir::new().unwrap();
     let mut s = store(&root);
-    let live_blob = BlobOid::new("blob-live");
-    let dead_blob = BlobOid::new("blob-dead");
+    let live_blob = FragmentKey::new("blob-live");
+    let dead_blob = FragmentKey::new("blob-dead");
     s.put_fragments(&[
-        FragmentInput { blob: &live_blob, lang: "rust", frontend_version: 1, bytes: b"live" },
-        FragmentInput { blob: &dead_blob, lang: "rust", frontend_version: 1, bytes: b"dead" },
+        FragmentInput { key: &live_blob, lang: "rust", frontend_version: 1, bytes: b"live" },
+        FragmentInput { key: &dead_blob, lang: "rust", frontend_version: 1, bytes: b"dead" },
     ])
     .unwrap();
 
-    let mut live = cgx_store::BlobSet::new();
+    let mut live = cgx_store::FragmentKeySet::new();
     live.insert(live_blob.clone());
     let stats = s.prune(&live, false).unwrap();
 
@@ -525,6 +742,27 @@ fn prune_drops_only_fragments_absent_from_the_live_set() {
     assert_eq!(stats.graphs_removed, 0, "prune never GCs graphs (recon §A.1)");
     assert!(s.fragment(&live_blob).unwrap().is_some());
     assert!(s.fragment(&dead_blob).unwrap().is_none());
+}
+
+#[test]
+fn a_fragment_failing_its_checksum_is_a_miss_and_is_rewritten() {
+    use cgx_store::{FragmentInput, FragmentKey};
+    let root = TempDir::new().unwrap();
+    let mut s = store(&root);
+    let blob = FragmentKey::new("blob-torn");
+    let input = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"facts" };
+    s.put_fragments(&[input]).unwrap();
+
+    let path = ObjectOid(blob.0.clone()).object_path(&root.path().join(".cgx").join("fragments"));
+    let sealed = fs::read(&path).unwrap();
+    let mut flipped = sealed.clone();
+    flipped[0] ^= 0xff;
+    fs::write(&path, &flipped).unwrap();
+
+    assert!(s.fragment(&blob).unwrap().is_none(), "checksum mismatch reads as a miss");
+    s.put_fragments(&[input]).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), sealed, "same-version re-put rewrites a bad fragment");
+    assert_eq!(s.fragment(&blob).unwrap().unwrap().fragment, b"facts");
 }
 
 fn plant_orphan_object(root: &TempDir, bytes: &[u8]) {

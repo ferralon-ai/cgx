@@ -5,8 +5,8 @@ mod common;
 
 use cgx_core::codec::encode;
 use cgx_store::{
-    BlobOid, BlobSet, FactStore, FragmentInput, LinkedGraph, SqliteStore, TreeOid, SCHEMA_VERSION,
-    VIEW_SCHEMA_VERSION, VIEW_SET,
+    FactStore, FragmentInput, FragmentKey, FragmentKeySet, LinkedGraph, SqliteStore, TreeOid,
+    SCHEMA_VERSION, VIEW_SCHEMA_VERSION, VIEW_SET,
 };
 use common::sample_graph;
 
@@ -14,9 +14,9 @@ fn open() -> SqliteStore {
     SqliteStore::open_in_memory().expect("open in-memory store")
 }
 
-fn frag<'a>(blob: &'a BlobOid, bytes: &'a [u8]) -> FragmentInput<'a> {
+fn frag<'a>(key: &'a FragmentKey, bytes: &'a [u8]) -> FragmentInput<'a> {
     FragmentInput {
-        blob,
+        key,
         lang: "rust",
         frontend_version: 1,
         bytes,
@@ -46,8 +46,12 @@ fn own_effects_survive_the_round_trip() {
     store.put_graph(&tree, None, &g).unwrap();
     let back = store.read_graph(&tree).unwrap();
 
-    // node1 in the sample graph carries io.file + nondeterministic.
-    let n1 = back.nodes.iter().find(|n| n.id.0 == 1).expect("node 1");
+    // Conn::commit in the sample graph carries io.file + nondeterministic.
+    let n1 = back
+        .nodes
+        .iter()
+        .find(|n| n.fqn == "app::db::Conn::commit")
+        .expect("commit node");
     assert!(n1.own_effects.contains(Effect::IoFile));
     assert!(n1.own_effects.contains(Effect::Nondeterministic));
     assert_eq!(n1.own_effects.len(), 2);
@@ -117,7 +121,7 @@ fn re_putting_same_tree_replaces_rows_without_appending() {
 #[test]
 fn fragment_put_and_get_round_trips_bytes() {
     let mut store = open();
-    let blob = BlobOid::new("blob-1");
+    let blob = FragmentKey::new("blob-1");
     let bytes = encode(&sample_graph().nodes[0]).unwrap();
 
     store.put_fragments(&[frag(&blob, &bytes)]).unwrap();
@@ -131,13 +135,13 @@ fn fragment_put_and_get_round_trips_bytes() {
 #[test]
 fn fragment_absent_returns_none() {
     let store = open();
-    assert!(store.fragment(&BlobOid::new("nope")).unwrap().is_none());
+    assert!(store.fragment(&FragmentKey::new("nope")).unwrap().is_none());
 }
 
 #[test]
 fn re_putting_unchanged_blob_is_a_no_op() {
     let mut store = open();
-    let blob = BlobOid::new("blob-stable");
+    let blob = FragmentKey::new("blob-stable");
     let bytes = b"canonical-fragment-bytes".to_vec();
 
     store.put_fragments(&[frag(&blob, &bytes)]).unwrap();
@@ -153,13 +157,33 @@ fn re_put_does_not_overwrite_existing_bytes_for_same_oid() {
     // A blob OID is content-addressed: the first stored bytes are authoritative.
     // A no-op ON CONFLICT means a second put with different bytes is ignored.
     let mut store = open();
-    let blob = BlobOid::new("blob-cad");
+    let blob = FragmentKey::new("blob-cad");
     store.put_fragments(&[frag(&blob, b"original")]).unwrap();
     store.put_fragments(&[frag(&blob, b"different")]).unwrap();
     assert_eq!(
         store.fragment(&blob).unwrap().unwrap().fragment,
         b"original"
     );
+}
+
+#[test]
+fn put_with_a_different_frontend_version_replaces_the_fragment() {
+    let mut store = open();
+    let blob = FragmentKey::new("blob-versioned");
+    let v1 = FragmentInput { key: &blob, lang: "rust", frontend_version: 1, bytes: b"old" };
+    let v2 = FragmentInput { key: &blob, lang: "go", frontend_version: 2, bytes: b"new" };
+
+    store.put_fragments(&[v1]).unwrap();
+    store.put_fragments(&[v2]).unwrap();
+    let got = store.fragment(&blob).unwrap().unwrap();
+    assert_eq!(got.frontend_version, 2);
+    assert_eq!(got.lang, "go");
+    assert_eq!(got.fragment, b"new");
+
+    // Re-putting the same version is still a no-op: the stored bytes win.
+    let v2_other = FragmentInput { bytes: b"ignored", ..v2 };
+    store.put_fragments(&[v2_other]).unwrap();
+    assert_eq!(store.fragment(&blob).unwrap().unwrap().fragment, b"new");
 }
 
 // ---- View-schema-version present + views queryable --------------------------
@@ -255,13 +279,13 @@ fn round_trip_then_re_encode_is_byte_identical() {
 #[test]
 fn prune_removes_orphaned_blobs_and_keeps_live_ones() {
     let mut store = open();
-    let live_blob = BlobOid::new("live");
-    let dead_blob = BlobOid::new("dead");
+    let live_blob = FragmentKey::new("live");
+    let dead_blob = FragmentKey::new("dead");
     store
         .put_fragments(&[frag(&live_blob, b"a"), frag(&dead_blob, b"b")])
         .unwrap();
 
-    let mut live: BlobSet = BlobSet::new();
+    let mut live: FragmentKeySet = FragmentKeySet::new();
     live.insert(live_blob.clone());
 
     let stats = store.prune(&live, false).unwrap();
@@ -277,10 +301,10 @@ fn prune_aggressive_compacts() {
     // page reclaim, but the flag and the operation must succeed on a file db.
     let tmp = tempfile::tempdir().unwrap();
     let mut store = SqliteStore::open(tmp.path().join("index.db")).unwrap();
-    let blob = BlobOid::new("x");
+    let blob = FragmentKey::new("x");
     store.put_fragments(&[frag(&blob, b"payload")]).unwrap();
 
-    let mut live = BlobSet::new();
+    let mut live = FragmentKeySet::new();
     live.insert(blob);
     let stats = store.prune(&live, true).unwrap();
     assert!(stats.compacted);
@@ -289,10 +313,10 @@ fn prune_aggressive_compacts() {
 #[test]
 fn shared_blob_survives_when_still_live() {
     let mut store = open();
-    let shared = BlobOid::new("shared");
+    let shared = FragmentKey::new("shared");
     store.put_fragments(&[frag(&shared, b"s")]).unwrap();
 
-    let mut live = BlobSet::new();
+    let mut live = FragmentKeySet::new();
     live.insert(shared.clone());
     store.prune(&live, false).unwrap();
     assert!(store.fragment(&shared).unwrap().is_some());
@@ -476,7 +500,7 @@ fn unchanged_cache_reindex_leaves_db_bytes_identical() {
 // ---- Property: round-trip identity over arbitrary graphs --------------------
 
 use cgx_core::{
-    Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId, NodeRecord,
+    Candidate, Confidence, CutMarkers, EdgeCondition, EdgeId, EdgeKind, EdgeRecord, NodeId, NodeRecord,
     SymbolKind, Tier, Visibility,
 };
 use proptest::prelude::*;
@@ -509,34 +533,77 @@ prop_compose! {
 }
 
 prop_compose! {
+    /// A graph in the canonical form the linker emits: nodes sorted by (file,
+    /// line, fqn) with ids by position (random FQNs make duplicates likely), edges
+    /// sorted by (src, dst, kind, stmt, group) with ids by position, and candidate
+    /// groups — edges of one src sharing a stmt — numbered by first appearance,
+    /// with one candidate row per member edge.
     fn arb_graph()(n in 1usize..12)(
-        nodes in (0..n).map(|i| arb_node(i as u32)).collect::<Vec<_>>(),
-        edge_specs in proptest::collection::vec((0u32..n as u32, 0u32..n as u32), 0..20),
+        mut nodes in (0..n).map(|i| arb_node(i as u32)).collect::<Vec<_>>(),
+        edge_specs in proptest::collection::vec(
+            (0u32..n as u32, 0u32..n as u32, any::<bool>(), proptest::option::of(0u32..3), any::<bool>()),
+            0..20,
+        ),
     ) -> LinkedGraph {
-        let edges = edge_specs
+        cgx_core::sort::sort_nodes(&mut nodes);
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.id = NodeId(i as u32);
+        }
+        // Provisional group key: (src, stmt) for the edges flagged as grouped.
+        let mut edges: Vec<(Option<(u32, u32)>, EdgeRecord)> = edge_specs
             .into_iter()
-            .enumerate()
-            .map(|(i, (src, dst))| EdgeRecord {
-                id: EdgeId(i as u32),
-                src: NodeId(src),
-                dst: NodeId(dst),
-                kind: EdgeKind::Calls,
-                condition: EdgeCondition::Always,
-                confidence: Confidence::Probable,
-                tier: Tier::NameSyntactic,
-                rule: "name-arity".into(),
-                site_id: None,
-                stmt_index: None,
-                cut_markers: CutMarkers::new(),
-                implicit: None,
-                candidate_group: None,
-                established_by: None,
-                cfg_condition: None,
-                macro_origin: None,
-                transform: None,
+            .map(|(src, dst, virt, stmt, grouped)| {
+                let group = (grouped && stmt.is_some()).then(|| (src, stmt.unwrap()));
+                let edge = EdgeRecord {
+                    id: EdgeId(0),
+                    src: NodeId(src),
+                    dst: NodeId(dst),
+                    kind: if virt { EdgeKind::CallsVirtual } else { EdgeKind::Calls },
+                    condition: EdgeCondition::Always,
+                    confidence: Confidence::Probable,
+                    tier: Tier::NameSyntactic,
+                    rule: "name-arity".into(),
+                    site_id: None,
+                    stmt_index: stmt,
+                    cut_markers: CutMarkers::new(),
+                    implicit: None,
+                    candidate_group: None,
+                    established_by: None,
+                    cfg_condition: None,
+                    macro_origin: None,
+                    transform: None,
+                };
+                (group, edge)
             })
             .collect();
-        LinkedGraph::new(nodes, edges, vec![])
+        // A candidate set names each target once (the linker dedups its dsts).
+        let mut seen = std::collections::HashSet::new();
+        edges.retain(|(g, e)| g.is_none_or(|g| seen.insert((g, e.dst))));
+        let key = |g: Option<u32>, e: &EdgeRecord| {
+            (e.src.0, e.dst.0, e.kind as u8, e.stmt_index.unwrap_or(u32::MAX), g.unwrap_or(u32::MAX))
+        };
+        // Order with provisional groups placed by first appearance, number them,
+        // then sort by the final numbers (a fixed point, as in the linker).
+        edges.sort_by_key(|(_, e)| key(None, e));
+        let mut numbers: std::collections::HashMap<(u32, u32), u32> = Default::default();
+        for (g, e) in &mut edges {
+            if let Some(g) = g {
+                let next = numbers.len() as u32;
+                e.candidate_group = Some(*numbers.entry(*g).or_insert(next));
+            }
+        }
+        let mut edges: Vec<EdgeRecord> = edges.into_iter().map(|(_, e)| e).collect();
+        edges.sort_by_key(|e| key(e.candidate_group, e));
+        let mut candidates = Vec::new();
+        for (i, e) in edges.iter_mut().enumerate() {
+            e.id = EdgeId(i as u32);
+            if let Some(g) = e.candidate_group {
+                let rank = candidates.iter().filter(|c: &&Candidate| c.candidate_group == g).count();
+                candidates.push(Candidate { candidate_group: g, dst: e.dst, rank: rank as u32 });
+            }
+        }
+        candidates.sort_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+        LinkedGraph::new(nodes, edges, candidates)
     }
 }
 

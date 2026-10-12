@@ -29,9 +29,16 @@ cargo build --release          # -> target/release/cgx
 
 cgx auto-indexes on the first query — there is no separate `index` step (pass
 `--no-auto-index` to require an explicit `cgx index` instead). The questions
-below run against this repository's own checked-in fixture corpus
-([`fixtures/rust-sample/`](fixtures/rust-sample/), a small hand-audited tree), so
-you can reproduce them exactly from a fresh clone.
+below run against this repository's own checked-in fixture corpus under
+[`fixtures/`](fixtures/) — small, hand-audited trees. cgx indexes the whole
+repository, so every symbol below resolves from the repo root and you can
+reproduce each answer exactly from a fresh clone.
+
+Two questions — an exact answer and an over-approximate one — asked the same way
+in every supported language. Pick the language you want to see:
+
+<details open>
+<summary><b>Rust</b></summary>
 
 **What does this function call?** `direct::chain` makes three ordinary calls, so
 the answer is exact — every edge is a direct static binding:
@@ -43,7 +50,7 @@ rust_sample::direct::chain  fixtures/rust-sample/src/direct.rs:47
 ├─ rust_sample::direct::step_b  fixtures/rust-sample/src/direct.rs:54
 └─ rust_sample::direct::step_c  fixtures/rust-sample/src/direct.rs:55
 approximation: exact (within modeled graph)
-freshness: current | indexed tree 706ab89, working tree clean
+freshness: current | indexed tree b52f0a0, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `make_speak` takes a `&dyn Speak`, so
@@ -58,8 +65,131 @@ rust_sample::virtual_dispatch::make_speak  fixtures/rust-sample/src/virtual_disp
 ├─ rust_sample::virtual_dispatch::Dog::speak  fixtures/rust-sample/src/virtual_dispatch.rs:18  [possible]
 └─ rust_sample::virtual_dispatch::Speak::speak  fixtures/rust-sample/src/virtual_dispatch.rs:6  [possible]
 approximation: over- and under-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur; 2 call(s) in the searched region resolved to no in-repo target (external/unindexed callee; no SCIP) and could not be followed
-freshness: current | indexed tree 706ab89, working tree clean
+freshness: current | indexed tree b52f0a0, working tree clean
 ```
+</details>
+
+<details>
+<summary><b>Go</b></summary>
+
+**What does this function call?** `Chain` makes three ordinary calls — the answer
+is exact, every edge a direct static binding:
+
+```console
+$ cgx callees go::Chain
+go::Chain  fixtures/go/direct_chain.go:4
+├─ go::StepA  fixtures/go/direct_chain.go:10
+├─ go::StepB  fixtures/go/direct_chain.go:11
+└─ go::StepC  fixtures/go/direct_chain.go:12
+approximation: exact (within modeled graph)
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+
+**What does a dynamic call dispatch to?** `MakeBark` calls through the `Barker`
+interface, so the target is a candidate set. cgx labels every such edge
+`[possible]` and states the over-approximation:
+
+```console
+$ cgx callees go::MakeBark
+go::MakeBark  fixtures/go/virtual_dispatch.go:14
+├─ go::(*Cat)::Bark  fixtures/go/virtual_dispatch.go:12  [possible]
+└─ go::(*Dog)::Bark  fixtures/go/virtual_dispatch.go:11  [possible]
+approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+</details>
+
+<details>
+<summary><b>TypeScript</b></summary>
+
+**What does this function call?** `chain` makes three ordinary calls — the answer
+is exact, every edge a direct static binding:
+
+```console
+$ cgx callees ts::direct_chain::chain
+ts::direct_chain::chain  fixtures/ts/src/direct_chain.ts:17
+├─ ts::direct_chain::stepA  fixtures/ts/src/direct_chain.ts:4
+├─ ts::direct_chain::stepB  fixtures/ts/src/direct_chain.ts:8
+└─ ts::direct_chain::stepC  fixtures/ts/src/direct_chain.ts:12
+approximation: exact (within modeled graph)
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+
+**What does a dynamic call dispatch to?** `dispatchVocal` calls through the
+`Vocalizer` interface, so the target is a candidate set. cgx labels every such
+edge `[possible]` and states the over-approximation:
+
+```console
+$ cgx callees ts::polymorphism::dispatchVocal
+ts::polymorphism::dispatchVocal  fixtures/ts/src/polymorphism.ts:26
+├─ ts::polymorphism::Cat::vocalize  fixtures/ts/src/polymorphism.ts:19  [possible]
+├─ ts::polymorphism::Dog::vocalize  fixtures/ts/src/polymorphism.ts:13  [possible]
+└─ ts::polymorphism::Vocalizer::vocalize  fixtures/ts/src/polymorphism.ts:9  [possible]
+approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+</details>
+
+<details>
+<summary><b>Java</b></summary>
+
+**What does this function call?** `Direct.chain` makes three ordinary calls — the
+answer is exact, every edge a direct static binding:
+
+```console
+$ cgx callees com::example::direct::Direct::chain
+com::example::direct::Direct::chain  fixtures/java/Direct.java:4
+├─ com::example::direct::Direct::stepA  fixtures/java/Direct.java:10
+├─ com::example::direct::Direct::stepB  fixtures/java/Direct.java:14
+└─ com::example::direct::Direct::stepC  fixtures/java/Direct.java:18
+approximation: exact (within modeled graph)
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+
+**What does a dynamic call dispatch to?** `makeChirp` calls through the `Chirper`
+interface, so the target is a candidate set. cgx labels every such edge
+`[possible]` and states the over-approximation:
+
+```console
+$ cgx callees com::example::dispatch::VirtualDispatch::makeChirp
+com::example::dispatch::VirtualDispatch::makeChirp  fixtures/java/VirtualDispatch.java:4
+├─ com::example::dispatch::Cat::chirp  fixtures/java/VirtualDispatch.java:22  [possible]
+└─ com::example::dispatch::Dog::chirp  fixtures/java/VirtualDispatch.java:15  [possible]
+approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+</details>
+
+<details>
+<summary><b>Python</b></summary>
+
+**What does this function call?** `chain` makes three ordinary calls — the answer
+is exact, every edge a direct static binding:
+
+```console
+$ cgx callees fixtures::python::direct_chain::chain
+fixtures::python::direct_chain::chain  fixtures/python/direct_chain.py:17
+├─ fixtures::python::direct_chain::step_a  fixtures/python/direct_chain.py:5
+├─ fixtures::python::direct_chain::step_b  fixtures/python/direct_chain.py:9
+└─ fixtures::python::direct_chain::step_c  fixtures/python/direct_chain.py:13
+approximation: exact (within modeled graph)
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+
+**What does a dynamic call dispatch to?** `make_howl` calls `.howl()` on an
+untyped parameter, so the target is a candidate set. cgx labels every such edge
+`[possible]` and states the over-approximation:
+
+```console
+$ cgx callees fixtures::python::virtual_dispatch::make_howl
+fixtures::python::virtual_dispatch::make_howl  fixtures/python/virtual_dispatch.py:20
+├─ fixtures::python::virtual_dispatch::Cat::howl  fixtures/python/virtual_dispatch.py:16  [possible]
+├─ fixtures::python::virtual_dispatch::Dog::howl  fixtures/python/virtual_dispatch.py:11  [possible]
+└─ fixtures::python::virtual_dispatch::Howler::howl  fixtures/python/virtual_dispatch.py:6  [possible]
+approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+freshness: current | indexed tree b52f0a0, working tree clean
+```
+</details>
 
 The last two lines of each answer — the approximation contract and the freshness
 envelope — are the part worth reading closely.
@@ -84,7 +214,7 @@ rust_sample::virtual_dispatch::make_speak  (fixtures/rust-sample/src/virtual_dis
     -> rust_sample::virtual_dispatch::Speak::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:6)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
     -> rust_sample::virtual_dispatch::Dog::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:18)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
     -> rust_sample::virtual_dispatch::Cat::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:24)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
-freshness: current | indexed tree 706ab89, working tree clean
+freshness: current | indexed tree b52f0a0, working tree clean
 ```
 
 **Answers carry an approximation contract and a freshness envelope.** The

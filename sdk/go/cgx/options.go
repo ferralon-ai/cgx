@@ -98,9 +98,10 @@ func WithAllowSchemaSkew() Option { return func(c *config) { c.allowSchemaSkew =
 type IndexOption func(*indexConfig)
 
 type indexConfig struct {
-	force    bool
-	worktree bool
-	scip     string
+	force     bool
+	worktree  bool
+	scip      string
+	scipBytes *SCIPInput
 }
 
 // Force rebuilds even when the persisted graph matches HEAD.
@@ -113,3 +114,45 @@ func Worktree() IndexOption { return func(c *indexConfig) { c.worktree = true } 
 // SCIP applies the SCIP index at path (relative to the process's working
 // directory). An Index with SCIP always rebuilds.
 func SCIP(path string) IndexOption { return func(c *indexConfig) { c.scip = path } }
+
+// The size limits on SCIPInput, enforced by the engine on both transports.
+const (
+	MaxSCIPBytes            = 256 << 20
+	MaxCompileCommandsBytes = 64 << 20
+)
+
+// SCIPInput is a SCIP index to overlay on an index, supplied as bytes: the
+// in-memory form of `cgx index --scip --compdb --compdb-complete`. The overlay
+// only upgrades call edges the engine already found, and its semantics are
+// the engine's: the SDK passes the bytes through.
+type SCIPInput struct {
+	// Index is the .scip file's contents, from rust-analyzer or scip-clang. At
+	// most MaxSCIPBytes.
+	Index []byte
+	// CompileCommands is the compile_commands.json scip-clang compiled from;
+	// nil when none is known. At most MaxCompileCommandsBytes. A scip-clang
+	// index promotes a call edge to certain only when this covers every C++
+	// translation unit the index finds (.cpp, .cc, .cxx; headers never count)
+	// and otherwise caps it at probable; IndexStats.SCIP.Compdb reports which.
+	// Ignored for a rust-analyzer index.
+	CompileCommands []byte
+	// CompileCommandsDir is the base for an entry without "directory", the
+	// role the file's own directory plays for `cgx index --compdb`. Default:
+	// SourceRoot.
+	CompileCommandsDir string
+	// CompileCommandsComplete asserts that the compile commands cover every
+	// translation unit, without checking (`--compdb-complete`).
+	CompileCommandsComplete bool
+	// SourceRoot is the repository directory as CompileCommands names it.
+	// Default: the directory Open resolved (absolute, symlinks evaluated).
+	// Set it when the build ran elsewhere, e.g. in a container.
+	SourceRoot string
+}
+
+// SCIPBytes overlays in on the index. An Index with SCIPBytes always rebuilds,
+// and it cannot be combined with SCIP. The Graph keeps in, slices included,
+// to rebuild the same graph if the engine has to restart; do not modify them
+// afterwards.
+func SCIPBytes(in SCIPInput) IndexOption {
+	return func(c *indexConfig) { c.scipBytes = &in }
+}

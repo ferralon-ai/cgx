@@ -64,6 +64,22 @@ A `*Graph` is safe for concurrent use. Operations take turns on the engine; one
 waiting its turn gives up when its context is done, and `Close` aborts the one
 in progress.
 
+## SCIP overlays
+
+`Index` takes a SCIP index from rust-analyzer or scip-clang, either as a path
+(`cgx.SCIP`) or as bytes (`cgx.SCIPBytes`), which suits a caller that holds
+its build outputs in memory. The overlay only upgrades the confidence of call
+edges the engine already found. For a scip-clang index, `SCIPInput` also takes
+the build's `compile_commands.json` as bytes: a resolved edge becomes
+`certain` only when those commands cover every C++ translation unit in the
+repository (or `CompileCommandsComplete` asserts that they do), and otherwise
+stays `probable`. `IndexReport.Stats.SCIP` reports the upgrades and the
+completeness verdict, with a sample of any translation units the commands
+missed. Entries are matched against the repository directory as `Open`
+resolved it; set `SourceRoot` when the build ran elsewhere. The SCIP index is
+capped at `MaxSCIPBytes` (256 MiB) and the compile commands at
+`MaxCompileCommandsBytes` (64 MiB), on both transports.
+
 ## The embedded engine
 
 Release versions of this module (`sdk/go/vX.Y.Z` tags) embed `cgx.wasm`. On

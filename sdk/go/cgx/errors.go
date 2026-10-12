@@ -82,3 +82,9 @@ type IndexReport = transport.IndexReport
 
 // IndexStats are the engine's pipeline counters for one Index.
 type IndexStats = transport.IndexStats
+
+// SCIPStats is what a SCIP overlay changed (IndexStats.SCIP).
+type SCIPStats = transport.SCIPStats
+
+// CompdbStats is the scip-clang compile-commands completeness verdict.
+type CompdbStats = transport.CompdbStats

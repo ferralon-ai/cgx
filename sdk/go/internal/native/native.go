@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -48,6 +49,11 @@ type request struct {
 	Dataflow *bool           `json:"dataflow,omitempty"`
 	SCIP     *string         `json:"scip,omitempty"`
 	Force    *bool           `json:"force,omitempty"`
+
+	Compdb         *string `json:"compdb,omitempty"`
+	CompdbDir      *string `json:"compdb_dir,omitempty"`
+	CompdbComplete *bool   `json:"compdb_complete,omitempty"`
+	SourceRoot     *string `json:"source_root,omitempty"`
 }
 
 type response struct {
@@ -62,6 +68,7 @@ type Client struct {
 	bin    string
 	env    []string
 	cfg    transport.Config
+	dir    string // the work tree's top-level directory
 	stderr *transport.Ring
 
 	mu        sync.Mutex
@@ -109,7 +116,7 @@ func New(ctx context.Context, bin string, extraEnv []string, cfg transport.Confi
 		}
 		bin = p
 	}
-	return &Client{bin: bin, env: Env(os.Environ(), extraEnv), cfg: cfg,
+	return &Client{bin: bin, env: Env(os.Environ(), extraEnv), cfg: cfg, dir: repo.Dir,
 		stderr: transport.NewRing(stderr), stats: transport.Stats{Transport: name}}, nil
 }
 
@@ -330,7 +337,7 @@ func (c *Client) Index(ctx context.Context, req transport.IndexRequest) (*transp
 
 	// SCIP and an explicit dataflow choice always rebuild, as the engine's
 	// own index does.
-	if req.Mode == abi.ModeHead && !req.Force && req.SCIP == "" && req.Dataflow == nil {
+	if req.Mode == abi.ModeHead && !req.Rebuilds() {
 		r, err := c.open(ctx)
 		if err != nil {
 			return nil, err
@@ -343,6 +350,13 @@ func (c *Client) Index(ctx context.Context, req transport.IndexRequest) (*transp
 	ir := request{Op: "index", Mode: req.Mode, Dataflow: req.Dataflow, Force: &force}
 	if req.SCIP != "" {
 		ir.SCIP = &req.SCIP
+	}
+	if d := req.SCIPData; d != nil {
+		dir, err := writeSCIPFiles(&ir, d, c.dir)
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(dir)
 	}
 	raw, err := c.roundTrip(ctx, ir)
 	if err != nil {
@@ -414,4 +428,47 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	return nil
+}
+
+// writeSCIPFiles hands a bytes overlay to the engine, which reads its inputs
+// from files: it writes them to a fresh private directory, which the caller
+// removes, and points ir at them. The source root and compdb base are always
+// sent explicitly, defaulting as the wasm transport does: the engine's own
+// compdb default (the file's directory) would be the temporary one.
+func writeSCIPFiles(ir *request, d *transport.SCIPData, repoDir string) (string, error) {
+	dir, err := os.MkdirTemp("", "cgx-scip-")
+	if err != nil {
+		return "", err
+	}
+	write := func(name string, b []byte) (*string, error) {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			return nil, err
+		}
+		return &p, nil
+	}
+	if ir.SCIP, err = write("index.scip", d.Index); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	root := d.SourceRoot
+	if root == "" {
+		root = repoDir
+	}
+	ir.SourceRoot = &root
+	if d.CompileCommands != nil {
+		if ir.Compdb, err = write("compile_commands.json", d.CompileCommands); err != nil {
+			os.RemoveAll(dir)
+			return "", err
+		}
+		base := d.CompileCommandsDir
+		if base == "" {
+			base = root
+		}
+		ir.CompdbDir = &base
+	}
+	if d.CompileCommandsComplete {
+		ir.CompdbComplete = &d.CompileCommandsComplete
+	}
+	return dir, nil
 }

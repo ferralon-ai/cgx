@@ -261,7 +261,7 @@ func (h *Host) Index(ctx context.Context, req transport.IndexRequest) (*transpor
 func (h *Host) indexHead(ctx context.Context, head string, req transport.IndexRequest, ph *transport.Phases) (*transport.IndexReport, error) {
 	// SCIP and an explicit dataflow choice always rebuild, as the engine's
 	// own index does.
-	if !req.Force && req.SCIP == "" && req.Dataflow == nil {
+	if !req.Rebuilds() {
 		if h.residentKey == head && !h.worktree {
 			return transport.UpToDateReport(head), nil
 		}
@@ -432,13 +432,9 @@ func (h *Host) runIndex(ctx context.Context, opts abi.IndexBeginOpts, entries, c
 	h.statsMu.Unlock()
 
 	t = time.Now()
-	finish := [][]byte{[]byte("{}")}
-	if req.SCIP != "" {
-		scip, err := os.ReadFile(req.SCIP)
-		if err != nil {
-			return nil, err
-		}
-		finish = append(finish, scip)
+	finish, err := h.finishFrame(req)
+	if err != nil {
+		return nil, err
 	}
 	lock, err := flock.Acquire(ctx, filepath.Join(h.dir, "objects.lock"), flock.DefaultTimeout, flock.DefaultPoll)
 	if err != nil {
@@ -631,3 +627,33 @@ func firstNonNil(a, b *bool) *bool {
 }
 
 var _ transport.Transport = (*Host)(nil)
+
+// finishFrame builds cgx_index_finish's frame: [opts, scip?, source_root?,
+// compdb?, compdb_dir?]. The guest sees the repository at /, so the source
+// root the compile commands are anchored against is always the host's.
+func (h *Host) finishFrame(req transport.IndexRequest) ([][]byte, error) {
+	d := req.SCIPData
+	if req.SCIP != "" {
+		scip, err := os.ReadFile(req.SCIP)
+		if err != nil {
+			return nil, err
+		}
+		d = &transport.SCIPData{Index: scip}
+	}
+	if d == nil {
+		return [][]byte{[]byte("{}")}, nil
+	}
+	opts, err := json.Marshal(abi.IndexFinishOpts{CompdbComplete: d.CompileCommandsComplete})
+	if err != nil {
+		return nil, err
+	}
+	root := d.SourceRoot
+	if root == "" {
+		root = h.repo.Dir
+	}
+	frame := [][]byte{opts, d.Index, []byte(root)}
+	if d.CompileCommands != nil {
+		frame = append(frame, d.CompileCommands, []byte(d.CompileCommandsDir))
+	}
+	return frame, nil
+}

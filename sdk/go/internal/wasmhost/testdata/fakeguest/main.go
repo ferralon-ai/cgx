@@ -247,7 +247,7 @@ func writeFile(path string, b []byte) error {
 //go:wasmexport cgx_index_finish
 func cgxIndexFinish(p, n int32) int64 {
 	ff, err := abi.DecodeFrame(take(p, n))
-	if err != nil || len(ff) == 0 || len(ff) > 2 {
+	if err != nil || len(ff) == 0 || len(ff) > 5 {
 		return fail(abi.KindInvalidParams, "finish frame")
 	}
 	lastFinish = len(ff)

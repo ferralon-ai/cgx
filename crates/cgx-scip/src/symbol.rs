@@ -38,13 +38,18 @@ pub enum SymClass {
     /// A free function or an inherent (non-trait) method — eligible for
     /// `certain` when its def-site is unique.
     FreeOrInherent,
-    /// A trait method / associated item — capped at `probable` downstream.
+    /// A trait method / associated item — capped at `probable` downstream
+    /// (rust-analyzer resolves the occurrence to the trait *declaration*).
     TraitMember,
+    /// A C++ virtual / overridable member — capped at `probable` downstream.
+    /// scip-clang resolves a virtual call to the statically declared target,
+    /// which is not a devirtualization, so it never earns `certain`.
+    VirtualMember,
 }
 
 /// What kind of entity a descriptor names (decided by its trailing sigil).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DescKind {
+pub(crate) enum DescKind {
     /// `name/` — namespace / module.
     Namespace,
     /// `name#` — type (struct / enum / trait).
@@ -61,19 +66,31 @@ enum DescKind {
 
 /// A single parsed descriptor: its surviving name and what it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Descriptor {
-    name: String,
-    kind: DescKind,
+pub(crate) struct Descriptor {
+    pub(crate) name: String,
+    pub(crate) kind: DescKind,
 }
 
 /// The result of mapping a SCIP symbol to cgx coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedSymbol {
-    /// The crate-rooted cgx qualified name (e.g. `cgx_core::cut::CutMarkers::iter`).
+    /// The signature-free cgx qualified name (e.g. `cgx_core::cut::CutMarkers::iter`,
+    /// or `ns::f` for every C++ overload of `ns::f`). This is the display +
+    /// node-matching key.
     pub qname: String,
-    /// The Cargo package name (GM-14 dependency attribute).
+    /// The overload-precise identity key. For rust-analyzer symbols this equals
+    /// [`MappedSymbol::qname`] (Rust has no signature-free overload collision at
+    /// this layer). For scip-clang C++ symbols it carries the method
+    /// disambiguator, so `ns::f(int)` and `ns::f(double)` differ — and
+    /// [`crate::ScipResolver::def_count`] keys multiplicity on `(qname,
+    /// overload_key)` rather than on `qname` alone. Two def sites of the *same*
+    /// overload (header decl + `.cpp` def) share one key.
+    pub overload_key: String,
+    /// The package name (GM-14 dependency attribute). Empty for a C++
+    /// project-local symbol whose SCIP package fields are the placeholder `.`.
     pub package: String,
-    /// The semver version string (GM-14 dependency attribute).
+    /// The semver version string (GM-14 dependency attribute). May be empty for
+    /// a C++ symbol with no package-map coordinate.
     pub version: String,
 }
 
@@ -106,6 +123,7 @@ pub fn map_symbol(symbol: &str) -> Option<MappedSymbol> {
         .collect::<Vec<_>>()
         .join("::");
     Some(MappedSymbol {
+        overload_key: qname.clone(),
         qname,
         package,
         version,
@@ -232,7 +250,7 @@ fn tokenize(symbol: &str) -> Option<(String, String, Vec<Descriptor>)> {
 
 /// Parse the descriptor tail into a list of typed descriptors, classifying each
 /// by its trailing sigil.
-fn parse_descriptors(tail: &str) -> Vec<Descriptor> {
+pub(crate) fn parse_descriptors(tail: &str) -> Vec<Descriptor> {
     let mut out = Vec::new();
     let chars: Vec<char> = tail.chars().collect();
     let mut i = 0usize;

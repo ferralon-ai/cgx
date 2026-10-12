@@ -19,6 +19,7 @@
 //! extracted; files no adapter handles are skipped and counted, never
 //! mis-parsed.
 
+pub(crate) mod compdb;
 pub mod scip_relabel;
 
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ use cgx_resolve::{
 use cgx_scip::ScipResolver;
 use cgx_store::{BlobOid, FactStore, FragmentInput, LinkedGraph, TreeOid};
 
+pub use compdb::CompdbReport;
 pub use scip_relabel::ScipStats;
 
 /// Optional ingestion sources layered onto a base index run. `Default` (all
@@ -50,6 +52,15 @@ pub struct IndexOpts {
     /// value nodes, zero dataflow edges, unchanged latency). Set by
     /// `cgx index --dataflow`.
     pub dataflow: bool,
+    /// Path to a `compile_commands.json` backing a scip-clang (C++) index. When
+    /// set, the pipeline verifies it covers every C++ TU cgx discovers and passes
+    /// `Complete`/`Partial` to the fail-closed relabel gate (Phase F2). `None` ⇒
+    /// fail-closed `Partial` for a scip-clang index. Ignored for non-scip-clang
+    /// indices. Set by `cgx index --compdb`.
+    pub compdb: Option<PathBuf>,
+    /// CI assertion that the backing compdb is complete (`--compdb-complete`).
+    /// Overrides the coverage self-check to `Complete` for a scip-clang index.
+    pub compdb_complete: bool,
 }
 
 /// Counters describing what an index run did. The incremental win is observable
@@ -77,6 +88,10 @@ pub struct IndexStats {
     pub unresolved: usize,
     /// SCIP re-label counters, present only when an index was run with `--scip`.
     pub scip: Option<ScipStats>,
+    /// C++ compdb-completeness verdict + evidence, present only when a scip-clang
+    /// index was run (`--scip` with a scip-clang producer). Drives the fail-closed
+    /// gate and explains why C++ promotions did or did not reach `certain`.
+    pub compdb: Option<CompdbReport>,
     /// CHA trait-scoping counters. CHA is pure graph analysis and always runs
     /// (with or without `--scip`), so these are always present.
     pub cha: ChaStats,
@@ -285,6 +300,8 @@ pub(crate) fn extract_and_link<S: FactStore>(
 pub(crate) fn apply_scip(
     graph: &mut ResolvedGraph,
     stats: &mut IndexStats,
+    sources: &[SourceFile],
+    source_root: &Path,
     opts: &IndexOpts,
 ) -> Result<()> {
     let Some(scip_path) = opts.scip.as_ref() else {
@@ -293,7 +310,31 @@ pub(crate) fn apply_scip(
     let bytes = read_scip(scip_path)?;
     let resolver = ScipResolver::from_bytes(&bytes)
         .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
-    let scip_stats = scip_relabel::relabel(graph, &resolver, &scip_relabel::ScipRelabelOpts::default());
+    // FAIL-CLOSED compdb policy (ADR B2 Decision 3 / Phase F2): rust-analyzer
+    // indices have no compile_commands.json, so the gate does not apply. A
+    // scip-clang index's completeness is verified against the discovered C++ TU
+    // set (Eric's 2026-10-06 policy) — `Complete` only when every discovered TU
+    // is covered (or `--compdb-complete` asserts it); otherwise `Partial` caps
+    // promotion at `probable`.
+    let compdb = match resolver.scheme() {
+        cgx_scip::SymbolScheme::RustAnalyzer => scip_relabel::CompdbCompleteness::NotApplicable,
+        cgx_scip::SymbolScheme::ScipClang => {
+            let report = compdb::completeness(
+                sources,
+                source_root,
+                opts.compdb.as_deref(),
+                opts.compdb_complete,
+            );
+            let completeness = report.completeness;
+            stats.compdb = Some(report);
+            completeness
+        }
+    };
+    let relabel_opts = scip_relabel::ScipRelabelOpts {
+        local_packages: Vec::new(),
+        compdb,
+    };
+    let scip_stats = scip_relabel::relabel(graph, &resolver, &relabel_opts);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
     stats.scip = Some(scip_stats);

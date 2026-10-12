@@ -121,7 +121,25 @@ pub fn occurrence(range: &[i32], symbol: &str, roles: i64) -> Msg {
 
 /// Build a `SymbolInformation` message: `symbol=1`, `kind=5`, `enclosing=8`.
 pub fn symbol_info(symbol: &str, kind: i64, enclosing: &str) -> Msg {
+    symbol_info_rel(symbol, kind, enclosing, Vec::new())
+}
+
+/// Build a `Relationship` message: `symbol=1`, `is_implementation=3`.
+pub fn relationship(symbol: &str, is_implementation: bool) -> Msg {
     let mut m = Msg::new().string(1, symbol);
+    if is_implementation {
+        m = m.varint(3, 1);
+    }
+    m
+}
+
+/// Build a `SymbolInformation` message with `relationships=4` (repeated) in
+/// addition to `symbol=1`, `kind=5`, `enclosing=8`.
+pub fn symbol_info_rel(symbol: &str, kind: i64, enclosing: &str, relationships: Vec<Msg>) -> Msg {
+    let mut m = Msg::new().string(1, symbol);
+    for rel in relationships {
+        m = m.message(4, rel);
+    }
     if kind != 0 {
         m = m.varint(5, kind);
     }

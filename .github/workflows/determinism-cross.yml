@@ -1,0 +1,124 @@
+# determinism-cross.yml — the wasm engine and the native engine must write
+# byte-identical stores for a large real repository.
+#
+# The Go SDK's conformance suite (ci.yml, job go-sdk) asserts this on the
+# fixtures on every PR. A cold django index takes minutes natively and several
+# times that under wasm, so the large-repository check runs weekly and on
+# demand instead. Both sides index through the SDK's cgxsdk driver; the stores
+# are compared as the conformance suite compares them: every file under
+# objects/, fragments/ and refs/, plus the HEAD.json pointer (index.db,
+# cache.db and lock files excluded).
+
+name: determinism-cross
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WASI_SDK_VERSION: "34.0"
+  WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+  DJANGO_REPO: https://github.com/django/django.git
+  DJANGO_SHA: 8abacfc36d755d8e762a4d2074601b8dc412bfee
+
+jobs:
+  django:
+    name: wasm vs native store identity (django)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache wasi-sdk archive
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux-${{ env.WASI_SDK_SHA256 }}
+      - name: Install wasi-sdk
+        run: |
+          set -euo pipefail
+          # The archive is verified on every run, cached or not.
+          archive="$HOME/.cache/wasi-sdk/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          if [ ! -f "$archive" ]; then
+            mkdir -p "$(dirname "$archive")"
+            curl -sSfL -o "$archive" \
+              "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION%%.*}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          fi
+          echo "${WASI_SDK_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux" >> "$GITHUB_ENV"
+      - name: Build the engines
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- wasm --out "$RUNNER_TEMP/cgx.wasm"
+          cargo build --release --locked -p cgx-cli
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+      - name: Build cgxsdk
+        working-directory: sdk/go
+        run: go build -o "$RUNNER_TEMP/cgxsdk" ./internal/cmd/cgxsdk
+      - name: Check out django at the pinned commit (one copy per engine)
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/django-wasm"
+          git init -q "$src"
+          git -C "$src" fetch -q --depth 1 "$DJANGO_REPO" "$DJANGO_SHA"
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$src" rev-parse HEAD)" = "$DJANGO_SHA"
+          cp -a "$src" "$RUNNER_TEMP/django-native"
+      - name: Index with the wasm engine
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/django-wasm"
+          rm -rf "$repo/.cgx"
+          "$RUNNER_TEMP/cgxsdk" index -transport wasm -wasm "$RUNNER_TEMP/cgx.wasm" \
+            -force -json -repo "$repo" > "$RUNNER_TEMP/report-wasm.json"
+      - name: Index with the native engine
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/django-native"
+          rm -rf "$repo/.cgx"
+          "$RUNNER_TEMP/cgxsdk" index -transport native -bin "$GITHUB_WORKSPACE/target/release/cgx" \
+            -force -json -repo "$repo" > "$RUNNER_TEMP/report-native.json"
+      - name: Compare the stores
+        run: |
+          set -euo pipefail
+          manifest() {
+            (
+              cd "$1/.cgx"
+              test -f HEAD.json || { echo "::error::$1 has no .cgx/HEAD.json" >&2; exit 1; }
+              for p in objects fragments refs HEAD.json; do
+                if [ -e "$p" ]; then find "$p" -type f; fi
+              done | LC_ALL=C sort | tr '\n' '\0' | xargs -0 sha256sum
+            )
+          }
+          manifest "$RUNNER_TEMP/django-wasm" > "$RUNNER_TEMP/manifest-wasm.txt"
+          manifest "$RUNNER_TEMP/django-native" > "$RUNNER_TEMP/manifest-native.txt"
+          files="$(wc -l < "$RUNNER_TEMP/manifest-wasm.txt")"
+          if ! diff -u "$RUNNER_TEMP/manifest-wasm.txt" "$RUNNER_TEMP/manifest-native.txt" > "$RUNNER_TEMP/manifest.diff"; then
+            echo "::error::wasm and native stores differ ($(grep -c '^[-+][0-9a-f]' "$RUNNER_TEMP/manifest.diff") manifest lines; first 50 below)"
+            head -n 50 "$RUNNER_TEMP/manifest.diff"
+            exit 1
+          fi
+          echo "byte-identical: ${files} store files, django ${DJANGO_SHA}"
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-cross-django
+          path: |
+            ${{ runner.temp }}/report-*.json
+            ${{ runner.temp }}/manifest-*.txt
+            ${{ runner.temp }}/manifest.diff
+          if-no-files-found: ignore
+          retention-days: 30

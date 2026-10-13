@@ -45,6 +45,28 @@ extraction across instances and holds the store's write lock. `cgx-session` is
 the single implementation of session semantics for that module and for the
 native `cgx session` verb.
 
+The module imports one host function besides WASI: `cgx_host.yield() -> i32`.
+A host may run the session instance without per-loop termination checks
+(they multiply the instruction count of link-heavy work), so the engine calls
+out at a bounded cadence instead: every 4,096 allocator calls (deallocation
+included), every 4,096 iterations of the allocation-free loops in linking,
+the graph passes and the store (sorts, scans and rebuilds of the graph),
+between 1 MiB chunks when a reallocation copies a large block, and once per
+object the store writes. The call gives the host a point to run its own
+scheduler (a Go host's garbage collector cannot stop the world while compiled
+guest code runs) and to cancel: a non-zero return makes the module exit at
+once with status 125. Exiting there is safe because store writes are
+temp-then-rename with the ref and `HEAD.json` written last. Native builds
+compile the yield points to nothing.
+
+On a cold index of the Django repository (commit 8abacfc) under the Go SDK,
+the longest stop-the-world pause fell in the 0.9–1.6 ms histogram bucket and a
+cancel returned in 1.6–19 ms depending on the phase; `sdk/go/README.md` gives
+the details. The Go SDK's `TestYieldCadence` holds the cadence: it rewrites
+the module to count loop iterations between yields and fails when a run
+exceeds 2,097,152 on a generated repository, as an unticked pass over the
+graph does.
+
 This document specifies:
 
 - AR-1: Language choice (Rust decision and Go fallback assessment)

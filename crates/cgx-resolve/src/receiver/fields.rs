@@ -105,6 +105,7 @@ impl<'a> Fields<'a> {
         trace: bool,
     ) {
         for (file, func, base, field, src) in std::mem::take(&mut self.pending) {
+            cgx_core::yield_hook::tick();
             let classes = match base {
                 ValueSource::Var(v) => ix
                     .locals
@@ -117,6 +118,7 @@ impl<'a> Fields<'a> {
             match classes {
                 Some(cs) => {
                     for c in cs {
+                        cgx_core::yield_hook::tick();
                         self.typed_stores.insert((c, field));
                         self.store(ix, file, func, (c, field), src);
                     }
@@ -130,6 +132,7 @@ impl<'a> Fields<'a> {
             }
         }
         for (key, o, v) in std::mem::take(&mut self.copies) {
+            cgx_core::yield_hook::tick();
             let ts = flow.get(o, v).cloned().unwrap_or_else(TypeSet::top);
             self.stores.entry(key).or_default().join(&ts);
         }
@@ -140,8 +143,8 @@ impl<'a> Fields<'a> {
     /// name, and anywhere through a name of unknown type.
     pub(crate) fn attr_stores(&self) -> (Vec<(u32, &'a str)>, Vec<&'a str>) {
         (
-            self.typed_stores.iter().copied().collect(),
-            self.poisoned.iter().copied().collect(),
+            cgx_core::yield_hook::ticking(self.typed_stores.iter().copied()).collect(),
+            cgx_core::yield_hook::ticking(self.poisoned.iter().copied()).collect(),
         )
     }
 
@@ -180,6 +183,7 @@ impl<'a> Fields<'a> {
             lattice.ids().get(p)
         });
         for o in owners {
+            cgx_core::yield_hook::tick();
             if family.contains(o) || self.floating.contains(o) {
                 return None;
             }
@@ -187,6 +191,7 @@ impl<'a> Fields<'a> {
         let mut ts = TypeSet::default();
         let mut seen = false;
         for &x in family.iter().chain(&self.floating) {
+            cgx_core::yield_hook::tick();
             if let Some(s) = self.stores.get(&(x, f)) {
                 seen = true;
                 ts.join(s);
@@ -202,7 +207,9 @@ fn with_ancestors(lattice: &Lattice, mut classes: BTreeSet<u32>) -> (BTreeSet<u3
     let mut stack: Vec<u32> = classes.iter().copied().collect();
     let mut unknown = false;
     while let Some(x) = stack.pop() {
+        cgx_core::yield_hook::tick();
         for b in lattice.bases(x) {
+            cgx_core::yield_hook::tick();
             match b {
                 Base::Classes(cs) => {
                     stack.extend(cs.iter().copied().filter(|&s| classes.insert(s)));

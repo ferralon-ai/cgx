@@ -121,15 +121,11 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
     // "Compatibility definition"). The call site's language is its caller's —
     // looked up via the placeholder edge's `src`, the same `NodeRecord.lang` the
     // frontend stamped from `file.lang` when the caller was emitted.
-    let lang_by_id: BTreeMap<NodeId, &str> = graph
-        .nodes
-        .iter()
+    let lang_by_id: BTreeMap<NodeId, &str> = cgx_core::yield_hook::ticking(&graph.nodes)
         .map(|n| (n.node.id, n.node.lang.as_str()))
         .collect();
 
-    let mut next_group: u32 = graph
-        .edges
-        .iter()
+    let mut next_group: u32 = cgx_core::yield_hook::ticking(&graph.edges)
         .filter_map(|e| e.edge.candidate_group)
         .max()
         .map(|g| g + 1)
@@ -140,6 +136,7 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
     let mut drop_edge_idx: BTreeSet<usize> = BTreeSet::new();
 
     for site in &sites {
+        cgx_core::yield_hook::tick();
         // Always drop the placeholder edge — it is a sentinel, never stored as-is.
         drop_edge_idx.insert(site.edge_index);
 
@@ -215,7 +212,7 @@ struct IndirectSite {
 /// order. Each placeholder is one edge (the link pass emits exactly one).
 fn collect_indirect_sites(graph: &ResolvedGraph) -> Vec<IndirectSite> {
     let mut by_site: BTreeMap<(NodeId, SiteId), IndirectSite> = BTreeMap::new();
-    for (i, e) in graph.edges.iter().enumerate() {
+    for (i, e) in cgx_core::yield_hook::ticking(&graph.edges).enumerate() {
         let is_indirect = matches!(
             e.edge.kind,
             EdgeKind::CallsClosure | EdgeKind::CallsCallback | EdgeKind::CallsIndirect
@@ -304,8 +301,7 @@ impl CallableIndex {
     fn build(graph: &ResolvedGraph) -> CallableIndex {
         // A free function's FQN parent is not a type. Collect type FQNs first so we
         // can exclude methods (a callable whose parent is a known type).
-        let type_fqns: BTreeSet<&str> = graph
-            .node_records()
+        let type_fqns: BTreeSet<&str> = cgx_core::yield_hook::ticking(graph.node_records())
             .filter(|n| n.kind == SymbolKind::Type)
             .map(|n| n.fqn.as_str())
             .collect();
@@ -313,6 +309,7 @@ impl CallableIndex {
         let mut by_lang_arity: BTreeMap<(String, usize), Vec<NodeId>> = BTreeMap::new();
         let mut all_by_lang: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
         for n in graph.node_records() {
+            cgx_core::yield_hook::tick();
             let is_value = match n.kind {
                 SymbolKind::Lambda => true,
                 // Free function: a Function whose FQN parent is not a known type
@@ -332,11 +329,17 @@ impl CallableIndex {
             all_by_lang.entry(n.lang.clone()).or_default().push(n.id);
         }
         for v in by_lang_arity.values_mut() {
-            v.sort_by_key(|id| id.0);
+            v.sort_by_key(|id| {
+                cgx_core::yield_hook::tick();
+                id.0
+            });
             v.dedup();
         }
         for v in all_by_lang.values_mut() {
-            v.sort_by_key(|id| id.0);
+            v.sort_by_key(|id| {
+                cgx_core::yield_hook::tick();
+                id.0
+            });
             v.dedup();
         }
         CallableIndex {

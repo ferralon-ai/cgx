@@ -85,10 +85,12 @@ impl Lattice {
     pub(crate) fn intern(inputs: &[FileInput<'_>]) -> Self {
         let mut l = Lattice::default();
         for f in inputs {
+            cgx_core::yield_hook::tick();
             let Some(rules) = lang::rules(&f.lang) else {
                 continue;
             };
             for d in f.facts.defs.iter().filter(|d| d.kind == SymbolKind::Type) {
+                cgx_core::yield_hook::tick();
                 if l.ids.contains_key(&d.fqn) {
                     l.fqn_collisions += 1;
                     continue;
@@ -108,7 +110,9 @@ impl Lattice {
         l.subclasses = vec![BTreeSet::new(); n];
         l.structural = vec![false; n];
         for f in inputs.iter().filter(|f| lang::rules(&f.lang).is_some()) {
+            cgx_core::yield_hook::tick();
             for d in &f.facts.defs {
+                cgx_core::yield_hook::tick();
                 let Some((parent, m)) = d.fqn.rsplit_once("::") else {
                     continue;
                 };
@@ -122,6 +126,7 @@ impl Lattice {
                 set[c as usize].insert(m.into());
             }
             for tf in &f.facts.type_facts {
+                cgx_core::yield_hook::tick();
                 if let TypeFact::FieldBind { func, field, .. } = tf {
                     if let Some(c) = l.owning_class(func) {
                         l.attrs[c as usize].insert(field.clone());
@@ -152,6 +157,7 @@ impl Lattice {
         untyped: impl IntoIterator<Item = &'s str>,
     ) {
         for (c, f) in typed {
+            cgx_core::yield_hook::tick();
             self.attrs[c as usize].insert(f.to_owned());
         }
         self.foreign_attrs
@@ -207,7 +213,9 @@ impl Lattice {
                 table,
             };
             for (i, f) in inputs.iter().enumerate() {
+                cgx_core::yield_hook::tick();
                 for tf in &f.facts.type_facts {
+                    cgx_core::yield_hook::tick();
                     let TypeFact::ClassBases { class, bases } = tf else {
                         continue;
                     };
@@ -244,11 +252,13 @@ impl Lattice {
         let mut floating = BTreeSet::new();
         let mut meta_roots = Vec::new();
         for (c, bs) in resolved {
+            cgx_core::yield_hook::tick();
             seen[c as usize] = true;
             if bs.is_empty() {
                 self.rootless[c as usize] = true;
             }
             for r in bs {
+                cgx_core::yield_hook::tick();
                 self.open_nonclass_bases += usize::from(r.dynamic);
                 if r.meta {
                     meta_roots.push(c);
@@ -262,6 +272,7 @@ impl Lattice {
                 match &r.base {
                     Base::Classes(cs) => {
                         for &s in cs {
+                            cgx_core::yield_hook::tick();
                             self.subclasses[s as usize].insert(c);
                         }
                     }
@@ -275,17 +286,21 @@ impl Lattice {
             }
         }
         for (c, s) in seen.iter().enumerate() {
+            cgx_core::yield_hook::tick();
             if !s && self.rules[c].class_lattice {
                 self.bases[c].push(Base::Unknown);
                 floating.insert(c as u32);
             }
         }
         for c in meta_roots {
+            cgx_core::yield_hook::tick();
             for &s in self.cone(c).iter() {
+                cgx_core::yield_hook::tick();
                 self.meta[s as usize] = true;
             }
         }
         for &f in &floating {
+            cgx_core::yield_hook::tick();
             let cone = self.cone(f);
             self.floating.extend(cone.iter().copied());
         }

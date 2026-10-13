@@ -270,6 +270,7 @@ impl<'a> ReceiverIndex<'a> {
                     .iter()
                     .filter(|d| ledger::is_method_candidate(d, lang))
                 {
+                    cgx_core::yield_hook::tick();
                     if let Some(owner) = method_owner(&d.fqn, lang) {
                         by_owner.entry(owner).or_default().push(d);
                     }

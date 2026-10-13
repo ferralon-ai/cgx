@@ -99,7 +99,7 @@ fn overload_graph() -> ResolvedGraph {
             node(2, "app::f", "src/f.cpp", 7, SymbolKind::Function), // f(double)
         ],
         // Lexical default dst = node 2; both overloads are candidates (group 0).
-        edges: vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 0)],
+        edges: vec![call_edge(0, 2, EdgeKind::Calls, "src/main.cpp", 10, 5, 0)].into(),
         candidates: vec![
             Candidate { candidate_group: 0, dst: NodeId(2), rank: 0 },
             Candidate { candidate_group: 0, dst: NodeId(1), rank: 1 },
@@ -221,7 +221,16 @@ fn virtual_dispatch_caps_at_probable_even_under_complete_compdb() {
             node(0, "app::run", "src/main.cpp", 10, SymbolKind::Function),
             node(1, "shape::Circle::area", "src/shape.cpp", 5, SymbolKind::Method),
         ],
-        edges: vec![call_edge(0, 1, EdgeKind::CallsVirtual, "src/main.cpp", 10, 5, 0)],
+        edges: vec![call_edge(
+            0,
+            1,
+            EdgeKind::CallsVirtual,
+            "src/main.cpp",
+            10,
+            5,
+            0,
+        )]
+        .into(),
         candidates: vec![Candidate { candidate_group: 0, dst: NodeId(1), rank: 0 }],
         ..Default::default()
     };

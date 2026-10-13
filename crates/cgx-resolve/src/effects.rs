@@ -89,11 +89,15 @@ fn propagates_effects(kind: cgx_core::edge::EdgeKind) -> bool {
 pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
     // Own effects + forward propagating adjacency, keyed by NodeId (deterministic).
     let mut own: BTreeMap<NodeId, EffectSet> = BTreeMap::new();
+    // Every loop here visits each node or edge once with no allocation in
+    // most iterations: tick so a wasm host gets its yield points.
     for n in &graph.nodes {
+        cgx_core::yield_hook::tick();
         own.insert(n.node.id, n.node.own_effects);
     }
     let mut succ: BTreeMap<NodeId, BTreeSet<NodeId>> = BTreeMap::new();
     for e in &graph.edges {
+        cgx_core::yield_hook::tick();
         if propagates_effects(e.edge.kind) {
             // Ignore self-loops for adjacency; a direct self-recursive call adds no
             // effect beyond the node's own (handled by the SCC union anyway).
@@ -114,6 +118,7 @@ pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
     let mut scc_of: BTreeMap<NodeId, usize> = BTreeMap::new();
     for (i, comp) in sccs.iter().enumerate() {
         for &n in comp {
+            cgx_core::yield_hook::tick();
             scc_of.insert(n, i);
         }
     }
@@ -134,12 +139,14 @@ pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
         // Union all members' own effects (the SCC fixpoint: every member sees every
         // other member's effects through the cycle).
         for &n in comp {
+            cgx_core::yield_hook::tick();
             acc.union_with(*own.get(&n).unwrap_or(&EffectSet::new()));
         }
         // Union the settled effects of every successor outside this component.
         for &n in comp {
             if let Some(targets) = succ.get(&n) {
                 for &t in targets {
+                    cgx_core::yield_hook::tick();
                     let tj = scc_of[&t];
                     if tj != i {
                         acc.union_with(scc_effects[tj]);
@@ -152,6 +159,7 @@ pub fn run_effect_closure(graph: &mut ResolvedGraph) -> EffectStats {
 
     // Write each node's transitive set from its SCC's settled effects.
     for n in &mut graph.nodes {
+        cgx_core::yield_hook::tick();
         let eff = scc_of
             .get(&n.node.id)
             .map(|&i| scc_effects[i])

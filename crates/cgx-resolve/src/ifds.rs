@@ -131,6 +131,7 @@ pub fn run_ifds_summaries(
     let mut succ: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (caller, fd) in fns {
         for cs in &fd.calls {
+            cgx_core::yield_hook::tick();
             if let Some(callee) = &cs.callee_fqn {
                 if nodes.contains(callee) {
                     succ.entry(caller.clone()).or_default().insert(callee.clone());
@@ -163,6 +164,7 @@ pub fn run_ifds_summaries(
         loop {
             let mut changed = false;
             for fn_fqn in comp {
+                cgx_core::yield_hook::tick();
                 let Some(fd) = fns.get(fn_fqn) else { continue };
                 let new = compute_summary(fd, &summaries);
                 let prev = summaries.get(fn_fqn);
@@ -203,9 +205,11 @@ pub fn run_ifds_summaries(
     let mut applied_edges: u64 = 0;
     for fd in fns.values() {
         for cs in &fd.calls {
+            cgx_core::yield_hook::tick();
             let Some(callee) = &cs.callee_fqn else { continue };
             let Some(facts) = summaries.get(callee) else { continue };
             for sf in facts {
+                cgx_core::yield_hook::tick();
                 // SC4 materializes only Return flows; OutParam is reserved.
                 if !matches!(sf.formal_out, FormalOut::Return) {
                     continue;
@@ -309,6 +313,7 @@ fn compute_summary(
         let mut stack: Vec<(String, Transform, EdgeCondition)> =
             vec![(ret.clone(), Transform::Copy, EdgeCondition::Always)];
         while let Some((node, tr, cond)) = stack.pop() {
+            cgx_core::yield_hook::tick();
             if !visited.insert(node.clone()) {
                 continue;
             }

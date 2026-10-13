@@ -104,10 +104,16 @@ impl SymbolTable {
         }
         // Keep candidate lists deterministic.
         for v in t.by_short.values_mut() {
-            v.sort_by_key(|a| a.node_id.0);
+            v.sort_by_key(|a| {
+                cgx_core::yield_hook::tick();
+                a.node_id.0
+            });
         }
         for v in t.by_module_prefix.values_mut() {
-            v.sort_by_key(|a| a.node_id.0);
+            v.sort_by_key(|a| {
+                cgx_core::yield_hook::tick();
+                a.node_id.0
+            });
         }
         for m in t.by_module_prefix.keys() {
             t.by_module_last
@@ -226,7 +232,10 @@ impl SymbolTable {
                         }
                     }
                 }
-                hits.sort_by_key(|a| a.node_id.0);
+                hits.sort_by_key(|a| {
+                    cgx_core::yield_hook::tick();
+                    a.node_id.0
+                });
                 hits.dedup_by(|a, b| a.node_id == b.node_id);
                 match hits.len() {
                     0 => {}
@@ -275,7 +284,10 @@ pub fn collect_import_bindings(imports: &[ImportFact]) -> Vec<ImportBinding> {
             });
         }
     }
-    out.sort_by(|a, b| (&a.local, &a.specifier).cmp(&(&b.local, &b.specifier)));
+    out.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        (&a.local, &a.specifier).cmp(&(&b.local, &b.specifier))
+    });
     out
 }
 

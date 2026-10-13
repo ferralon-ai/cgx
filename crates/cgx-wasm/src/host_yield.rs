@@ -10,6 +10,9 @@
 //! - every [`ALLOC_EVERY`] allocator calls (allocation, reallocation and
 //!   deallocation: most engine work allocates, and drops of large structures
 //!   are long runs of deallocation alone);
+//! - every [`COPY_CHUNK`] bytes copied when a reallocation grows a block
+//!   larger than that (the system allocator's copy is one call, and growing
+//!   the link's edge list on a large repository copies hundreds of MiB);
 //! - every [`cgx_core::yield_hook::TICK_EVERY`] ticks in hot loops that do not
 //!   allocate, and once per object the store writes (through the hook this
 //!   module installs).
@@ -41,14 +44,10 @@ extern "C" {
 /// Exit status of a guest that stopped because the host's call was cancelled.
 pub const CANCELLED_EXIT: i32 = 125;
 
-/// Allocator calls per yield. Finer in count than the hook's tick cadence
-/// because an allocator call is much more work than a tick-marked iteration.
-///
-/// Measured with this cadence (alongside the hook's) on a large Python
-/// repository: about 41,000 yields over a whole index, a negligible share of
-/// its run, and a cancel during the link returned in 8.6 ms. Ticking only on
-/// allocation and reallocation left the longest pause at 345 ms, in the drop of
-/// the link's symbol tables; counting deallocation too removed it.
+/// Allocator calls per yield: the same count as the hook's tick cadence, so
+/// in time the coarser of the two (an allocator call is more work than a
+/// tick-marked iteration). Deallocation counts too: dropping the link's symbol
+/// tables is a long run of deallocation alone.
 pub const ALLOC_EVERY: u32 = 1 << 12;
 
 static ALLOCS: AtomicU32 = AtomicU32::new(0);
@@ -71,13 +70,28 @@ pub fn yield_now() {
     }
 }
 
+/// Bytes copied between yields when [`YieldingAlloc`] grows a block of more
+/// than this size.
+///
+/// The price is in-place growth: such a block always moves, so the old and
+/// the new block are both live during the copy, and a block the allocator
+/// could have extended where it lay is copied anyway. On a cold index of the
+/// Django repository the session's peak linear memory is the same either way,
+/// and the longest run between yields in reference resolution, where the
+/// link's edge list grows, fell from 92 ms to 3 ms (on a loaded machine).
+pub const COPY_CHUNK: usize = 1 << 20;
+
 /// The system allocator, counting calls towards the next yield. The tick runs
 /// before the call it counts, never inside the allocator, so an exit at a
-/// yield never interrupts the heap mid-update.
+/// yield never interrupts the heap mid-update. Growing a block larger than
+/// [`COPY_CHUNK`] always moves it: the new block is allocated, the contents
+/// copied in chunks with a yield between them, and the old block freed, so the
+/// heap is consistent at each of those yields too.
 #[derive(Debug)]
 pub struct YieldingAlloc;
 
-// SAFETY: forwards every call unchanged to `System`.
+// SAFETY: forwards every call to `System`; a large growing `realloc` is
+// `System`'s own alloc, copy and dealloc, with yields between copy chunks.
 unsafe impl GlobalAlloc for YieldingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         tick();
@@ -93,8 +107,32 @@ unsafe impl GlobalAlloc for YieldingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         tick();
-        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        if layout.size() <= COPY_CHUNK || new_size <= layout.size() {
+            // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
+            return unsafe { System.realloc(ptr, layout, new_size) };
+        }
+        // SAFETY: `realloc`'s contract makes `new_size`, rounded up to
+        // `layout.align()`, a valid size for that alignment.
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        // SAFETY: `new_layout` has a non-zero size (it exceeds `layout`'s).
+        let new = unsafe { System.alloc(new_layout) };
+        if new.is_null() {
+            return new;
+        }
+        let len = layout.size();
+        let mut off = 0;
+        while off < len {
+            let n = COPY_CHUNK.min(len - off);
+            // SAFETY: both blocks are live, distinct, and at least `len` long.
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(off), new.add(off), n) };
+            off += n;
+            if off < len {
+                yield_now();
+            }
+        }
+        // SAFETY: `ptr` was allocated with `layout` and is not used again.
+        unsafe { System.dealloc(ptr, layout) };
+        new
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {

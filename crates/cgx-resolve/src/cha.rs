@@ -103,9 +103,7 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     let node_index = node_index(graph);
 
     // Allocate new group ids above the current maximum, deterministically.
-    let mut next_group: u32 = graph
-        .edges
-        .iter()
+    let mut next_group: u32 = cgx_core::yield_hook::ticking(&graph.edges)
         .filter_map(|e| e.edge.candidate_group)
         .max()
         .map(|g| g + 1)
@@ -119,6 +117,7 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     let mut drop_edge_idx: BTreeSet<usize> = BTreeSet::new();
 
     for site in &sites {
+        cgx_core::yield_hook::tick();
         let template = &graph.edges[site.edge_indices[0]];
         let method = match short_name_of(graph, &node_index, template.edge.dst) {
             Some(m) => m,
@@ -178,9 +177,10 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     graph.edges.reserve_exact(new_edges.len());
     graph.edges.extend(new_edges);
 
-    graph
-        .candidates
-        .retain(|c| !replaced_groups.contains(&c.candidate_group));
+    graph.candidates.retain(|c| {
+        cgx_core::yield_hook::tick();
+        !replaced_groups.contains(&c.candidate_group)
+    });
     graph.candidates.extend(new_candidates);
 
     crate::canonicalize(graph);
@@ -199,7 +199,7 @@ struct Site {
 /// indices in ascending index order.
 fn collect_name_method_sites(graph: &ResolvedGraph) -> Vec<Site> {
     let mut by_site: BTreeMap<(NodeId, SiteId), Vec<usize>> = BTreeMap::new();
-    for (i, e) in graph.edges.iter().enumerate() {
+    for (i, e) in cgx_core::yield_hook::ticking(&graph.edges).enumerate() {
         if e.edge.kind == EdgeKind::CallsVirtual && e.edge.rule == NAME_METHOD_RULE {
             if let Some(site_id) = e.edge.site_id {
                 by_site.entry((e.edge.src, site_id)).or_default().push(i);
@@ -215,7 +215,7 @@ fn collect_name_method_sites(graph: &ResolvedGraph) -> Vec<Site> {
 /// scanning the node list per lookup.
 fn node_index(graph: &ResolvedGraph) -> HashMap<NodeId, usize> {
     let mut index = HashMap::with_capacity(graph.nodes.len());
-    for (i, n) in graph.nodes.iter().enumerate() {
+    for (i, n) in cgx_core::yield_hook::ticking(&graph.nodes).enumerate() {
         index.entry(n.node.id).or_insert(i);
     }
     index
@@ -312,6 +312,7 @@ impl Lattice {
         let mut type_fqns: BTreeSet<String> = BTreeSet::new();
 
         for n in &graph.nodes {
+            cgx_core::yield_hook::tick();
             node_by_fqn.insert(n.node.fqn.clone(), n.node.id);
             match n.node.kind {
                 SymbolKind::Method | SymbolKind::Function => {
@@ -330,6 +331,7 @@ impl Lattice {
         };
 
         for e in &graph.edges {
+            cgx_core::yield_hook::tick();
             match e.edge.kind {
                 EdgeKind::Implements => {
                     if let (Some(ty), Some(tr)) = (fqn_of(e.edge.src), fqn_of(e.edge.dst)) {
@@ -349,7 +351,10 @@ impl Lattice {
             }
         }
         for v in implementors.values_mut() {
-            v.sort();
+            v.sort_by(|a, b| {
+                cgx_core::yield_hook::tick();
+                a.cmp(b)
+            });
             v.dedup();
         }
 
@@ -360,6 +365,7 @@ impl Lattice {
         let mut trait_methods_by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut has_default_body: BTreeSet<String> = BTreeSet::new();
         for n in &graph.nodes {
+            cgx_core::yield_hook::tick();
             if !matches!(n.node.kind, SymbolKind::Method | SymbolKind::Function) {
                 continue;
             }

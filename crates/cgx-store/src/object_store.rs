@@ -131,9 +131,22 @@ struct StoredCandidate {
 /// equivalent `Shard`.
 #[derive(Default, Serialize)]
 struct ShardRef<'a> {
+    #[serde(serialize_with = "ticking_seq")]
     nodes: Vec<StoredNodeRef<'a>>,
+    #[serde(serialize_with = "ticking_seq")]
     edges: Vec<StoredEdgeRef<'a>>,
+    #[serde(serialize_with = "ticking_seq")]
     candidates: Vec<StoredCandidate>,
+}
+
+/// Serialize `v` exactly as a `Vec<T>` (a length, then the elements), with a
+/// yield tick per element: one large shard is otherwise a single long encode
+/// with no yield point on wasm.
+fn ticking_seq<T: Serialize, S: serde::Serializer>(
+    v: &[T],
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.collect_seq(v.iter().inspect(|_| cgx_core::yield_hook::tick()))
 }
 
 #[derive(Serialize)]
@@ -278,6 +291,7 @@ impl StoredEdge {
 /// what lets an edge into another shard name its target without making that
 /// shard depend on the whole graph's numbering.
 pub(crate) fn sha1_stable_key(fqn: &str, dup_ordinal: u32) -> u64 {
+    cgx_core::yield_hook::tick();
     let mut h = Sha1::new();
     h.update((fqn.len() as u64).to_le_bytes());
     h.update(fqn.as_bytes());
@@ -300,11 +314,15 @@ fn stable_keys<'a>(
     nodes: impl Iterator<Item = &'a str>,
     hasher: fn(&str, u32) -> u64,
 ) -> Result<(Vec<u64>, HashMap<u64, u32>)> {
-    let mut ordinals: HashMap<&str, u32> = HashMap::new();
-    let mut keys = Vec::new();
-    let mut by_key: HashMap<u64, u32> = HashMap::new();
-    let mut fqns: Vec<&str> = Vec::new();
+    // Sized up front: growing a map of every node rehashes all of it in one
+    // call, a run with no yield point.
+    let n = nodes.size_hint().0;
+    let mut ordinals: HashMap<&str, u32> = HashMap::with_capacity(n);
+    let mut keys = Vec::with_capacity(n);
+    let mut by_key: HashMap<u64, u32> = HashMap::with_capacity(n);
+    let mut fqns: Vec<&str> = Vec::with_capacity(n);
     for (i, fqn) in nodes.enumerate() {
+        cgx_core::yield_hook::tick();
         let ord = ordinals.entry(fqn).or_insert(0);
         let sk = hasher(fqn, *ord);
         *ord += 1;
@@ -326,21 +344,22 @@ fn stable_keys<'a>(
 fn check_canonical(g: &LinkedGraph) -> Result<()> {
     let bad = |reason: String| Err(StoreError::NonCanonical { reason });
     for (i, n) in g.nodes.iter().enumerate() {
+        cgx_core::yield_hook::tick();
         if n.id.index() != i {
             return bad(format!("node `{}` has id {} at position {i}", n.fqn, n.id.0));
         }
     }
-    if let Some(w) = g
-        .nodes
-        .windows(2)
-        .find(|w| node_sort_key(&w[0]) > node_sort_key(&w[1]))
-    {
+    if let Some(w) = g.nodes.windows(2).find(|w| {
+        cgx_core::yield_hook::tick();
+        node_sort_key(&w[0]) > node_sort_key(&w[1])
+    }) {
         return bad(format!("node `{}` sorts after `{}`", w[0].fqn, w[1].fqn));
     }
     let n = g.nodes.len();
     let mut group_src: Vec<NodeId> = Vec::new();
     let mut prev = None;
     for (i, e) in g.edges.iter().enumerate() {
+        cgx_core::yield_hook::tick();
         if e.id.index() != i {
             return bad(format!("edge has id {} at position {i}", e.id.0));
         }
@@ -367,6 +386,7 @@ fn check_canonical(g: &LinkedGraph) -> Result<()> {
     }
     let mut prev = None;
     for c in &g.candidates {
+        cgx_core::yield_hook::tick();
         if c.candidate_group as usize >= group_src.len() {
             return bad(format!("candidate group {} has no edge", c.candidate_group));
         }
@@ -565,6 +585,7 @@ impl ObjectStore {
                 continue;
             };
             for f in files {
+                cgx_core::yield_hook::tick();
                 if let Some(rest) = f.file_name().to_str() {
                     if rest.ends_with(".tmp") {
                         continue;
@@ -586,6 +607,7 @@ impl ObjectStore {
 fn owning_key<'a>(fqn: &'a str, callables: &BTreeSet<&str>) -> &'a str {
     let mut s = fqn;
     loop {
+        cgx_core::yield_hook::tick();
         if callables.contains(s) {
             return s;
         }
@@ -616,6 +638,9 @@ impl FactStore for ObjectStore {
     fn put_fragments(&mut self, batch: &[FragmentInput<'_>]) -> Result<()> {
         let _lock = WriteLock::acquire(&self.lock_path)?;
         for f in batch {
+            // One yield per fragment, as per shard in `put_graph`; a fragment
+            // is written whole or not at all, so stopping here is safe.
+            cgx_core::yield_hook::yield_now();
             let path = ObjectOid(f.key.0.clone()).object_path(&self.fragments_dir);
             // Write-once per (key, frontend version): an unchanged file
             // re-puts to a true no-op (IX-1). An object written by a different
@@ -651,17 +676,21 @@ impl FactStore for ObjectStore {
 
         // Attribution: the callable FQNs, then each node's owning-function key.
         // Same-FQN nodes share a key, so dup-ordinals are shard-local too.
-        let callables: BTreeSet<&str> = g
-            .nodes
-            .iter()
-            .filter(|n| n.kind.is_callable())
-            .map(|n| n.fqn.as_str())
-            .collect();
+        let callables: BTreeSet<&str> = cgx_core::yield_hook::collect_set(
+            g.nodes
+                .iter()
+                .filter(|n| {
+                    cgx_core::yield_hook::tick();
+                    n.kind.is_callable()
+                })
+                .map(|n| n.fqn.as_str()),
+        );
 
         // Per node: its shard key and its index within that shard.
         let mut placement: Vec<(&str, u32)> = Vec::with_capacity(g.nodes.len());
         let mut shards: BTreeMap<&str, ShardRef<'_>> = BTreeMap::new();
         for n in &g.nodes {
+            cgx_core::yield_hook::tick();
             let key = owning_key(&n.fqn, &callables);
             let shard = shards.entry(key).or_default();
             placement.push((key, shard.nodes.len() as u32));
@@ -672,6 +701,7 @@ impl FactStore for ObjectStore {
         let mut group_place: Vec<(&str, u32)> = Vec::new();
         let mut shard_groups: HashMap<&str, u32> = HashMap::new();
         for e in &g.edges {
+            cgx_core::yield_hook::tick();
             let (key, src) = placement[e.src.index()];
             let group = e.candidate_group.map(|gr| {
                 if gr as usize == group_place.len() {
@@ -685,6 +715,7 @@ impl FactStore for ObjectStore {
             shard.edges.push(StoredEdgeRef::new(e, src, sk[e.dst.index()], group));
         }
         for c in &g.candidates {
+            cgx_core::yield_hook::tick();
             let (key, group) = group_place[c.candidate_group as usize];
             shards.get_mut(key).expect("group placed").candidates.push(StoredCandidate {
                 group,
@@ -707,9 +738,10 @@ impl FactStore for ObjectStore {
             if self.stop_at_shard == Some(shard_entries.len()) {
                 return Err(std::io::Error::other("stopped at a yield point").into());
             }
-            shard
-                .candidates
-                .sort_unstable_by_key(|c| (c.group, c.rank, c.dst));
+            shard.candidates.sort_unstable_by(|a, b| {
+                cgx_core::yield_hook::tick();
+                (a.group, a.rank, a.dst).cmp(&(b.group, b.rank, b.dst))
+            });
             let oid = self.write_object(&mut batch, &encode(&shard)?)?;
             shard_entries.push(ShardEntry {
                 fn_key: fn_key.to_owned(),
@@ -920,11 +952,13 @@ impl FactStore for ObjectStore {
                     continue;
                 };
                 for oid in manifest.referenced_oids() {
+                    cgx_core::yield_hook::tick();
                     live.insert(oid.0.clone());
                 }
             }
         }
         for (oid, path) in Self::all_object_oids(&self.objects_dir)? {
+            cgx_core::yield_hook::tick();
             if !live.contains(&oid.0) {
                 fs::remove_file(&path)?;
             }
@@ -958,7 +992,7 @@ const SHA1_LEN: usize = 20;
 /// Encode a fragment with a trailing SHA-1 of its encoding.
 fn seal_fragment(sf: &StoredFragment) -> Result<Vec<u8>> {
     let mut bytes = encode(sf)?;
-    let digest = Sha1::digest(&bytes);
+    let digest = crate::oid::sha1(&bytes);
     bytes.extend_from_slice(&digest);
     Ok(bytes)
 }
@@ -968,7 +1002,7 @@ fn seal_fragment(sf: &StoredFragment) -> Result<Vec<u8>> {
 fn open_fragment(bytes: &[u8]) -> Option<StoredFragment> {
     let body_len = bytes.len().checked_sub(SHA1_LEN)?;
     let (body, trailer) = bytes.split_at(body_len);
-    if Sha1::digest(body).as_slice() != trailer {
+    if crate::oid::sha1(body).as_slice() != trailer {
         return None;
     }
     decode::<StoredFragment>(body).ok()

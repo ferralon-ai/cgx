@@ -16,21 +16,10 @@
 //! results are sorted by path.
 
 use crate::error::{IndexError, Result};
+use crate::source::SourceFile;
 use gix::bstr::ByteSlice;
 use std::collections::BTreeMap;
 use std::path::Path;
-
-/// One source file to index: its content-addressed identity plus its bytes.
-#[derive(Debug, Clone)]
-pub struct SourceFile {
-    /// Git blob OID (hex). For working-dir files this is the synthetic OID git
-    /// *would* assign — identical to the committed OID when content matches.
-    pub blob_oid: String,
-    /// Repo-relative, `/`-separated path.
-    pub rel_path: String,
-    /// Raw file bytes.
-    pub content: Vec<u8>,
-}
 
 /// A repository handle plus the means to enumerate sources from it.
 #[derive(Debug)]
@@ -96,8 +85,9 @@ impl Repo {
 
     /// Enumerate source files from `root` on disk (a working directory or linked
     /// worktree), computing each file's git blob OID from its current content
-    /// (IX-6 worktree awareness, IX-3 dirty handling). `.git` is skipped. Results
-    /// are sorted by repo-relative path.
+    /// (IX-6 worktree awareness, IX-3 dirty handling). Every `.git` entry is
+    /// skipped, and so is the `.cgx` directory directly under `root` (cgx's own
+    /// index); nothing else is excluded. Results are sorted by repo-relative path.
     pub fn enumerate_workdir(&self, root: impl AsRef<Path>) -> Result<Vec<SourceFile>> {
         let root = root.as_ref();
         let hash_kind = self.inner.object_hash();
@@ -385,6 +375,12 @@ fn walk_dir(
             path: path.display().to_string(),
             source,
         })?;
+        // cgx's own index at the walk root is never source. Walked, it would make
+        // every indexed checkout read as dirty and key the working set on store
+        // files whose bytes depend on which writer built them.
+        if file_type.is_dir() && dir == root && file_name == ".cgx" {
+            continue;
+        }
         if file_type.is_dir() {
             walk_dir(root, &path, hash_kind, out)?;
         } else if file_type.is_file() {

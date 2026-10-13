@@ -52,6 +52,8 @@ impl MatchOptions {
 struct Parse {
     family: Family,
     nfa: Nfa,
+    /// See [`Pattern::final_literals`](crate::grammar::Pattern::final_literals).
+    final_literals: Option<Vec<String>>,
 }
 
 /// A compiled selector: the union of every tokenizer's clean parse, plus the
@@ -89,6 +91,7 @@ pub fn compile(selector: &str) -> Result<Selector, SelectorError> {
                 parses.push(Parse {
                     family: tok.family(),
                     nfa: Nfa::compile(&pattern),
+                    final_literals: pattern.final_literals().map(<[String]>::to_vec),
                 });
             }
             Err(reason) => rejects.push(reason),
@@ -115,6 +118,20 @@ impl Selector {
     /// The families whose tokenizer accepted this selector (its provenance union).
     pub fn families(&self) -> &[Family] {
         &self.families
+    }
+
+    /// The final FQN segments (the text after the last `::`) a node must end in
+    /// to match, under any options: `Some` when every parse ends in a literal
+    /// segment or literal alternation, `None` when some parse's final segment is
+    /// a wildcard, negation or globstar. Lets a caller narrow candidates through
+    /// an index on final segments before evaluating, instead of scanning every
+    /// node.
+    pub fn final_segments(&self) -> Option<std::collections::BTreeSet<&str>> {
+        let mut out = std::collections::BTreeSet::new();
+        for parse in &self.parses {
+            out.extend(parse.final_literals.as_ref()?.iter().map(String::as_str));
+        }
+        Some(out)
     }
 
     /// Parse-time diagnostics (e.g. the `!*` → `*!` rewrite warning).

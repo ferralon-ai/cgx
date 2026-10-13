@@ -1,5 +1,5 @@
 // xtask — build tooling entry point
-// Subcommands: eval, determinism, bench (WP-12)
+// Subcommands: eval, determinism, bench (WP-12), wasm
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod bench;
 mod determinism;
 mod eval;
+mod wasm;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "cgx build tooling")]
@@ -23,6 +24,8 @@ enum Commands {
     Determinism(determinism::DeterminismArgs),
     /// Time index + a few representative queries against a repo.
     Bench(bench::BenchArgs),
+    /// Build the engine as a wasm32-wasip1 reactor module (needs a pinned wasi-sdk).
+    Wasm(wasm::WasmArgs),
 }
 
 fn main() -> Result<()> {
@@ -31,5 +34,6 @@ fn main() -> Result<()> {
         Commands::Eval(args) => eval::run(args),
         Commands::Determinism(args) => determinism::run(args),
         Commands::Bench(args) => bench::run(args),
+        Commands::Wasm(args) => wasm::run(args),
     }
 }

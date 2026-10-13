@@ -97,7 +97,31 @@ enum Affix {
     Contains,
 }
 
+impl Pattern {
+    /// The exact texts the pattern's final segment accepts, when that segment is
+    /// a plain literal or literal alternation; `None` when it is a wildcard,
+    /// negation or globstar (or the pattern is empty).
+    pub fn final_literals(&self) -> Option<&[String]> {
+        match self.segments.last()? {
+            PatternSeg::Segment(m) => m.literal_options(),
+            PatternSeg::Globstar => None,
+        }
+    }
+}
+
 impl SegmentMatcher {
+    /// The exact segment texts this matcher accepts when it is a plain literal or
+    /// literal alternation (no star, no negation); `None` otherwise.
+    pub fn literal_options(&self) -> Option<&[String]> {
+        match self.pieces.as_slice() {
+            [Piece::Run(RunPred::Set {
+                options,
+                negated: false,
+            })] => Some(options),
+            _ => None,
+        }
+    }
+
     /// Whether one FQN segment satisfies this matcher. Pure, O(segment length ×
     /// alternatives); no backtracking.
     pub fn matches(&self, seg: &str) -> bool {

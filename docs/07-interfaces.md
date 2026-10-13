@@ -41,7 +41,7 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | IF-15 | MCP tool: `explain` | Shipped |
 | IF-15a | MCP tools: `reaches`, `search`, `symbols`, `flows_to`, `flows_from`, `coupling` | Shipped |
 | IF-16 | MCP resources: `cgx://symbols/{root}`, `cgx://schema/{root}` | **Planned** — `resources/list` returns `method not found` |
-| IF-17 | MCP structured output: `structuredContent` per 2025-06-18 spec | **Shipped** — every tool result carries `structuredContent` alongside the `content` text mirror. A declared `outputSchema` is still Planned |
+| IF-17 | MCP structured output: `structuredContent` + `outputSchema` per 2025-06-18 spec | **Shipped** — every tool result carries `structuredContent` alongside the `content` text mirror, and every tool declares an `outputSchema` in `tools/list` |
 | IF-18 | MCP pagination: `cursor` + `has_more` | **Shipped** — both keys are present on every graph-backed tool result |
 | IF-19 | MCP token-efficiency: `max_results` | **Shipped** for `max_results` / `total_matched`. Compact symbol IDs and `resource_link` bulk evidence are Planned |
 | IF-20 | `paths` subcommand: must-analysis flags (`--must-pass-through`, `--avoiding`, `--quantifier`, `--including-exception-paths`, `--assert-all-reach-sink`) | **Planned (not yet shipped in v0.3.0)** |
@@ -301,7 +301,7 @@ Configuration in Claude Code (`.mcp.json` or project settings):
 
 `root` is required on every tool: the MCP server is addressed per call, not per session.
 
-**Still Planned:** MCP resources (IF-16), a declared `outputSchema` (IF-17), and the tools `taint_paths` (IF-23) and `diff_security` (IF-24).
+**Still Planned:** MCP resources (IF-16) and the tools `taint_paths` (IF-23) and `diff_security` (IF-24).
 
 **The CLI surface is larger than the MCP surface.** `index`, `doctor`, `diff` and `mcp` have no MCP equivalent. A statement that the MCP server "covers the same capability set as the CLI" is not true today.
 
@@ -349,7 +349,7 @@ Every tool result carries the same outer shape, verified by a live call against 
 
 Five things in that document are worth stating explicitly, because a doc that omits them misleads:
 
-1. **`structuredContent` is shipped**, and it is the canonical result. The `content[0].text` entry is a serialization of the same document, kept for clients that only consume `TextContent`. A declared `outputSchema` is not shipped.
+1. **`structuredContent` is shipped**, and it is the canonical result. The `content[0].text` entry is a serialization of the same document, kept for clients that only consume `TextContent`. Each tool declares the shape of its `structuredContent` as an `outputSchema` (IF-17).
 2. **`cursor`, `has_more` and `total_matched` are shipped** — pagination is real, driven by `max_results`.
 3. **`matches_head: null` is the *common* case, not an edge case.** With the MCP default `include_dirty: true`, any indexed repository returns `null` here and a freshness verdict of `unknown`. In the run above the working tree was clean and had just been indexed, yet `dirty: true` and `dirty_files_analyzed: 3`: the working-tree walk and the dirty-file count apply different ignore rules and disagree. **`matches_head` is three-valued (`true` / `false` / `null`); a client that treats it as a boolean is wrong in the ordinary case.**
 4. **`graph_version` exists on MCP and on no CLI format.** When an overlay is in play it takes the form `<indexed-tree>+dirty.<overlay-digest>`.
@@ -566,14 +566,13 @@ Returns the graph schema: node types, edge types, condition label vocabulary, co
 
 Both resources are subscribable; the server sends a `notifications/resources/updated` event when the index changes (after `cgx index` completes).
 
-### IF-17: Structured output per 2025-06-18 MCP spec — **Shipped, except `outputSchema`**
-
-The server response already includes both halves of this design:
+### IF-17: Structured output per 2025-06-18 MCP spec — **Shipped**
 
 - `structuredContent` — the primary structured result, present on every tool result (see "The MCP response envelope" above for a verbatim example)
 - `content` — the same data serialized as `TextContent` for clients that do not consume `structuredContent`
+- `outputSchema` — every tool registration in `tools/list` declares a JSON Schema (draft 2020-12) for its `structuredContent`, with an object root and named `$defs`
 
-**Planned:** the `outputSchema` declaration in tool registration. `tools/list` does not carry one today, so a client can consume `structuredContent` but cannot validate it against a declared schema.
+The schemas are generated from the Rust types the handlers serialize (`crates/cgx-mcp/src/output.rs`), so the declaration and the emitted bytes share one definition. `tools/list` omits `description` and `format` annotations to keep the registry small; `cgx mcp --print-schemas` prints the annotated document for code generators — every tool's output types under `$defs` keyed by type name, each tool's `inputSchema` under `<Tool>Input`, and `properties` mapping each tool name to `{input, output}`. The same document is checked in at `schemas/mcp-tools.schema.json`. Tests fail when it drifts from the code, when any tool's real output stops validating against its declared schema, or when the bytes of the fixture answers change (golden snapshot).
 
 ### IF-18: Pagination — **Shipped**
 

@@ -6,13 +6,16 @@ use crate::cut::CutMarkers;
 use crate::id::{EdgeId, NodeId, SiteId};
 use crate::provenance::Provenance;
 use crate::transform::Transform;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Edge kinds (GM-2.1 call edges, GM-2.2 structural/dataflow, GM-9 `spawns`).
 ///
 /// `spawns` is an edge *kind*, orthogonal to the edge-condition label set
 /// (GM-9.1); a spawn inside a `catch` is `Spawns` with condition `Exception`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum EdgeKind {

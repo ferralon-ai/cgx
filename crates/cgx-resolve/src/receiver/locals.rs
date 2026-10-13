@@ -33,7 +33,9 @@ impl<'a> Locals<'a> {
     pub(crate) fn build(inputs: &'a [FileInput<'a>]) -> Self {
         let mut l = Locals::default();
         for f in inputs.iter().filter(|f| lang::rules(&f.lang).is_some()) {
+            cgx_core::yield_hook::tick();
             for tf in &f.facts.type_facts {
+                cgx_core::yield_hook::tick();
                 match tf {
                     TypeFact::Param { func, name, .. } => {
                         l.locals.insert((func, name));

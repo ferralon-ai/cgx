@@ -110,8 +110,10 @@ impl<'a> Flow<'a> {
     /// Propagate along copy edges until nothing changes.
     fn solve(&mut self) {
         loop {
+            cgx_core::yield_hook::tick();
             let mut changed = false;
             for &(from, to) in &self.copies {
+                cgx_core::yield_hook::tick();
                 let (src, dst) = if from < to {
                     let (a, b) = self.state.split_at_mut(to);
                     (&a[from], &mut b[0])
@@ -143,10 +145,12 @@ impl<'a> TypeEnv<'a> {
     pub(crate) fn build(ix: &ReceiverIndex<'a>, inputs: &'a [FileInput<'a>], trace: bool) -> Self {
         let mut env = TypeEnv::default();
         for (i, f) in inputs.iter().enumerate() {
+            cgx_core::yield_hook::tick();
             if f.lang != "python" || f.facts.module.is_none() {
                 continue;
             }
             for tf in &f.facts.type_facts {
+                cgx_core::yield_hook::tick();
                 match tf {
                     TypeFact::Param {
                         func,
@@ -217,6 +221,7 @@ pub(crate) fn typed_lookup(lattice: &Lattice, ts: &TypeSet, m: &str) -> Lookup {
         out.targets.extend(r.targets.iter().copied());
     }
     for &(c, cone) in &ts.types {
+        cgx_core::yield_hook::tick();
         let r = if cone {
             lattice.cone_lookup(c, m)
         } else {
@@ -241,6 +246,7 @@ pub(crate) fn resolve_type(
         TypeExpr::Union(members) => {
             let mut ts = TypeSet::default();
             for m in members {
+                cgx_core::yield_hook::tick();
                 ts.join(&resolve_type(ix, file, scope, m, cone));
             }
             return if ts.known() { ts } else { TypeSet::top() };
@@ -254,6 +260,7 @@ pub(crate) fn resolve_type(
         Resolved::Class(ids) => {
             let mut ts = TypeSet::default();
             for c in ids {
+                cgx_core::yield_hook::tick();
                 if ix.lattice.is_structural(c) {
                     return TypeSet::top();
                 }

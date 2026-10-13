@@ -37,7 +37,9 @@ pub(crate) fn seed<'a>(ix: &ReceiverIndex<'a>, inputs: &'a [FileInput<'a>], flow
         .enumerate()
         .filter(|(_, f)| f.lang == GO && f.facts.module.is_some());
     for (i, f) in files {
+        cgx_core::yield_hook::tick();
         for tf in &f.facts.type_facts {
+            cgx_core::yield_hook::tick();
             match tf {
                 TypeFact::Param {
                     func,
@@ -104,6 +106,7 @@ pub(crate) fn classify<'t>(ix: &ReceiverIndex<'t>, site: &Site<'_>) -> Option<Ve
     }
     let mut out = Vec::new();
     for &(c, _) in &ts.types {
+        cgx_core::yield_hook::tick();
         let hits = ix.hits_for(&BTreeSet::from([c]), site.method(), GO);
         if hits.is_empty() {
             return None;

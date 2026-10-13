@@ -19,13 +19,13 @@ const cancelledExit = 125
 
 // instantiateHost registers cgx_host.yield() -> i32 in rt.
 //
-// The engine calls it at a bounded cadence while it computes (every few
-// thousand allocator calls, every few tens of thousands of iterations of its
-// allocation-free loops, and per object the store writes). Being a Go
-// function call, it is a safepoint: compiled guest code in a runtime without
-// termination checks has none of its own, so without these calls a long
-// guest computation would hold up every stop-the-world garbage collection in
-// the process. It returns 1 when the calling operation's context is done; the
+// The engine calls it at a bounded cadence while it computes (every 4,096
+// allocator calls, every 4,096 iterations of its allocation-free loops,
+// between 1 MiB chunks of a large reallocation's copy, and per object the
+// store writes). Being a Go function call, it is a safepoint: compiled guest
+// code in a runtime without termination checks has none of its own, so
+// without these calls a long guest computation would hold up every
+// stop-the-world garbage collection in the process. It returns 1 when the calling operation's context is done; the
 // guest then exits with cancelledExit, and the operation returns the
 // context's error.
 func instantiateHost(ctx context.Context, rt wazero.Runtime) error {

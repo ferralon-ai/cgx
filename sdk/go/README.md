@@ -70,12 +70,27 @@ An operation whose context is done (or that `Close` aborts) returns the
 context's error. With the native transport the session process is stopped.
 With the wasm engine the call stops at the engine's next yield point: the
 extractors are compiled with wazero's termination checks, and the session
-module calls back into the host (`cgx_host.yield`) every few thousand
-allocations and every few tens of thousands of iterations of its
-allocation-free loops, and once per object it writes. Cancellation latency is
-bounded by that cadence, typically a few milliseconds. The same yield points
-let the Go runtime stop the world for garbage collection while the engine
-runs, so other goroutines are not held up by a long index.
+module calls back into the host (`cgx_host.yield`) every 4,096 allocator calls,
+every 4,096 iterations of its long allocation-free loops, between 1 MiB chunks
+when it grows a large block, and once per object it writes. A cancelled call
+then discards the session instance, and the next call starts a new one.
+
+Those calls are also the only points at which the Go runtime can stop the world
+while the session module runs, so garbage collection waits for the next one.
+Measured on a cold index of the Django repository (commit 8abacfc: 3,044
+files extracted, 180,568 nodes, 1.5 million edges) in a two-CPU Linux VM:
+
+- a cancel returned in 1.6 ms during extraction and in 12–19 ms during
+  linking, the graph passes and the store write (one run per phase);
+- the longest stop-the-world pause over the whole index fell in the
+  0.9–1.6 ms bucket of the runtime's pause histogram
+  (`/sched/pauses/total/gc:seconds`; two runs);
+- a collection forced with `runtime.GC` every quarter second finished within
+  20 ms from the end of extraction to the end of the index, but took up to
+  half a second during extraction.
+
+So other goroutines are held up by an index: for about a millisecond per
+collection in these runs, longer when the host is short of CPU.
 
 A cancelled `Index` never leaves the store half-written. Objects are written
 to temporary files and renamed into place, and the ref and `HEAD.json` that

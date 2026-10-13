@@ -116,10 +116,14 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // The ledger is keyed by symbol-table ids, which the sort may just have moved.
     let (precision, mut narrowing) = ledger.finish(&table);
     if let Some(remap) = remap {
-        narrowing = narrowing
-            .into_iter()
-            .map(|(id, counts)| (remap[id.index()], counts))
-            .collect();
+        // Inserts, not `collect`: collecting sorts the remapped keys in one
+        // run with no yield point.
+        let mut remapped = std::collections::BTreeMap::new();
+        for (id, counts) in narrowing {
+            cgx_core::yield_hook::tick();
+            remapped.insert(remap[id.index()], counts);
+        }
+        narrowing = remapped;
     }
     let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
     graph.dataflow = dataflow;

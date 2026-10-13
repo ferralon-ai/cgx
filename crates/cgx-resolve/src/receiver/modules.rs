@@ -77,9 +77,11 @@ impl ModuleIndex {
     pub(crate) fn build(inputs: &[FileInput<'_>]) -> Self {
         let mut idx = ModuleIndex::default();
         for (i, f) in inputs.iter().enumerate() {
+            cgx_core::yield_hook::tick();
             let Some(m) = &f.facts.module else { continue };
             idx.modules.entry(m.clone()).or_default().push(i);
             for tf in &f.facts.type_facts {
+                cgx_core::yield_hook::tick();
                 if let TypeFact::Bind { func, var, src } = tf {
                     if func == m {
                         let key = (m.clone(), var.clone());
@@ -96,6 +98,7 @@ impl ModuleIndex {
             }
         }
         for m in idx.modules.keys() {
+            cgx_core::yield_hook::tick();
             let last = m.rsplit("::").next().unwrap_or(m);
             idx.by_last
                 .entry(last.to_owned())
@@ -105,8 +108,10 @@ impl ModuleIndex {
         idx.files = inputs.iter().map(file_scope).collect();
         let mut ambiguous = BTreeSet::new();
         for fs in &idx.files {
+            cgx_core::yield_hook::tick();
             let targets = fs.bindings.values().flatten().map(Target::spec);
             for s in targets.chain(&fs.globs) {
+                cgx_core::yield_hook::tick();
                 if matches!(idx.in_repo(s), InRepo::Suffix(ref v) if v.len() > 1) {
                     ambiguous.insert(&s.path);
                 }
@@ -217,12 +222,14 @@ impl ModuleIndex {
         if let Some(targets) = fs.bindings.get(head) {
             let mut acc = None;
             for t in targets {
+                cgx_core::yield_hook::tick();
                 join(&mut acc, self.resolve_target_fresh(d, t, rest));
             }
             return acc.unwrap_or(Resolved::NotFound);
         }
         let mut acc = None;
         for g in &fs.globs {
+            cgx_core::yield_hook::tick();
             join_found(
                 &mut acc,
                 self.resolve_target_fresh(d, &Target::Module(g.clone()), path),
@@ -288,6 +295,7 @@ impl ModuleIndex {
             InRepo::Suffix(ms) => {
                 let mut acc = None;
                 for m in &ms {
+                    cgx_core::yield_hook::tick();
                     join_found(&mut acc, self.resolve_in(d, m, path, seen));
                 }
                 if let Some(r) = acc {
@@ -342,12 +350,14 @@ impl ModuleIndex {
             return true;
         }
         for &f in self.modules.get(module).map(Vec::as_slice).unwrap_or(&[]) {
+            cgx_core::yield_hook::tick();
             let fs = &self.files[f];
             let bound = fs.bindings.get(name).into_iter().flatten();
             if bound.map(Target::spec).any(|s| s != spec) {
                 return true;
             }
             for g in fs.globs.iter().filter(|g| *g != spec) {
+                cgx_core::yield_hook::tick();
                 let serves = match self.in_repo(g) {
                     InRepo::Exact(m) => self.may_serve(d, m, name, spec, visited),
                     InRepo::Suffix(_) | InRepo::Missing | InRepo::External => true,
@@ -379,7 +389,9 @@ impl ModuleIndex {
         let files = self.modules.get(module).map(Vec::as_slice).unwrap_or(&[]);
         let mut acc = None;
         for &f in files {
+            cgx_core::yield_hook::tick();
             for t in self.files[f].bindings.get(n).into_iter().flatten() {
+                cgx_core::yield_hook::tick();
                 join(&mut acc, self.resolve_target(d, t, rest, seen));
             }
         }
@@ -387,7 +399,9 @@ impl ModuleIndex {
             return r;
         }
         for &f in files {
+            cgx_core::yield_hook::tick();
             for g in &self.files[f].globs {
+                cgx_core::yield_hook::tick();
                 join_found(&mut acc, self.resolve_spec(d, g, path, seen));
             }
         }
@@ -431,6 +445,7 @@ impl ModuleIndex {
         }
         let mut acc = None;
         for src in srcs {
+            cgx_core::yield_hook::tick();
             let r = match src {
                 ValueSource::Var(x) => {
                     let path: Vec<String> = std::iter::once(x.clone())

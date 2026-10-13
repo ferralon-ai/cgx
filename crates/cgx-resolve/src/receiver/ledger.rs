@@ -71,8 +71,10 @@ impl Ledger {
         c.edges_after += hits.len();
         self.counts.entry(site.caller_id).or_default().typed_out += 1;
         self.note_narrowed(site);
-        let kept: BTreeSet<NodeId> = hits.iter().map(|d| d.node_id).collect();
+        let kept: BTreeSet<NodeId> =
+            cgx_core::yield_hook::collect_set(hits.iter().map(|d| d.node_id));
         for k in kept {
+            cgx_core::yield_hook::tick();
             *self.kept.entry(k).or_default() += 1;
         }
         if self.trace {
@@ -135,11 +137,13 @@ impl Ledger {
         table: &SymbolTable,
     ) -> (PrecisionStats, BTreeMap<NodeId, NarrowingCounts>) {
         for ((lang, m), n) in &self.narrowed {
+            cgx_core::yield_hook::tick();
             for d in table
                 .defs_by_short(m)
                 .iter()
                 .filter(|d| is_method_candidate(d, lang))
             {
+                cgx_core::yield_hook::tick();
                 let kept = self.kept.get(&d.node_id).copied().unwrap_or(0);
                 let away = n.saturating_sub(kept);
                 if away > 0 {

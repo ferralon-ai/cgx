@@ -15,18 +15,19 @@
 
 /// Work units per hook call through [`tick`].
 ///
-/// A unit is one iteration of a loop that neither allocates nor otherwise
-/// reaches a yield point: a comparison in a sort, a probe in a scan — a few
-/// to a few tens of guest instructions. The counter costs one add and one
-/// compare per unit.
+/// A unit is one iteration of a loop that does not reliably reach another
+/// yield point: a comparison in a sort, a probe in a scan, one record of a
+/// pass over the graph (a few map lookups, a hash). The counter costs one add
+/// and one compare per unit; the hook's call out is a host call, about 0.6 µs
+/// under wazero.
 ///
-/// Measured with this cadence and the allocator's (`cgx-wasm`) on a large
-/// Python repository: about 41,000 yields over a whole index, a negligible
-/// share of its run, and a cancel during the link returned in 8.6 ms. The
-/// long garbage-collection pauses that run still saw came from loops with no
-/// yield point at all, not from the spacing between yields, so a finer cadence
-/// would buy nothing measured; the fix for such a pause is a tick in its loop.
-pub const TICK_EVERY: u32 = 1 << 16;
+/// Measured with this cadence and the allocator's (`cgx-wasm`) on a cold index
+/// of the Django repository: about 150,000 yields from the session instance
+/// (about 0.1 s of a 20 s index), and a longest run between two yields of
+/// 16 ms on a loaded machine, in reference resolution, whose units are the
+/// heaviest at a few microseconds each. A quarter of this count halved that
+/// run at 2.7 times the yields.
+pub const TICK_EVERY: u32 = 1 << 12;
 
 #[cfg(target_family = "wasm")]
 mod imp {
@@ -78,6 +79,34 @@ pub fn tick() {
 #[inline]
 pub fn yield_now() {
     imp::yield_now();
+}
+
+/// `iter` with one [`tick`] per item, for a pass written as an iterator chain.
+#[inline(always)]
+pub fn ticking<I: IntoIterator>(iter: I) -> impl Iterator<Item = I::Item> {
+    iter.into_iter().inspect(|_| tick())
+}
+
+/// `iter` collected into a [`BTreeSet`](std::collections::BTreeSet).
+///
+/// `collect` sorts the whole input first, a run with no yield point, so on
+/// wasm the set is built by inserts instead, one [`tick`] each. The set is the
+/// same either way; off wasm this is `collect`.
+#[cfg(target_family = "wasm")]
+pub fn collect_set<T: Ord>(iter: impl IntoIterator<Item = T>) -> std::collections::BTreeSet<T> {
+    let mut set = std::collections::BTreeSet::new();
+    for x in iter {
+        tick();
+        set.insert(x);
+    }
+    set
+}
+
+/// `iter` collected into a [`BTreeSet`](std::collections::BTreeSet).
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+pub fn collect_set<T: Ord>(iter: impl IntoIterator<Item = T>) -> std::collections::BTreeSet<T> {
+    iter.into_iter().collect()
 }
 
 /// Count one unit of work (a no-op off wasm).

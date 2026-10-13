@@ -30,13 +30,27 @@ where
 {
     // Stable dense indexing of nodes in ascending order.
     let node_vec: Vec<N> = nodes.iter().cloned().collect();
-    let index_of: BTreeMap<&N, usize> = node_vec.iter().enumerate().map(|(i, n)| (n, i)).collect();
+    // Ticks: every pass below is a loop over all nodes or edges that mostly
+    // does not allocate, so a wasm host would otherwise get no yield point.
+    let index_of: BTreeMap<&N, usize> = node_vec
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            cgx_core::yield_hook::tick();
+            (n, i)
+        })
+        .collect();
     // Adjacency as index lists in ascending node order (BTreeSet iterates sorted).
     let adj: Vec<Vec<usize>> = node_vec
         .iter()
         .map(|n| {
+            cgx_core::yield_hook::tick();
             succ.get(n)
-                .map(|ts| ts.iter().filter_map(|t| index_of.get(t).copied()).collect::<Vec<_>>())
+                .map(|ts| {
+                    cgx_core::yield_hook::ticking(ts)
+                        .filter_map(|t| index_of.get(t).copied())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default()
         })
         .collect();
@@ -57,6 +71,7 @@ where
     }
 
     for start in 0..n {
+        cgx_core::yield_hook::tick();
         if idx[start] != UNVISITED {
             continue;
         }
@@ -68,6 +83,7 @@ where
         on_stack[start] = true;
 
         while let Some(frame) = call_stack.last_mut() {
+            cgx_core::yield_hook::tick();
             let v = frame.v;
             if frame.child < adj[v].len() {
                 let w = adj[v][frame.child];
@@ -88,6 +104,7 @@ where
                 if low[v] == idx[v] {
                     let mut comp: Vec<usize> = Vec::new();
                     loop {
+                        cgx_core::yield_hook::tick();
                         let w = tarjan_stack.pop().unwrap();
                         on_stack[w] = false;
                         comp.push(w);
@@ -95,8 +112,13 @@ where
                             break;
                         }
                     }
-                    let mut named: Vec<N> = comp.into_iter().map(|i| node_vec[i].clone()).collect();
-                    named.sort();
+                    let mut named: Vec<N> = cgx_core::yield_hook::ticking(comp)
+                        .map(|i| node_vec[i].clone())
+                        .collect();
+                    named.sort_by(|a, b| {
+                        cgx_core::yield_hook::tick();
+                        a.cmp(b)
+                    });
                     sccs.push(named);
                 }
                 call_stack.pop();

@@ -61,6 +61,7 @@ Exit code 3 is still reachable, but on this subcommand it means *the repository 
 | `--format` | `human\|json\|sarif\|dot\|mermaid\|d2` | `human` | Output format. `dot`, `mermaid`, and `d2` are path-shaped renderers and are rejected with exit 2 on this subcommand. |
 | `--depth` | integer | unbounded | Maximum backward traversal depth from each changed symbol. Omitting it is the intended default: a test three hops from the change is still impacted. A bound fires the `depth-limit` under-reason, and cannot let an `--assert-empty` gate pass silently — see [the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
 | `--confidence` | `possible\|probable\|certain` | `possible` | Minimum confidence floor; edges below this level are excluded from the walk. Excluding any edge fires the `below-confidence-floor` under-reason. |
+| `--max-candidates` | integer | no cap | Drop call edges that belong to an over-approximated candidate set (dynamic dispatch or name-collision) with more than `N` targets — the fan-out dial, orthogonal to `--confidence`. A single resolved call is never dropped. Any exclusion is reported as a `dropped-max-candidates` under-reason on the approximation contract. Dropping edges can only shrink the impacted set. |
 | `--assert-empty` | — | off | CI assertion: exit 1 if any impacted test is found, 0 if none is, 4 if the empty answer proves nothing — see [`--assert-empty` and the vacuity guard](#--assert-empty-and-the-vacuity-guard). |
 | `--allow-vacuous` | — | off | Suppress the `--assert-empty` vacuity guard, converting its exit 4 to exit 0. It does **not** suppress the degenerate-answer exit 4. |
 | `--at` | git ref | — | Rejected (exit 2): `--at` pins a query to a single ref's graph and conflicts with a two-sided comparison. Pass the refs positionally instead. |
@@ -74,6 +75,8 @@ Exit code 3 is still reachable, but on this subcommand it means *the repository 
 A diff that touches only other languages produces a *visibly degenerate* answer: an empty result set, an `impacted-language-unsupported` reason on the contract, a line on stderr, and **exit 4**. It is never a silent empty list that reads as "no tests to run". See [Degenerate answers](#degenerate-answers).
 
 TypeScript and JavaScript are indexed by cgx but are **not supported here**. Their test entrypoints are recorded as hints whose FQNs are built from the test's string label, so they never match a symbol FQN, and calls inside inline test callbacks produce no graph edge. There is no partial recovery — no TypeScript or JavaScript test appears in any answer.
+
+C and C++ are indexed by cgx but are **not supported here** either: cgx recognises no C or C++ test entrypoints, so a change confined to `.c`, `.h`, `.cpp`, or the other C/C++ extensions is a degenerate answer (`no supported language in the changed set (c)`, or `(cpp)`) and exits 4. The `impacted-language-unsupported` reason text on such an answer repeats the TypeScript/JavaScript explanation verbatim; for C and C++ the operative fact is only that no test is recognised.
 
 ### What counts as a test
 

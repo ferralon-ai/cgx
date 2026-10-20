@@ -39,10 +39,11 @@ This subcommand takes no positional arguments.
 | `--kind` | `function\|method\|type\|field\|variable\|module\|constant\|macro\|lambda\|entrypoint` | — | Restrict output to one symbol kind. No flag = all kinds. |
 | `--repo` | path | CWD | Path to the indexed repository containing a `.cgx/` store. |
 | `--format` | `human\|json\|sarif` | `human` | Output format. `dot`, `mermaid`, and `d2` are listed in `--help` but rejected here with exit 2: they render a path walk, and `unused` returns a flat list. |
-| `--at` | git ref | — | Pin the query to a specific commit's graph snapshot (Q-17). Requires the ref to have been indexed. |
+| `--at` | git ref | — | Pin the query to a specific commit's graph snapshot (Q-17). Materializes the ref in a detached worktree, indexes it, and queries the resulting graph; the ref need not have been indexed before. The working-tree `.cgx/` pointer is not touched. |
 | `--depth` | integer | unbounded | Bounds the entrypoint-reachability walk. Left unset the walk is unbounded, which is what makes the answer meaningful; `--depth 0` searches zero hops, so nothing but the entrypoints counts as reached — on the corpus used here that turns 373 unused functions into 1,139. |
 | `--tree` | `full\|spanning` | `full` | Ignored by `unused` (flat list, not a tree). |
 | `--confidence` | `possible\|probable\|certain` | — | Floor filter for reachability edges. No flag = no floor, all tiers counted as reaching. Raising the floor *grows* the result list, because fewer edges count as reaching. |
+| `--max-candidates` | integer | no cap | Drop call edges that belong to an over-approximated candidate set (dynamic dispatch or name-collision) with more than `N` targets — the fan-out dial, orthogonal to `--confidence`. A single resolved call is never dropped. Like raising `--confidence`, dropping edges from the reachability walk can only *grow* the result list. |
 | `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any unused symbols are found, exit 0 if none. Filter exclusion cannot make this pass vacuously — see [Exit codes](#exit-codes). |
 | `--allow-vacuous` | boolean flag | — | Suppress the ADR-08 vacuity guard: converts exit 4 to exit 0 when `--assert-empty` passes vacuously. |
 | `--no-auto-index` | boolean flag | — | Require an explicit prior `cgx index`; if no `.cgx/` store is present, exit 3 instead of auto-indexing. |

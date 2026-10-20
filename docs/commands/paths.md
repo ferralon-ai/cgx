@@ -46,6 +46,7 @@ Both arguments accept a partial name; cgx resolves to the matching symbol. If th
 | `--at` | git ref | working HEAD | Pin the query to a historical graph snapshot (e.g. `HEAD~1`, a tag, a commit SHA) |
 | `--depth` | integer | `6` | Maximum traversal depth. `0` = unlimited here (work-budgeted) — this is the one command where that is true |
 | `--confidence` | `possible\|probable\|certain` | — | Minimum confidence floor; edges below this tier are excluded. No flag = no floor, equivalent to `possible` (the lowest tier) |
+| `--max-candidates` | integer | no cap | Drop call edges that belong to an over-approximated candidate set (dynamic dispatch or name-collision) with more than `N` targets — the fan-out dial, orthogonal to `--confidence`. A single resolved call is never dropped. Any exclusion is reported as a `dropped-max-candidates` under-reason on the approximation contract. |
 | `--assert-empty` | — | off | CI assertion: exit 1 if any paths are found |
 | `--allow-vacuous` | — | off | Suppress the ADR-08 vacuity guard (vacuous pass exits 0 instead of 4) |
 | `--no-auto-index` | — | off | Require an explicit `cgx index` first; a missing index exits 3 |

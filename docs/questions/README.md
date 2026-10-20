@@ -1,6 +1,6 @@
 # Question Cookbook — Index
 
-This directory contains 13 theme files totalling 139 answered questions drawn from the question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme.
+This directory contains 13 theme files totalling 139 answered questions: Q1–Q138 from the question inventory in [docs/02-personas-and-questions.md](../02-personas-and-questions.md). Each file focuses on a single question theme and provides `cgx` query recipes for every question in that theme. Q139 (the `diff --path-added` structural gate) is a cookbook addition with no inventory entry.
 
 ---
 
@@ -36,15 +36,25 @@ Each entry follows a consistent template defined in the cycle synthesis document
 |---|---|
 | `answerable-today` | The query runs against a current v0.3 `cgx` index as written. |
 | `partial` | The structural portion of the query runs today; a secondary filter (e.g. `EXISTS { MATCH }`, `count(distinct …)`, a taint-class property) is deferred. The entry shows a runnable approximation and notes what is missing. |
-| `deferred (v0.3)` | One or more required CQL features or node/edge properties exit 2 with a plan or parse error in v0.3.0. A workaround or illustrative form is shown with a `-- NOT VALID in v0.3.0` comment. |
+| `deferred (v0.3)` | One or more required CQL features or node/edge properties exit 2 with a plan or parse error in v0.3.0. A workaround or illustrative form is shown with a `// NOT VALID in v0.3.0` comment. |
 | `needs-schema-room-feature (name)` | The question requires a schema-room feature (e.g. GM-14 dependency edges, DF-11 typed taint labels) that is not yet implemented. |
 | `schema-room` | Shorthand for the above when the blocking gate is a schema-room milestone rather than a named feature ID. |
 | `core-extension` | The question requires a core-extension feature (e.g. DF-19 lineage type reconstruction) that is planned but not in v0.3.0. |
 | `not answerable as specced` | The question as written requires capabilities outside `cgx`'s graph-reachability model (e.g. branch-predicate feasibility); no workaround exists. |
 
-Queries for non-`answerable-today` entries are headed with a comment line `-- illustrative: requires <feature-id>` or `-- NOT VALID in v0.3.0` so you can distinguish runnable from illustrative queries at a glance.
+Queries for non-`answerable-today` entries are headed with a comment line `// illustrative: requires <feature-id>` or `// NOT VALID in v0.3.0` so you can distinguish runnable from illustrative queries at a glance. `//` is the CQL line-comment syntax, so a pasted illustrative CQL block fails on the deferred feature it illustrates rather than on its header. Where an illustrative form is a whole shell command (`cgx query '…' --repo ./`), its lines are commented out with `#` instead, so the block is inert if pasted into a shell.
 
-**The query block.** Most entries show a Layer 2 (`cgx query '…'`) expression in a fenced code block labelled `cgx`. Some simple lookups show the Layer 1 subcommand form (`cgx callers …`, `cgx paths …`) with a note that the Layer 2 form also exists. Runnable forms in v0.3.0 include `MATCH … WHERE … RETURN`, `CALL cgx.<proc>(…) YIELD …`, and the predicates `COMPATIBLE_WITH`, `IS EMPTY`, `NONE`, `ANY`. The `MATCH ALL … MUST PASS THROUGH` and `AVOIDING` keyword forms are deferred (CQL parse error, exit 2 in v0.3.0); entries that show them label the block `-- NOT VALID in v0.3.0`. No deferred syntax is presented as runnable. The full syntax specification is in [docs/05-queries.md](../05-queries.md).
+**The query block.** Most entries show a Layer 2 (`cgx query '…'`) expression in a fenced code block labelled `cgx`. Some simple lookups show the Layer 1 subcommand form (`cgx callers …`, `cgx paths …`) with a note that the Layer 2 form also exists. Runnable forms in v0.3.0 include `MATCH … WHERE … RETURN`, `CALL cgx.<proc>(…) YIELD …`, and the predicates `COMPATIBLE_WITH`, `IS EMPTY`, `NONE`, `ANY`. The `MATCH ALL … MUST PASS THROUGH` and `AVOIDING` keyword forms are deferred (plan error, exit 2 in v0.3.0; an `AVOIDING` clause without `MATCH ALL` is a parse error); entries that show them label the block as not valid. No deferred syntax is presented as runnable. The full syntax specification is in [docs/05-queries.md](../05-queries.md).
+
+**Matching symbols by name.** How a name matches depends on where it appears, and a mismatch returns zero rows with exit 0 rather than an error:
+
+| Form | Short name (`chain`) | Full FQN (`my_crate::direct::chain`) | Partial path (`direct::chain`) or glob (`*::chain`) |
+|---|---|---|---|
+| Property map: `(a {name:"…"})` | matches | matches | matches nothing |
+| `WHERE a.name = "…"` | matches nothing | matches | matches nothing |
+| `WHERE a.name IN ["…", …]` | matches nothing | matches | matches nothing |
+
+Many entries below use short names inside `IN [...]` lists for readability. Substitute full FQNs from `cgx search <name>` before you run them.
 
 **Breaking it down.** A table (for queries with three or more distinct fragments) or a short explanatory paragraph (for simpler queries) walks through each fragment of the query in plain English. The breakdown is written for a reader who can read the query language but does not write it beyond light use — every clause is explained, and every term of art used in the breakdown is defined in [docs/13-glossary.md](../13-glossary.md).
 
@@ -56,4 +66,4 @@ Queries for non-`answerable-today` entries are headed with a comment line `-- il
 
 - **Query language specification and worked examples:** [docs/05-queries.md](../05-queries.md) — the authoritative reference for all query syntax, subcommand signatures, and the full Q-1 through Q-33 feature list.
 - **Term definitions:** [docs/13-glossary.md](../13-glossary.md) — plain-language definitions of every term of art used across the cookbook, including edge conditions, confidence tiers, transience, pedigree, taint vocabulary, semantic classes, and indexing terms.
-- **Persona question inventory:** [docs/02-personas-and-questions.md](../02-personas-and-questions.md) — the authoritative list of all 138 questions, their themes, and the personas that ask them.
+- **Persona question inventory:** [docs/02-personas-and-questions.md](../02-personas-and-questions.md) — the authoritative list of the 138 inventory questions (Q1–Q138), their themes, and the personas that ask them.

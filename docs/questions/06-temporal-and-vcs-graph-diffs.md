@@ -115,11 +115,11 @@ cgx paths 'handleRequest' 'exec' --at HEAD --repo ./
 **Deferred form (requires taint classification — plan error on v0.3.0)**
 
 ```cgx
--- NOT VALID in v0.3.0: source_class and sink_class are plan-error properties
--- cgx query '
---   MATCH (src)-[:DATA_FLOW*]->(sink)
---   WHERE src.source_class = "network" AND sink.sink_class = "sql"
--- ' --repo ./
+# NOT VALID in v0.3.0: source_class and sink_class are plan-error properties
+# cgx query '
+#   MATCH (src)-[:DATA_FLOW*]->(sink)
+#   WHERE src.source_class = "network" AND sink.sink_class = "sql"
+# ' --repo ./
 ```
 
 Specified in docs/05 Worked Example 6 (branch-diff security gate).
@@ -239,12 +239,12 @@ cgx reaches 'main' 'exec' --at HEAD --repo ./
 **Deferred form (requires sink classification — plan error on v0.3.0)**
 
 ```cgx
--- NOT VALID in v0.3.0: sink_class is a plan-error property
--- cgx query --at HEAD '
---   MATCH (ep {kind:"entrypoint"})-[:CALLS*]->(sink)
---   WHERE sink.sink_class IN ["shell","eval","exec"]
---   RETURN ep.name, sink.name, sink.sink_class
--- ' --repo ./
+# NOT VALID in v0.3.0: sink_class is a plan-error property
+# cgx query --at HEAD '
+#   MATCH (ep {kind:"entrypoint"})-[:CALLS*]->(sink)
+#   WHERE sink.sink_class IN ["shell","eval","exec"]
+#   RETURN ep.name, sink.name, sink.sink_class
+# ' --repo ./
 ```
 
 **Breaking it down**
@@ -315,20 +315,20 @@ cgx diff sprint-start HEAD --repo ./
 To find functions whose call-graph neighborhood changed, compare callers at each ref for symbols of interest. `--param` is not a v0.3.0 `cgx query` flag. `fn.introducing_commit`/`r.introducing_commit` in the illustrative CQL below do not exist as CQL node or edge properties at all (`plan error: unknown node/edge property`) — IX-9 attribution ships, but only as a field of `cgx diff --path-added --format json`'s `added_paths[]` entries; it was never wired into `MATCH`/`RETURN`, and there is no future version where this becomes runnable rather than a permanent architectural gap. Treat the block below as illustrative only:
 
 ```cgx
--- ILLUSTRATIVE: fn/r.introducing_commit are not CQL properties (IX-9 is diff-only); --param does not exist
--- cgx query '
---   MATCH (fn)
---   WHERE fn.introducing_commit IN $sprint_commits
---      OR ANY(r IN [(fn)-[r:CALLS]->() | r]
---             WHERE r.introducing_commit IN $sprint_commits)
---   WITH fn,
---        count { (fn)<-[:CALLS]-() } AS caller_count,
---        count { (fn)-[:CALLS]->() } AS callee_count
---   WHERE caller_count + callee_count >= 3
---   RETURN fn.name, fn.file, fn.line,
---          caller_count, callee_count
---   ORDER BY caller_count + callee_count DESC
--- ' --repo ./
+# ILLUSTRATIVE: fn/r.introducing_commit are not CQL properties (IX-9 is diff-only); --param does not exist
+# cgx query '
+#   MATCH (fn)
+#   WHERE fn.introducing_commit IN $sprint_commits
+#      OR ANY(r IN [(fn)-[r:CALLS]->() | r]
+#             WHERE r.introducing_commit IN $sprint_commits)
+#   WITH fn,
+#        count { (fn)<-[:CALLS]-() } AS caller_count,
+#        count { (fn)-[:CALLS]->() } AS callee_count
+#   WHERE caller_count + callee_count >= 3
+#   RETURN fn.name, fn.file, fn.line,
+#          caller_count, callee_count
+#   ORDER BY caller_count + callee_count DESC
+# ' --repo ./
 ```
 
 **Breaking it down**
@@ -372,21 +372,21 @@ cgx reaches 'handleRequest' 'eval' --at HEAD --repo ./ --assert-empty
 **Deferred form (requires taint classification and IX-9 — not in v0.3.0)**
 
 ```cgx
--- NOT VALID in v0.3.0: phantom flags and plan-error properties
--- cgx diff main HEAD \
---     --new-paths-only \
---     --from-class network \
---     --to-class sql \
---     --calls-to-sink-class shell \
---     --assert-empty
+# NOT VALID in v0.3.0: phantom flags and plan-error properties
+# cgx diff main HEAD \
+#     --new-paths-only \
+#     --from-class network \
+#     --to-class sql \
+#     --calls-to-sink-class shell \
+#     --assert-empty
 
--- NOT VALID: unsafe_region, sink_class, and --param not supported; r.introducing_commit is not
--- a CQL edge property at all — IX-9 attribution never leaves cgx diff --path-added's own JSON
--- cgx query --at HEAD '
---   MATCH (a)-[r:CALLS]->(b)
---   WHERE b.unsafe_region = true
---     AND r.introducing_commit IN $pr_commits
--- ' --repo ./
+# NOT VALID: unsafe_region, sink_class, and --param not supported; r.introducing_commit is not
+# a CQL edge property at all — IX-9 attribution never leaves cgx diff --path-added's own JSON
+# cgx query --at HEAD '
+#   MATCH (a)-[r:CALLS]->(b)
+#   WHERE b.unsafe_region = true
+#     AND r.introducing_commit IN $pr_commits
+# ' --repo ./
 ```
 
 Specified in docs/05 Worked Example 6. The taint-typed and `unsafe_region` filters are genuinely
@@ -418,7 +418,7 @@ When a new variant is added to an enum, every `match` on that enum should either
 **The query**
 
 ```cgx
--- illustrative: requires GM-19 (schema-room)
+# illustrative: requires GM-19 (schema-room)
 cgx diff main HEAD --repo ./ \
     --enum-variant-gap-check \
     --format json > variant-gap.json
@@ -427,17 +427,17 @@ cgx diff main HEAD --repo ./ \
 Or using edge attribution to find match sites in changed files:
 
 ```cgx
--- illustrative: requires GM-19 (schema-room)
--- cgx query --at HEAD '
---   MATCH (match_site {kind:"match-arm"})
---   WHERE match_site.file IN $changed_files
---     AND match_site.enum_type IS NOT NULL
---     AND NOT match_site.is_exhaustive = true
---   RETURN match_site.name, match_site.enum_type,
---          match_site.file, match_site.line,
---          match_site.missing_variants
---   ORDER BY match_site.file, match_site.line
--- ' --repo ./ --param changed_files=$(git diff --name-only main..HEAD | jq -Rs 'split("\n")')
+# illustrative: requires GM-19 (schema-room)
+# cgx query --at HEAD '
+#   MATCH (match_site {kind:"match-arm"})
+#   WHERE match_site.file IN $changed_files
+#     AND match_site.enum_type IS NOT NULL
+#     AND NOT match_site.is_exhaustive = true
+#   RETURN match_site.name, match_site.enum_type,
+#          match_site.file, match_site.line,
+#          match_site.missing_variants
+#   ORDER BY match_site.file, match_site.line
+# ' --repo ./ --param changed_files=$(git diff --name-only main..HEAD | jq -Rs 'split("\n")')
 ```
 
 The `match-arm` node kind and its `is_exhaustive`/`missing_variants` attributes are GM-19 schema-room — they do not exist in the graph model today (the same gate as Q52's arm-level reachability). IX-9 contributes only the branch-local attribution; it does not carry this query on its own.
@@ -468,8 +468,8 @@ This is the structural PR gate use case for call/dataflow reachability: detect w
 ```bash
 cgx diff main HEAD \
     --path-added \
-    --from '*::handler::*' \
-    --to '*::sys::Command::*' \
+    --from '**::handler::*' \
+    --to '**::sys::Command::*' \
     --require-anchor-match \
     --repo /path/to/my-repo
 ```
@@ -479,8 +479,8 @@ For JSON output (CI artifact or further analysis):
 ```bash
 cgx diff main HEAD \
     --path-added \
-    --from '*::handler::*' \
-    --to '*::sys::Command::*' \
+    --from '**::handler::*' \
+    --to '**::sys::Command::*' \
     --require-anchor-match \
     --format json \
     --repo /path/to/my-repo
@@ -492,18 +492,18 @@ cgx diff main HEAD \
 |---|---|
 | `main HEAD` | Compare the graph at the PR's base (`main`) to the graph at the PR's head (`HEAD`). The gate reports paths present at head but absent at base. |
 | `--path-added` | Enter structural gate mode. Uses BFS shortest-path reachability over call and `DerivesFrom` (dataflow) edges. Exits 1 if any new path is found; 0 if clean. |
-| `--from '*::handler::*'` | Source anchor: any function whose FQN contains `::handler::`. This matches handler functions in any module named `handler`. |
-| `--to '*::sys::Command::*'` | Sink anchor: any function in an in-repo `sys::Command` wrapper. This is an **in-repo** symbol, not `std::process::Command::*` (see caveat below). |
+| `--from '**::handler::*'` | Source anchor: any symbol directly inside a module named `handler`, at any depth. Globs are segment-aware: `*` matches within one FQN segment (it stops at `::` and `/`), `**` matches across segments, and `?` matches one non-separator character. So `**::handler::*` matches `my_crate::web::api::handler::serve`, while `*::handler::*` matches only a three-segment FQN such as `my_crate::handler::serve`. |
+| `--to '**::sys::Command::*'` | Sink anchor: any method of an in-repo `sys::Command` wrapper, wherever the `sys` module sits. This is an **in-repo** symbol, not `std::process::Command::*` (see caveat below). |
 | `--require-anchor-match` | Fail closed: if the `--to` glob matches zero nodes in the head graph, exit 2 instead of silently returning exit 0. Required in CI to catch misconfigured or stale sinks. |
 | `--format json` | Emit a JSON document with `semantics`, `added_paths`, `introducing_commit`, and `via` (the shortest witness path). |
 
 **Reading the result**
 
-- **Exit 0** — no new reachability path from any `*::handler::*` node to any `*::sys::Command::*` node was introduced at head. The gate is clean.
+- **Exit 0** — no new reachability path from any `**::handler::*` node to any `**::sys::Command::*` node was introduced at head. The gate is clean.
 - **Exit 1** — at least one new path was found. The output names the `from` and `to` FQNs, the shortest witness path (`via`), and the `introducing_commit`. Assign review to that commit's author.
 - **Exit 2** — anchor error. Either `--from` or `--to` matched zero graph nodes (with `--require-anchor-match`), or both `--from` and `--to` were not supplied. Fix the glob or the anchor before trusting a clean result.
 
-**The external-sink caveat (why `*::sys::Command::*` and not `*std::process::Command::*`):**
+**The external-sink caveat (why `**::sys::Command::*` and not `std::process::Command::*`):**
 
 A plain `cgx index` does not index external (standard-library or third-party) symbols as graph nodes. A glob like `--to 'std::process::Command::*'` will match zero nodes and return exit 0 — meaning "sink not indexed," not "no path." To gate on the actual exec boundary, use an in-repo wrapper function (here, `sys::Command::run`) that calls the external API. Gate on the wrapper's FQN. To index external symbols directly, produce a SCIP index covering the relevant dependencies.
 
@@ -514,8 +514,8 @@ A plain `cgx index` does not index external (standard-library or third-party) sy
   run: |
     cgx diff ${{ github.event.pull_request.base.sha }} HEAD \
         --path-added \
-        --from '*::handler::*' \
-        --to '*::sys::Command::*' \
+        --from '**::handler::*' \
+        --to '**::sys::Command::*' \
         --require-anchor-match \
         --format json \
         --repo . \

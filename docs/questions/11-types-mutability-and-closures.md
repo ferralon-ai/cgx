@@ -24,9 +24,9 @@ constraints), `cgx` reconstructs the candidate type set. Specified in docs/05 Q-
 **The query**
 
 ```cgx
--- illustrative: requires DF-19 (core-extension) type reconstruction procedure
--- DEFERRED: `cgx.type_reconstruct` and named-argument CALL syntax are not supported in v0.3.0;
---           `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
+// illustrative: requires DF-19 (core-extension) type reconstruction procedure
+// DEFERRED: `cgx.type_reconstruct` and named-argument CALL syntax are not supported in v0.3.0;
+//           `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
 MATCH (v {name:"v", scope:"process"})
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 RETURN candidate_type, confidence, evidence
@@ -64,10 +64,10 @@ bug query).
 **The query**
 
 ```cgx
--- illustrative: requires DF-19 (core-extension) type reconstruction procedure
--- DEFERRED: `MATCH (v)` with no relationship causes a plan error (exit 2); `IS NOT NULL` /
---           `IS EMPTY` predicates are not supported in v0.3.0 (exit 2); `cgx.type_reconstruct`
---           and `COMPATIBLE_WITH` predicate are not supported in v0.3.0 (exit 2)
+// illustrative: requires DF-19 (core-extension) type reconstruction procedure
+// DEFERRED: `MATCH (v)` with no relationship causes a plan error (exit 2); `IS NOT NULL` /
+//           `IS EMPTY` predicates are not supported in v0.3.0 (exit 2); `cgx.type_reconstruct`
+//           and `COMPATIBLE_WITH` predicate are not supported in v0.3.0 (exit 2)
 MATCH (v)
 WHERE v.declared_type IS NOT NULL
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
@@ -84,9 +84,9 @@ ORDER BY v.file, v.line
 For checking a specific value:
 
 ```cgx
--- illustrative: requires DF-19 (core-extension) type reconstruction procedure
--- DEFERRED: named-argument CALL syntax and `cgx.type_reconstruct` are not supported in
---           v0.3.0; `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
+// illustrative: requires DF-19 (core-extension) type reconstruction procedure
+// DEFERRED: named-argument CALL syntax and `cgx.type_reconstruct` are not supported in
+//           v0.3.0; `MATCH (v {...})` with no relationship also causes a plan error (exit 2)
 MATCH (v {name:"result", scope:"Processor::run"})
 CALL cgx.type_reconstruct(v, direction: "all") YIELD candidate_type, confidence, evidence
 RETURN v.name, v.file, v.line, candidate_type, confidence
@@ -160,7 +160,7 @@ reference." Specified in docs/05 Q-27 (getters returning mutable internal state)
 **The query**
 
 ```cgx
--- illustrative: requires DF-17 (schema-room) for `return_is_internal_field` and `return_mutability` attributes
+// illustrative: requires DF-17 (schema-room) for `return_is_internal_field` and `return_mutability` attributes
 MATCH (getter:method)-[:MEMBER_OF]->(t)
 WHERE getter.name STARTS WITH "get"
   AND getter.return_mutability = "mutable"
@@ -173,7 +173,7 @@ ORDER BY t.name, getter.name
 To extend the query and find which callers mutate the exposed field through the reference:
 
 ```cgx
--- illustrative: requires DF-17 (schema-room)
+// illustrative: requires DF-17 (schema-room)
 MATCH (getter:method)-[:MEMBER_OF]->(t)
 WHERE getter.return_is_internal_field = true
   AND getter.return_mutability = "mutable"
@@ -209,10 +209,10 @@ docs/05 Q-27 (sanitization invalidation).
 **The query**
 
 ```cgx
--- illustrative: requires DF-17 (schema-room) for `taint_label.re_applied` and
---               `taint_label.reason = "mutation-after-sanitization"` edge attributes
--- DEFERRED: `sanitizer_class`, `sink_class`, and `taint_label` are not supported node/edge
---           properties in v0.3.0; submitting this query produces a plan error (exit 2)
+// illustrative: requires DF-17 (schema-room) for `taint_label.re_applied` and
+//               `taint_label.reason = "mutation-after-sanitization"` edge attributes
+// DEFERRED: `sanitizer_class`, `sink_class`, and `taint_label` are not supported node/edge
+//           properties in v0.3.0; submitting this query produces a plan error (exit 2)
 MATCH path = (sanitizer)-[:DATA_FLOW*]->(use {sink_class:"sql"})
 WHERE sanitizer.sanitizer_class = "sql"
   AND ANY(edge IN relationships(path)
@@ -248,7 +248,7 @@ source of bugs in async callbacks and goroutines. Specified in docs/05 Q-28
 **The query**
 
 ```cgx
--- illustrative: requires DF-18 (schema-room) capture edges with by-ref and binding mutability
+// illustrative: requires DF-18 (schema-room) capture edges with by-ref and binding mutability
 MATCH (loop_var)-[cap:CAPTURE {capture:"by-ref"}]->(closure)
 WHERE loop_var.binding_mutability = "mutable"
   AND loop_var.is_loop_variable = true
@@ -288,7 +288,7 @@ Specified in docs/05 Q-28 (captured-resource lifetime family).
 **The query**
 
 ```cgx
--- illustrative: requires DF-18 (schema-room) capture edges and GM-13 (schema-room) resource lifecycle pairs
+// illustrative: requires DF-18 (schema-room) capture edges and GM-13 (schema-room) resource lifecycle pairs
 MATCH (resource)-[cap:CAPTURE]->(closure)
 WHERE resource.resource_class IN ["lock", "file-handle", "db-connection"]
 RETURN resource.name, resource.file, resource.line,
@@ -300,7 +300,7 @@ ORDER BY resource.resource_class, resource.file, resource.line
 To find closures that escape to an outer scope (dangling-capture risk):
 
 ```cgx
--- illustrative: requires DF-18 (schema-room) and DF-16 (schema-room) aliasing / escape
+// illustrative: requires DF-18 (schema-room) and DF-16 (schema-room) aliasing / escape
 MATCH (v)-[cap:CAPTURE {capture:"by-ref"}]->(closure)
 MATCH escape_path = (closure)-[:DATA_FLOW*]->(sink)
 WHERE sink.scope_depth < v.scope_depth
@@ -339,7 +339,7 @@ could flow to it. Specified in docs/05 Q-29.
 **The query**
 
 ```cgx
--- illustrative: requires DF-18 (schema-room) function-value pedigree and indirect-call resolution
+// illustrative: requires DF-18 (schema-room) function-value pedigree and indirect-call resolution
 MATCH (callsite)-[:CALLS:indirect]->(target)
 WHERE callsite.scope = "process"
   AND callsite.arg_position = 0
@@ -378,9 +378,9 @@ without providing the correct value. Specified in docs/05 Q-30 (type-juggling-in
 **The query**
 
 ```cgx
--- illustrative: requires DF-10 coerce(from,to) transformation kind (schema-room)
--- DEFERRED: `source_class`, `sink_class`, and `sanitizer_class` are not supported node
---           properties in v0.3.0; submitting this query produces a plan error (exit 2)
+// illustrative: requires DF-10 coerce(from,to) transformation kind (schema-room)
+// DEFERRED: `source_class`, `sink_class`, and `sanitizer_class` are not supported node
+//           properties in v0.3.0; submitting this query produces a plan error (exit 2)
 MATCH path = (src)-[:DATA_FLOW*]->(coerce_site)-[:DATA_FLOW {transformation_kind:"coerce"}]
               ->(sink {sink_class:"auth-check"})
 WHERE src.source_class IN ["network","user-input"]
@@ -423,7 +423,7 @@ query).
 **The query**
 
 ```cgx
--- illustrative: requires GM-14.6 (schema-room) type-confidence boundary attribute
+// illustrative: requires GM-14.6 (schema-room) type-confidence boundary attribute
 MATCH (boundary)-[r:DATA_FLOW]->(typed_receiver)
 WHERE boundary.type_confidence_boundary = true
   AND typed_receiver.declared_type IS NOT NULL
@@ -438,7 +438,7 @@ ORDER BY boundary.file, boundary.line
 For the reverse direction — where fully-typed values first cross into untyped territory:
 
 ```cgx
--- illustrative: requires GM-14.6 (schema-room)
+// illustrative: requires GM-14.6 (schema-room)
 MATCH (typed_src)-[r:DATA_FLOW]->(boundary)
 WHERE typed_src.declared_type IS NOT NULL
   AND typed_src.declared_type <> "any"

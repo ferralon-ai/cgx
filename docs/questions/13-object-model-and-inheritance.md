@@ -13,7 +13,7 @@ When a virtual call site is bound at runtime to a concrete implementation, knowi
 **The query**
 
 ```cgx
--- illustrative: requires GM-22 (schema-room)
+// illustrative: requires GM-22 (schema-room)
 MATCH (site {name:"render"})-[:RESOLVES_TO]->(body:method)-[:MEMBER_OF]->(t)
 RETURN t.name, body.name, body.file, body.line
 ```
@@ -59,40 +59,52 @@ RETURN sub.name, sub.file, sub.line
 
 ### Q129 — Which overrides widen the exception contract their base method declared?
 
-**Personas:** PSE, SSE · **Status:** needs-schema-room-feature (Q-32)
+**Personas:** PSE, SSE · **Status:** answerable-today
 
 A base method's callers were written against the exception surface the base declared. An override that introduces new `throws`, `panic`, or `unwrap()` paths exposes those callers to failures they never anticipated. This is the exception-contract widening form of override-contract drift (Q-32), which composes `overrides` edges with `throws`/`panic` edge conditions and corrected Q-20 ∀-path semantics.
 
 **The query**
 
 ```cgx
--- illustrative: requires Q-32 (core-extension; depends on corrected Q-20)
 MATCH (sub:method)-[:OVERRIDES]->(base:method)
-MATCH p_sub = (sub)-[:CALLS*]->(x)
-MATCH p_base = (base)-[:CALLS*]->(x)
-WHERE ANY(r IN relationships(p_sub) WHERE r.condition IN ["exception","panic"])
+MATCH p_sub = (s)-[:CALLS*1..3]->(x)
+WHERE s.name = sub.name
+MATCH p_base = (b)-[:CALLS*1..3]->(x)
+WHERE b.name = base.name
+  AND ANY(r IN relationships(p_sub) WHERE r.condition IN ["exception","panic"])
   AND NONE(r IN relationships(p_base) WHERE r.condition IN ["exception","panic"])
-RETURN sub.name, sub.file, sub.line
+RETURN DISTINCT sub.name, sub.file, sub.line
 ```
 
-Q-32/`OVERRIDES` being unshipped is real, but it is not the only reason this query doesn't run: the
-form as originally written fed an inline, unbound pattern — `relationships((base)-[:CALLS*]->(x))`
-— straight to `relationships()`, which requires a **named path variable**. Live-verified against a
-`CALLS` edge that does exist today: that inline form is an eval error, `relationships: argument must
-be a path, got a bool value`, not a schema-room plan error. Naming the second leg `p_base` (as above)
-fixes that half independent of Q-32; `OVERRIDES` is still the genuine blocker for the query as a
-whole.
+`OVERRIDES` edges are emitted today (Rust trait impls, Java, and Python name-match overrides), so
+this runs. Three things about its shape matter:
+
+- **Join explicitly.** A later `MATCH` does not reuse a node variable bound by an earlier one —
+  writing `(sub)-[:CALLS*]->(x)` binds a fresh `sub` and silently produces a cross product of
+  unrelated methods. Bind fresh variables (`s`, `b`) and join them by name in `WHERE`.
+- **Filter after each `MATCH`.** Putting the `s.name = sub.name` filter directly after the
+  second `MATCH` prunes before the third is expanded; moving all predicates to a single trailing
+  `WHERE` gives the same rows but expands the full cross product first (about 30 s versus under
+  2 s on the bundled Rust sample).
+- **Bound the depth.** `*1..3` keeps the expansion tractable; widen it deliberately.
+
+Verified on a copy of the Rust sample extended with a trait whose default `load()` calls `fetch()`
+plainly and whose override calls `fetch()?`: the query returns exactly the override. On the
+unmodified Rust, Python and Java samples it returns no rows.
+
+The query only reports a callee `x` that *both* bodies reach. An override that adds an exceptional
+callee the base never reaches at all is not reported by this form.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
 | `(sub:method)-[:OVERRIDES]->(base:method)` | Bind each override/base pair in the `overrides` relation. |
-| `MATCH p_sub = (sub)-[:CALLS*]->(x)` | Find any node `x` reachable from the override's body, binding the path. |
-| `MATCH p_base = (base)-[:CALLS*]->(x)` | Find the same `x` reachable from the base's body, binding a second path — `relationships()` needs this name; it cannot take an inline pattern. |
+| `MATCH p_sub = (s)-[:CALLS*1..3]->(x)` … `WHERE s.name = sub.name` | Find any node `x` within three calls of the override's body, binding the path; the `WHERE` ties the fresh `s` to the override. |
+| `MATCH p_base = (b)-[:CALLS*1..3]->(x)` … `WHERE b.name = base.name` | Find the same `x` reachable from the base's body, binding a second path — `relationships()` needs a named path; it cannot take an inline pattern. |
 | `ANY(r IN relationships(p_sub) WHERE r.condition IN ["exception","panic"])` | At least one edge on that path is in the exceptional class — the override reaches `x` via an exception or panic path. |
 | `NONE(r IN relationships(p_base) WHERE r.condition IN ["exception","panic"])` | No such exceptional edge exists on any path from the base to the same `x` — the base never exposed this exceptional surface. |
-| `RETURN sub.name, sub.file, sub.line` | Return the override whose exceptional surface is a strict superset of the base's. |
+| `RETURN DISTINCT sub.name, sub.file, sub.line` | Return each override that reaches a shared callee exceptionally where the base reaches it cleanly; `DISTINCT` collapses one row per path. |
 
 **Reading the result** — Each returned method is an override that introduces exception or panic paths the base method did not have. Priority candidates are overrides that call `unwrap()`/`expect()` (panic edges) where the base returned a `Result`, or that throw checked exceptions the base never declared. Callers of the base may not handle these new failure modes.
 
@@ -107,7 +119,7 @@ If the base method routes every path to a sensitive sink through an authorisatio
 **The query**
 
 ```cgx
--- illustrative: requires Q-32 (core-extension; depends on corrected Q-20 ∀-path)
+// illustrative: requires Q-32 (core-extension; depends on corrected Q-20 ∀-path)
 MATCH (sub:method)-[:OVERRIDES]->(base:method)
 MATCH ALL (base)-[:CALLS*]->(sink {sink_class:"db-write"}) MUST PASS THROUGH (g {guard_class:"authz"})
 MATCH ALL (sub)-[:CALLS*]->(sink {sink_class:"db-write"}) AVOIDING (g)
@@ -123,7 +135,7 @@ RETURN sub.name, sub.file, sub.line
 | `MATCH ALL (sub)-[:CALLS*]->(sink {sink_class:"db-write"}) AVOIDING (g)` | Find cases where the override reaches the same sink class on a path that avoids that guard. An `AVOIDING` match produces results only when such a bypass path exists. |
 | `RETURN sub.name, sub.file, sub.line` | Return overrides where a bypass path was found. |
 
-**Reading the result** — This query is illustrative only; it exits 2 today. `MUST PASS THROUGH` and `AVOIDING` are parse errors in v0.3 (not recognised keywords), and `sink_class` / `guard_class` are plan errors (unsupported node properties). When Q-32 is implemented each returned row will be an override that has silently removed an authorisation check the base enforced.
+**Reading the result** — This query is illustrative only; it exits 2 today. `MATCH ALL … MUST PASS THROUGH` is a plan error in v0.3 (a bare `AVOIDING` without `MATCH ALL` is a parse error), and `sink_class` / `guard_class` are plan errors (unsupported node properties). When Q-32 is implemented each returned row will be an override that has silently removed an authorisation check the base enforced.
 
 ---
 
@@ -136,7 +148,7 @@ A `super` call statically and non-virtually delegates to a named ancestor's meth
 **The query**
 
 ```cgx
--- illustrative: requires GM-21 (core-extension)
+// illustrative: requires GM-21 (core-extension)
 MATCH (caller)-[s:CALLS:super]->(ancestor:method)
 RETURN caller.name, ancestor.name, s.bypassed_override, caller.file, caller.line
 ```
@@ -164,7 +176,7 @@ When a concrete class implements an interface or trait but does not override a m
 **The query**
 
 ```cgx
--- illustrative: requires GM-23 (schema-room)
+// illustrative: requires GM-23 (schema-room)
 MATCH (t)-[:IMPLEMENTS]->(iface)
 MATCH (t)-[:PROVIDES_BODY {method:"serialize"}]->(body:method)-[:MEMBER_OF]->(iface)
 RETURN t.name, body.name, body.file, body.line
@@ -192,7 +204,7 @@ A concrete type that does not supply an implementation for every abstract method
 **The query**
 
 ```cgx
--- illustrative: requires GM-25 (core-extension)
+// illustrative: requires GM-25 (core-extension)
 MATCH (t {kind:"type"})
 WHERE t.is_abstract = false AND t.unfulfilled_abstract IS NOT NULL
 RETURN t.name, t.unfulfilled_abstract, t.file, t.line
@@ -220,7 +232,7 @@ Given an abstract method declaration, finding which concrete method in each subc
 **The query**
 
 ```cgx
--- illustrative: requires GM-25 (core-extension)
+// illustrative: requires GM-25 (core-extension)
 MATCH (impl:method)-[:FULFILLS]->(decl:method {is_abstract:true, name:"Storage::put"})
 RETURN impl.name, impl.file, impl.line
 ```
@@ -247,7 +259,7 @@ When a subclass defines a getter, setter, or property that shadows a parent fiel
 **The query**
 
 ```cgx
--- illustrative: requires GM-24 (schema-room)
+// illustrative: requires GM-24 (schema-room)
 MATCH (acc:method)-[:SHADOWS_FIELD]->(parent_field)
 RETURN acc.name, parent_field.name, acc.file, acc.line
 ```
@@ -274,7 +286,7 @@ Before a virtual call is analysed for security or correctness, the reviewer need
 **The query**
 
 ```cgx
--- illustrative: requires GM-2.1 (virtual dispatch edge kind + candidate_set attribute, deferred)
+// illustrative: requires GM-2.1 (virtual dispatch edge kind + candidate_set attribute, deferred)
 MATCH (site)-[c:CALLS:virtual]->(target {name:"Codec::decode"})
 RETURN site.name, site.candidate_set, site.file, site.line
 ```
@@ -295,38 +307,40 @@ RETURN site.name, site.candidate_set, site.file, site.line
 
 ### Q137 — Which overrides change the receiver's field-write footprint relative to the base (write a field the base did not, or stop writing one it did)?
 
-**Personas:** SSE, ACA · **Status:** needs-schema-room-feature (Q-32)
+**Personas:** SSE, ACA · **Status:** needs-schema-room-feature (`WRITES_FIELD` population)
 
 An override that mutates fields the base method never touched, or stops mutating fields the base always wrote, changes the object's state contract. This is a field-footprint-drift form of override-contract drift (Q-32): it compares the `writes-field` sets of an override and its base method, using `writes-field` edges from GM-2.2.
 
 **The query**
 
 ```cgx
--- illustrative: requires Q-32 (core-extension) for OVERRIDES; ALSO has an independent syntax
--- defect below, unrelated to Q-32 — see the note after the query
+// runs today but returns no rows: no language frontend emits WRITES_FIELD edges yet
 MATCH (sub:method)-[:OVERRIDES]->(base:method)
-MATCH (sub)-[:WRITES_FIELD]->(f)
-WHERE NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)
+MATCH (s)-[:WRITES_FIELD]->(f)
+WHERE s.name = sub.name AND NOT (base)-[:WRITES_FIELD]->(f)
 RETURN sub.name, f.name, sub.file, sub.line
 ```
 
-`WRITES_FIELD` itself is real and shipped (GM-2.2) — it is not part of what Q-32 gates. The
-`[x IN (base)-[:WRITES_FIELD]->() | x]` fragment is not valid regardless of `OVERRIDES`:
-`IN` requires an actual list value, the kind `nodes(p)`/`relationships(p)` produce from a bound
-path — never a bare relationship pattern. Live-verified on a `CALLS` edge that exists today (standing
-in for `WRITES_FIELD`, to isolate the syntax question from the OVERRIDES gate): this form is an eval
-error, `expected a list (e.g. from nodes(p) / relationships(p))`, not a schema-room plan error. A
-working version would need to bind the base's written fields into a real list first (e.g. via
-`collect()` over a second `MATCH`) rather than embedding the pattern inline — not attempted here
-since `OVERRIDES` still blocks the query regardless.
+`OVERRIDES` is emitted today and is no longer the blocker. `WRITES_FIELD` is a recognised edge
+label — the query parses, plans and exits 0 — but no language frontend currently produces those
+edges, so on every bundled sample (Rust, Python, Java) the result is empty. Treat an empty result
+as "not modelled", not "no drift".
+
+The query shape itself is verified: substituting `CALLS` for `WRITES_FIELD` on a Rust sample with
+a trait default and an override that both call the same function, the `NOT (base)-[…]->(f)`
+predicate correctly drops the shared callee and keeps only callees unique to the override. An
+earlier form, `NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)`, is an eval error
+(`expected a list`): `IN` needs a real list such as `nodes(p)`, not a bare pattern. As in Q129,
+the second `MATCH` binds a fresh `s` joined by name, because a later `MATCH` does not reuse an
+earlier node variable.
 
 **Breaking it down**
 
 | Fragment | What it means |
 |---|---|
 | `(sub:method)-[:OVERRIDES]->(base:method)` | Bind each override/base pair. |
-| `MATCH (sub)-[:WRITES_FIELD]->(f)` | Find each field that the override writes directly — a real, shipped edge kind. |
-| `NONE(bf IN [x IN (base)-[:WRITES_FIELD]->() | x] WHERE bf = f)` | Intended to mean "the base method does not write field `f`," but the inline pattern inside `[... | x]` is not a valid list source — an eval error independent of whether `OVERRIDES` ships. |
+| `MATCH (s)-[:WRITES_FIELD]->(f)` + `s.name = sub.name` | Find each field the override writes directly (no frontend emits these edges yet). |
+| `NOT (base)-[:WRITES_FIELD]->(f)` | The base method does not write field `f`. |
 | `RETURN sub.name, f.name, sub.file, sub.line` | Return the override and the newly-written field. |
 
 **Reading the result** — Each row is a field that an override writes but the base method did not. This may indicate the override is taking on additional state responsibilities, or may reveal an unintended mutation. The inverse (fields the base writes but the override drops) requires a symmetric query with `sub` and `base` swapped.
@@ -342,7 +356,7 @@ In a diamond inheritance or mixin/trait hierarchy, the naive "nearest base" rule
 **The query**
 
 ```cgx
--- illustrative: requires GM-22 (schema-room)
+// illustrative: requires GM-22 (schema-room)
 MATCH (t {name:"Worker"})-[:RESOLVES_TO {method:"run"}]->(winner:method)-[:MEMBER_OF]->(provider)
 RETURN provider.name, winner.file, winner.line
 ```

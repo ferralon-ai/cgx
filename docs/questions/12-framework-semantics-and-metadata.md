@@ -26,10 +26,10 @@ false positives. Specified in docs/05 Q-31 (metadata-guard-aware authorization b
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — entrypoint_class, guard_class, framework_pack are
--- unknown node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
--- Illustrative of the intended GM-15 query shape; not executable until framework
--- pack properties and IS NULL predicates are supported.
+// NOTE: deferred in v0.3.0 — entrypoint_class, guard_class, framework_pack are
+// unknown node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+// Illustrative of the intended GM-15 query shape; not executable until framework
+// pack properties and IS NULL predicates are supported.
 MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
 WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
   AND NONE(n IN nodes(path)
@@ -45,17 +45,17 @@ ORDER BY hops, h.file, h.line
 CI gate (exits 1 if any bypass path exists):
 
 ```bash
--- NOTE: deferred in v0.3.0 — cgx paths takes two positional args <FROM> <TO>;
--- it has no --from, --to, --avoiding, or --exclude-edge-condition flags.
--- The guard-class / entrypoint-class filter requires framework pack properties
--- (GM-15) not yet supported. Use cgx query with a CQL predicate once supported.
---
--- Intended form (not yet executable):
--- cgx query 'MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
---   WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
---     AND NONE(n IN nodes(path) WHERE n.name = "require_admin" OR n.guard_class IS NOT NULL)
---   RETURN h.name, sink.name, length(path) AS hops' \
---   --repo PATH --assert-empty
+# NOTE: deferred in v0.3.0 — cgx paths takes two positional args <FROM> <TO>;
+# it has no --from, --to, --avoiding, or --exclude-edge-condition flags.
+# The guard-class / entrypoint-class filter requires framework pack properties
+# (GM-15) not yet supported. Use cgx query with a CQL predicate once supported.
+#
+# Intended form (not yet executable):
+# cgx query 'MATCH path = (h {kind:"entrypoint", entrypoint_class:"http"})-[:CALLS*]->(sink {name:"db::write"})
+#   WHERE NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
+#     AND NONE(n IN nodes(path) WHERE n.name = "require_admin" OR n.guard_class IS NOT NULL)
+#   RETURN h.name, sink.name, length(path) AS hops' \
+#   --repo PATH --assert-empty
 ```
 
 **Breaking it down**
@@ -85,10 +85,10 @@ docs/05 Q-31 (negative-guard inventory).
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — negative_guard_class, framework_pack are unknown
--- node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
--- Illustrative of the intended GM-15 negative-guard query; not executable until
--- framework pack properties and IS NULL predicates are supported.
+// NOTE: deferred in v0.3.0 — negative_guard_class, framework_pack are unknown
+// node properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+// Illustrative of the intended GM-15 negative-guard query; not executable until
+// framework pack properties and IS NULL predicates are supported.
 MATCH (ep {kind:"entrypoint"})
 WHERE ep.negative_guard_class IS NOT NULL
 RETURN ep.name, ep.file, ep.line,
@@ -124,9 +124,9 @@ docs/05 Q-31 (framework entrypoint reachability).
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — guard_class, entrypoint_class, framework_pack are
--- unknown node properties (plan error, exit 2); IS NULL predicate unsupported.
--- Illustrative of the intended GM-15 entrypoint query; not executable in v0.3.0.
+// NOTE: deferred in v0.3.0 — guard_class, entrypoint_class, framework_pack are
+// unknown node properties (plan error, exit 2); IS NULL predicate unsupported.
+// Illustrative of the intended GM-15 entrypoint query; not executable in v0.3.0.
 MATCH (ep {kind:"entrypoint"})
 WHERE ep.guard_class IS NULL
   AND ep.name NOT IN ["health_check", "favicon", "metrics"]
@@ -139,9 +139,9 @@ ORDER BY ep.framework_pack, ep.entrypoint_class, ep.name
 To find annotation-declared entrypoints that specifically lack auth middleware on every path to a protected resource:
 
 ```cgx
--- NOTE: deferred in v0.3.0 — guard_class, framework_pack, is_protected are
--- unknown node properties (plan error, exit 2); IS NULL/IS NOT NULL unsupported.
--- Illustrative of the intended GM-15/GM-16 extended query; not executable in v0.3.0.
+// NOTE: deferred in v0.3.0 — guard_class, framework_pack, is_protected are
+// unknown node properties (plan error, exit 2); IS NULL/IS NOT NULL unsupported.
+// Illustrative of the intended GM-15/GM-16 extended query; not executable in v0.3.0.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(resource)
 WHERE resource.is_protected = true
   AND ep.guard_class IS NULL
@@ -179,11 +179,11 @@ common reflection sites. Specified in docs/05 Q-31 (tainted-string reflective di
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
--- node properties (plan error, exit 2); cut_marker and string_pedigree are unknown
--- node properties; transformation_kind is an unknown edge property.
--- Security-typed taint (source_class, sink_class, sanitizer_class) and GM-18
--- reflection attributes are deferred; this query is illustrative only.
+// NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
+// node properties (plan error, exit 2); cut_marker and string_pedigree are unknown
+// node properties; transformation_kind is an unknown edge property.
+// Security-typed taint (source_class, sink_class, sanitizer_class) and GM-18
+// reflection attributes are deferred; this query is illustrative only.
 MATCH path = (src)-[:DATA_FLOW*]->(dispatch {cut_marker:"reflective"})
 WHERE src.source_class IN ["network","user-input"]
   AND NONE(n IN nodes(path) WHERE n.sanitizer_class = "method-name")
@@ -220,10 +220,10 @@ internals, ORM mappings, and plugin systems. Specified in docs/05 Q-31.
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — CALLS:indirect sub-type qualifier is recognised
--- but not supported (plan error, exit 2); cut_marker and string_pedigree are
--- unknown node properties (exit 2). r.confidence is a valid edge property but
--- this query cannot run until GM-18 attributes and CALLS:indirect ship.
+// NOTE: deferred in v0.3.0 — CALLS:indirect sub-type qualifier is recognised
+// but not supported (plan error, exit 2); cut_marker and string_pedigree are
+// unknown node properties (exit 2). r.confidence is a valid edge property but
+// this query cannot run until GM-18 attributes and CALLS:indirect ship.
 MATCH (callsite)-[r:CALLS:indirect]->(target)
 WHERE callsite.cut_marker = "reflective"
   AND r.confidence IN ["certain","probable"]
@@ -237,9 +237,9 @@ ORDER BY r.confidence DESC, callsite.file, callsite.line
 For unresolved reflection sites (no `probable` or better target found):
 
 ```cgx
--- NOTE: deferred in v0.3.0 — CALLS:indirect deferred (exit 2); cut_marker and
--- candidate_set are unknown node properties (exit 2); r.cut_marker is an
--- unknown edge property (exit 2). Illustrative only.
+// NOTE: deferred in v0.3.0 — CALLS:indirect deferred (exit 2); cut_marker and
+// candidate_set are unknown node properties (exit 2); r.cut_marker is an
+// unknown edge property (exit 2). Illustrative only.
 MATCH (callsite)-[r:CALLS:indirect]->(target)
 WHERE callsite.cut_marker = "reflective"
   AND r.confidence = "possible"
@@ -274,9 +274,9 @@ provenance. Specified in docs/05 Q-31 (framework-aware queries via GM-15/GM-17).
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — established_by and wiring_annotation are unknown
--- edge properties (plan error, exit 2); IS NOT NULL predicate unsupported.
--- GM-17 mediated call edges are deferred; this query is illustrative only.
+// NOTE: deferred in v0.3.0 — established_by and wiring_annotation are unknown
+// edge properties (plan error, exit 2); IS NOT NULL predicate unsupported.
+// GM-17 mediated call edges are deferred; this query is illustrative only.
 MATCH (caller)-[r:CALLS {established_by:"annotation"}]->(callee)
 WHERE r.established_by IS NOT NULL
 RETURN caller.name, caller.file, caller.line,
@@ -290,9 +290,9 @@ ORDER BY r.confidence DESC, caller.file, caller.name
 For auditing which frameworks are doing the wiring:
 
 ```cgx
--- NOTE: deferred in v0.3.0 — entrypoint_class, framework_pack are unknown node
--- properties (exit 2); established_by is unknown edge property (exit 2);
--- IS NOT NULL predicate unsupported. Illustrative only.
+// NOTE: deferred in v0.3.0 — entrypoint_class, framework_pack are unknown node
+// properties (exit 2); established_by is unknown edge property (exit 2);
+// IS NOT NULL predicate unsupported. Illustrative only.
 MATCH (ep {kind:"entrypoint"})-[:CALLS*]->(sink)
 WHERE ep.entrypoint_class = "http"
 MATCH (caller)-[r:CALLS]->(impl)
@@ -330,11 +330,11 @@ Specified in docs/05 Q-31 (via DF-20 and taint propagation).
 **The query**
 
 ```cgx
--- NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
--- node properties (plan error, exit 2); sink_class is an unsupported node property
--- (exit 2); linkage_kind and transformation_kind are unknown edge properties (exit 2).
--- Security-typed taint (source_class, sink_class, sanitizer_class) and DF-20
--- channel-linkage attributes are deferred; this query is illustrative only.
+// NOTE: deferred in v0.3.0 — source_class and sanitizer_class are unsupported
+// node properties (plan error, exit 2); sink_class is an unsupported node property
+// (exit 2); linkage_kind and transformation_kind are unknown edge properties (exit 2).
+// Security-typed taint (source_class, sink_class, sanitizer_class) and DF-20
+// channel-linkage attributes are deferred; this query is illustrative only.
 MATCH path = (src {source_class:"network"})-[:DATA_FLOW*]->(sink)
 WHERE sink.sink_class IN ["sql", "shell", "file_write"]
   AND ANY(edge IN relationships(path)
@@ -375,10 +375,10 @@ Specified in docs/05 Q-31 (via GM-19).
 **The query**
 
 ```cgx
--- illustrative: requires GM-19 (schema-room) `cfg-condition` attribute on nodes and edges
--- NOTE: deferred in v0.3.0 — cfg_condition is an unknown edge property (plan error,
--- exit 2); IS NULL predicate unsupported. The ALL/ANY path-predicate forms over
--- r.cfg_condition cannot run until GM-19 ships.
+// illustrative: requires GM-19 (schema-room) `cfg-condition` attribute on nodes and edges
+// NOTE: deferred in v0.3.0 — cfg_condition is an unknown edge property (plan error,
+// exit 2); IS NULL predicate unsupported. The ALL/ANY path-predicate forms over
+// r.cfg_condition cannot run until GM-19 ships.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(target {name:"legacy_auth"})
 WHERE ALL(r IN relationships(path)
           WHERE r.cfg_condition = "feature = \"LEGACY_AUTH\""
@@ -394,10 +394,10 @@ ORDER BY hops, ep.name
 To find all configuration-gated paths to any sink class (broader security gate):
 
 ```cgx
--- illustrative: requires GM-19 (schema-room)
--- NOTE: deferred in v0.3.0 — sink_class is an unsupported node property (plan
--- error, exit 2); cfg_condition is an unknown edge property (exit 2);
--- IS NOT NULL predicate unsupported. Illustrative only.
+// illustrative: requires GM-19 (schema-room)
+// NOTE: deferred in v0.3.0 — sink_class is an unsupported node property (plan
+// error, exit 2); cfg_condition is an unknown edge property (exit 2);
+// IS NOT NULL predicate unsupported. Illustrative only.
 MATCH (ep {kind:"entrypoint"})-[r:CALLS]->(sink)
 WHERE sink.sink_class IN ["sql","shell","eval"]
   AND r.cfg_condition IS NOT NULL

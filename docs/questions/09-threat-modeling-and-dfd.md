@@ -24,10 +24,10 @@ call. `cgx` adds edge-condition and sanitizer context that dependency-level tool
 **The query**
 
 ```cgx
--- illustrative: requires GM-14 (schema-room) for dependency edge package/version attribution,
--- AND a CQL grammar change — `edge.dependency.package` is a 2-segment nested property path,
--- which is categorically rejected today ("nested property access is not supported"), independent
--- of whether `dependency` itself is populated. GM-14 shipping alone would not make this runnable.
+// illustrative: requires GM-14 (schema-room) for dependency edge package/version attribution,
+// AND a CQL grammar change — `edge.dependency.package` is a 2-segment nested property path,
+// which is categorically rejected today ("nested property access is not supported"), independent
+// of whether `dependency` itself is populated. GM-14 shipping alone would not make this runnable.
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::parse_header"})
 WHERE ANY(edge IN relationships(path)
           WHERE edge.dependency.package = "libfoo"
@@ -55,8 +55,8 @@ LIMIT 20
 To additionally check whether a sanitizer sits on every path (the sanitizer-negation variant from Q-23):
 
 ```cgx
--- illustrative: requires GM-14 (schema-room) AND deferred sanitizer_class node property
--- n.sanitizer_class causes a plan error (exit 2) in v0.3.0; update when sanitizer taint ships
+// illustrative: requires GM-14 (schema-room) AND deferred sanitizer_class node property
+// n.sanitizer_class causes a plan error (exit 2) in v0.3.0; update when sanitizer taint ships
 MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::parse_header"})
 WHERE ANY(edge IN relationships(path)
           WHERE edge.dependency.package = "libfoo")
@@ -132,7 +132,7 @@ ORDER BY hops, src.file, src.line
 The ∀-path must-pass-through form using the `AVOIDING` keyword is also deferred (`AVOIDING` is not a recognized CQL keyword in v0.3.0 and causes a parse error, exit 2):
 
 ```cgx
--- deferred: AVOIDING is not a valid CQL keyword in v0.3.0 (parse error, exit 2)
+// deferred: AVOIDING is not a valid CQL keyword in v0.3.0 (parse error, exit 2)
 MATCH ALL path = (src)-[:CALLS*]->(sink)
 WHERE src.trust_zone = "external"
   AND sink.trust_zone = "internal"
@@ -156,7 +156,7 @@ RETURN src.name, src.file, src.line, sink.name, length(path) AS hops
 
 ### Q85 — Show me the complete attack tree from `unauthenticated HTTP request` to `database write`, with all intermediate call nodes and edge-condition labels.
 
-**Personas:** PSE · **Status:** partially-answerable — the `NONE`-predicate negative path constraint and edge-condition filtering are answerable-today (v0.3.0); the `entrypoint_class` and `sink_class` node properties are deferred (plan error, exit 2). The CQL query below is illustrative; the name-based variant is runnable today.
+**Personas:** PSE · **Status:** partially-answerable — the `NONE`-predicate negative path constraint and edge-condition filtering are answerable-today (v0.3.0); the `entrypoint_class` and `sink_class` node properties are deferred (plan error, exit 2). The CQL query below is illustrative; the name-based variant further down is runnable today.
 
 An attack tree is a structured enumeration of all paths an attacker can take from
 an initial capability (unauthenticated HTTP access) to a high-value target
@@ -178,19 +178,22 @@ RETURN ep.name, ep.file, ep.line,
 ORDER BY depth, ep.name
 ```
 
-**Name-based variant (answerable-today in v0.3.0):** replace the deferred property filters with `n.name` matches for known entrypoint and sink function names:
+**Name-based variant (answerable-today in v0.3.0):** replace the deferred property filters with name matches for a known entrypoint and sink, and project bare names, because string concatenation (`+`) is an arithmetic expression and is deferred (plan error, exit 2):
 
 ```cgx
-MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(sink {name:"db_execute"})
-WHERE NONE(n IN nodes(path) WHERE n.name IN ["require_auth", "require_admin",
-                                             "check_session", "authenticate"])
+MATCH path = (ep {name:"handle_request"})-[:CALLS*1..8]->(sink {name:"db_execute"})
+WHERE NONE(n IN nodes(path) WHERE n.name IN ["my_crate::auth::require_auth",
+                                             "my_crate::auth::require_admin",
+                                             "my_crate::auth::check_session"])
   AND NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])
 RETURN ep.name, ep.file, ep.line,
-       [n IN nodes(path) | n.name + "@" + n.file + ":" + n.line] AS call_chain,
+       [n IN nodes(path) | n.name] AS call_chain,
        [r IN relationships(path) | r.condition] AS edge_conditions,
        length(path) AS depth
 ORDER BY depth, ep.name
 ```
+
+The property maps take a short name or a full FQN; the `IN [...]` list needs full FQNs (a short name there silently matches nothing). Anchor the entrypoint in the pattern's property map, as here, rather than only in `WHERE`: that keeps `nodes(path)` ordered from entrypoint to sink. Run one query per entrypoint, and read file and line for each hop from `cgx explain <fqn>` or a follow-up `RETURN n.file, n.line`.
 
 Or using the `paths` subcommand for a quick scan between two known symbol FQNs (positional `FROM TO` args; no `--from`, `--to-class`, `--avoiding`, or `--exclude-edge-condition` flags exist):
 
@@ -208,7 +211,7 @@ cgx paths 'my_crate::handlers::handle_request' 'my_crate::db::execute' \
 | `sink.sink_class = "sql"` | End at any node that is a SQL sink. `sink_class` is a deferred node property (plan error, exit 2 in v0.3.0). |
 | `NONE(n IN nodes(path) WHERE n.name IN [...])` | Exclude paths that pass through any named authentication check. Paths that include an auth check are assumed to be guarded; paths that avoid all named checks are the attack paths. This clause is answerable-today. |
 | `NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | Restrict to non-exception paths — structural attack paths, not paths that only exist in error-handling branches. This clause is answerable-today. |
-| `[n IN nodes(path) | n.name + "@" + n.file + ":" + n.line] AS call_chain` | Project the full list of call nodes on the path as a human-readable call chain, each node named with its source location. |
+| `[n IN nodes(path) | n.name] AS call_chain` | Project the full list of call nodes on the path as the call chain. The illustrative block's `n.name + "@" + n.file …` concatenation is not runnable in v0.3.0 (`+` is deferred). |
 | `[r IN relationships(path) | r.condition] AS edge_conditions` | Project the edge condition label at each hop — shows where conditional, loop, or exception-class edges appear on paths that are otherwise non-exception. |
 
 **Reading the result** — Each row is one complete attack path. The `call_chain` column is the attack tree branch — every intermediate function the attacker's request passes through. The `depth` column orders branches from most direct (fewest hops) to most indirect; the shallowest paths are typically the most reliable exploit vectors. Pipe with `--format sarif` to import the findings into GitHub Advanced Security for inline annotation.

@@ -128,7 +128,7 @@ Every subcommand except `index` and `mcp` accepts `--format`. The format applies
 > | **C** — allow-list per diff mode | `diff` | full mode `human`/`json`; `--path-added` adds `dot`/`mermaid`/`d2` | everything else, checked before any indexing |
 > | **D** — no gate, silent fallthrough to human, **exit 0** | `explain`, `doctor` | `json` renders JSON | *nothing* — every other value renders human text |
 >
-> Regime D is a known defect of the same class PR #38 fixed for `diff`: `cgx doctor --format sarif` gives you human text and a successful exit, not SARIF. Do not build a CI step on it.
+> Regime D is a known defect of the same class already fixed for `diff`: `cgx doctor --format sarif` gives you human text and a successful exit, not SARIF. Do not build a CI step on it.
 >
 > Path-shaped results (the regime-A gate) are: `paths` always, `reaches <FROM> <TO>`, and `query` when the CQL is `RETURN path`. `callers`, `callees`, `reaches <FROM>`, `flows-*`, `unused` and tabular `query` are never path-shaped.
 

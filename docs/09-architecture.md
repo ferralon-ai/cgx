@@ -283,7 +283,7 @@ Two properties of this ladder are load-bearing and easy to misread:
   `Tier::NameSyntactic` to `possible` for exactly this reason
   (`crates/cgx-resolve/src/link.rs:1296-1312`).
 
-  **Known defect (backlog B-5).** That clamp is keyed on `rule == "name-arity"`,
+  **Known defect.** That clamp is keyed on `rule == "name-arity"`,
   so it does not apply to step 3's `name-method` band. A singleton same-name
   method keeps `probable`/`scope_graph` even when the receiver type was never
   resolved in-repo — and `probable`/`scope_graph` is precisely the value that

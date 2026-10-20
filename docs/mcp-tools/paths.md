@@ -324,8 +324,8 @@ the envelope on a failed call.
 A virtual-receiver call whose type cannot be resolved in-repo, where exactly one
 method anywhere shares the short name, is banded `probable`. `probable` does not trip
 the contract's `over` predicate, so a path built on such an edge can appear inside an
-answer reported as `direction: "exact"` with `min_confidence: "probable"`. Backlog
-**B-5**. Where a path crosses duck-typed or cross-class same-name method calls, read
+answer reported as `direction: "exact"` with `min_confidence: "probable"`.
+Where a path crosses duck-typed or cross-class same-name method calls, read
 the per-step `confidence` rather than trusting the contract's summary.
 
 ---

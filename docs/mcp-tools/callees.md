@@ -155,7 +155,7 @@ Contrast the [`callers`](callers.md#a-positive-answer) direction on the same sym
 
 **Errors carry no envelope.** An unresolved symbol, an unknown `kind` token, or an unparseable `cursor` comes back as a JSON-RPC error object (`-32602`) with no result document — so no `freshness`, no `approximation`, no `graph_version`.
 
-**Method calls on an untyped receiver.** A virtual-receiver call whose type cannot be resolved in-repo, where exactly one method anywhere shares the short name, is banded `probable`. `probable` does not trip the contract's `over` predicate, so such an answer can report `direction: "exact"` while carrying one wrong edge. Backlog **B-5** — treat `exact` with least confidence on duck-typed and cross-class same-name method calls.
+**Method calls on an untyped receiver.** A virtual-receiver call whose type cannot be resolved in-repo, where exactly one method anywhere shares the short name, is banded `probable`. `probable` does not trip the contract's `over` predicate, so such an answer can report `direction: "exact"` while carrying one wrong edge. Treat `exact` with least confidence on duck-typed and cross-class same-name method calls.
 
 ## See also
 

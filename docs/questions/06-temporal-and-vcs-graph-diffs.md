@@ -222,7 +222,7 @@ Functions in dangerous sink classes (`shell`, `eval`, `exec`) that were previous
 
 **The query (structural — answerable today)**
 
-`cgx diff` rejects `--format sarif` (exit 2, both diff modes, since PR #38) — it is not a real option
+`cgx diff` rejects `--format sarif` (exit 2, both diff modes) — it is not a real option
 here. Use `--format json`:
 
 ```cgx
@@ -355,7 +355,7 @@ This is the unified security gate for a pull request. In v0.3.0, `source_class`,
 **The query (structural gate — answerable today)**
 
 `cgx diff` rejects `--format sarif` outright (exit 2, "sarif format is not supported by `cgx diff`
-— use --format human|json") in both diff modes since PR #38 — it is not a CI-integration option here
+— use --format human|json") in both diff modes — it is not a CI-integration option here
 at all. Use `--format json` and consume the added/removed/changed edge lists directly:
 
 ```cgx

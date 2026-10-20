@@ -210,7 +210,7 @@ schedulers/`Worker` above are).
 
 ---
 
-### Go — Tier 1 (shipped, PR #24)
+### Go — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-go`. Go reached Go-column parity as the first of the three
 post-launch Tier-1 adapters.
@@ -244,7 +244,7 @@ is not yet complete.
 
 ---
 
-### Java — Tier 1 (shipped, PR #25)
+### Java — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-java`.
 
@@ -270,7 +270,7 @@ Concurrency/async hints are partial (`~`).
 
 ---
 
-### Python — Tier 1 (shipped, PR #26)
+### Python — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-python`. Python is the newest adapter and carries the highest test
 count of the three post-launch languages.

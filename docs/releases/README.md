@@ -58,8 +58,7 @@ matches only three-field tags (`vX.Y.Z`), so a two-field alias can never itself
 enter the workflow.
 
 (cgx ships as a binary, not a `uses:`-consumed GitHub Action, so the alias is a
-convenience pointer to the latest patch rather than a resolution target — but the
-mechanic mirrors `ferralon-assay` so the two release processes read alike.)
+convenience pointer to the latest patch rather than a resolution target.)
 
 ## Change Date basis
 

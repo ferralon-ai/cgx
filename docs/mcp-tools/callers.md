@@ -255,7 +255,7 @@ which is the whole point of the negative-completeness envelope.
   resolvable in-repo and exactly one method anywhere shares the short name, the
   edge is banded `probable` — which does **not** trip the contract's `over`
   predicate, so such an answer can report `direction: "exact"` while containing
-  one wrong edge. Backlog **B-5**. Duck-typed and cross-class same-name method
+  one wrong edge. Duck-typed and cross-class same-name method
   calls are the shapes where a `callers` answer's `exact` deserves least trust.
 
 ## See also

@@ -1,6 +1,6 @@
 # 08 — Language Support
 
-**Status:** Mixed — the five Tier-1 adapters (Rust, TypeScript/JavaScript, Go, Java, Python) are implemented and registered; everything about Tier 2, Tier 3 and the framework/primitive-harvest layers is specification ahead of implementation. Each section says which it is.
+**Status:** Mixed — seven adapters are implemented and registered: the five Tier-1 adapters (Rust, TypeScript/JavaScript, Go, Java, Python) and the C and C++ adapters (LS-1); everything else about Tier 2, Tier 3 and the framework/primitive-harvest layers is specification ahead of implementation. Each section says which it is.
 **Audience:** Engineers extending `cgx` with new language support; contributors; advanced users evaluating language coverage
 **Cross-references:** docs/03-code-graph-model.md (GM-) · docs/04-dataflow-and-provenance.md (DF-) · docs/09-architecture.md (AR-)
 
@@ -44,6 +44,38 @@ concurrency hints are partial (`~`) rather than complete. See
 [14 — Implementation Status Matrix](14-implementation-status-matrix.md) for the
 per-capability `✓`/`~` breakdown, which is the authoritative per-cell ledger.
 
+**C and C++ ship and are registered** in the same registry (`cgx-lang-c`,
+`cgx-lang-cpp`). They sit between the tiers: hierarchy and syntactic facts are
+Tier-1 quality, while anything that needs types is banded at Tier 2. What they
+extract, and the limits, verified against the adapters:
+
+- **Files.** C claims `.c` and `.h`; C++ claims `.cpp`, `.cc`, `.cxx`, `.hpp`,
+  `.hh`, `.hxx`. A `.h` header is always parsed as C.
+- **Symbols and identity.** C has one global namespace, so a C symbol's FQN is
+  its bare name (`square`), and `static` makes it file-local. C++ FQNs are built
+  from namespaces and classes (`ns::Widget::draw`). See GM-1.2 in docs/03.
+- **Calls.** An intra-file direct call resolves `certain`. A cross-file
+  (cross-translation-unit) call resolves by name and is banded `possible`.
+  Function-pointer and callback calls are banded `possible` and never given a
+  fabricated target. C++ virtual calls get a CHA candidate set (one candidate
+  is `probable`, several are `possible`); a call to an overloaded name is a
+  candidate set over every overload (`possible`); templates are parsed but never
+  instantiated.
+- **Hierarchy.** C++ emits `Inherits` and `Overrides`. C has none.
+- **Edge conditions.** `conditional` and `loop` in both; C++ adds `exception`
+  inside `catch` handlers. `setjmp`/`longjmp` are not modelled, and no RAII
+  destructor edge is ever emitted (only destructor calls spelled in source).
+- **Entrypoints.** `main` only (`Main`); no test detection.
+- **Preprocessor: grammar-only.** Nothing is expanded. Every `#if`/`#ifdef` arm
+  is walked (over-approximate), `#include` becomes an import fact, and a call to
+  a known function-like macro becomes an `UnexpandedMacro` cut with no edge.
+- **Own-effects** from a name table of libc/POSIX (and, for C++, standard
+  library) calls, including `Spawns` at `pthread_create`/`std::thread` sites.
+- **No intraprocedural dataflow.** C/C++ files produce no value nodes or
+  `derives-from` edges, so `flows-to`/`flows-from` have nothing to walk.
+- **Precision overlay.** `cgx index --scip` accepts a scip-clang index for
+  C/C++ (LS-5); without one, the bands above are the answer.
+
 **Tier 1 planned:** C#. No `cgx-lang-csharp` crate exists; C# rows in LS-7 and
 LS-8 are specification ahead of implementation.
 
@@ -70,7 +102,9 @@ Parse via tree-sitter grammar; cross-file name resolution via heuristic matching
 (unique name match, import-path resolution). No language-specific scope graph.
 Dispatch is approximated.
 
-Languages in Tier 2: **C, C++, C#, Kotlin, Swift, Ruby, PHP**
+Languages in Tier 2: **Kotlin, Swift, Ruby, PHP** (none implemented). C and C++
+have shipped adapters that use Tier-2 banding for type-dependent calls; see
+Tier 1 above.
 
 Characteristic capabilities at Tier 2:
 - Callee resolution at `probable` confidence when the callee name is unique in
@@ -116,8 +150,8 @@ supported language's error/exception surface to `cgx` edge conditions.
 | **JavaScript / TypeScript** | `throw` / `catch`; `Promise.reject`; unhandled rejections | `exception` on edges in `catch` blocks; `always` on edges in `finally` blocks (`finally` runs on every path, so calls inside it are unconditional); `exception` on `.catch()` callbacks | Async throw/reject annotated via async model (see LS-4) |
 | **Rust** | `Result<T, E>` / `?` operator; `panic!` / `unwrap` / `expect` | `exception` on edges gated by `?` or `Err(e) =>` match arm (data-conditioned failure branch); `panic` on edges reached only via `panic!` / `unwrap` / `expect` | Rust `?` and `Err` arms are ordinary data-conditioned branches, not exceptions in the unwinding sense; `cgx` labels them `exception` so cross-language "non-exception path" queries work uniformly. `panic` (non-recoverable) stays distinct. See GM-3 in docs/03-code-graph-model.md. |
 | **Go** | `error` return value; `panic` / `recover` | `exception` on edges inside `if err != nil` blocks (data-conditioned failure branch); `panic` on `panic()` paths; `exception` on `recover()` defers | Go error returns are ordinary data-conditioned branches; `cgx` labels them `exception` for cross-language query consistency (same as Rust `?`). `panic` stays distinct. |
-| **C** | Sentinel return values (NULL, negative int, errno); `longjmp` | `conditional` on edges gated by sentinel check; `exception` on longjmp paths | `cgx` identifies sentinel checks via pattern matching; confidence is `probable` |
-| **C++** | `throw` / `catch`; RAII destructor chains | `exception` on edges in catch blocks; `exception` on destructor calls reached only via stack unwinding | Destructor call edges during unwinding are labeled `exception` |
+| **C** | Sentinel return values (NULL, negative int, errno); `longjmp` | `conditional` on edges inside `if`/`switch` arms, `loop` inside loops — a sentinel check is an ordinary `conditional` branch | No sentinel-pattern recognition and no `exception` label: `setjmp`/`longjmp` are not modelled |
+| **C++** | `throw` / `catch`; RAII destructor chains | `exception` on edges inside `catch` handlers; `conditional`/`loop` as in C | No compiler-inserted (RAII) destructor edge is emitted, on unwinding or otherwise; only destructor calls spelled in source are recorded |
 | **C#** | `throw` / `catch`; `Task` faulted state | `exception` on catch block edges; `exception` on `.ContinueWith` fault continuations | Async model follows LS-4 |
 | **Kotlin** | Unchecked exceptions; `Result<T>` / `runCatching` | `exception` on catch edges; `conditional` on `runCatching` success/failure paths | Coroutine cancellation is annotated as `exception` |
 | **Swift** | `throw` / `catch`; `Result<T, E>`; `fatalError` | `exception` on try/catch edges; `conditional` on Result branches; `exception` on fatalError | |
@@ -157,8 +191,8 @@ more callee symbols and what confidence label it assigns.
 | **TypeScript** | Same as JS plus structural typing; interface dispatch | Interface implementations resolved via structural match at `probable`; generic type parameter calls at `possible` | `probable` (structural match), `certain` (direct static call with type narrowing) |
 | **Rust** | Static calls; trait dispatch (static monomorphization or `dyn Trait`); closure calls | Static and monomorphized calls at `certain`; `dyn Trait` produces trait impl candidate set at `probable`; closure stored in variable tracked via data-flow | `certain` (static/monomorphized), `probable` (dyn Trait impl set), `possible` (closure via unknown capture) |
 | **Go** | Direct calls; interface satisfaction; function values; goroutine launch | Interface calls produce candidate set from types satisfying the interface; goroutine launch annotated as async edge | `probable` (interface impl set), `certain` (direct call) |
-| **C** | Direct calls; function pointers | Direct calls at `certain`; function pointer calls at `possible` (callee unknown without data-flow) | `certain` (direct), `possible` (function pointer) |
-| **C++** | vtable (virtual); templates (monomorphized); std::function; function pointers | Virtual dispatch: CHA-style candidate set; templates: monomorphized call at `certain`; std::function: `possible` | `certain` (direct/template), `probable` (virtual, single override), `possible` (std::function / function pointer) |
+| **C** | Direct calls; function pointers | Intra-file direct calls at `certain`; cross-file direct calls name-matched across translation units at `possible`; function pointer and callback calls at `possible` with no fabricated target | `certain` (intra-file direct), `possible` (cross-file, function pointer); a scip-clang index (LS-5) can upgrade |
+| **C++** | vtable (virtual); overloads; templates; std::function; function pointers | Virtual dispatch: CHA-style candidate set; an overloaded name: candidate set over every overload; templates parsed but not instantiated (a call through a template-parameter-typed receiver is a candidate set or dangles); std::function / function pointer: `possible` | `certain` (intra-file direct), `probable` (virtual, single candidate), `possible` (multiple candidates, overloads, cross-file, function pointer); a scip-clang index (LS-5) can upgrade |
 | **DI frameworks** *(Planned)* | Spring (Java), Angular (TypeScript), Guice | Constructor injection and `@Autowired` / `@Inject` annotations tracked; injected type resolves to registered implementation | `probable` (single registered impl), `possible` (multiple candidates or dynamic registration) |
 | **Closures (all languages)** | Closure captures; higher-order functions passed as callbacks | Call edge from call site to closure body; capture tracking feeds DF- pedigree; higher-order call at `possible` if callee is a parameter | `probable` (closure assigned to typed variable), `possible` (callback parameter) |
 
@@ -210,8 +244,10 @@ languages.
 **SCIP ingestion is optional enrichment, not baseline.** `cgx` does not require
 a SCIP index to function; it falls back to its own heuristic resolution when
 none is provided. SCIP ingestion is an accuracy upgrade for teams whose build
-tooling already generates SCIP outputs (e.g., `scip-typescript`, `scip-rust` /
-`rust-analyzer --emit-scip`, `scip-python`).
+tooling already generates SCIP outputs. Two producers are supported, detected
+from the index metadata: `rust-analyzer scip` for Rust and `scip-clang` for
+C/C++. Indexes from other producers (`scip-typescript`, `scip-python`, …) have
+no symbol mapping onto cgx FQNs yet.
 
 **Status: partially shipped.** The ingest path is real — `cgx index --scip <index.scip>` is a flag on the binary, `crates/cgx-scip` parses the protobuf wire format, and `crates/cgx-index/src/pipeline/scip_relabel.rs` performs the upgrade-only re-label that raises matched edges to the `scip` confidence tier. That tier shows up in `cgx explain` output as `tier=scip`. What is **not** shipped is the packaging this section describes below: `cgx-scip` is an ordinary workspace dependency of `cgx-index`, not an optional Cargo feature, so "isolated behind an optional feature flag" states an intent rather than the current build.
 
@@ -222,6 +258,28 @@ protobuf schema itself is stable and versioned; if the upstream crate becomes
 unmaintained, `cgx` can regenerate bindings from the protobuf schema. For this
 reason, SCIP ingestion is isolated behind an optional feature flag and is not
 part of the critical indexing path.
+
+**scip-clang (C/C++).** A scip-clang index resolves overloads, ADL and
+template calls that the C++ adapter can only band as candidate sets; the relabel
+pass keys each promotion on the SCIP overload disambiguator, so it can redirect
+an overloaded call to the exact overload. Because scip-clang only sees the
+translation units its `compile_commands.json` lists, a partial compdb can make
+a multiply-defined symbol look unique. cgx therefore **fails closed**: a
+scip-clang promotion is capped at `probable` unless the compdb is known
+complete. Completeness comes from one of two flags on `cgx index`:
+
+- `--compdb <compile_commands.json>`: cgx checks that the compdb covers every
+  C++ translation unit (`.cpp`/`.cc`/`.cxx`; headers never count) it finds in
+  the source tree. Full coverage allows `certain`; any missing TU keeps the cap
+  and is reported.
+- `--compdb-complete`: a CI assertion that the build guarantees a complete
+  compdb, skipping the self-check.
+
+With neither flag, or with an unreadable or malformed compdb, the cap stays on.
+For a scip-clang index, the index summary prints a `compdb:` line (`COMPLETE` or `PARTIAL`, with the TU
+counts) and the `scip:` line counts promotions `capped (partial compdb)`.
+Source: `crates/cgx-index/src/pipeline/compdb.rs`,
+`crates/cgx-scip/src/symbol_cxx.rs`.
 
 *(That risk is already retired in practice: `crates/cgx-scip` is a hand-rolled,
 zero-dependency read-only protobuf decoder — the workspace never depended on the
@@ -274,9 +332,11 @@ partially implemented — spawn and lock constructs land as `spawns` / `blocking
 (the Java adapter emits `Spawns` at thread and executor launch sites), while the
 `.await` suspension edge is partial. That is the Concurrency `~` cell in
 [14 — Implementation Status Matrix](14-implementation-status-matrix.md), which is
-the authoritative per-cell ledger. Rows for **C/C++, Kotlin, Swift, C#** are
-specification ahead of implementation — they ground the schema reservation, and
-no adapter exists for any of them.
+the authoritative per-cell ledger. For **C/C++**, only the `Spawns` effect at
+`pthread_create`/`thrd_create` and `std::thread`/`std::async` sites ships; the
+rest of their rows are specification ahead of implementation. Rows for
+**Kotlin, Swift, C#** are specification ahead of implementation — they ground
+the schema reservation, and no adapter exists for any of them.
 
 This section specifies the per-language mapping of concurrency constructs to
 the graph attributes defined in docs/03-code-graph-model.md: `spawns` edge kind

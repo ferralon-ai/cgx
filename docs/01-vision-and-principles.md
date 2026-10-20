@@ -5,7 +5,8 @@
 `cgx` makes the call graph of a codebase a first-class queryable artifact —
 general-purpose across programming languages via a tiered adapter model (LS-1),
 implemented in Rust. Tier-1 adapters shipped: Rust, TypeScript/JavaScript, Go, Python,
-and Java; C# is the last Tier-1 language planned. The tier system adds languages
+and Java; C# is the last Tier-1 language planned. C and C++ adapters also ship,
+with a grammar-only preprocessor (see [08](08-language-support.md)). The tier system adds languages
 incrementally, and a Tier-0 generic tree-sitter fallback covers files no adapter claims.
 Software engineers, security engineers, and AI coding/security agents ask structural
 and dataflow questions about source code; `cgx` answers them with file:line evidence,

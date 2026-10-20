@@ -12,8 +12,8 @@ querying call structure over MCP instead of inferring it. `cgx <command>` is the
 human and CI surface (exit-code contract, JSON/SARIF output); `cgx mcp` serves
 the same answers to agents over MCP.
 
-Language adapters ship for Rust, TypeScript/JavaScript, Go, Java and Python
-(`crates/cgx-lang-*`). Files in any other language are counted as unsupported in
+Language adapters ship for Rust, TypeScript/JavaScript, Go, Java, Python, C and
+C++ (`crates/cgx-lang-*`). Files in any other language are counted as unsupported in
 the index report rather than silently dropped.
 
 This repository contains the implementation. The full specification — vision,
@@ -30,8 +30,21 @@ cargo build --release          # -> target/release/cgx
 cgx auto-indexes on the first query — there is no separate `index` step (pass
 `--no-auto-index` to require an explicit `cgx index` instead). The questions
 below run against this repository's own checked-in fixture corpus
-([`fixtures/rust-sample/`](fixtures/rust-sample/), a small hand-audited tree), so
-you can reproduce them exactly from a fresh clone.
+([`fixtures/rust-sample/`](fixtures/rust-sample/), a small hand-audited tree),
+indexed on its own. To reproduce the output byte for byte, copy that one fixture
+into an empty repository — the indexed tree OID is derived from content alone, so
+yours will read `4cca809` too:
+
+```sh
+mkdir demo && cd demo && git init -q
+mkdir fixtures && cp -R <path-to-cgx-checkout>/fixtures/rust-sample fixtures/
+git add -A && git commit -qm demo
+```
+
+Run inside the full checkout instead and the tree OID differs, and the
+`make_speak` call below resolves by method-name match (`rule=name-method`, three
+candidates including the trait declaration `Speak::speak`) rather than by
+class-hierarchy analysis.
 
 **What does this function call?** `direct::chain` makes three ordinary calls, so
 the answer is exact — every edge is a direct static binding:
@@ -43,22 +56,21 @@ rust_sample::direct::chain  fixtures/rust-sample/src/direct.rs:47
 ├─ rust_sample::direct::step_b  fixtures/rust-sample/src/direct.rs:54
 └─ rust_sample::direct::step_c  fixtures/rust-sample/src/direct.rs:55
 approximation: exact (within modeled graph)
-freshness: current | indexed tree 706ab89, working tree clean
+freshness: current | indexed tree 4cca809, working tree clean
 ```
 
 **What does a dynamic call dispatch to?** `make_speak` takes a `&dyn Speak`, so
-the target is a candidate set, not a single binding. cgx labels every such edge
-`[possible]` and states the over-approximation rather than pretending to one
-answer:
+the target is a candidate set, not a single binding. cgx labels each edge in a
+multi-target set `[possible]` and states the over-approximation rather than
+pretending to one answer:
 
 ```console
 $ cgx callees rust_sample::virtual_dispatch::make_speak
 rust_sample::virtual_dispatch::make_speak  fixtures/rust-sample/src/virtual_dispatch.rs:36
 ├─ rust_sample::virtual_dispatch::Cat::speak  fixtures/rust-sample/src/virtual_dispatch.rs:24  [possible]
-├─ rust_sample::virtual_dispatch::Dog::speak  fixtures/rust-sample/src/virtual_dispatch.rs:18  [possible]
-└─ rust_sample::virtual_dispatch::Speak::speak  fixtures/rust-sample/src/virtual_dispatch.rs:6  [possible]
-approximation: over- and under-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur; 2 call(s) in the searched region resolved to no in-repo target (external/unindexed callee; no SCIP) and could not be followed
-freshness: current | indexed tree 706ab89, working tree clean
+└─ rust_sample::virtual_dispatch::Dog::speak  fixtures/rust-sample/src/virtual_dispatch.rs:18  [possible]
+approximation: over-approximate — resolved through an over-approximated candidate set (dynamic dispatch or name-collision); some reported edges may not occur
+freshness: current | indexed tree 4cca809, working tree clean
 ```
 
 The last two lines of each answer — the approximation contract and the freshness
@@ -68,23 +80,22 @@ envelope — are the part worth reading closely.
 
 **Confidence is three-valued, per edge.** `certain` is a direct static binding
 with no ambiguity left — the `chain` edges above carry no label because they are
-certain. `probable` is a small, credible candidate set (a unique name match in
-scope, class-hierarchy analysis with few overrides). `possible` is an
-over-approximation: every `make_speak` edge above is `possible` because the
-target was resolved by matching the method name across the trait's implementors,
-not from a static binding. `cgx explain` shows the tier and the rule behind each
+certain. `probable` is a single credible candidate (a unique name match in scope, or
+class-hierarchy analysis that leaves exactly one implementor). `possible` is an
+over-approximation: both `make_speak` edges are `possible` because
+class-hierarchy analysis (CHA) narrows the `&dyn Speak` call to the trait's
+implementors — `Dog` and `Cat` — and nothing static picks between them. `cgx explain` shows the tier and the rule behind each
 edge:
 
 ```console
 $ cgx explain rust_sample::virtual_dispatch::make_speak
 rust_sample::virtual_dispatch::make_speak  (fixtures/rust-sample/src/virtual_dispatch.rs:36)
   kind: function
-  callers: 0, callees: 3
+  callers: 0, callees: 2
   edges:
-    -> rust_sample::virtual_dispatch::Speak::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:6)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
-    -> rust_sample::virtual_dispatch::Dog::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:18)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
-    -> rust_sample::virtual_dispatch::Cat::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:24)  [always]  [possible]  tier=scope_graph  rule=name-method  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
-freshness: current | indexed tree 706ab89, working tree clean
+    -> rust_sample::virtual_dispatch::Dog::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:18)  [always]  [possible]  tier=cha_rta  rule=cha-trait-set  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
+    -> rust_sample::virtual_dispatch::Cat::speak  (fixtures/rust-sample/src/virtual_dispatch.rs:24)  [always]  [possible]  tier=cha_rta  rule=cha-trait-set  site=fixtures/rust-sample/src/virtual_dispatch.rs:36
+freshness: current | indexed tree 4cca809, working tree clean
 ```
 
 **Answers carry an approximation contract and a freshness envelope.** The

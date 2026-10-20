@@ -66,10 +66,34 @@ Every named program entity is a **symbol** in the graph. Symbols are the nodes.
 
 ### GM-1.2 — Symbol identity
 
-Each symbol is identified by a **fully-qualified name** (FQN) composed from its
-enclosing scopes separated by `::` (language-agnostic normalisation). Where a
-SCIP index is available, the SCIP symbol descriptor is used as a stable,
-canonical identifier and the FQN is derived from it.
+Each symbol is identified by a **fully-qualified name** (FQN): a **root**
+followed by the symbol's enclosing scopes, each segment separated by `::`
+(language-agnostic normalisation). The root names the unit the symbol belongs
+to, and is taken from the language's own declared identity rather than from the
+directory layout wherever a manifest or declaration provides one:
+
+| Language | Root | Example |
+|---|---|---|
+| Rust | The owning `Cargo.toml` `[package] name`, as a crate identifier (`-` becomes `_`) | `rust_sample::direct::chain` |
+| Go | Import path: the owning `go.mod` `module` path joined with the package subdirectory by `/` | `example.com/app/svc::Run` |
+| TypeScript/JavaScript | The nearest `package.json` `name`, verbatim (a scoped `@scope/pkg` keeps its `@` and `/`), then the file's subpath below the package | `@acme/utils::helper` |
+| Python | The module path below the import root (the `pyproject.toml`/`setup.py` directory, plus `src/` for a src layout) | `dataflow::transform` |
+| Java | The file's `package` declaration | `com::example::flow::Dataflow` |
+| C | None: C has one global namespace, so the FQN is the bare source name | `square` |
+| C++ | The enclosing namespaces and classes, from the AST | `ns::Widget::draw` |
+
+Because Go and TS/JS roots carry the manifest identity verbatim, an FQN root may
+contain `/` (and `@`, `.`, `-`). The non-root part is always `::`-separated. The
+manifests are resolved pipeline-side (`crates/cgx-index/src/manifest.rs` for
+`go.mod`, `package.json` and `pyproject.toml`/`setup.py`; `cargo_pkg.rs` for
+Cargo), and each file takes its nearest-ancestor manifest, so a nested module
+in a monorepo gets its own root. When no manifest is in scope, the Go and TS/JS
+adapters fall back to a best-effort, directory-derived root that is not
+canonical.
+
+A SCIP index (LS-5 in docs/08) does not replace the FQN. The relabel pass maps
+each SCIP symbol onto a cgx FQN and upgrades the matching edges; node identity
+stays the cgx FQN.
 
 ### GM-1.3 — Symbol attributes
 
@@ -442,11 +466,13 @@ configuration:
 | Python | `if __name__ == "__main__"` block, pytest functions named `test_*` |
 | Go | `func main()` in package `main`, `func Test*(*testing.T)` |
 | JavaScript / TypeScript | Top-level `export default`, Jest `test()`/`it()` calls |
+| C | A function named `main`; no test-framework detection |
+| C++ | A non-member function named `main` (a namespace-qualified one included); no test-framework detection |
 
 **Every framework/HTTP-handler row is Planned and has been removed from the table above** —
 Spring `@Controller`/`@RestController`, Django/Flask routes, Express/Fastify handlers. The
 `EntrypointKind::HttpHandler` variant is defined in `crates/cgx-core/src/node.rs` and is
-constructed **nowhere**: it has zero producers across all five language adapters, so no symbol
+constructed **nowhere**: it has zero producers across all seven language adapters, so no symbol
 in any indexed repository carries it. `EntrypointKind::Declared` is likewise never constructed
 (see GM-7.2).
 

@@ -19,6 +19,10 @@ of string literals. Three groups, with three different consumers:
    determinism tests (`crates/cgx-index/tests/scip_relabel_integration.rs`). See
    its own [`REGEN.md`](scip-relabel/REGEN.md).
 
+`c/` is a small C call chain across files (`app.c` → `mathlib.c`,
+`main → square → helper`). Like `python-app/`, it has no consumer anywhere in the
+workspace yet; the C adapter's own tests use inline sources.
+
 `python-app/` has no consumer anywhere in the workspace.
 
 ## Layout
@@ -72,6 +76,7 @@ fixtures/
   python/               # shapes, lattice, dataflow
   ts/src/               # dataflow, effects
   python-app/           # app, storage
+  c/                    # app.c -> mathlib.c (main -> square -> helper)
   scip-relabel/         # tiny crate for the SCIP re-label tests (see REGEN.md)
 ```
 

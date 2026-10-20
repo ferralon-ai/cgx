@@ -20,7 +20,8 @@ and apply **different `depth` defaults** (see
 
 Traversal is over the call-edge family only. `reaches` accepts no `kind` or
 `edge_condition` filter — the walk is `EdgeFilter::calls()` plus an optional
-confidence floor (`crates/cgx-mcp/src/tools.rs:767`).
+confidence floor (`reaches_call` in `crates/cgx-mcp/src/tools.rs`), plus the optional
+`max_candidates` fan-out cap.
 
 ## Input schema
 
@@ -31,7 +32,8 @@ confidence floor (`crates/cgx-mcp/src/tools.rs:767`).
 | `root` | string | yes | — | Repository root path. A `.cgx/` store is not required; the server indexes per call into an in-memory store. |
 | `depth` | integer | no | `2` in the `from → *` form; **unbounded** in the `from → to` form | Maximum traversal depth. The registry advertises `2` for both; the handler applies it to one. See the note below. |
 | `confidence` | string | no | — | Minimum confidence floor. One of `certain`, `probable`, `possible`. Omitted = every edge. |
-| `max_results` | integer | no | `20` | Page size, `from → *` form only. Clamped to `[1, 200]` (`MAX_MAX_RESULTS`, `crates/cgx-mcp/src/tools.rs:28`); `0` clamps up to 1. |
+| `max_results` | integer | no | `20` | Page size, `from → *` form only. Clamped to `[1, 200]` (`MAX_MAX_RESULTS`); `0` clamps up to 1. |
+| `max_candidates` | integer ≥ 1 | no | — | Fan-out cap: drop call edges from an over-approximated candidate set larger than N targets (orthogonal to `confidence`). Dropped edges are reported as a `dropped-max-candidates` reason in `approximation`, which turns the answer `under`. |
 | `cursor` | string | no | — | Opaque pagination cursor, `from → *` form only. A decimal offset string; an unparseable value is an `invalid_params` error. |
 | `include_dirty` | boolean | no | `true` | Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted. |
 
@@ -268,8 +270,8 @@ applies that default to **one** form:
 
 | Form | Handler | Absent `depth` means |
 |------|---------|----------------------|
-| `from → to` | `max_depth: opt_u32(args, "depth")?` (`crates/cgx-mcp/src/tools.rs:778`) | `None` — **unbounded** |
-| `from → *` | `.unwrap_or(DEFAULT_FOREST_DEPTH)` (`crates/cgx-mcp/src/tools.rs:796`) | `2` |
+| `from → to` | `max_depth: opt_u32(args, "depth")?` (`reaches_call`) | `None` — **unbounded** |
+| `from → *` | `.unwrap_or(DEFAULT_FOREST_DEPTH)` (`reaches_call`) | `2` |
 
 This is a schema-vs-behaviour mismatch, not a documentation shortcut: the two
 requests in the example above differ only by the value the schema calls the
@@ -283,7 +285,7 @@ expect a bounded negative to mean "not within `depth`", never "not at all".
 
 ### An empty `to` is an omitted `to`
 
-`to` is read through `.filter(|s| !s.is_empty())` (`crates/cgx-mcp/src/tools.rs:772`),
+`to` is read through `.filter(|s| !s.is_empty())` (`reaches_call`),
 so `"to": ""` selects the `from → *` form rather than failing or searching for a
 symbol named `""`. A client that always sends every key with a default of `""`
 gets the forest, not an error.

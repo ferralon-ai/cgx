@@ -225,6 +225,9 @@ has been an object with `results`/`total_matched`/`has_more`/`cursor` since
 before the change (verified against `8af8bcf:crates/cgx-mcp/src/tools.rs`). A
 client written against MCP `search` needed no migration.
 
+The CLI's `--agnostic` flag has no MCP counterpart: the schema has no `agnostic`
+property, and an `"agnostic": true` argument is silently ignored, not rejected.
+
 ## See also
 
 - [symbols](symbols.md) — rank symbols by reference count, when the question is "which symbol matters" rather than "which symbol is this"

@@ -136,12 +136,13 @@ Two call-graph codes are routinely conflated and are not the same fact: `unresol
 
 ### Which tools carry what
 
-Not every answer carries both objects. Of the twelve tools, **eleven emit `freshness`** and **nine emit `approximation`**, and the two sets are not the same nine.
+Not every answer carries both objects. Of the thirteen tools, **twelve emit `freshness`** and **ten emit `approximation`**, and the two sets are not nested.
 
 | tools | count | `graph_version` / `dirty` / `dirty_files_analyzed` | `freshness` | `approximation` |
 |---|---|---|---|---|
 | `callers`, `callees`, `reaches`, `paths`, `unused`, `flows_to`, `flows_from`, `graph_query` | 8 | ✓ | ✓ | ✓ |
 | `explain`, `search`, `symbols` | 3 | ✓ | ✓ | **✗** by design |
+| `impacted_tests` | 1 | `dirty` / `dirty_files_analyzed` only — no `graph_version` (it compares two graphs and emits both `graph_key`s) | ✓ | ✓ |
 | `coupling` | 1 | **✗** | **✗** | ✓ |
 
 `explain`, `search` and `symbols` skip `with_contract` deliberately (`tools.rs:566`): none performs a graph traversal, so there is no frontier to under-approximate and no candidate set to over-approximate.

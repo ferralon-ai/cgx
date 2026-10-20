@@ -28,14 +28,15 @@ hop crosses an exceptional execution class. The tool is the MCP equivalent of `c
 | `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters) |
 | `max_depth` | integer | no | `10` | Maximum traversal depth. **`0` is not an unlimited sentinel over MCP** — see below |
 | `max_results` | integer | no | `10` | Maximum paths to return per page. Clamped to `[1, 200]`; `0` is raised to 1 and values above 200 reduced to 200, neither an error |
-| `exclude_edge_condition` | string | no | — | Exclude paths that contain any edge with this condition. One of: `always`, `conditional`, `exception`, `loop`, `panic` |
-| `only_edge_condition` | string | no | — | Return only paths where every edge has this condition. One of: `always`, `conditional`, `exception`, `loop`, `panic` |
+| `exclude_edge_condition` | string | no | — | Per-edge traversal filter: never follow an edge with this condition, so no returned path contains one. One of: `always`, `conditional`, `exception`, `loop`, `panic` |
+| `only_edge_condition` | string | no | — | Per-edge traversal filter: follow only edges with this condition, so every edge on a returned path has it. One of: `always`, `conditional`, `exception`, `loop`, `panic` |
 | `confidence` | string | no | — | Minimum confidence floor; edges below this tier are excluded. One of: `certain`, `probable`, `possible` |
+| `max_candidates` | integer ≥ 1 | no | — | Fan-out cap: drop call edges from an over-approximated candidate set larger than N targets (orthogonal to `confidence`). Dropped edges are reported as a `dropped-max-candidates` reason in `approximation`, which turns the answer `under`. |
 | `cursor` | string | no | — | Pagination cursor returned by a previous response. `"0"` requests the first page explicitly |
 | `include_dirty` | boolean | no | `true` | When `true`, includes facts from dirty (unindexed) files via the incremental overlay |
 
 **`max_depth: 0` returns nothing.** The handler passes the value straight through as
-a bound (`paths_call`, `crates/cgx-mcp/src/tools.rs:642`), so `0` bounds the walk at
+a bound (`paths_call` in `crates/cgx-mcp/src/tools.rs`), so `0` bounds the walk at
 the seed node and the result is an empty `paths` array. This differs from the CLI,
 where `cgx paths --depth 0` maps to *unbounded* (`paths_max_depth`,
 `crates/cgx-cli/src/main.rs:2036`). The MCP tool has no unlimited sentinel; pass a
@@ -43,7 +44,7 @@ large integer instead, subject to the work budget.
 
 **Supplying both edge-condition filters is not an error.** `only_edge_condition`
 silently wins — the handler tests it first and only falls through to
-`exclude_edge_condition` when it is absent (`tools.rs:632-636`). Pass exactly one.
+`exclude_edge_condition` when it is absent (`paths_call`). Pass exactly one.
 
 **No `at` parameter.** The CLI's git-ref pinning flag is not in this tool's input
 schema. Unknown arguments are ignored without error, so passing `at` is a silent

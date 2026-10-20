@@ -78,6 +78,34 @@ sink categories (I/O, network, shell calls) deep in the footprint; their presenc
 method's reach warrants a security review. Edge labels (`always`/`conditional`/`exception`) and
 confidence values affect how to read each hop — see `reference/mental-model.md`.
 
+**As a compact JSON card** (`Since: v0.3`): `cgx pack dependency-footprint <exact FQN>` wraps the
+same forward walk (default `--depth 2`) in one document with `direct_callees`, `external_callees`,
+the `callees` list and the answer's `approximation`. The FQN must be exact — copy it from
+`cgx search`; a miss returns `"resolved": false` with an `error` at exit 0, not an empty footprint.
+
+```bash
+cgx pack dependency-footprint rust_sample::virtual_dispatch::make_speak   # fixtures/rust-sample
+```
+
+---
+
+## Interface map — who implements what
+
+### Which types implement this interface, and which interfaces does this type satisfy?
+
+**Status:** runnable today  **Since: v0.3**
+
+```bash
+cgx pack interface-map --interface rust_sample::virtual_dispatch::Speak   # → Dog, Cat
+cgx pack interface-map --type rust_sample::virtual_dispatch::Dog          # → Speak
+cgx pack                                                                  # whole repo + manifest
+```
+
+Output is JSON: an `edges` list of `{interface, type, …_file}` pairs with an `approximation`.
+`--interface` and `--type` are mutually exclusive. The bare `cgx pack` emits every address-free
+card (today, the full interface map) under a `manifest` header describing the graph it was built
+from — the shape to hand an agent as up-front context.
+
 ---
 
 ## Per-symbol incident edges

@@ -21,6 +21,9 @@ It has two modes:
 `cgx coupling <BASE> <HEAD>` answers the other temporal question — which files historically change
 together — from committed history alone, with no index.
 
+`cgx impacted-tests <BASE> <HEAD>` answers "which tests does this change reach?" — see the section
+below. It compares against `merge-base(BASE, HEAD)` by default, whereas `cgx diff` compares tips.
+
 Use `--at <REF>` on `cgx query` to pin any query to a historical graph snapshot.
 
 **Formats are mode-dependent, and `sarif` is rejected in both.** Full-mode `diff` accepts
@@ -221,6 +224,29 @@ Pass **`--require-anchor-match`** in CI to turn that warning into exit 2. Withou
 name, or a sink that lives in a dependency rather than in the indexed repo, reads as a passing gate.
 The output's own `[reachability, not a security guarantee]` tag is the other half of the same
 caution: a new path means a new *way to get there*, not a new vulnerability.
+
+---
+
+### Which tests should run for this branch?
+
+**Status:** runnable today (Rust, Go, Java, Python)   **Since:** v0.3
+
+```bash
+cgx impacted-tests main HEAD                 # tests reaching anything this branch changed
+cgx impacted-tests main HEAD --no-merge-base # against main's tip instead (cgx diff semantics)
+cgx impacted-tests --uncommitted             # inner loop: working tree vs HEAD
+```
+
+Verified with `HEAD~1 HEAD` on a copy of `fixtures/python-app` whose last commit edited the body of
+`build_record`: `app::build_record app.py:11` → `test_app::test_build_record test_app.py:10
+[probable]`, exit 0. The changed set is graph-diff symbols plus every symbol in a changed file, so
+body-only edits count.
+
+A changed set in TypeScript/JavaScript, C or C++ only exits **4** with
+`impacted-language-unsupported` — vacuous, not "no tests to run"; gate CI on that exit code rather
+than on an empty list. A rename is not caught: the tests' calls to the old name stop resolving, so
+nothing reaches the new one — run `cgx callers <old FQN>` before renaming instead (see
+`recipes/impact.md`).
 
 ---
 

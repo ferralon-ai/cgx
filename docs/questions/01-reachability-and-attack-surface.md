@@ -90,7 +90,7 @@ A vulnerability scanner reports that a dependency contains a known-vulnerable fu
 **The query**
 
 ```cgx
--- illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
+# illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
 cgx query '
   MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln {name:"libfoo::deserialize"})
   RETURN ep.name, ep.file, ep.line,
@@ -145,7 +145,7 @@ cgx query '
 ' --repo ./
 ```
 
-`ALL(r IN relationships(path) WHERE r.condition IN [...])` keeps only paths where every edge is in the exceptional class — the "ONLY through exception handlers" case. The looser form below returns paths with *at least one* exception edge:
+`ALL(r IN relationships(path) WHERE r.condition IN [...])` keeps only paths where every edge is in the exceptional class — the "ONLY through exception handlers" case. The form below is stricter, not looser: it keeps the same `ALL(...)` clause, adds an `ANY(...)` clause (implied by `ALL` on any non-empty path), and also restricts the start node to `kind:"entrypoint"`. It returns a subset of the first query's rows. To get paths with *at least one* exception edge instead, drop the `ALL(...)` clause and keep only `ANY(...)`:
 
 ```cgx
 cgx query '
@@ -176,8 +176,8 @@ This question combines taint propagation with entrypoint enumeration: find every
 **The query**
 
 ```cgx
--- illustrative: requires DF-11 typed taint labels (core-extension, Phase 3)
--- source_class, sanitizer_class are unsupported node properties at v0.3 (plan error, exit 2)
+# illustrative: requires DF-11 typed taint labels (core-extension, Phase 3)
+# source_class, sanitizer_class are unsupported node properties at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (src)-[:DATA_FLOW*]->(sink {name:"template::render"})
   WHERE src.source_class IN ["network","cli","user-input"]
@@ -250,8 +250,8 @@ This question maps the attack surface of the dependency tree: if a vulnerability
 **The query**
 
 ```cgx
--- illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
--- entrypoint_class, package, version are not supported node properties at v0.3 (plan error, exit 2)
+# illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
+# entrypoint_class, package, version are not supported node properties at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(dep_fn)
   WHERE dep_fn.package IS NOT NULL
@@ -363,8 +363,8 @@ An automated security agent processing a SBOM-derived CVE list needs function-le
 Note: `entrypoint_class` is not a supported node property at v0.3 (plan error, exit 2). Query parameters (`$name`) are also not supported at v0.3 (plan error, exit 2); substitute the literal function name. The `--param` flag does not exist:
 
 ```cgx
--- illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
--- entrypoint_class unsupported at v0.3; substitute literal vulnerable_fn name
+# illustrative: requires Q-25 (schema-room) for dependency-edge package/version attributes
+# entrypoint_class unsupported at v0.3; substitute literal vulnerable_fn name
 cgx query '
   MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(vuln)
   WHERE vuln.name = "libfoo::parse_header"
@@ -434,7 +434,7 @@ Sinks that are only reachable during exception handling represent a specific ris
 Note: `sink_class` is not a supported node property at v0.3 (plan error, exit 2). `NOT EXISTS { MATCH ... }` subquery syntax is also not supported at v0.3 (parse error, exit 2). Enumerate sink names explicitly and split the two-path condition into separate queries:
 
 ```cgx
--- Step 1: find paths with at least one exception-conditioned edge
+# Step 1: find paths with at least one exception-conditioned edge
 cgx query '
   MATCH path = (ep {kind:"entrypoint"})-[:CALLS*]->(sink)
   WHERE sink.name IN ["std::fs::File::open", "std::fs::write",
@@ -470,8 +470,8 @@ User-controlled input reaching JWT generation or validation is a high-severity f
 **The query**
 
 ```cgx
--- illustrative: requires DF-11 typed taint labels (core-extension, Phase 3)
--- source_class, sanitizer_class, transformation_kind are unsupported at v0.3 (plan error, exit 2)
+# illustrative: requires DF-11 typed taint labels (core-extension, Phase 3)
+# source_class, sanitizer_class, transformation_kind are unsupported at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (src)-[:DATA_FLOW*]->(jwt_fn)
   WHERE src.source_class IN ["network","cli","user-input"]
@@ -561,14 +561,14 @@ cgx query '
   WHERE NONE(n IN nodes(path) WHERE n.name = "authz::require_permission")
   RETURN path
 ' --repo ./
--- Zero results = every path to the resource passes through the check.
--- Non-empty results = at least one path reaches the resource without the check.
+# Zero results = every path to the resource passes through the check.
+# Non-empty results = at least one path reaches the resource without the check.
 ```
 
 The following form is illustrative only — it causes a plan error at v0.3:
 
 ```cgx
--- deferred: MATCH ALL ... MUST PASS THROUGH → plan error, exit 2 at v0.3
+# deferred: MATCH ALL ... MUST PASS THROUGH → plan error, exit 2 at v0.3
 cgx query '
   MATCH ALL path = (ep {kind:"entrypoint"})-[:CALLS*]->(resource {name:"protected_resource::access"})
   MUST PASS THROUGH (check {name:"authz::require_permission"})
@@ -596,8 +596,8 @@ This question targets SSRF (server-side request forgery) and open redirect vulne
 **The query**
 
 ```cgx
--- illustrative: requires Q-23 typed taint (core-extension, Phase 3)
--- source_class, sink_class, sanitizer_class are unsupported at v0.3 (plan error, exit 2)
+# illustrative: requires Q-23 typed taint (core-extension, Phase 3)
+# source_class, sink_class, sanitizer_class are unsupported at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (src)-[:DATA_FLOW*]->(sink)
   WHERE src.source_class = "network"
@@ -631,9 +631,9 @@ Deserialization gadget chains are a serious attack vector: if an attacker contro
 **The query**
 
 ```cgx
--- illustrative: requires Q-23 typed taint (core-extension, Phase 3) and
---               GM-14 dependency edges (schema-room) for cross-crate types
--- source_class, sink_class are unsupported node properties at v0.3 (plan error, exit 2)
+# illustrative: requires Q-23 typed taint (core-extension, Phase 3) and
+#               GM-14 dependency edges (schema-room) for cross-crate types
+# source_class, sink_class are unsupported node properties at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (src {source_class:"deserialization"})-[:DATA_FLOW*]->(constructor)
   WHERE constructor.kind IN ["method","function"]
@@ -671,8 +671,8 @@ Mass assignment vulnerabilities occur when deserialized fields are written direc
 **The query**
 
 ```cgx
--- illustrative: requires Q-23 typed taint (core-extension, Phase 3)
--- source_class, sink_class, sanitizer_class, transformation_kind unsupported at v0.3 (plan error, exit 2)
+# illustrative: requires Q-23 typed taint (core-extension, Phase 3)
+# source_class, sink_class, sanitizer_class, transformation_kind unsupported at v0.3 (plan error, exit 2)
 cgx query '
   MATCH path = (src)-[:DATA_FLOW*]->(sink {sink_class:"sql"})
   WHERE src.source_class = "deserialization"

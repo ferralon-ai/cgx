@@ -65,9 +65,10 @@ The response envelope:
 | `dirty_files_analyzed` | integer | Count of files whose content differs between the two sides. |
 | `degenerate` | boolean | `true` when the answer is vacuous rather than clean. |
 | `degenerate_reason` | string or null | Why, when `degenerate` is `true`. |
+| `freshness` | object | Which tree the head side was computed over and how it relates to `HEAD`: `indexed_tree` (a tree OID, or `workdir:<digest>` for the working tree), `head_tree`, `matches_head`, `dirty_files_base`, `dirty_files`, `stale`. See [the response envelope](README.md#freshness--which-tree-the-answer-was-computed-over). |
 | `approximation` | object | The approximation contract. See below. |
 
-**There is no `graph_version` field.** Every other tool emits one; this tool
+**There is no `graph_version` field.** Every other graph-backed tool emits one; this tool
 compares two graphs, so it emits the two `graph_key`s and the two resolved refs
 instead, which are strictly more informative.
 
@@ -113,6 +114,8 @@ the negative *with* the terms it was established under. A non-empty answer
 carries no `scope`.
 
 ### Reason codes
+
+Rows marked "emitted when receiver narrowing is enabled" cannot currently fire from this tool: `impacted_tests` (like `cgx impacted-tests`) builds both graphs with receiver narrowing off, and `cgx index --receiver-narrowing` does not reach it.
 
 **Under-approximation** — a test may be missing:
 

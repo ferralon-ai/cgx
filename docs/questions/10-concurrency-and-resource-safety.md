@@ -37,7 +37,7 @@ least one suspension point. Specified in docs/05 Q-24 (TOCTOU family).
 **The query**
 
 ```cgx
--- illustrative: requires GM-10 (schema-room) for the `suspends` property on call-site nodes
+// illustrative: requires GM-10 (schema-room) for the `suspends` property on call-site nodes
 MATCH path = (validate)-[:CALLS*]->(use)
 WHERE validate.name = $validate_fn
   AND use.name = $use_fn
@@ -59,7 +59,7 @@ Note: CQL query parameters (`$validate_fn`, `$use_fn`) must be substituted as li
 For a broader sweep — any check-then-use with an `await` between them:
 
 ```cgx
--- illustrative: requires GM-10 (schema-room)
+// illustrative: requires GM-10 (schema-room)
 MATCH path = (check {name:"validate_path"})-[:CALLS*]->(use {name:"fs::open"})
 WHERE ANY(n IN nodes(path) WHERE n.suspends = true)
 RETURN check.file, check.line, use.file, use.line
@@ -91,7 +91,7 @@ in docs/05 Q-22 (acquire/release pairing).
 **The query**
 
 ```cgx
--- illustrative: requires GM-13 (schema-room) resource lifecycle pairs and Q-22 pairing predicates
+// illustrative: requires GM-13 (schema-room) resource lifecycle pairs and Q-22 pairing predicates
 MATCH path = (acquire {name:"db::Connection::begin"})-[:CALLS*]->(exit_node)
 WHERE exit_node.is_return_site = true
   AND NONE(n IN nodes(path)
@@ -145,8 +145,8 @@ populating code anywhere) and `a.spawn_context` (not a field on any node or edge
 record at all — `grep -rn spawn_context crates/` is empty):
 
 ```cgx
--- illustrative: requires GM-11 (schema-room) lock-set attribute and a per-access
--- spawn-context identity, which does not exist as a field anywhere yet
+// illustrative: requires GM-11 (schema-room) lock-set attribute and a per-access
+// spawn-context identity, which does not exist as a field anywhere yet
 MATCH (a)-[:CALLS*]->(site_a)-[:READS_FIELD|WRITES_FIELD]->(field)
 MATCH (b)-[:CALLS*]->(site_b)-[:READS_FIELD|WRITES_FIELD]->(field)
 WHERE a.spawn_context <> b.spawn_context
@@ -186,10 +186,10 @@ Specified in docs/05 Q-24 (await-holding-lock and blocking-in-async families).
 Await-holding-lock (inter-procedural):
 
 ```cgx
--- illustrative: requires GM-10 (schema-room) and GM-11 (schema-room)
--- Note: MATCH (site) with no relationship is a plan error in v0.3.0 (exit 2).
--- When GM-10/GM-11 are available this will require a relationship clause, e.g.:
--- MATCH (caller)-[:CALLS]->(site) WHERE site.suspends = true ...
+// illustrative: requires GM-10 (schema-room) and GM-11 (schema-room)
+// Note: MATCH (site) with no relationship is a plan error in v0.3.0 (exit 2).
+// When GM-10/GM-11 are available this will require a relationship clause, e.g.:
+// MATCH (caller)-[:CALLS]->(site) WHERE site.suspends = true ...
 MATCH (caller)-[:CALLS]->(site)
 WHERE site.suspends = true
   AND size(site.lock_set) > 0
@@ -201,10 +201,10 @@ ORDER BY site.file, site.line
 Blocking-in-async:
 
 ```cgx
--- illustrative: the `blocking` effect itself ships and is populated (GM-12,
--- effect.rs:27); what's not queryable is fn.transitive_effects (CQL rejects it,
--- "unknown node property") and the async-entrypoint `async` property (GM-10-
--- adjacent, also CQL-rejected)
+// illustrative: the `blocking` effect itself ships and is populated (GM-12,
+// effect.rs:27); what's not queryable is fn.transitive_effects (CQL rejects it,
+// "unknown node property") and the async-entrypoint `async` property (GM-10-
+// adjacent, also CQL-rejected)
 MATCH path = (ep {kind:"entrypoint", async:true})-[:CALLS*]->(fn)
 WHERE "blocking" IN fn.transitive_effects
   AND NONE(n IN nodes(path) WHERE n.name IN ["spawn_blocking",
@@ -246,10 +246,10 @@ guaranteed lock coverage. Specified in docs/05 Q-24 (cross-spawn race family).
 **The query**
 
 ```cgx
--- illustrative: `writes-global` does not exist in the effect lattice (real gap);
--- GM-11 lock sets and a per-access spawn_context identity are unpopulated (real gap).
--- GM-9 itself is not a gap: EdgeKind::Spawns ships — `(spawn_a)-[:CALLS*]->(fn_a)`
--- would need `-[:SPAWNS]->` as its first hop to actually anchor on a spawn site
+// illustrative: `writes-global` does not exist in the effect lattice (real gap);
+// GM-11 lock sets and a per-access spawn_context identity are unpopulated (real gap).
+// GM-9 itself is not a gap: EdgeKind::Spawns ships — `(spawn_a)-[:CALLS*]->(fn_a)`
+// would need `-[:SPAWNS]->` as its first hop to actually anchor on a spawn site
 MATCH (spawn_a {edge_type:"spawns"})-[:CALLS*]->(fn_a)
 MATCH (spawn_b {edge_type:"spawns"})-[:CALLS*]->(fn_b)
 WHERE spawn_a <> spawn_b
@@ -290,10 +290,10 @@ underlying fact. Specified in docs/05 Q-24 (effect-based queries).
 **The query**
 
 ```cgx
--- illustrative: the `nondeterministic` effect ships and is populated (effect.rs:27).
--- Blocked by two narrower gaps instead: `own_effects`/`transitive_effects` are not
--- queryable CQL node properties (`unknown node property`, live-verified), and
--- `is_pure`/`reachable_from_test_only` are not fields on any node record at all
+// illustrative: the `nondeterministic` effect ships and is populated (effect.rs:27).
+// Blocked by two narrower gaps instead: `own_effects`/`transitive_effects` are not
+// queryable CQL node properties (`unknown node property`, live-verified), and
+// `is_pure`/`reachable_from_test_only` are not fields on any node record at all
 MATCH path = (fn)-[:CALLS*]->(ndet_fn)
 WHERE (fn.is_pure = true OR fn.reachable_from_test_only = true)
   AND "nondeterministic" IN ndet_fn.transitive_effects
@@ -308,10 +308,10 @@ For a broader sweep of all functions whose transitively-computed effects include
 `nondeterministic` (regardless of pure/test annotations):
 
 ```cgx
--- illustrative: blocked by `own_effects`/`transitive_effects` not being queryable
--- CQL node properties, not by `nondeterministic` itself (which ships).
--- Note: MATCH (fn) with no relationship is a plan error in v0.3.0 (exit 2) — the
--- relationship clause below is required regardless of the property gap.
+// illustrative: blocked by `own_effects`/`transitive_effects` not being queryable
+// CQL node properties, not by `nondeterministic` itself (which ships).
+// Note: MATCH (fn) with no relationship is a plan error in v0.3.0 (exit 2) — the
+// relationship clause below is required regardless of the property gap.
 MATCH (fn)-[:CALLS]->(callee)
 WHERE "nondeterministic" IN fn.transitive_effects
   AND NOT "nondeterministic" IN fn.own_effects

@@ -22,12 +22,13 @@ Results are paginated. The default page size is 20; the hard cap is 200.
 | `edge_condition` | string | no | — | Restrict the walk to a single edge-condition class. One of: `always`, `conditional`, `exception`, `loop`, `panic`. |
 | `confidence` | string | no | — | Minimum confidence floor. One of: `certain`, `probable`, `possible`. No value = all tiers shown. |
 | `kind` | array of string | no | — | Restrict the walk to these call-edge kinds. Tokens: `calls`, `calls_virtual`, `calls_closure`, `calls_callback`, `calls_async`, `calls_indirect`, `spawns`. An empty array is treated as absent. |
+| `max_candidates` | integer ≥ 1 | no | — | Fan-out cap: drop call edges from an over-approximated candidate set larger than N targets (orthogonal to `confidence`). Dropped edges are reported as a `dropped-max-candidates` reason in `approximation`, which turns the answer `under`. |
 | `include_dirty` | boolean | no | `true` | Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted. |
 
 **`edge_condition` restricts, it does not exclude.** `"edge_condition":
 "conditional"` returns only edges whose condition is `conditional`; every other
-edge, `always` included, is filtered out (`neighbor_filter`,
-`crates/cgx-mcp/src/tools.rs:427`).
+edge, `always` included, is filtered out (`neighbor_filter` in
+`crates/cgx-mcp/src/tools.rs`).
 
 **`kind` tokens are underscored on input and hyphenated on output.** The schema
 accepts `calls_virtual`; passing `calls-virtual` is rejected with
@@ -66,7 +67,7 @@ Each record in `results`:
 |-------|------|---------|
 | `name` | string | Fully-qualified name of the caller. |
 | `file` | string | Source file path (relative to repo root). |
-| `line` | integer | Line number of the call site. |
+| `line` | integer | Definition line of the caller — not the call site. |
 | `depth` | integer | Graph hops from the target symbol to this caller. |
 | `edge_condition` | string | Edge condition: `always`, `conditional`, `exception`, `loop`, or `panic`. |
 | `confidence` | string | Confidence of this specific edge: `certain`, `probable`, or `possible`. |
@@ -255,7 +256,7 @@ which is the whole point of the negative-completeness envelope.
   resolvable in-repo and exactly one method anywhere shares the short name, the
   edge is banded `probable` — which does **not** trip the contract's `over`
   predicate, so such an answer can report `direction: "exact"` while containing
-  one wrong edge. Backlog **B-5**. Duck-typed and cross-class same-name method
+  one wrong edge. Duck-typed and cross-class same-name method
   calls are the shapes where a `callers` answer's `exact` deserves least trust.
 
 ## See also

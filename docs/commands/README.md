@@ -1,6 +1,6 @@
 # cgx CLI — Command Reference
 
-cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
+cgx provides 22 subcommands organised into nine groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
 
 ## Commands
 
@@ -11,6 +11,7 @@ cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/
 | `cgx index` | Analyze source files and write the call graph (and dataflow layer) to `.cgx/` | [index.md](index.md) |
 | `cgx doctor` | Report on the quality and trust level of the current on-disk index | [doctor.md](doctor.md) |
 | `cgx diff` | Diff the call graph between two git refs | [diff.md](diff.md) |
+| `cgx dump` | Print the raw stored graph (nodes, edges, candidate sets), whole or filtered to one symbol | [dump.md](dump.md) |
 
 ### Reachability
 
@@ -38,6 +39,14 @@ cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/
 | `cgx unused` | Symbols not reachable from any indexed entrypoint | [unused.md](unused.md) |
 | `cgx coupling` | Which files historically change together across a commit range | [coupling.md](coupling.md) |
 
+### Index sharing
+
+| Command | Purpose | Reference |
+|---------|---------|-----------|
+| `cgx push` | Publish the local index to a remote under the non-branch ref `refs/cgx/index` | [push.md](push.md) |
+| `cgx pull` | Fetch `refs/cgx/index` from a remote and materialize `.cgx/` locally | [pull.md](pull.md) |
+| `cgx configure-remote` | Add the `refs/cgx/*` fetch/push refspecs to a remote so plain `git fetch` carries the index | [configure-remote.md](configure-remote.md) |
+
 ### Change impact
 
 | Command | Purpose | Reference |
@@ -49,6 +58,12 @@ cgx provides 17 subcommands organised into seven groups. Most read from a `.cgx/
 | Command | Purpose | Reference |
 |---------|---------|-----------|
 | `cgx query` | Run a Layer-2 CQL (Cypher-subset) query against the call graph or dataflow graph | [query.md](query.md) |
+
+### Agent context
+
+| Command | Purpose | Reference |
+|---------|---------|-----------|
+| `cgx pack` | Emit JSON "cards" (`interface-map`, `dependency-footprint`) plus a graph-honesty manifest for an agent's context | [pack.md](pack.md) |
 
 ### Server
 
@@ -85,9 +100,12 @@ Not every command carries both, and which it carries follows from what it comput
 
 | Command | `approximation` | `freshness` |
 |---------|-----------------|-------------|
-| `callers`, `callees`, `flows-to`, `flows-from`, `reaches`, `paths`, `unused`, `query` | yes | yes |
+| `callers`, `callees`, `flows-to`, `flows-from`, `reaches`, `paths`, `unused`, `query`, `impacted-tests` | yes | yes |
 | `search`, `symbols`, `explain` | no — a table scan or a single symbol's incident edges, with no traversal to approximate | yes |
+| `pack` | per card — each card carries its own `approximation` object | no |
 | `doctor` | no — the report *is* an index-quality verdict | no |
+| `dump` | no — it prints the stored graph itself, not an answer | no |
+| `push`, `pull`, `configure-remote` | no — transport, not a query | no |
 | `diff` | no — a graph-to-graph delta, not a query answer | no |
 | `coupling` | yes — but scoped to a *history* model, not the call graph: co-change is file-level and the rev range is bounded | no — it reads committed git history and never opens the index, so there is no index freshness to report |
 
@@ -97,7 +115,7 @@ Not every command carries both, and which it carries follows from what it comput
 
 All command reference examples query the same corpus: **the cgx worktree itself**, indexed at its root. That covers the crate sources under `crates/` and both language fixtures under `fixtures/` in one graph, which is what the shown output was captured from — file paths in every example are worktree-relative (`fixtures/rust-sample/src/conditions.rs:42`, `crates/cgx-cli/src/forest.rs:345`).
 
-One page is an exception: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so that page builds throwaway repositories from the fixture trees and documents the setup itself.
+Some pages are exceptions and state their own setup: [impacted-tests.md](impacted-tests.md) compares two git states, which the corpus directory does not carry on its own, so it builds throwaway repositories from the fixture trees; [dump.md](dump.md), [pack.md](pack.md), [push.md](push.md), [pull.md](pull.md), and [configure-remote.md](configure-remote.md) were captured on a fresh copy of `fixtures/rust-sample` committed into its own repository, and the receiver-narrowing example in [index.md](index.md) on `fixtures/python-app`.
 
 **Index the corpus** (run once, from the worktree root):
 

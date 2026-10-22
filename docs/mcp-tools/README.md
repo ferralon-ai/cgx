@@ -87,7 +87,7 @@ The A3/A4 answer-honesty contract, serialized straight off the shared `cgx_query
 | `modeled_graph` | string | The boundary the answer is exact *within*. A required field with no default, so a bare unqualified `exact` cannot be constructed. Call-graph answers carry the standing `MODELED_GRAPH` text (`crates/cgx-query/src/contract.rs:106`); an answer derived from something else states its own boundary — `coupling` walks git history and models no call edges at all. |
 | `scope` | object | `{searched_edge_kinds, confidence_floor, max_depth}` — exactly what was searched before concluding nothing was there. Attached when the answer is an **absence claim**, which is not the same as "when the result list is empty" — see [when `scope` is attached](#when-scope-is-attached). Absent (not `null`) otherwise. |
 
-`direction: "exact"` means *exact within `modeled_graph`* — external and unindexed callees, undescended closure bodies, and unexpanded macros are outside it. Treat it as a scoped claim, never as proof the answer is complete. One case where it currently over-claims: a virtual-receiver call whose short name matches exactly one method anywhere in the index resolves at `probable` with no receiver-type corroboration (`rule = "name-method"`), and `probable` does not trip the contract's `over` predicate — so a single wrong edge can sit inside an answer reported as `exact`. Tracked as backlog **B-5**; `callers`, `callees`, `paths` and `reaches` answers over duck-typed or cross-class same-name method calls are the shapes to distrust.
+`direction: "exact"` means *exact within `modeled_graph`* — external and unindexed callees, undescended closure bodies, and unexpanded macros are outside it. Treat it as a scoped claim, never as proof the answer is complete. One case where it currently over-claims: a virtual-receiver call whose short name matches exactly one method anywhere in the index resolves at `probable` with no receiver-type corroboration (`rule = "name-method"`), and `probable` does not trip the contract's `over` predicate — so a single wrong edge can sit inside an answer reported as `exact`. `callers`, `callees`, `paths` and `reaches` answers over duck-typed or cross-class same-name method calls are the shapes to distrust.
 
 #### When `scope` is attached
 
@@ -136,12 +136,13 @@ Two call-graph codes are routinely conflated and are not the same fact: `unresol
 
 ### Which tools carry what
 
-Not every answer carries both objects. Of the twelve tools, **eleven emit `freshness`** and **nine emit `approximation`**, and the two sets are not the same nine.
+Not every answer carries both objects. Of the thirteen tools, **twelve emit `freshness`** and **ten emit `approximation`**, and the two sets are not nested.
 
 | tools | count | `graph_version` / `dirty` / `dirty_files_analyzed` | `freshness` | `approximation` |
 |---|---|---|---|---|
 | `callers`, `callees`, `reaches`, `paths`, `unused`, `flows_to`, `flows_from`, `graph_query` | 8 | ✓ | ✓ | ✓ |
 | `explain`, `search`, `symbols` | 3 | ✓ | ✓ | **✗** by design |
+| `impacted_tests` | 1 | `dirty` / `dirty_files_analyzed` only — no `graph_version` (it compares two graphs and emits both `graph_key`s) | ✓ | ✓ |
 | `coupling` | 1 | **✗** | **✗** | ✓ |
 
 `explain`, `search` and `symbols` skip `with_contract` deliberately (`tools.rs:566`): none performs a graph traversal, so there is no frontier to under-approximate and no candidate set to over-approximate.

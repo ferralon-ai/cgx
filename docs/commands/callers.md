@@ -38,6 +38,7 @@ Every answer carries the approximation contract and the index-freshness envelope
 | `--depth` | integer | `2` | Maximum traversal depth, honoured as given. `0` returns the seed symbol only — it does **not** mean unlimited. (The `--help` text claims `0` = unlimited; that is true only for [`cgx paths`](paths.md).) |
 | `--tree` | `full\|spanning` | `full` | Tree rendering mode. `spanning` collapses duplicate subtrees to a single occurrence. |
 | `--confidence` | `possible\|probable\|certain` | — | Floor filter: exclude edges below this confidence tier. No flag = all tiers shown. |
+| `--max-candidates` | integer | no cap | Drop call edges that belong to an over-approximated candidate set (dynamic dispatch or name-collision) with more than `N` targets — the fan-out dial, orthogonal to `--confidence`. A single resolved call is never dropped. Any exclusion is reported as a `dropped-max-candidates` under-reason on the approximation contract. |
 | `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any results are found; exit 4 if the query passed vacuously (filters excluded all candidates). See [Exit codes](#exit-codes). |
 | `--allow-vacuous` | boolean flag | — | Suppress the ADR-08 vacuity guard: converts exit 4 to exit 0 when `--assert-empty` passes vacuously. |
 | `--no-auto-index` | boolean flag | — | Require an explicit prior `cgx index`; if no `.cgx/` store is present, exit 3 instead of auto-indexing. |

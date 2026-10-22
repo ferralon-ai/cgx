@@ -20,9 +20,10 @@ This is the forward counterpart of [`callers`](callers.md). Use `callees` when y
 | `edge_condition` | string | no | — | Restrict the walk to a single edge condition. One of `always`, `conditional`, `exception`, `loop`, `panic`. When omitted, all edge conditions are returned. |
 | `confidence` | string | no | — | Minimum confidence floor. One of `certain`, `probable`, `possible`. Edges below this tier are excluded. When omitted, all tiers are returned. |
 | `kind` | array of string | no | — | Restrict the walk to these call-edge kinds: `calls`, `calls_virtual`, `calls_closure`, `calls_callback`, `calls_async`, `calls_indirect`, `spawns`. An empty array is treated as absent; an unrecognized token is an error. |
+| `max_candidates` | integer ≥ 1 | no | — | Fan-out cap: drop call edges from an over-approximated candidate set larger than N targets (orthogonal to `confidence`). Dropped edges are reported as a `dropped-max-candidates` reason in `approximation`, which turns the answer `under`. |
 | `include_dirty` | boolean | no | `true` | Analyze uncommitted working-tree changes via a per-call content-addressed overlay. The overlay is never persisted. Set `false` to index and query the committed tree (`HEAD`) instead. |
 
-**`edge_condition` is a restriction, not an exclusion.** `"edge_condition": "conditional"` returns only `conditional` edges; `always` edges are filtered out with everything else (`neighbor_filter`, `crates/cgx-mcp/src/tools.rs:427`).
+**`edge_condition` is a restriction, not an exclusion.** `"edge_condition": "conditional"` returns only `conditional` edges; `always` edges are filtered out with everything else (`neighbor_filter` in `crates/cgx-mcp/src/tools.rs`).
 
 **`kind` tokens are underscored on input.** `calls_virtual` is accepted; `calls-virtual` is rejected as an unknown edge kind. The hyphenated spelling is the *output* vocabulary, used in `approximation.scope.searched_edge_kinds`.
 
@@ -155,7 +156,7 @@ Contrast the [`callers`](callers.md#a-positive-answer) direction on the same sym
 
 **Errors carry no envelope.** An unresolved symbol, an unknown `kind` token, or an unparseable `cursor` comes back as a JSON-RPC error object (`-32602`) with no result document — so no `freshness`, no `approximation`, no `graph_version`.
 
-**Method calls on an untyped receiver.** A virtual-receiver call whose type cannot be resolved in-repo, where exactly one method anywhere shares the short name, is banded `probable`. `probable` does not trip the contract's `over` predicate, so such an answer can report `direction: "exact"` while carrying one wrong edge. Backlog **B-5** — treat `exact` with least confidence on duck-typed and cross-class same-name method calls.
+**Method calls on an untyped receiver.** A virtual-receiver call whose type cannot be resolved in-repo, where exactly one method anywhere shares the short name, is banded `probable`. `probable` does not trip the contract's `over` predicate, so such an answer can report `direction: "exact"` while carrying one wrong edge. Treat `exact` with least confidence on duck-typed and cross-class same-name method calls.
 
 ## See also
 

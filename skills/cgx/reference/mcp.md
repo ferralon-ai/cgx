@@ -17,17 +17,20 @@ This file covers the MCP STDIO interface for AI agents driving cgx programmatica
 For CLI flag detail, see `reference/cli.md`. For CQL syntax, see `reference/query-language.md`.
 For MCP-specific usage patterns, see `recipes/ai-agent.md`.
 
-Run `cgx --version` first. The current shipped binary is v0.3.0 — but that string has not
-moved since `graph_query`'s live CQL execution, the `reaches`/`search`/`symbols`/`flows_to`/
+Run `cgx --version` first. The current shipped binary is v0.3.0, and a build from the `v0.3.0`
+tag or later has everything below — but development builds before the tag reported the same
+`0.3.0` while `graph_query`'s live CQL execution, the `reaches`/`search`/`symbols`/`flows_to`/
 `flows_from`/`coupling` tools, the `kind` edge-filter, the approximation contract, and the
-index-freshness envelope shipped on `main`. `cgx --version` cannot discriminate any of them,
+index-freshness envelope landed one by one. `cgx --version` cannot discriminate any of them,
 and **no single check covers all five**. They landed in the order below, each needs its own
 probe, and a lower one passing does not imply a higher one:
 
 1. **Live `graph_query`** — call it with a trivial query and see whether a table comes back
    instead of an error. A binary at this point still registers **6** tools and has no `search`.
-2. **The added tools** — `tools/list` returns **12** entries; `search` present means the
-   first five landed, `coupling` present means all six did. A binary with 11 has no `coupling`.
+2. **The added tools** — `tools/list` returns **13** entries on a current binary; `search`
+   present means the first five landed, `coupling` present means all six did, and
+   `impacted_tests` is the thirteenth. A binary with 11 has no `coupling`; one with 12 has no
+   `impacted_tests`.
 3. **The `kind` edge-filter** — a `kind` property in the `callers` `inputSchema`.
 4. **The approximation contract** — an `approximation` object in a `callers` result.
 5. **The index-freshness envelope** — a `freshness` object in a `callers` result.
@@ -46,7 +49,7 @@ cgx mcp --root /path/to/repo   # `root` is injected into calls that omit it
 ```
 
 **There is no CWD fallback.** `cgx mcp` without `--root` sets no default: `root` is a required
-argument on all twelve tool schemas, and a call that omits it fails. The MCP crate reads no
+argument on all thirteen tool schemas, and a call that omits it fails. The MCP crate reads no
 working directory and no environment variable — the root comes from `--root` or from the call.
 
 **`root` must be inside a git repository; it does not need a `.cgx/` store, and no `.cgx/` is
@@ -86,25 +89,26 @@ wins; the default is injected only when the argument is absent or empty.
 
 ## Tool surface
 
-12 tools are registered, in this order. **All are functional**, including `graph_query`
+13 tools are registered, in this order. **All are functional**, including `graph_query`
 (see below).
 
 The base 6 (`callers`, `callees`, `paths`, `unused`, `explain`, `graph_query`) shipped in
-v0.1. `reaches`, `search`, `symbols`, `flows_to`, `flows_from`, `coupling`, the `kind`
-edge-filter on `callers`/`callees`, and `graph_query`'s live CQL execution all ship on `main`
-ahead of the `0.3.0` version string — do not gate them on `Since: v0.3` (see the version note
-above).
+v0.1. `reaches`, `search`, `symbols`, `flows_to`, `flows_from`, `coupling`, `impacted_tests`, the
+`kind` edge-filter on `callers`/`callees`, `max_candidates`, and `graph_query`'s live CQL
+execution all postdate v0.2. Every one is in the `v0.3.0` tag, but pre-tag builds also report
+`0.3.0`, so probe for the tool or property rather than trusting the version string (see the
+version note above).
 
-**Eleven of the twelve read the code graph; `coupling` reads committed git history instead.**
+**Twelve of the thirteen read the code graph; `coupling` reads committed git history instead.**
 That split is what decides which envelope fields an answer carries (see "Result envelope") and
 is worth holding in mind before reading any result.
 
 | Tool | Required args | Optional args |
 |------|---------------|----------------|
-| `callers` | `symbol`, `root` | `depth` (default 1), `max_results` (default 20), `cursor`, `edge_condition`, `confidence`, `kind`, `include_dirty` (default true) |
+| `callers` | `symbol`, `root` | `depth` (default 1), `max_results` (default 20), `cursor`, `edge_condition`, `confidence`, `kind` (array of call-family edge kinds: `calls`, `calls_virtual`, `calls_closure`, `calls_callback`, `calls_async`, `calls_indirect`, `spawns`; default all), `max_candidates` (integer ≥ 1), `include_dirty` (default true) |
 | `callees` | `symbol`, `root` | same as `callers` |
-| `reaches` | `from`, `root` | `to`, `depth` (declared default 2 — applied on the `from → *` form only; **with `to` set, an omitted `depth` walks unbounded**), `confidence`, `max_results` (default 20), `cursor`, `include_dirty` (default true) |
-| `paths` | `from`, `to`, `root` | `max_depth` (default 10), `max_results` (default 10), `confidence`, `exclude_edge_condition`, `only_edge_condition`, `cursor`, `include_dirty` (default true) |
+| `reaches` | `from`, `root` | `to`, `depth` (declared default 2 — applied on the `from → *` form only; **with `to` set, an omitted `depth` walks unbounded**), `confidence`, `max_candidates`, `max_results` (default 20), `cursor`, `include_dirty` (default true) |
+| `paths` | `from`, `to`, `root` | `max_depth` (default 10), `max_results` (default 10), `confidence`, `max_candidates`, `exclude_edge_condition`, `only_edge_condition`, `cursor`, `include_dirty` (default true) |
 | `unused` | `root` | `kind` (`function`/`method`/`field`/`all`, default `all`), `entrypoint`, `max_results` (default 20), `cursor`, `include_dirty` (default true) |
 | `explain` | `symbol`, `root` | `include_dirty` (default true) |
 | `search` | `root` | `pattern`, `all` (default false), `regex` (default false), `kind` (`function`/`method`/`field`/`type`/`module`/`all`, default `all`), `max_results` (default 20), `cursor`, `include_dirty` (default true) |
@@ -113,6 +117,7 @@ is worth holding in mind before reading any result.
 | `flows_from` | `symbol`, `root` | same as `flows_to` |
 | `graph_query` | `query`, `root` | `max_results` (default 20), `cursor`, `include_dirty` (default true) |
 | `coupling` | `root`, `base`, `head` | `min_cochanges` (default 2), `max_files_per_commit` (default 50), `limit` (default 50). **No `include_dirty`, no `max_results`, no `cursor`** — it reads git history, not the graph |
+| `impacted_tests` | `root` | `base` (omit → working tree vs `HEAD`), `head` (default `HEAD`; used only when `base` is set and `include_dirty` is false), `merge_base` (default true), `confidence`, `depth` (omit → unbounded), `max_results` (default 20), `cursor`, `include_dirty` (default true) |
 
 ### graph_query
 
@@ -221,8 +226,10 @@ at the emission site, never from one helper:
 
 - **`graph_version`/`dirty`/`dirty_files_analyzed`/`freshness`** — the session metadata plus the
   index-freshness envelope, attached by the one function every **graph-backed** tool passes
-  through. **11 of 12** tools; `coupling` is the exception, because it never opens the index.
-- **`approximation`** — the answer-honesty contract. **9 of 12** tools. `explain`, `search`, and
+  through. **12 of 13** tools; `coupling` is the exception, because it never opens the index.
+  (`impacted_tests` carries `freshness`/`dirty`/`dirty_files_analyzed` but reports
+  `base_graph_key`/`head_graph_key` in place of `graph_version`.)
+- **`approximation`** — the answer-honesty contract. **10 of 13** tools. `explain`, `search`, and
   `symbols` skip it by design: they walk no graph, so there is no frontier to cut and no
   candidate set to over-count. `coupling` carries it as a field of its own report rather than
   through the shared helper — a grep for the helper undercounts by one.
@@ -573,7 +580,9 @@ scan, no graph walk.
 **Note:** pass exactly one of `pattern` or `all`; passing both, or neither, is an
 `invalid_params` error. `search`'s `kind` is a symbol-kind string enum (`function`/
 `method`/`field`/`type`/`module`/`all`) — distinct from `callers`/`callees`'s `kind`,
-which is an array of call-edge-kind tokens.
+which is an array of call-edge-kind tokens. There is **no selector grammar and no `agnostic`
+parameter** over MCP: a `pattern` containing `**` or `(a|b)` is matched as a literal substring.
+For selectors, use `graph_query` with CQL `select(node, "<selector>")` — see `reference/cli.md`.
 
 ```json
 {
@@ -685,6 +694,27 @@ Response: `base_rev`/`base_commit`/`head_rev`/`head_commit`, the four commit cou
 `graph_version`, no `dirty`, no `cursor`. Full field-by-field treatment:
 [`docs/mcp-tools/coupling.md`](../../../docs/mcp-tools/coupling.md).
 
+### impacted_tests
+
+Test entrypoints whose call graph reaches a changed symbol — the MCP form of
+`cgx impacted-tests`. Omit `base` to compare the working tree against `HEAD`; pass `base` for a
+ref range, which compares against `merge-base(base, head)` unless `merge_base: false`.
+
+```json
+{ "name": "impacted_tests", "arguments": { "root": "/workspace", "base": "main" } }
+```
+
+Response: `results` (each `{name, file, line, reached_change, depth, confidence,
+min_confidence_on_path, edge_condition, …}`), `changed_symbols`, `base_ref`/`head_ref`,
+`base_graph_key`/`head_graph_key`, `degenerate`/`degenerate_reason`, `approximation`,
+`freshness`, `dirty`, `dirty_files_analyzed`, `total_matched`, `has_more`, `cursor`.
+
+**Rust, Go, Java and Python only.** A change touching only other languages (TS/JS, C, C++) is
+**not** an error: it is a successful call with `degenerate: true`, an empty `results`, and an
+`impacted-language-unsupported` reason on the contract. Check `degenerate` before reading an
+empty `results` as "no tests to run". Full treatment:
+[`docs/mcp-tools/impacted_tests.md`](../../../docs/mcp-tools/impacted_tests.md).
+
 ---
 
 ## Token-efficiency guidance
@@ -696,6 +726,7 @@ Token budgets constrain agent context. Follow these practices:
 | Start with `explain` | One call returns caller count, callee count, and all edges. Decide whether deeper queries are needed before paginating. |
 | Use small `depth` | Default is 1 on `callers`/`callees`, 2 on `reaches`/`flows_to`/`flows_from`; `paths` uses `max_depth` 10. Increase only when you need transitive results. Depth 2–3 is usually enough. |
 | Set `max_results` explicitly | Default 20 (10 for `paths`) is reasonable. Cap at 50 unless you need the full set. Hard cap 200, silently clamped. |
+| Cap fan-out with `max_candidates` | On `callers`/`callees`/`reaches`/`paths`, `max_candidates: N` drops edges from a name-collision or dynamic-dispatch candidate set wider than `N`; a singly-resolved call is never dropped. The contract turns `under` with a `dropped-max-candidates` reason counting what was cut. Not on `flows_to`/`flows_from`. |
 | Paginate on demand | Check `has_more`; fetch the next page only if the current page does not answer the question. |
 | Filter by edge condition — **use the right parameter name** | `edge_condition: "exception"` on `callers`/`callees`. On `paths` the parameters are `only_edge_condition` / `exclude_edge_condition`. Passing `edge_condition` to `paths` is **silently dropped** — the server validates no arguments — and you get an unfiltered path set back with no error. |
 | Prefer a narrower tool over `graph_query` | `graph_query` pages like any other tool, but it computes the whole result set before paging it; prefer `callers`/`callees`/`paths`/`unused`/`reaches` when one answers the question more cheaply. |

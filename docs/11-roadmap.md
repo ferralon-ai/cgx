@@ -175,6 +175,14 @@ Phase 2 shipped as the **v0.2 "Semantic precision"** release. What landed:
 Not advertised: Rust closure / fn-ptr indirect-call resolution (the Rust frontend emits no
 indirect-call refs; closure sig-sets exist on the TypeScript frontend only).
 
+**Shipped since v0.3.0.** C and C++ adapters (`cgx-lang-c`, `cgx-lang-cpp`); scip-clang
+ingestion through the same `--scip` flag, with `--compdb` / `--compdb-complete` gating C++
+promotions to `certain` on a verified-complete `compile_commands.json` (fail-closed to
+`probable` otherwise); Go, TypeScript and Python symbol roots derived from the nearest build manifest (`go.mod`,
+`package.json`, `pyproject.toml` / `setup.py`) rather than directory layout; retirement of the
+SQLite copy of the index, which `cgx index` now deletes; and opt-in receiver narrowing for
+Python (`cgx index --receiver-narrowing`).
+
 ---
 
 ## Phase 3: Dataflow, Provenance, and Taint
@@ -306,7 +314,9 @@ branch-lifecycle GC; Q-25 CVE reachability.
 
 - **`cgx diff` compares ref *tips*, not the merge-base.** A gate run on a branch whose fork
   point trails `main` attributes paths introduced *on `main`* to the branch under review.
-  `BlameRepo::merge_base` exists and is tested but has no non-test caller.
+  `BlameRepo::merge_base` now has a caller, but only `cgx impacted-tests` uses it (merge-base
+  by default, `--no-merge-base` for tips); `cgx diff` still compares tips, so the two commands
+  disagree on the same pair of refs.
 - **`cgx coupling` on a shallow clone returns an *empty* answer, not a partial one, at exit 0** —
   including for a rev range that sits entirely inside the fetched depth. `actions/checkout`
   defaults to `fetch-depth: 1`, so a CI job gating on exit code alone reads "no coupling here"
@@ -471,7 +481,7 @@ The following risks are identified across all research findings. Each phase that
 
 **Description.** If SQLite is used as the query layer (the `--sql` alternative path), recursive CTEs for transitive closure can be slow on large graphs. SQLite does not have a native graph traversal engine; recursive CTEs are O(n²) without careful indexing.
 
-**Mitigation — held, by a simpler route than planned.** No recursive CTE is on any query path. `crates/cgx-query` walks a loaded in-memory `GraphView` with hand-written Rust graph algorithms; SQLite is a fact store, and `--sql` against the `v_*` views is an inspection escape hatch, not the engine. The mitigation as recorded named `ascent` Datalog over `petgraph`; **neither crate is a dependency** (docs/09 AR-5). Direct walks were chosen not for speed but because path-relative transience (GM-4) and spawn-domain reset (GM-9.2) are per-walk state that neither a CTE nor a relational fixed point can express.
+**Mitigation — held, by a simpler route than planned.** No recursive CTE is on any query path. `crates/cgx-query` walks a loaded in-memory `GraphView` with hand-written Rust graph algorithms; facts persist in a content-addressed object store, SQLite holds only scratch dataflow caches, and the `v_*` views behind the unimplemented `--sql` flag are not the engine. The mitigation as recorded named `ascent` Datalog over `petgraph`; **neither crate is a dependency** (docs/09 AR-5). Direct walks were chosen not for speed but because path-relative transience (GM-4) and spawn-domain reset (GM-9.2) are per-walk state that neither a CTE nor a relational fixed point can express.
 
 The residual risk moved rather than vanished: it is now graph *load* time and per-query traversal cost on very large graphs, since nothing is materialized. See docs/09 AR-6 "Known scaling limits."
 
@@ -641,7 +651,7 @@ extension; `schema-room` — reserve the representation now, implement analysis 
 | Q-31 | Framework-aware queries | core-extension | Phase 3 | Phase 3 | Requires GM-15 metadata facts + GM-17 mediated edges + GM-18 reflection; metadata-guard-aware must-pass-through; framework-entrypoint reachability; tainted-reflection dispatch |
 | LS-8 | Per-language primitive harvest table | schema-room | Phase 1 (spec) | Phase 1 (basic), Phase 2 (refined) | Per-language mapping of implicit call kinds and resource-pair syntax; companion to LS-7; serves as the lowering reference for GM-16 and GM-19 |
 | docs/12 FW-1..6 | Framework pack design, semantic classes, per-framework mappings, mediated edges, build variance, reflection packs | schema-room | Phase 1 (schema) | Phase 3 (pack evaluation) | All sections `schema-room` per docs/12; pack config schema and metadata-fact representation reserved in Phase 1; built-in pack evaluation and user-extensible pack loading in Phase 3 |
-| `--sql` (Q-10) | SQL escape hatch (unstable, view-based — Q-10) | core-extension | Phase 1 | Phase 1 | Scoped to the versioned views only — `v_symbols`, `v_call_edges`, `v_data_flow_edges`, `v_call_sites`, `v_provenance`, `cgx_meta`; physical tables are not API; `view_schema_version` available via `cgx_meta`. **Not shipped, and the flag misreports itself:** `--sql` is hidden, and its help says it "always exits 2." On `query` it does — a hard usage error before any work. On every other subcommand carrying it, it is accepted and silently discarded at exit 0. Reaching the views today means opening `.cgx/`'s SQLite directly |
+| `--sql` (Q-10) | SQL escape hatch (unstable, view-based — Q-10) | core-extension | Phase 1 | Phase 1 | Scoped to the versioned views only — `v_symbols`, `v_call_edges`, `v_data_flow_edges`, `v_call_sites`, `v_provenance`, `cgx_meta`; physical tables are not API; `view_schema_version` available via `cgx_meta`. **Not shipped, and the flag misreports itself:** `--sql` is hidden, and its help says it "always exits 2." On `query` it does — a hard usage error before any work. On every other subcommand carrying it, it is accepted and silently discarded at exit 0. No on-disk database carries the views: the persisted index is the object store, and `.cgx/cache.db` holds only dataflow caches |
 | GM-5.3 `unexpanded-macro` | Cut-marker for proc-macro blind spot | core-extension | Phase 1 | Phase 1 | Emitted from Phase 1 at every proc-macro invocation site; gap is queryable and counted by `cgx doctor` |
 | GM-21 | `calls:super` edge kind | core-extension | Phase 1 | Phase 1 | Statically-bound delegation to a named ancestor's body, bypassing virtual dispatch; single resolved target + `bypassed_override` attribute; re-classification of existing call edge |
 | GM-22 | Method-resolution order (linearization) | schema-room | Phase 1 | Phase 3 | Ordered MRO per type; language-specific linearization algorithms (Python C3, Scala, Ruby ancestry, C++ virtual-base); `resolves-to` derived edge; reserve now to avoid schema migration |

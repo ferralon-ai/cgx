@@ -43,10 +43,11 @@ cgx flows-to [OPTIONS] <SYMBOL>
 |------|-------|---------|---------|
 | `--repo` | path | CWD | Path to the indexed repository containing a `.cgx/` store. |
 | `--format` | `human\|json\|sarif` | `human` | Output format. `dot`, `mermaid`, and `d2` are listed in `--help` (clap prints the whole enum on every command) but are rejected here with exit 2: they render a path walk, and `flows-to` returns a forest. |
-| `--at` | git ref | — | Pin the query to a specific commit's graph snapshot (Q-17). Requires the ref to have been indexed. |
+| `--at` | git ref | — | Pin the query to a specific commit's graph snapshot (Q-17). Materializes the ref in a detached worktree, indexes it, and queries the resulting graph; the ref need not have been indexed before. The working-tree `.cgx/` pointer is not touched. **Does not work on this command today:** the pinned ref is indexed without the dataflow layer, so its graph has no SSA value nodes and every SSA name fails to resolve (`cgx: no symbol matched pattern …`, exit 2). |
 | `--depth` | integer | `2` | Maximum traversal depth, honoured as given. `0` returns the seed value node only — it is **not** unlimited, despite the `--help` text (that holds only for [`cgx paths`](paths.md)). |
 | `--tree` | `full\|spanning` | `full` | Tree rendering mode. `spanning` collapses duplicate subtrees to a single occurrence. |
 | `--confidence` | `possible\|probable\|certain` | — | Floor filter: exclude edges below this confidence tier. No flag = all tiers shown. |
+| `--max-candidates` | integer | no cap | Drop call edges that belong to an over-approximated candidate set (dynamic dispatch or name-collision) with more than `N` targets — the fan-out dial, orthogonal to `--confidence`. A single resolved call is never dropped. Any exclusion is reported as a `dropped-max-candidates` under-reason on the approximation contract. |
 | `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any results are found; exit 4 if the query passed vacuously (filters excluded all candidates). See [Exit codes](#exit-codes). |
 | `--allow-vacuous` | boolean flag | — | Suppress the ADR-08 vacuity guard: converts exit 4 to exit 0 when `--assert-empty` passes vacuously. |
 | `--no-auto-index` | boolean flag | — | Require an explicit prior `cgx index`; if no `.cgx/` store is present, exit 3 instead of auto-indexing. |

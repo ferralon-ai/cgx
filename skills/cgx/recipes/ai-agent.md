@@ -17,19 +17,25 @@ round-trips and context-window consumption. For MCP tool schemas and pagination 
 
 ---
 
-## The MCP tool surface — 12 tools, all live
+## The MCP tool surface — 13 tools, all live
 
-`tools/list` returns twelve tools, in this fixed order
+`tools/list` returns thirteen tools, in this fixed order
 (`tool_list`, `crates/cgx-mcp/src/tools.rs`):
 
 ```
 callers  callees  reaches  paths  unused  explain  search  symbols
-flows_to  flows_from  graph_query  coupling
+flows_to  flows_from  graph_query  coupling  impacted_tests
 ```
 
 Every one of them executes. Three spelling traps: the MCP names are `flows_to` / `flows_from` /
 `graph_query` with **underscores**, while the CLI subcommands are `flows-to` / `flows-from` /
 `query`.
+
+**`impacted_tests` answers "which tests should I run for this change?"** — omit `base` for the
+working tree against `HEAD`, or pass `base` for a branch. Rust, Go, Java and Python only; any other
+language returns `degenerate: true` with empty `results`, which means "not analysed", not "no tests".
+`callers`/`callees`/`reaches`/`paths` also take `max_candidates: N`, which drops edges from a
+candidate set wider than `N` and reports the cut as an `under` reason. See `reference/mcp.md`.
 
 **`graph_query` is live and is the tool to reach for when no fixed-shape tool asks your question.**
 It routes to `cgx_cql::run` (`tools.rs:978`) — the same engine `cgx query` drives, not a fork — so a
@@ -136,7 +142,7 @@ Never port a working `--depth 0` between the two surfaces by copying the argumen
 Every MCP answer carries session metadata beside the result. Two fields decide whether the result
 is safe to act on, and both are easy to parse past.
 
-**`approximation` — which direction this answer can be wrong in.** Present on 9 of the 12 tools;
+**`approximation` — which direction this answer can be wrong in.** Present on 10 of the 13 tools;
 `explain`, `search` and `symbols` skip it by design (`with_contract` vs `with_session_meta`,
 `with_contract` at `tools.rs:553`, `with_session_meta` at `tools.rs:575` — `with_session_meta` is
 the one function every graph-backed tool's response passes through, which is why `freshness` has the
@@ -160,7 +166,7 @@ wider coverage of the two). Shape:
   empty result with `"direction": "under"` is **not** a negative finding.
 - `over_under` is the one token in the system spelled with an underscore rather than a hyphen.
 
-**`freshness` — which tree the answer was computed over.** Present on 11 of the 12 tools; `coupling`
+**`freshness` — which tree the answer was computed over.** Present on 12 of the 13 tools; `coupling`
 carries none because it never opens the index (it reads committed git history only). All six keys
 are always emitted, `null` where unknown.
 

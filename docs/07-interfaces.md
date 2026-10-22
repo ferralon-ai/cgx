@@ -29,7 +29,7 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | IF-4 | Exit-code contract (0/1/2/3/4) | Shipped |
 | IF-5 | CI assertion mode: `--assert-empty` | Shipped |
 | IF-5a | CI assertion mode: `--assert-count N`, `--assert-max N` | **Planned (not yet shipped in v0.3.0)** |
-| IF-6 | `--explain` flag: per-fact provenance, rule annotation, index version | Shipped |
+| IF-6 | Per-symbol provenance | Shipped as the `explain` subcommand (and MCP tool); there is no `--explain` flag |
 | IF-7 | `--at <ref>` flag: query against a specific commit | Shipped |
 | IF-8 | `--order` flag: stable result ordering | **Planned (not yet shipped in v0.3.0)** — engine already returns rows in a fixed deterministic order; no CLI flag exists |
 | IF-9 | MCP STDIO server mode: `cgx mcp` | Shipped |
@@ -39,10 +39,10 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | IF-13 | MCP tool: `paths` | Shipped |
 | IF-14 | MCP tool: `unused` | Shipped |
 | IF-15 | MCP tool: `explain` | Shipped |
-| IF-15a | MCP tools: `reaches`, `search`, `symbols`, `flows_to`, `flows_from`, `coupling` | Shipped |
+| IF-15a | MCP tools: `reaches`, `search`, `symbols`, `flows_to`, `flows_from`, `coupling`, `impacted_tests` | Shipped |
 | IF-16 | MCP resources: `cgx://symbols/{root}`, `cgx://schema/{root}` | **Planned** — `resources/list` returns `method not found` |
 | IF-17 | MCP structured output: `structuredContent` per 2025-06-18 spec | **Shipped** — every tool result carries `structuredContent` alongside the `content` text mirror. A declared `outputSchema` is still Planned |
-| IF-18 | MCP pagination: `cursor` + `has_more` | **Shipped** — both keys are present on every graph-backed tool result |
+| IF-18 | MCP pagination: `cursor` + `has_more` | **Shipped** — both keys are present on every list-shaped tool result; `explain`, `reaches` with `to`, and `coupling` return a single document without them (see IF-18) |
 | IF-19 | MCP token-efficiency: `max_results` | **Shipped** for `max_results` / `total_matched`. Compact symbol IDs and `resource_link` bulk evidence are Planned |
 | IF-20 | `paths` subcommand: must-analysis flags (`--must-pass-through`, `--avoiding`, `--quantifier`, `--including-exception-paths`, `--assert-all-reach-sink`) | **Planned (not yet shipped in v0.3.0)** |
 | IF-21 | `paths` subcommand: typed-taint flags (`--from-class`, `--to-class`, `--require-sanitizer-class`, `--negate-sanitizer`, `--to-package`) | **Planned (not yet shipped in v0.3.0)** |
@@ -60,9 +60,9 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 cgx <subcommand> [ARGS] [--repo <path>] [flags]
 ```
 
-**The repository is an option, not a trailing positional.** `--repo <path>` names the repository root or any subdirectory and defaults to the current directory; a trailing positional path is a clap parse error, exit 2. The one exception is `cgx index`, which takes a **positional** `[PATH]` and rejects `--repo`. `cgx` locates the graph index by walking up from the resolved root (see `docs/06-indexing-and-vcs.md`).
+**The repository is an option, not a trailing positional.** `--repo <path>` names the repository root or any subdirectory and defaults to the current directory; a trailing positional path is a clap parse error, exit 2. Three exceptions: `cgx index` takes a **positional** `[PATH]` and rejects `--repo`; `cgx configure-remote` has no `--repo` and acts on the repository containing the current directory; and `cgx mcp` takes `--root`, with each tool call naming its own `root`. `cgx` locates the graph index by walking up from the resolved root (see `docs/06-indexing-and-vcs.md`).
 
-**Top-level subcommands — sixteen, shipped in v0.3.0:**
+**Top-level subcommands — twenty-two, shipped in v0.3.0:**
 
 | Subcommand | Description |
 |------------|-------------|
@@ -80,7 +80,13 @@ cgx <subcommand> [ARGS] [--repo <path>] [flags]
 | `query` | Execute a full CQL query-language expression |
 | `search` | Search the symbol table by FQN substring or regex (`Since: v0.2`) |
 | `symbols` | Rank symbols by reference count, with a per-symbol edge breakdown |
-| `doctor` | Report on the quality of the current on-disk index. **Does not auto-index** — exit 3 on an unindexed repo, unlike every other read command |
+| `impacted-tests` | Test entrypoints whose call graph reaches a symbol changed between two refs (`<BASE> [<HEAD>]` positional) or in the uncommitted working tree |
+| `pack` | Generate an agent-context pack of JSON cards over the graph (`--json`) |
+| `doctor` | Report on the quality of the current on-disk index. **Does not auto-index** — exit 3 on an unindexed repo |
+| `dump` | Dump the current on-disk graph (nodes, edges, candidates) for inspection. **Does not auto-index** — exit 3 on an unindexed repo |
+| `push` | Publish the local `.cgx` committable index under `refs/cgx/index` and push it to a remote |
+| `pull` | Fetch `refs/cgx/index` from a remote and materialize `.cgx/` locally |
+| `configure-remote` | Configure a remote so `refs/cgx/*` round-trips through plain `git fetch`/`git push` |
 | `mcp` | Start MCP STDIO server |
 
 **Planned subcommands (not yet shipped in v0.3.0):**
@@ -104,7 +110,7 @@ That is the right default for a tool whose identity property is byte-identical r
 
 ### IF-3: `--format` flag
 
-Every subcommand except `index` and `mcp` accepts `--format`. The format applies to the result stream; progress and error output always go to stderr.
+Fifteen subcommands accept this six-value `--format`; `index`, `mcp`, `push`, `pull`, `configure-remote` and `pack` do not (`pack` has `--json` instead), and `dump` has its own `--format text|json`. The format applies to the result stream; progress and error output always go to stderr.
 
 **The enum has exactly six values:**
 
@@ -123,14 +129,14 @@ Every subcommand except `index` and `mcp` accepts `--format`. The format applies
 >
 > | Regime | Commands | Accepted | Rejected → exit 2 |
 > |---|---|---|---|
-> | **A** — full six, graph formats gated by result shape | `callers`, `callees`, `flows-to`, `flows-from`, `reaches`, `paths`, `unused`, `query` | `human`/`json`/`sarif` always; `dot`/`mermaid`/`d2` **only when the result is path-shaped** | `dot`/`mermaid`/`d2` on a non-path result |
+> | **A** — full six, graph formats gated by result shape | `callers`, `callees`, `flows-to`, `flows-from`, `reaches`, `paths`, `unused`, `query`, `impacted-tests` | `human`/`json`/`sarif` always; `dot`/`mermaid`/`d2` **only when the result is path-shaped** | `dot`/`mermaid`/`d2` on a non-path result |
 > | **B** — allow-list `human\|json` | `search`, `symbols`, `coupling` | `human`, `json` | `sarif`, `dot`, `mermaid`, `d2` |
 > | **C** — allow-list per diff mode | `diff` | full mode `human`/`json`; `--path-added` adds `dot`/`mermaid`/`d2` | everything else, checked before any indexing |
 > | **D** — no gate, silent fallthrough to human, **exit 0** | `explain`, `doctor` | `json` renders JSON | *nothing* — every other value renders human text |
 >
-> Regime D is a known defect of the same class PR #38 fixed for `diff`: `cgx doctor --format sarif` gives you human text and a successful exit, not SARIF. Do not build a CI step on it.
+> Regime D is a known defect of the same class already fixed for `diff`: `cgx doctor --format sarif` gives you human text and a successful exit, not SARIF. Do not build a CI step on it.
 >
-> Path-shaped results (the regime-A gate) are: `paths` always, `reaches <FROM> <TO>`, and `query` when the CQL is `RETURN path`. `callers`, `callees`, `reaches <FROM>`, `flows-*`, `unused` and tabular `query` are never path-shaped.
+> Path-shaped results (the regime-A gate) are: `paths` always, `reaches <FROM> <TO>`, and `query` when the CQL is `RETURN path`. `callers`, `callees`, `reaches <FROM>`, `flows-*`, `unused`, `impacted-tests` and tabular `query` are never path-shaped.
 
 **`dot` vs `mermaid` guidance:**
 - Use `--format mermaid` for documentation embedded in GitHub Markdown or Notion. Mermaid renders inline in both. Human-writeable and diff-friendly.
@@ -213,29 +219,28 @@ cgx paths '**' dangerous::sink --repo . \
     sarif_file: findings.sarif
 ```
 
-### IF-6: `--explain` flag
+### IF-6: Per-symbol provenance — the `explain` subcommand
 
-Adding `--explain` to any subcommand or query command annotates each result fact with its full provenance record:
+There is no `--explain` flag; passing one is a clap parse error, exit 2. Provenance is a subcommand of its own: `cgx explain <SYMBOL>` prints the symbol's definition, its caller and callee counts, and every direct incident edge with its condition, confidence, resolution tier, resolution rule and call site:
 
 ```
-Call edge: main::baz -> crypto::hash
-  Source:       src/main.rs:42:8
-  Evidence:     call expression AST node #1337
-  Edge type:    CALLS
-  Condition:    always
-  Confidence:   certain
-  Rule:         direct_call_resolution v1.2
-  Graph build:  commit abc1234, indexed 2026-06-11T13:00:00Z
-  Index:        .cgx/index.db (sha256: deadbeef...)
+$ cgx explain rust_sample::direct::chain --repo .
+rust_sample::direct::chain  (src/direct.rs:47)
+  kind: function
+  callers: 1, callees: 3
+  edges:
+    <- rust_sample::imports::utils::run_chain  (src/imports.rs:41)  [always]  [probable]  tier=scope_graph  rule=import-ref  site=src/imports.rs:41
+    -> rust_sample::direct::step_a  (src/direct.rs:53)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/direct.rs:47
+    -> rust_sample::direct::step_b  (src/direct.rs:54)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/direct.rs:47
+    -> rust_sample::direct::step_c  (src/direct.rs:55)  [always]  [certain]  tier=scope_graph  rule=scope-ref  site=src/direct.rs:47
+freshness: current | indexed tree c19123d, working tree clean
 ```
 
-Without `--explain`, provenance is available in `--format json` as structured fields on each result object. `--explain` adds the verbose rule annotation to human-readable output.
-
-Every result node always carries `{file, line, col}` provenance. Every graph edge carries the AST node reference that generated it. Both are stored in the index at index time, not computed at query time.
+`--format json` returns the same record as a document; the MCP `explain` tool returns it as `structuredContent` (IF-15). For traversal results, provenance is the per-result `file`, `line`, `edge_condition` and `confidence` fields in `--format json`.
 
 ### IF-7: `--at <ref>` flag
 
-The eight subcommands sharing the query flag block — `callers`, `callees`, `reaches`, `paths`, `flows-to`, `flows-from`, `query`, `unused` — accept `--at <ref>` to query the graph as it existed at a specific commit. `explain`, `search`, `symbols`, `doctor`, `diff` and `coupling` do **not**, and no MCP tool does:
+The eight subcommands sharing the query flag block — `callers`, `callees`, `reaches`, `paths`, `flows-to`, `flows-from`, `query`, `unused` — accept `--at <ref>` to query the graph as it existed at a specific commit. `explain`, `search`, `symbols`, `doctor`, `diff`, `coupling`, `dump`, `pack` and the transport commands do **not**, and no MCP tool does. `impacted-tests` lists `--at` in `--help` (it shares the flag block) but rejects it at runtime with exit 2 — pass the refs positionally instead:
 
 ```bash
 cgx callers crypto::hash --repo . --at abc1234
@@ -265,14 +270,14 @@ The default `file` ordering described above is the current shipped behavior even
 ### IF-9: Starting the MCP server
 
 ```bash
-cgx mcp [--root <path>] [--log-level debug|info|warn]
+cgx mcp [--root <path>]
 ```
 
 `cgx mcp` reads from stdin and writes to stdout using the MCP 2025-06-18 STDIO transport. It speaks NDJSON (newline-delimited JSON). The MCP server is single-process, single-client; for multi-client use, wrap it in an MCP proxy (future work, v2).
 
 **Recommended v1 transport:** STDIO. SSE/HTTP transport is a v2 feature. STDIO works in Claude Code, Cursor, Continue.dev, and any MCP-compatible agent harness without network configuration.
 
-All graph-querying MCP tools accept `include_dirty: true` (the MCP default) to analyze uncommitted working-tree changes via a per-call content-addressed overlay that is never persisted to the index. The CLI `--include-dirty` flag defaults to false. See docs/06-indexing-and-vcs.md IX-3 for the overlay lifetime and memoization semantics.
+All graph-querying MCP tools accept `include_dirty: true` (the MCP default) to analyze uncommitted working-tree changes via a per-call content-addressed overlay that is never persisted to the index. There is no CLI `--include-dirty` flag. See docs/06-indexing-and-vcs.md IX-3 for the overlay lifetime and memoization semantics.
 
 Configuration in Claude Code (`.mcp.json` or project settings):
 
@@ -288,7 +293,7 @@ Configuration in Claude Code (`.mcp.json` or project settings):
 
 ### MCP tool surface
 
-**Twelve tools are registered.** `tools/list` returns them in this order, with these required arguments:
+**Thirteen tools are registered.** `tools/list` returns them in the order `callers`, `callees`, `reaches`, `paths`, `unused`, `explain`, `search`, `symbols`, `flows_to`, `flows_from`, `graph_query`, `coupling`, `impacted_tests`, with these required arguments:
 
 | Tool | Required arguments |
 |---|---|
@@ -298,12 +303,13 @@ Configuration in Claude Code (`.mcp.json` or project settings):
 | `unused`, `search`, `symbols` | `root` |
 | `graph_query` | `query`, `root` |
 | `coupling` | `root`, `base`, `head` |
+| `impacted_tests` | `root` (`base` optional — omitting it compares the working tree to `HEAD`) |
 
 `root` is required on every tool: the MCP server is addressed per call, not per session.
 
 **Still Planned:** MCP resources (IF-16), a declared `outputSchema` (IF-17), and the tools `taint_paths` (IF-23) and `diff_security` (IF-24).
 
-**The CLI surface is larger than the MCP surface.** `index`, `doctor`, `diff` and `mcp` have no MCP equivalent. A statement that the MCP server "covers the same capability set as the CLI" is not true today.
+**The CLI surface is larger than the MCP surface.** `index`, `doctor`, `diff`, `dump`, `pack`, `push`, `pull`, `configure-remote` and `mcp` have no MCP equivalent. A statement that the MCP server "covers the same capability set as the CLI" is not true today.
 
 #### The MCP response envelope
 
@@ -353,7 +359,7 @@ Five things in that document are worth stating explicitly, because a doc that om
 2. **`cursor`, `has_more` and `total_matched` are shipped** — pagination is real, driven by `max_results`.
 3. **`matches_head: null` is the *common* case, not an edge case.** With the MCP default `include_dirty: true`, any indexed repository returns `null` here and a freshness verdict of `unknown`. In the run above the working tree was clean and had just been indexed, yet `dirty: true` and `dirty_files_analyzed: 3`: the working-tree walk and the dirty-file count apply different ignore rules and disagree. **`matches_head` is three-valued (`true` / `false` / `null`); a client that treats it as a boolean is wrong in the ordinary case.**
 4. **`graph_version` exists on MCP and on no CLI format.** When an overlay is in play it takes the form `<indexed-tree>+dirty.<overlay-digest>`.
-5. **`approximation` is not universal.** Nine of the twelve tools carry it; `explain`, `search` and `symbols` omit it by design, and `coupling` carries `approximation` but no index `freshness` because it never opens the index. MCP *errors* carry neither.
+5. **`approximation` is not universal.** Ten of the thirteen tools carry it; `explain`, `search` and `symbols` omit it by design, and `coupling` carries `approximation` but no index `freshness` because it never opens the index. MCP *errors* carry neither.
 
 > **On the CLI/MCP JSON breaking change:** `cgx search --format json` and `cgx symbols --format json` changed from a bare array to `{"results": […], "freshness": {…}}`. The element shape did not change, so a `jq '.[0]'` becomes `jq '.results[0]'`. **This affected the CLI only.** The MCP `search` and `symbols` tools have always returned an object and did not break — the `results` array has always been a field of the response document, as the live output above shows. Do not "port" a fix to MCP clients that never needed one.
 
@@ -380,27 +386,32 @@ Execute a full query-language expression and return structured results. `graph_q
 
 That is the schema as `tools/list` reports it, verbatim. Note what is **absent**: there is no `at` parameter on `graph_query` (pinning to a ref is CLI-only, via `--at`) and no `format` parameter (the response document is the format).
 
-**Response** (`structuredContent` per 2025-06-18 spec):
+**Response** (`structuredContent` per 2025-06-18 spec). The result is a table: `columns` names the `RETURN` projections and `rows` holds one array per match, in column order. A `RETURN path` query yields a paths channel instead. Live call against a clean, unindexed checkout of the Rust sample fixture, query `MATCH (a)-[:CALLS]->(b {name:"chain"}) RETURN a.name, a.file, a.line`:
 
 ```json
 {
   "structuredContent": {
-    "results": [
-      {
-        "name": "main::baz",
-        "file": "src/main.rs",
-        "line": 42,
-        "col": 8,
-        "edge_condition": "always",
-        "confidence": "certain"
-      }
+    "approximation": { "direction": "exact", "modeled_graph": "…", "reasons": [] },
+    "columns": ["a.name", "a.file", "a.line"],
+    "rows": [
+      ["rust_sample::imports::utils::run_chain", "src/imports.rs", 41]
     ],
-    "has_more": false,
     "cursor": null,
-    "graph_version": "abc1234",
     "dirty": false,
     "dirty_files_analyzed": 0,
-    "total_matched": 1
+    "freshness": {
+      "dirty_files": 0,
+      "dirty_files_base": "c19123dd915dcb04a2735de3426b640ac2f21738",
+      "head_tree": "c19123dd915dcb04a2735de3426b640ac2f21738",
+      "indexed_tree": "c19123dd915dcb04a2735de3426b640ac2f21738",
+      "matches_head": true,
+      "stale": false
+    },
+    "graph_version": "c19123d",
+    "has_more": false,
+    "total_matched": 1,
+    "truncated": false,
+    "truncation_reason": null
   }
 }
 ```
@@ -426,6 +437,7 @@ The `structuredContent` field is the canonical structured result. For backward c
       "confidence":      { "type": "string", "enum": ["certain","probable","possible"] },
       "kind":            { "type": "array", "items": { "type": "string", "enum": ["calls","calls_virtual","calls_closure","calls_callback","calls_async","calls_indirect","spawns"] },
                            "description": "Restrict traversal to these call-family edge kinds (default: all call edges)" },
+      "max_candidates":  { "type": "integer", "minimum": 1, "description": "Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to confidence); excluded edges are reported in the approximation contract" },
       "include_dirty":   { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["symbol", "root"]
@@ -460,10 +472,11 @@ Same schema as `callers` with identical parameters. Returns symbols the named sy
       "root":                    { "type": "string" },
       "max_depth":               { "type": "integer", "default": 10 },
       "max_results":             { "type": "integer", "default": 10 },
-      "exclude_edge_condition":  { "type": "string" },
-      "only_edge_condition":     { "type": "string" },
+      "exclude_edge_condition":  { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
+      "only_edge_condition":     { "type": "string", "enum": ["always","conditional","exception","loop","panic"] },
+      "confidence":              { "type": "string", "enum": ["certain","probable","possible"] },
+      "max_candidates":          { "type": "integer", "minimum": 1 },
       "cursor":                  { "type": "string" },
-      "at":                      { "type": "string" },
       "include_dirty":           { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["from", "to", "root"]
@@ -493,9 +506,7 @@ Same schema as `callers` with identical parameters. Returns symbols the named sy
     "properties": {
       "root":           { "type": "string" },
       "kind":           { "type": "string", "enum": ["function","method","field","all"], "default": "all" },
-      "type_filter":    { "type": "string", "description": "Restrict to members of this type" },
       "entrypoint":     { "type": "string" },
-      "confidence":     { "type": "string", "enum": ["certain","probable"] },
       "max_results":    { "type": "integer", "default": 20 },
       "cursor":         { "type": "string" },
       "include_dirty":  { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
@@ -507,7 +518,7 @@ Same schema as `callers` with identical parameters. Returns symbols the named sy
 
 #### IF-15: `explain`
 
-Returns the full provenance record for a single symbol: definition location, caller count, callee count, all edges with their condition and confidence labels, index version, and build metadata.
+Returns the full provenance record for a single symbol: definition location, caller count, callee count, and every direct incident edge with its condition, confidence, resolution tier, rule and call site.
 
 ```json
 {
@@ -517,7 +528,6 @@ Returns the full provenance record for a single symbol: definition location, cal
     "properties": {
       "symbol":        { "type": "string" },
       "root":          { "type": "string" },
-      "at":            { "type": "string" },
       "include_dirty": { "type": "boolean", "default": true, "description": "Analyze uncommitted working-tree changes via a per-call content-addressed overlay; never persisted" }
     },
     "required": ["symbol", "root"]
@@ -525,32 +535,52 @@ Returns the full provenance record for a single symbol: definition location, cal
 }
 ```
 
-**Response structure:**
+**Response structure** (live call, same clean checkout as IF-10; two of the four edges shown):
 
 ```json
 {
   "structuredContent": {
-    "symbol": "crypto::hash",
-    "file": "src/crypto.rs",
-    "line": 15,
-    "callers_count": 12,
+    "symbol": "rust_sample::direct::chain",
+    "kind": "function",
+    "file": "src/direct.rs",
+    "line": 47,
+    "callers_count": 1,
     "callees_count": 3,
     "edges": [
       {
         "direction": "incoming",
-        "from": "main::baz",
+        "peer": "rust_sample::imports::utils::run_chain",
+        "peer_file": "src/imports.rs",
+        "peer_line": 41,
+        "condition": "always",
+        "confidence": "probable",
+        "tier": "scope_graph",
+        "rule": "import-ref",
+        "resolution_source": null,
+        "site": { "file": "src/imports.rs", "line": 41 }
+      },
+      {
+        "direction": "outgoing",
+        "peer": "rust_sample::direct::step_a",
+        "peer_file": "src/direct.rs",
+        "peer_line": 53,
         "condition": "always",
         "confidence": "certain",
-        "from_file": "src/main.rs",
-        "from_line": 42
+        "tier": "scope_graph",
+        "rule": "scope-ref",
+        "resolution_source": null,
+        "site": { "file": "src/direct.rs", "line": 47 }
       }
     ],
-    "graph_version": "abc1234",
-    "index_file": ".cgx/index.db",
-    "index_sha256": "deadbeef..."
+    "dirty": false,
+    "dirty_files_analyzed": 0,
+    "freshness": { "matches_head": true, "stale": false, "…": "…" },
+    "graph_version": "c19123d"
   }
 }
 ```
+
+`peer` is the other end of the edge whichever way it points; `direction` says which way. `explain` carries no `approximation` and no pagination keys — it is one document per symbol.
 
 ### IF-16: MCP Resources — **Planned (not yet shipped in v0.3.0)**
 
@@ -577,11 +607,11 @@ The server response already includes both halves of this design:
 
 ### IF-18: Pagination — **Shipped**
 
-All tools that return multiple results support pagination via `cursor` / `has_more`.
+Every tool that returns a result list supports pagination via `cursor` / `has_more` / `total_matched`. Three responses are single documents and carry none of the three keys: `explain`, `reaches` with `to` (a verdict plus one witness), and `coupling` (its `pairs` list is bounded by `limit` instead).
 
 **Request:** Include `cursor` from the prior response to fetch the next page.  
 **Response:** Includes `has_more: true` and a new `cursor` value when more results exist.  
-**Default page size:** 20 results per call. Override with `max_results` (max 200).
+**Default page size:** 20 results per call (`paths`: 10). Override with `max_results`, clamped to 1–200.
 
 Agents implement multi-hop traversal by chaining tool calls (callers of result → callers of those callers) rather than requesting deep recursive expansion in a single call.
 
@@ -591,7 +621,7 @@ Token budgets are a real constraint for AI agent contexts. `cgx mcp` implements 
 
 **Compact symbol IDs.** Results use qualified names (`module::Type::method`) not file paths as identifiers. A qualified name is stable across renames of the containing file and is shorter than a file path.
 
-**`max_results` parameter.** Every tool accepts `max_results`. When the result set exceeds the limit, `has_more: true` and a cursor let the agent decide whether to paginate or summarize.
+**`max_results` parameter.** Every tool except `explain` and `coupling` (which takes `limit`) accepts `max_results`. When the result set exceeds the limit, `has_more: true` and a cursor let the agent decide whether to paginate or summarize.
 
 **`resource_link` for bulk evidence.** When a tool result would return large evidence sets (e.g., all 200 callers), the response can include a `resource_link` pointing to a resource URI instead of inlining the full list. The agent fetches the resource only if it needs the full set.
 

@@ -12,7 +12,7 @@ cgx mcp [OPTIONS]
 
 `cgx mcp` starts a long-running [Model Context Protocol](../07-interfaces.md) server that communicates over standard input and output. It exposes the cgx call-graph as a set of MCP tools that AI coding agents, security agents, and IDE extensions can call using standard JSON-RPC 2.0 framing.
 
-The server conforms to the 2025-06-18 MCP specification and responds to `tools/list` and `tools/call`. It registers **twelve** tools, all functional:
+The server conforms to the 2025-06-18 MCP specification and responds to `tools/list` and `tools/call`. It registers **thirteen** tools, all functional:
 
 | Tool | CLI equivalent | Per-tool reference |
 |------|----------------|--------------------|
@@ -28,10 +28,11 @@ The server conforms to the 2025-06-18 MCP specification and responds to `tools/l
 | `flows_from` | [`cgx flows-from`](flows-from.md) | [mcp-tools/flows_from.md](../mcp-tools/flows_from.md) |
 | `graph_query` | [`cgx query`](query.md) | [mcp-tools/graph_query.md](../mcp-tools/graph_query.md) |
 | `coupling` | [`cgx coupling`](coupling.md) | [mcp-tools/coupling.md](../mcp-tools/coupling.md) |
+| `impacted_tests` | [`cgx impacted-tests`](impacted-tests.md) | [mcp-tools/impacted_tests.md](../mcp-tools/impacted_tests.md) |
 
 Tool names use underscores where the CLI uses hyphens (`flows_to`, not `flows-to`). The registry in `tools/list` is the authoritative list; the schemas below cover the tools this page documents in detail, and [docs/mcp-tools/](../mcp-tools/README.md) is the full per-tool reference.
 
-Each tool call returns a JSON result envelope containing session metadata alongside the tool-specific result payload. The server does not maintain state between tool calls; every call loads from the on-disk `.cgx/` index.
+Each tool call returns a JSON result envelope containing session metadata alongside the tool-specific result payload. The server does not maintain state between tool calls: every call indexes the repository afresh into an in-memory store and answers from that. The on-disk `.cgx/` index is never read, so options that exist only on `cgx index` — SCIP enrichment, a C/C++ compilation database, receiver narrowing — do not apply to MCP answers.
 
 **MCP vs CLI differences:**
 
@@ -67,9 +68,10 @@ Symbols that (transitively, to `depth`) call the named symbol.
 | `depth` | integer | no | `1` | Maximum traversal depth. |
 | `max_results` | integer | no | `20` | Page size. Capped at 200. |
 | `cursor` | string | no | — | Pagination cursor from a prior response's `cursor` field. `"0"` is a valid first-page value. |
-| `kind` | array of string | no | — | Restrict results to these symbol kinds. |
+| `kind` | array of string | no | — | Restrict traversal to these call-family edge kinds: `calls`, `calls_virtual`, `calls_closure`, `calls_callback`, `calls_async`, `calls_indirect`, `spawns`. Default: all of them. |
 | `edge_condition` | string | no | — | Filter to one edge condition: `always`, `conditional`, `exception`, `loop`, or `panic`. |
 | `confidence` | string | no | — | Floor filter: `certain`, `probable`, or `possible`. |
+| `max_candidates` | integer ≥ 1 | no | — | Drop call edges from an over-approximated candidate set larger than N targets (fan-out cap, orthogonal to `confidence`). Dropped edges are reported as a `dropped-max-candidates` reason in `approximation`. |
 | `include_dirty` | boolean | no | `true` | Include uncommitted working-tree changes in analysis. |
 
 ### callees
@@ -88,9 +90,10 @@ Enumerate call paths from one symbol to another, surfacing per-path confidence a
 | `max_depth` | integer | no | `10` | Maximum path depth. Note: the CLI equivalent flag is `--depth` with a default of 6. |
 | `max_results` | integer | no | `10` | Page size. Capped at 200. |
 | `cursor` | string | no | — | Pagination cursor. |
-| `exclude_edge_condition` | string | no | — | Omit paths that include this edge condition. |
-| `only_edge_condition` | string | no | — | Return only paths that include this edge condition. |
+| `exclude_edge_condition` | string | no | — | Per-edge traversal filter: never follow an edge with this condition. |
+| `only_edge_condition` | string | no | — | Per-edge traversal filter: follow only edges with this condition, so every hop on a returned path carries it. Wins if both are given. |
 | `confidence` | string | no | — | Minimum confidence floor for path inclusion. |
+| `max_candidates` | integer ≥ 1 | no | — | Fan-out cap, as on `callers`. |
 | `include_dirty` | boolean | no | `true` | Include uncommitted working-tree changes. |
 
 ### unused
@@ -148,9 +151,9 @@ Forward data-flow slice and backward data-flow pedigree over `derives-from` edge
 
 There is no `edge_condition` or `kind` property on these two: the walk follows a single edge family.
 
-### reaches, search, symbols, coupling
+### reaches, search, symbols, coupling, impacted_tests
 
-Registered and functional; their schemas live in [docs/mcp-tools/](../mcp-tools/README.md) alongside the four above.
+Registered and functional; their schemas live in [docs/mcp-tools/](../mcp-tools/README.md) alongside the ones above. `reaches` also accepts `max_candidates`.
 
 ## Response envelope
 
@@ -163,8 +166,8 @@ Every successful tool call includes these session metadata fields alongside the 
 | `dirty_files_analyzed` | integer | Count of working-tree files included in the overlay. |
 | `has_more` | boolean | Whether additional pages exist (IF-18 pagination). |
 | `cursor` | string or null | Pass to the next call to retrieve the next page. |
-| `freshness` | object | The index-freshness envelope: `indexed_tree`, `head_tree`, `matches_head`, `dirty_files_base`, `dirty_files`, `stale`. Present on eleven of the twelve tools — `coupling` omits it, because it reads committed git history and never opens the index. |
-| `approximation` | object | The approximation contract: `direction` (`exact`, `over`, `under`, or `over_under`), `modeled_graph`, and `reasons[]`, plus a `scope` object on a negative answer. Present on nine of the twelve tools. |
+| `freshness` | object | The index-freshness envelope: `indexed_tree`, `head_tree`, `matches_head`, `dirty_files_base`, `dirty_files`, `stale`. Present on twelve of the thirteen tools — `coupling` omits it, because it reads committed git history and never opens the index. |
+| `approximation` | object | The approximation contract: `direction` (`exact`, `over`, `under`, or `over_under`), `modeled_graph`, and `reasons[]`, plus a `scope` object on a negative answer. Present on ten of the thirteen tools. |
 
 `explain`, `search`, and `symbols` carry `freshness` but **no** `approximation`, by design: none of them walks a frontier, so there is nothing to over- or under-approximate. `explain` returns one symbol's recorded incident edges, and `search`/`symbols` are table scans.
 
@@ -191,7 +194,7 @@ cgx mcp
 The server blocks, reading JSON-RPC 2.0 messages on stdin and writing responses to stdout. Send an `initialize` request first; the server responds with its capabilities and version.
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"my-agent","version":"1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"my-agent","version":"1.0"}}}
 ```
 
 ```json
@@ -444,12 +447,12 @@ The response `edges` array uses `peer`, `peer_file`, and `peer_line` for the nei
 
 ## Exit codes
 
-`cgx mcp` itself does not exit until the client closes its end of the pipe. Startup errors (unrecognised flags, bad `--root` path) exit immediately.
+`cgx mcp` itself does not exit until the client closes its end of the pipe. Unrecognised flags exit immediately with code 2. A bad `--root` path is **not** checked at startup: the server starts, and each tool call that relies on it fails with a JSON-RPC error (`-32603`, `git error: … path is not a directory`); the process still exits 0 when the client disconnects.
 
 | Code | Condition |
 |------|-----------|
 | `0` | Client closed the connection normally. |
-| `2` | Bad argument to `cgx mcp` (unrecognised flag, invalid `--root`). |
+| `2` | Unrecognised argument to `cgx mcp`. |
 
 Tool-level errors are returned as JSON-RPC error objects within the protocol; they do not affect the process exit code.
 
@@ -463,4 +466,4 @@ Tool-level errors are returned as JSON-RPC error objects within the protocol; th
 - [cgx explain](explain.md) — CLI equivalent of the `explain` MCP tool
 - [cgx query](query.md) — CLI equivalent of the `graph_query` MCP tool
 - [cgx flows-to](flows-to.md), [cgx flows-from](flows-from.md) — CLI equivalents of `flows_to` / `flows_from`
-- [docs/mcp-tools/](../mcp-tools/README.md) — per-tool schema and response reference for all twelve tools
+- [docs/mcp-tools/](../mcp-tools/README.md) — per-tool schema and response reference for all thirteen tools

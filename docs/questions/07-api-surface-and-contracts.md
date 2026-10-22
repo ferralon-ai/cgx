@@ -117,7 +117,7 @@ When an exported function accepts a callback and invokes it, the callback runs w
 **The query**
 
 ```cgx
--- illustrative: requires DF-18 (schema-room); visibility is not a CQL node property in v0.3.0
+# illustrative: requires DF-18 (schema-room); visibility is not a CQL node property in v0.3.0
 cgx query '
   MATCH (exported_fn {kind:"function"})-[:CALLS]->(callback_site)
   WHERE callback_site.kind = "indirect-call"
@@ -153,7 +153,7 @@ Trust boundaries are the lines between zones of different trust level: an HTTP h
 **Illustrative query (non-runnable in v0.3.0)**
 
 ```cgx
--- NOT RUNNABLE: trust_zone, trust_boundary_annotated, sanitizer_class → exit 2 in v0.3.0
+# NOT RUNNABLE: trust_zone, trust_boundary_annotated, sanitizer_class → exit 2 in v0.3.0
 cgx query '
   MATCH (src)-[:CALLS*]->(fn)-[:CALLS*]->(dst)
   WHERE src.trust_zone = "untrusted"

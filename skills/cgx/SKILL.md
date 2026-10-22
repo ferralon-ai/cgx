@@ -3,7 +3,7 @@ name: cgx
 description: >-
   Use when answering structural or call-graph questions about a codebase with the cgx tool (CLI or MCP):
   who calls a function, what a function calls, whether one symbol reaches another, the call paths between
-  two symbols, dead or unused code, the blast radius of a change, exception/failure paths, taint or data
+  two symbols, dead or unused code, the blast radius of a change, which tests a change impacts, exception/failure paths, taint or data
   provenance, framework entrypoints, inheritance/overrides, call-graph diffs between git refs, or which
   files historically change together. Also use when interpreting a cgx answer — its confidence labels,
   approximation contract, or index-freshness envelope — or when a cgx command failed unexpectedly
@@ -13,8 +13,8 @@ description: >-
 # cgx — deterministic call-graph tool
 
 cgx is a general-purpose, deterministic call-graph and code-graph tool for source code in any language,
-implemented in Rust. No daemon, fast startup, usable as a **human/agent CLI** (16 subcommands) and over a
-**STDIO MCP server** (12 tools). Every answer carries `file:line` evidence and a labeled confidence
+implemented in Rust. No daemon, fast startup, usable as a **human/agent CLI** (22 subcommands) and over a
+**STDIO MCP server** (13 tools). Every answer carries `file:line` evidence and a labeled confidence
 (`certain`/`probable`/`possible`). **No LLM is in the answer path** — answers are deterministic and
 reproducible: the same query against the same graph returns byte-identical output. cgx tells you about
 *structure and reachability*; it does not run the code.
@@ -45,7 +45,12 @@ cgx search Counter                     # case-insensitive substring over the who
 cgx search make --kind function        # narrow to functions
 cgx search 'derive_key' --regex        # regex over the full FQN
 cgx search --all                       # list every symbol (no pattern; Since: v0.3)
+cgx search 'mycrate::**::dispatch'     # selector: ** spans segments, * stays in one (Since: v0.3)
 ```
+
+A pattern containing `**`, `(` or `!` is a **selector**, not a substring; a lone `*` is still a literal
+character. MCP `search` has no selectors (use `graph_query` with CQL `select()`), and selectors are gated by source-language
+family — C and C++ symbols match only with `--agnostic`. See `reference/cli.md` §Selectors.
 
 The index auto-builds on first query into `.cgx/`; force a rebuild with `cgx index .`.
 There is no `prune`/`clean`. Two exceptions to "auto-builds": **`cgx doctor` never auto-indexes**
@@ -67,6 +72,9 @@ answer means.
 |---|---|
 | Find who calls / what calls a symbol; whether/how X reaches Y; enumerate call paths | `recipes/reachability.md` |
 | Assess impact / blast radius of changing a symbol; what could break | `recipes/impact.md` |
+| Which tests cover X / which tests to run for this change — **use `cgx impacted-tests`** (Rust, Go, Java, Python; TS/JS and C/C++ get a degenerate answer at exit 4) | `recipes/impact.md` + `reference/cli.md` |
+| Hand an agent a compact JSON context pack (interface map, dependency footprint) | `reference/cli.md` (`pack`) |
+| Share a built index through a git remote instead of re-indexing (`push`/`pull`) | `reference/cli.md` (Transport) |
 | Find dead / unused / unreachable code | `recipes/dead-code.md` |
 | Rank symbols by importance / find graph hubs / attack-surface entry points *(v0.3)* | `reference/cli.md` (`symbols`) |
 | Reason about exception / panic / failure paths; ∀-path "must pass through" | `recipes/failure-paths.md` |
@@ -100,7 +108,7 @@ answer means.
 - **CQL strings use double quotes.** Wrap the whole query in single quotes for the shell:
   `cgx query 'MATCH (a)-[:CALLS]->(b) WHERE b.name = "foo" RETURN a.name'`.
 - **`--depth 0` does not mean "unlimited"** — except on CLI `paths`, and the shared `--depth` help
-  text claims otherwise on all eight commands that take it. Everywhere else `0` is literally zero
+  text claims otherwise on all nine commands that take it. Everywhere else `0` is literally zero
   hops: `callers`/`callees`/`reaches`/`flows-*` return nothing, and `unused` returns an inflated
   dead-code report that looks like a rich, successful answer. Over MCP the sentinel is *inverted* —
   `paths` `max_depth: 0` returns nothing. To walk wide, pass an explicitly large `--depth N`. See
@@ -119,7 +127,8 @@ answer means.
   and **on by default** (SC6) — no `--dataflow` flag needed; disable with `cgx index --no-dataflow`.
   Security-typed taint (classes, sanitizers) is deferred past v0.3.
 - **Exit codes:** `0` = success *including empty results*; `2` = bad symbol / CQL parse-or-plan error / bad arg
-  (not "empty"); `1`/`4` = `--assert-empty` outcomes. See `reference/output-and-exit.md`.
+  (not "empty"); `1`/`4` = `--assert-empty` outcomes, and `4` is also `impacted-tests` refusing to
+answer for a changed set it cannot analyse. See `reference/output-and-exit.md`.
 
 ## Note on the question cookbook
 

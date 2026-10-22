@@ -44,12 +44,17 @@ Shipped status reflects v0.3.0. Features without a "Planned" note are available 
 | Q-6 | `explain` subcommand | 1 | Shipped |
 | Q-7 | `diff` subcommand (`<BASE> <HEAD>` positional) | 1 | Shipped, including `--added/--removed/--changed`, `--kind`, `--edge-condition`, `--from/--to`, `--path-added`, `--require-anchor-match` |
 | Q-7b | `coupling` subcommand (file-level co-change frequency over git history) | 1 | Shipped |
+| — | `impacted-tests` subcommand (test entrypoints reaching a symbol changed between two refs or in the working tree) | 1 | Shipped — Rust, Go, Java and Python; see [docs/commands/impacted-tests.md](commands/impacted-tests.md) |
+| — | `pack` subcommand (agent-context JSON cards: `interface-map`, `dependency-footprint`) | 1 | Shipped |
+| — | `dump` subcommand (read-only listing of the on-disk graph) | 1 | Shipped |
+| — | `push` / `pull` / `configure-remote` (move the committable index between clones over `refs/cgx/index`; docs/06) | — | Shipped |
+| — | Selector patterns in `search` and the CQL `select()` predicate (see [Selector patterns](#selector-patterns)) | 1 + 2 | Shipped |
 | Q-8 | Full query language: `cgx query '<q>' --repo <path>` | 2 | Shipped (CALLS + DATA_FLOW) |
 | Q-9 | Query from file: `cgx query @file.cql --repo <path>` | 2 | Shipped |
 | Q-10 | SQL alternative: `cgx query --sql 'WITH RECURSIVE ...'` | 2 | **Planned** — the flag is parsed and **rejected with exit 2** on `query` |
 | Q-11 | Edge-condition filters | 1 + 2 | Shipped in CQL (`r.condition`) and on `cgx diff --edge-condition`. **Not** on `callers`/`callees`/`paths` |
 | Q-12 | Path-relative transience predicates | 2 | Shipped |
-| Q-13 | Depth limits (`--depth`) | 1 + 2 | Shipped. Fan-out limits (`--max-fanout`, `--through-sentinels`) are **Planned** |
+| Q-13 | Depth limits (`--depth`) | 1 + 2 | Shipped. The candidate-set cap `--max-candidates N` is shipped (see [Per-node fan-out cap](#per-node-fan-out-cap)); the per-node fan-out limits (`--max-fanout`, `--through-sentinels`) are **Planned** |
 | Q-14 | Negative path constraints (`reaches X WITHOUT passing through Y`) | 2 | Shipped |
 | Q-15 | Reachability matrix queries | 2 | Shipped |
 | Q-16 | Graph diff queries across commit or branch ranges | 1 + 2 | Shipped; see Q-7 for the real flag set |
@@ -563,6 +568,57 @@ deserve the same treatment. `git fetch --unshallow` before running is the other 
 report's `shallow_repository` and `truncated_at_history_boundary` booleans carry the same
 signal if you prefer a top-level field to a reason lookup.
 
+### Selector patterns
+
+`cgx search` and the CQL `select()` predicate accept **selector patterns**: a
+package-pattern grammar over `::`-segmented FQNs, compiled by the node-selector
+engine (`crates/cgx-select`). A `search` pattern is routed to the engine when it
+contains `**`, `(`, or `!`; any other pattern keeps the substring match (or regex,
+with `--regex`, which also opts out of selector routing). Full flag details are
+in [docs/commands/search.md](commands/search.md).
+
+Selectors are not globs and not regexes. They are anchored at both ends, so a
+bare segment is an *equals* match, and each `*` stays inside one segment:
+
+| Form | Meaning |
+|---|---|
+| `Service` | segment equals `Service` |
+| `*Service` / `Svc*` / `*Svc*` | segment ends with / starts with / contains |
+| `*` (whole segment) | any one segment |
+| `**` (whole segment) | zero or more whole segments |
+| `(foo\|bar)::Svc` | two segments: `foo` or `bar`, then `Svc` |
+| `(foo\|bar)Svc` | one segment: `fooSvc` or `barSvc` |
+| `!seg`, `!seg*`, `*!Test` | segment not-equals / not-starts-with / not-ends-with |
+
+A selector may be written in a language's own surface syntax (`com.example.**`,
+`crate::mod::**`); each language's tokenizer decides whether it accepts the string.
+Tokenizer families exist for Rust, Go, TypeScript, Java and Python. C and C++
+have none yet, so a selector reaches C/C++ symbols only with `--agnostic`.
+By default matching is **native**: a symbol matches only through a language family
+that owns its language, so a Java-style dotted selector does not match Rust
+symbols. `cgx search --agnostic` drops that family gate and prints a stderr note
+when matches came from a different language than the selector's syntax. A
+selector no tokenizer accepts is a labelled usage error (exit 2), never a silent
+empty result.
+
+```bash
+cgx search 'rust_sample::**::dispatch'            # any depth between the two segments
+cgx search 'rust_sample.**.dispatch' --agnostic   # dotted syntax, family gate dropped
+```
+
+In CQL, `select(node, "<selector>" [, agnostic])` is a `WHERE` predicate, so
+selectors compose with `AND`/`OR`/`NOT`. The optional third argument is a
+boolean; it defaults to native matching.
+
+```cql
+MATCH (a)-[:CALLS]->(b)
+WHERE select(b, "rust_sample::direct::**") AND NOT select(a, "**::*chain")
+RETURN a.name, b.name
+```
+
+The `callers`/`callees`/`reaches`/`paths` symbol arguments do not go through the
+selector engine; they use the symbol-pattern rules described for each command.
+
 ### Answer envelopes by command
 
 "Every cgx answer carries both envelopes" is a convenient sentence and it is not true. Which envelope a command emits follows from what the command actually does, and a script that unconditionally reads `.approximation` will `null`-deref on a third of the surface. Verified by running each command in `human` format and counting the trailing lines:
@@ -570,11 +626,13 @@ signal if you prefer a top-level field to a reason lookup.
 | Command | approximation | freshness | Why |
 |---|---|---|---|
 | `callers`, `callees`, `reaches`, `paths`, `unused`, `flows-to`, `flows-from`, `query` | yes | yes | A bounded search over an index: both the search's error direction and the index's currency are in question |
+| `impacted-tests` | yes | yes | A bounded walk from the changed set; the contract also discloses the file-granular over-approximation |
 | `explain` | no | yes | Reports what the index holds about one symbol; no search to characterise |
 | `search`, `symbols` | no | yes | Symbol-table lookups, not graph traversals |
 | `coupling` | yes | **no** | Approximate in several named ways, but never opens the index |
 | `diff` (both modes) | no | no | Both sides come from committed trees; the working-tree index is not consulted |
-| `doctor` | no | no | Reports *on* the index rather than answering from it |
+| `doctor`, `dump` | no | no | Report *on* the index rather than answering from it |
+| `pack` | per card | no | Each card carries its own `approximation`; the document's `manifest.graph_honesty` header describes the graph |
 
 The same split holds in `json` (`approximation` / `freshness` keys) and in `sarif` (`cgx/approximation-contract` / `cgx/index-freshness` notes). One more asymmetry worth knowing: under `--format dot|mermaid|d2` the freshness envelope is deliberately **omitted** rather than computed — emitting a graph does not justify the working-tree walk, so an uninspected envelope is substituted.
 
@@ -792,13 +850,13 @@ ORDER BY src.file, src.line
 
 ### Q-10: SQL alternative (unstable, view-based) — **Planned (not yet shipped in v0.3.0)**
 
-**Status: planned.** `--sql` is a hidden flag on the shared flag block. On `cgx query` it is read and **rejected with exit 2**. On the other seven commands that inherit the flag block nothing reads it, so it is accepted and silently ignored (exit 0) — a known defect; do not write scripts that rely on either behaviour.
+**Status: planned.** `--sql` is a hidden flag on the shared flag block. On `cgx query` it is read and **rejected with exit 2**. On the other eight commands that inherit the flag block nothing reads it, so it is accepted and silently ignored (exit 0) — a known defect; do not write scripts that rely on either behaviour.
 
-For v1 implementations that use SQLite storage, a recursive-CTE interface is available. Queries execute against a small set of documented, versioned SQL views; physical tables are not API and carry no stability guarantee.
+The design below is a recursive-CTE interface over a small set of documented, versioned SQL views; physical tables would not be API and would carry no stability guarantee. It is not reachable today: the persisted index is the content-addressed object store under `.cgx/objects/` (docs/09 AR-6), not a SQLite database, so there is no on-disk SQL surface to run it against.
 
 **Documented views:** `v_symbols`, `v_call_edges` (includes `site_id`, `edge_condition`, `confidence`, `introducing_commit`/`introducing_author` when present), `v_call_sites`, `v_provenance`. A `cgx_meta` view exposes `view_schema_version` (integer); view-breaking changes bump it. The feature is **unstable** in v1: the view set and columns may change between minor versions; pin `view_schema_version` in scripts.
 
-Physical tables remain readable (SQLite cannot hide them cheaply) but are documented as **not API, no stability guarantee, may vanish entirely**.
+Any physical tables would be documented as **not API, no stability guarantee, may vanish entirely**.
 
 ```bash
 cgx query --sql '
@@ -897,7 +955,7 @@ Most items below produce a clear `plan error: … (deferred)` message rather tha
 | `COMPATIBLE_WITH` predicate | Requires type reconstruction (`cgx.type_reconstruct`) which is deferred |
 | `IS EMPTY` predicate | Requires type reconstruction; deferred with type-reconstruct |
 | `cgx.type_reconstruct` procedure | Type-lineage extraction from the frontend is a follow-up cycle |
-| `--sql` (Q-10) | The SQLite backend *is* integrated (`rusqlite`, the store's only backend); what is missing is the documented view set and its version contract. Rejected with exit 2 on `query`; silently ignored on the other seven commands that inherit the flag |
+| `--sql` (Q-10) | The persisted index is the content-addressed object store, not SQLite (docs/09 AR-6), so there is no on-disk database for the views to run against. Rejected with exit 2 on `query`; silently ignored on the other eight commands that inherit the flag |
 | `MATCH ALL … MUST PASS THROUGH / AVOIDING` (Q-20 guarded cut) | Requires call-site dominator facts at index time (Phase 3); planned follow-up |
 | `UNWIND` | Deferred clause |
 | `OPTIONAL MATCH` | Deferred clause |
@@ -1037,10 +1095,10 @@ cgx query '
 ' --repo .
 ```
 
-To check all branches at once against main (planned v0.4):
+To check all branches at once against main (planned v0.4 — `--calls-to` and a glob head ref do not exist yet; `--edge-condition` does):
 
 ```bash
-# cgx diff --base main --head "refs/heads/*" --repo . --calls-to vulnerable::bar --edge-condition exception
+# cgx diff main "refs/heads/*" --repo . --calls-to vulnerable::bar --edge-condition exception
 ```
 
 ---
@@ -1154,8 +1212,8 @@ cgx diff HEAD~10 HEAD
 # Only edges added at HEAD that were absent at HEAD~1 (--newer-than shipped)
 cgx diff HEAD~1 HEAD --newer-than
 
-# New exception-path edges introduced in the last commit (PLANNED v0.4 — not yet runnable)
-# cgx diff --base HEAD~1 --head HEAD --repo . --edge-condition exception
+# New exception-path edges introduced in the last commit (--edge-condition shipped)
+cgx diff HEAD~1 HEAD --repo . --edge-condition exception
 
 # Diff expressed as a query (compare graph at two commits)
 cgx query --at HEAD '
@@ -1204,6 +1262,23 @@ an unbounded search remains work-budgeted and frequently truncates. The reliable
 never the flag — it is the approximation contract on the answer you actually got.
 
 ### Per-node fan-out cap
+
+**Shipped today: the candidate-set cap.** The query subcommands that take the
+shared flag block (`callers`, `callees`, `reaches`, `paths`, `unused`,
+`flows-to`, `flows-from`, `query`, `impacted-tests`) accept `--max-candidates N`,
+and the MCP traversal tools (`callers`, `callees`, `reaches`, `paths`) accept
+`max_candidates`. It drops call edges that come from an over-approximated
+candidate set (dynamic dispatch or name collision) with more than `N` targets; a
+single resolved call is never dropped. It is orthogonal to `--confidence`, and
+the approximation contract reports how many edges it excluded:
+
+```
+$ cgx callees make_speak --max-candidates 1
+rust_sample::virtual_dispatch::make_speak  src/virtual_dispatch.rs:36
+approximation: under-approximate — 2 edge(s) in a candidate set larger than 1 were excluded from the search (--max-candidates fan-out cap) | scope: call edges, confidence>=possible, depth<=2
+```
+
+**Planned: the per-node neighbor cap described below.**
 
 The transitive subcommands (`callers`, `callees`, `paths`, `pedigree`,
 `mutation-fanout`) and the query language accept `--max-fanout N`:

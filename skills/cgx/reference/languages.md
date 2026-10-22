@@ -1,7 +1,7 @@
 ---
 title: Language Support
 audience: agents and engineers using cgx
-Last Updated: 2026-08-06
+Last Updated: 2026-10-20
 ---
 
 # Language Support
@@ -15,7 +15,8 @@ Edge-condition labels (`always`, `conditional`, `exception`, `loop`, `panic`) an
 how each language's semantics map to those labels.
 
 **⚠ `panic` is schema-only: no shipped frontend produces an observable `panic` edge.** Every
-frontend populates `always`, `conditional`, `loop`, and `exception`. The Rust adapter is the only
+frontend populates `always`, `conditional`, and `loop`, and every frontend except C populates
+`exception` (C has no exception mechanism; `setjmp`/`longjmp` are not modeled). The Rust adapter is the only
 one that *labels* anything `panic`, and none of those labels survives into the graph — see
 "The `panic` label never reaches the graph" under Rust below. A query filtered on
 `r.condition = "panic"` returns **zero rows on every repo in every language**, and does so at exit 0
@@ -67,13 +68,17 @@ scope, import, or type corroboration is exactly the resolver's Tier-0 name(+arit
 that band is **clamped to `possible` even when a single definition survives** — a lone hit there is
 a name collision with one survivor, not a resolution. A Tier-2 language therefore has no route to
 `probable`: `probable` is reserved for a uniquely-resolved *import binding* or a singleton dispatch
-candidate set, both of which need the scope graph a Tier-2 adapter does not build. No Tier-2
-adapter ships today, so this describes the band a Tier-2 language would land in, not observed
-output.
+candidate set, both of which need the scope graph a Tier-2 adapter does not build. This is the
+band C cross-file calls and C++ type-dependent calls (overloads, ADL, template-dependent targets)
+land in — see their sections below.
 
 ---
 
-## Languages runnable today (v0.3)
+## Languages runnable today
+
+Rust, TypeScript, Go, Java and Python are in the `v0.3.0` release. C and C++ shipped on `main` after
+it and report the same `0.3.0` version string — probe with `cgx index` on a `.c`/`.cpp` file (the
+`blobs:` line counts it as extracted, not unsupported) rather than gating on the version.
 
 ### Rust — Tier 1 (primary, fully exercised)
 
@@ -176,9 +181,9 @@ size like every other language — **`probable`** when the binding resolves to o
 name match follow the same singleton/multi split. Generic type parameter calls and Proxy traps:
 `possible`.
 
-Since: v0.2 — SCIP enrichment via `scip-typescript` promotes structural-match edges from `possible`
-(heuristic) to `probable` (type-resolved), and cross-file direct calls to `certain` where SCIP gives a
-single precise target.
+SCIP enrichment for TypeScript is **unvalidated**: cgx has no `scip-typescript` symbol scheme, so a
+`scip-typescript` index is read with the rust-analyzer scheme and whether it promotes any edge is
+unestablished (see "SCIP enrichment" below).
 
 **Own-effects and dataflow**
 
@@ -210,7 +215,7 @@ schedulers/`Worker` above are).
 
 ---
 
-### Go — Tier 1 (shipped, PR #24)
+### Go — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-go`. Go reached Go-column parity as the first of the three
 post-launch Tier-1 adapters.
@@ -244,7 +249,7 @@ is not yet complete.
 
 ---
 
-### Java — Tier 1 (shipped, PR #25)
+### Java — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-java`.
 
@@ -265,12 +270,12 @@ available** (`planned`).
 Lambda and method-reference call edges are tracked as ordinary call edges. `Thread.start`,
 `ExecutorService.submit`/`execute`, and `CompletableFuture.supplyAsync`/`runAsync` record a `spawns`
 **effect** on the enclosing symbol — an `own_effects` node attribute, not a `spawns` edge. (Only the
-Rust, Go, and Python frontends emit `spawns` *edges*; TypeScript, like Java, records the effect.)
+Rust, Go, and Python frontends emit `spawns` *edges*; TypeScript, C and C++, like Java, record the effect.)
 Concurrency/async hints are partial (`~`).
 
 ---
 
-### Python — Tier 1 (shipped, PR #26)
+### Python — Tier 1 (shipped)
 
 The language frontend is `cgx-lang-python`. Python is the newest adapter and carries the highest test
 count of the three post-launch languages.
@@ -301,11 +306,77 @@ same-named method exists anywhere in the index, therefore keeps `probable` — a
 the scope-graph tier is precisely the value that lets the approximation contract report
 `direction: "exact"`. A single coincidental name match elsewhere in the tree can produce an
 answer that presents as exact. Duck typing makes Python meet this most often, but it affects all
-five shipped languages and is a tracked resolver backlog item, not a Python-specific defect.
+seven shipped languages and is a known resolver limitation, not a Python-specific defect.
 Check `rule` and `tier` in `cgx explain --format json` before relying on such an edge.
 
 The *other* half of this — the bare global name(+arity) fallback over-reporting `probable` for a
 singleton — was fixed and is no longer live: that band is clamped to `possible`.
+
+---
+
+### C — Tier 2 cross-file, scope-resolved within a file (shipped on `main`)
+
+The language frontend is `cgx-lang-c`. It claims `.c` **and `.h`** — a C++ header named `.h` is
+parsed as C.
+
+**Namespace and FQNs.** C has one flat namespace, so a symbol's FQN is its bare name (`square`,
+not `mathlib::square`). `static` marks a function file-local.
+
+**Resolution.** A call to a function defined in the same file resolves `certain`. A call across
+translation units goes through the shared bare-name fallback and is **`possible`**, however
+unique the name — on `fixtures/c`, `callees main --depth 3` shows `main → square [possible]` (the
+cross-file call) and `square → helper` unlabeled (same file, `certain`). Function-pointer and
+callback calls (`(*fp)(…)`, a function-pointer parameter, `obj->handler(…)`) are `possible`, never
+a fabricated concrete target.
+
+**Preprocessor — grammar only.** Nothing is expanded. Every `#if`/`#ifdef` arm is walked, so code
+behind a disabled branch is in the graph (over-approximate). `#include` is recorded as an import. A
+call to a function-like macro produces **no edge** — an `unexpanded-macro` cut, counted by
+`cgx doctor` — never an edge to the macro name.
+
+**Error model.** None. C edges are `always`, `conditional` or `loop`; there is no `exception`
+label, and `setjmp`/`longjmp` paths are not modeled.
+
+**Entrypoints.** Only `main`. On a library with no `main`, `cgx unused` reports every function as
+unused at `direction: "exact"` (verified: deleting `app.c` from `fixtures/c` turns an empty
+`unused --kind function` into `helper`, `square`). Read `unused` on C as "unreachable from `main`".
+
+**Concurrency.** `pthread_create`/`thrd_create` record a `spawns` **effect** on the enclosing
+function, not a `spawns` edge.
+
+**Not available:** dataflow (the `index` summary reads `dataflow: 0 fns recomputed`), selectors
+without `--agnostic`, and `impacted-tests` (exit 4).
+
+---
+
+### C++ — Tier 1 hierarchy, Tier 2 type-dependent calls (shipped on `main`)
+
+The language frontend is `cgx-lang-cpp`. It claims `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`; `.h`
+goes to the C adapter.
+
+**What is modeled.** Namespaces (`geo::total`), classes/structs/unions with methods,
+constructors and destructors, `Inherits`/`Overrides` edges, class-hierarchy virtual dispatch (the
+shared size-based band: `probable` for one surviving override, `possible` for several), `throw`/
+`catch` (calls inside a `catch` are `exception`), templates, and overload candidate sets. The same
+grammar-only preprocessor as C applies.
+
+**Type-dependent calls are `possible`** — overload resolution, argument-dependent lookup, and
+template-dependent targets need types the parser does not have. A `scip-clang` index promotes them
+(see "SCIP enrichment" below).
+
+**⚠ A function declared in a header and defined in a `.cpp` is two symbols with one FQN.** Every
+command that takes a symbol name then exits 2 (`matched 2 symbols; expected one`) — and the body's outgoing edges sit on the **header** node, not the definition. Reach it from a
+neighbour instead (`cgx callers <callee>`, `cgx callees <caller>`), or via CQL, which accepts the
+duplicate:
+`cgx query 'MATCH (a)-[r:CALLS]->(b) WHERE a.fqn = "geo::total" RETURN a.file, b.name, r.confidence'`.
+
+**Entrypoints and concurrency.** Only `main` is an entrypoint (same `unused` caveat as C).
+`pthread_create`, `thrd_create`, `std::thread` and `std::async` record a `spawns` effect, not an
+edge. No RAII/destructor call edges are synthesised.
+
+**Not available:** dataflow, selectors without `--agnostic`, and `impacted-tests` (exit 4).
+Parameter nodes (`geo::check::v#0`) are indexed, but no data-flow edges are built, so `flows-to`
+on one returns nothing at `direction: "exact"` — an absence of modeling, not of flow.
 
 ---
 
@@ -318,7 +389,7 @@ and semantics ahead of implementation. Tag: not available until the language's T
 
 C# has full LS-2/LS-3/LS-4/LS-7/LS-8 specifications in docs/08-language-support.md but no
 language-specific crate yet. It is the last Tier-1 language on the roadmap — Rust, TypeScript, Go, Java,
-and Python have all shipped.
+and Python have shipped at Tier 1, and C and C++ at the mixed tiers described above.
 
 Key reading caveats for when it ships:
 
@@ -326,7 +397,7 @@ Key reading caveats for when it ships:
 |----------|------------------------|------------------------|
 | **C#** | `throw`/`catch` → `exception`; `Task` faulted state → `exception` on fault continuations | Properties are implicit method calls; GC-scheduled finalizers → `possible` |
 
-### Tier 2: C, C++, C#, Kotlin, Swift, Ruby, PHP
+### Tier 2: Kotlin, Swift, Ruby, PHP
 
 Heuristic resolution; no exception-path annotation. Calls labeled `always` or left unlabeled. No
 type-based dispatch narrowing.
@@ -380,16 +451,24 @@ uncertain ones `possible` or `probable` and lets the caller decide whether to in
 
 SCIP (Stack-based Index of Positions and Calls) is optional pre-computed resolution that upgrades
 heuristic (`possible`) edges to type-resolved (`probable` for dispatch candidate sets, `certain` for
-single-target direct calls). Supported generators: `scip-typescript` and `rust-analyzer --emit-scip`
-(`scip-rust`). **`scip-python` is not supported** — Python SCIP enrichment is planned, matching the
-Python section above.
+single-target direct calls). **Two producers are understood:** `rust-analyzer` (`rust-analyzer scip`)
+for Rust, and `scip-clang` for C/C++. cgx picks the symbol scheme from the index's tool metadata;
+an index from any other producer is read with the rust-analyzer scheme, so whether a
+`scip-typescript`, `scip-go`, `scip-java` or `scip-python` index would upgrade any edge is
+unestablished — "not yet available" in the per-language sections means "unshipped and unvalidated",
+not "the flag rejects it".
 
-The `--scip` flag itself is language-agnostic: it accepts any `.scip` path and applies no
-language-based gating. What is *validated* is narrower — the symbol-mapping grammar is written and
-tested against `rust-analyzer`'s scheme and TypeScript's npm scheme only. Whether a `scip-go`,
-`scip-java`, or `scip-python` index would in fact upgrade any edge has not been established either
-way; "not yet available" in the per-language sections above means "unshipped and unvalidated", not
-"the flag rejects it".
+**`scip-clang` is fail-closed on build coverage.** Its promotions are capped at `probable` unless
+cgx knows the compile database covers every C++ translation unit:
+
+```bash
+cgx index . --scip index.scip --compdb compile_commands.json   # cgx verifies coverage itself
+cgx index . --scip index.scip --compdb-complete                # CI: assert coverage, skip the check
+```
+
+`--compdb` checks every discovered `.cpp`/`.cc`/`.cxx` file (headers excluded); any missing TU keeps
+the cap and prints the missing-TU diagnostic. Without either flag a scip-clang index stays at
+`probable`. Both flags are ignored for a rust-analyzer index. (Shipped on `main` after `v0.3.0`.)
 
 SCIP ingestion is not required; cgx falls back to heuristic resolution without it. The `--scip` flag is
 available on `cgx index` since v0.2.
@@ -401,7 +480,8 @@ with the <100ms warm startup target.
 
 ## Summary: what to check when reading results
 
-1. **Which tier is this language?** — sets the confidence ceiling.
+1. **Which tier is this language?** — sets the confidence ceiling. For C, every cross-file call is
+   `possible`; for C++, every overload/ADL/template call is, until `scip-clang` promotes it.
 2. **Is the edge condition `exception` in a Rust or Go codebase?** — means `Result`-branch or
    `if err != nil`, not an exception object. See `reference/mental-model.md` for the `exception` label.
 3. **Is the edge `possible`?** — the callee was not narrowed to one candidate. In Tier 1 this is a

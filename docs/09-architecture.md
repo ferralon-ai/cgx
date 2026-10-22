@@ -22,14 +22,16 @@ The workspace is layered so that no crate depends on a surface above it
 ```
 cgx-core                     model only: nodes, edges, conditions, confidence, cut markers
   ├── cgx-frontend           LanguageFrontend seam + FileFacts + Tier-0 fallback
-  │     └── cgx-lang-{rust,ts,go,python,java}
+  │     └── cgx-lang-{rust,ts,go,python,java,c,cpp}
   ├── cgx-resolve            cross-file link + CHA/RTA/sig/IFDS/effects passes
-  ├── cgx-store              SQLite persistence, v_* views, advisory write lock
+  ├── cgx-store              content-addressed object store; SQLite for dataflow caches; write lock
   ├── cgx-query              GraphView / PathWalker / EdgeFilter + contract + freshness
   │     └── cgx-cql          Cypher subset lowered onto cgx-query primitives
+  ├── cgx-select             language-agnostic node-selector engine (selector-grammar patterns)
   ├── cgx-scip               hand-rolled SCIP protobuf decoder
   ├── cgx-index              pipeline: enumerate → extract → link → refine → store
-  ├── cgx-diff               graph diff, edge age/attribution, co-change coupling
+  ├── cgx-diff               graph diff, edge age/attribution, co-change coupling, impacted tests
+  ├── cgx-transport          push/pull of the committable .cgx set over refs/cgx/index
   ├── cgx-doctor             index-quality report
   ├── cgx-mcp                JSON-RPC 2.0 STDIO server
   └── cgx-cli                clap command surface
@@ -79,7 +81,8 @@ crate (`ascent`), a zero-copy mmap store (`rkyv`), and the official MCP SDK
 (`rmcp`). **None of these is a dependency of this workspace** — `Cargo.lock`
 contains no entry for any of them. What was built instead is described in AR-4,
 AR-5, AR-6, and AR-8 respectively: a hand-rolled resolution engine, direct graph
-walks, plain SQLite, and a hand-rolled JSON-RPC server. Each replacement is
+walks, a plain-file content-addressed object store, and a hand-rolled JSON-RPC
+server. Each replacement is
 simpler than the crate it displaced and carries fewer transitive dependencies,
 which is why the decision held; but the ecosystem argument for Rust is weaker
 than the original table claimed.
@@ -133,8 +136,8 @@ Source files (git tree or working directory)
     ▼
 ┌─────────────────────────────────────────────────────┐
 │  Storage layer (AR-6)                               │
-│  SQLite (rusqlite, bundled, WAL); postcard blobs;   │
-│  versioned v_* read views                           │
+│  content-addressed object store (postcard objects,  │
+│  per-function shards, ref pointer per tree)         │
 └─────────────────────────────────────────────────────┘
     │  Content-addressed index under `.cgx/`
     ▼
@@ -281,9 +284,9 @@ Two properties of this ladder are load-bearing and easy to misread:
   surviving definition under a bare-name match is a name collision that happens
   to have one hit, not a resolution. `emit_candidate_set` clamps
   `Tier::NameSyntactic` to `possible` for exactly this reason
-  (`crates/cgx-resolve/src/link.rs:1296-1312`).
+  (`emit_candidate_set` in `crates/cgx-resolve/src/link.rs`).
 
-  **Known defect (backlog B-5).** That clamp is keyed on `rule == "name-arity"`,
+  **Known defect.** That clamp is keyed on `rule == "name-arity"`,
   so it does not apply to step 3's `name-method` band. A singleton same-name
   method keeps `probable`/`scope_graph` even when the receiver type was never
   resolved in-repo — and `probable`/`scope_graph` is precisely the value that
@@ -408,59 +411,88 @@ escalation path, not a shipped one, and no such dependency exists today.
 
 ## AR-6: Storage Layer
 
-### Decision: SQLite (rusqlite, bundled, WAL) — and nothing else
+### Decision: a content-addressed object store, with SQLite only for scratch caches
 
-`crates/cgx-store` is the whole persistence layer. `rusqlite` 0.40 with the
-`bundled` feature, WAL mode, plus `fd-lock` for advisory write locking. There is
-no mmap overlay and no second store: **`rkyv` is not a dependency of this
-workspace**, and the "SQLite primary + rkyv hot-path overlay" design was never
-built. Records round-trip through canonical `postcard` bytes in a `data` column.
+`crates/cgx-store` is the whole persistence layer. The on-disk index is
+`ObjectStore` (`crates/cgx-store/src/object_store.rs`): plain files under
+`.cgx/`, every object named by the SHA-1 of its canonical `postcard` bytes
+(`crates/cgx-store/src/oid.rs`). There is no mmap overlay: **`rkyv` is not a
+dependency of this workspace**, and the "SQLite primary + rkyv hot-path
+overlay" design was never built. An earlier release also wrote a full SQLite
+copy of every graph to `.cgx/index.db`; that copy is retired, and `cgx index`
+deletes a leftover `index.db`
+(`remove_retired_files` in `crates/cgx-cli/src/store_loc.rs`).
 
 Two layers, matching the model in docs/06:
 
 - **Layer 1 — per-blob fragments.** A file's facts are canonical postcard bytes
-  keyed by its git blob OID, in `blob_facts`. Re-putting an unchanged blob is a
-  no-op; content-addressed keying is what makes re-indexing an untouched file
-  free (IX-1).
+  keyed by its git blob OID plus path context, stored under `.cgx/fragments/`.
+  Re-putting an unchanged blob is a no-op; content-addressed keying is what makes
+  re-indexing an untouched file free (IX-1). A fragment's name is not the hash of
+  its bytes, so each carries a SHA-1 trailer and a mismatch reads as a cache
+  miss.
 - **Layer 2 — per-tree linked graphs.** A `LinkedGraph` (nodes + edges +
-  candidate sets) is materialized per tree OID into `nodes`/`edges`/`candidates`
-  and read back byte-identically.
+  candidate sets) is sharded **per owning function** into objects under
+  `.cgx/objects/<oid[0:2]>/<oid[2:]>`. A per-tree manifest object names the
+  shards in canonical order, and a ref file under `.cgx/refs/` (one per graph
+  key) names the current manifest. A one-function edit rewrites only that
+  function's shard; every unchanged function keeps its OID, so trees and
+  branches share storage. `.cgx/HEAD.json` records the graph the last
+  `cgx index` produced.
 
-The dataflow caches — `fn_intraproc_cache`, `fn_summaries`, `summary_deps` — are
-the only derived artifacts persisted, all content-addressed by blob OID
-(`crates/cgx-store/src/schema.rs`).
+The dataflow caches — `fn_intraproc_cache`, `fn_summaries`, `summary_deps` —
+want keyed upsert and delete rather than content addressing, so the object
+store delegates them to an internally owned SQLite database, `.cgx/cache.db`
+(`rusqlite` 0.40, `bundled` feature, WAL). It is index-time scratch: gitignored,
+never part of the committed or transported object set. The same SQLite
+implementation (`SqliteStore`) also backs the in-memory store the MCP server
+builds for each tool call; that store is never persisted.
+
+Reads re-hash every object against its OID. A missing or mismatched object
+surfaces as a corruption error rather than being served, and the next index run
+rewrites it. The committable subset — `objects/`, `refs/` and `HEAD.json`, never
+`fragments/` or `cache.db` — is what `cgx push`/`cgx pull` move between clones
+(docs/06; `crates/cgx-transport`).
 
 ### SQL view contract (ADR-05)
 
-Physical tables are **not** a public API. The only SQL-visible stability
-contract is the versioned view set — `v_symbols`, `v_call_edges`,
-`v_data_flow_edges`, `v_call_sites`, `v_provenance`, and `cgx_meta` (which
-exposes `view_schema_version`). `--sql` runs against these views alone.
-View-breaking changes bump `VIEW_SCHEMA_VERSION`; an incompatible physical
-layout is rejected by `SCHEMA_VERSION` at open time
-(`crates/cgx-store/src/schema.rs:38,48,57`).
+The versioned view set — `v_symbols`, `v_call_edges`, `v_data_flow_edges`,
+`v_call_sites`, `v_provenance`, and `cgx_meta` (which exposes
+`view_schema_version`) — is still defined in `crates/cgx-store/src/schema.rs`
+for the SQLite implementation, but no on-disk index carries it any more: the
+persisted graph lives in the object store. `--sql` is not implemented.
 
-**Known defect:** `--sql` is read only by the `query` command's run path and is
-silently accepted-and-ignored on the other query subcommands, which exit 0 as
-though it had applied.
+**Known defect:** `--sql` is read only by the `query` command's run path (exit
+2) and is silently accepted-and-ignored on the other query subcommands, which
+exit 0 as though it had applied.
 
 ### Concurrency
 
-WAL gives readers MVCC snapshots. Writers take an advisory `WriteLock` (IX-7)
-and use a check → lock → re-check pattern. Parallel `cgx` invocations against
-one index are safe: multiple simultaneous readers, single writer.
+Writers take an advisory `WriteLock` on `.cgx/objects.lock` (IX-7) and use a
+check → lock → re-check pattern. Every object is written to a temporary file and
+atomically renamed into place, the batch is flushed, and only then is the ref
+pointer advanced — itself by atomic rename. Advancing the ref is the single
+linearization point, so a reader never observes a ref naming an object that is
+not durably in place. Parallel `cgx` invocations against one index are safe:
+multiple simultaneous readers, single writer.
 
 ### Trade-off criteria and decision rationale
 
-**Option A (selected): SQLite via rusqlite**
+**Option A (selected): content-addressed object store, SQLite for caches**
+
+The first implementation stored everything in SQLite; the object store replaced
+it as the persisted graph because content-addressed per-function objects dedup
+across trees and can be moved between clones through git's own object database
+(`cgx push`/`cgx pull`). The criteria below still describe why SQLite remains
+the right home for the keyed dataflow caches.
 
 | Criterion | Assessment |
 |---|---|
-| Cold-start time | SQLite file open + query is a few milliseconds; see AR-11 for the end-to-end budget. |
-| Traversal performance | Traversal is not done in SQL (AR-5). SQLite is a fact store; the walk is Rust over an in-memory `GraphView`. |
-| Concurrent CLI access | WAL: multiple readers, single writer, plus advisory file locking (IX-7). |
-| Pure Rust | No. SQLite is C, vendored and compiled through `rusqlite`'s `bundled` feature. This is the one FFI dependency in the workspace. |
-| Query expressiveness | SQL is exposed only through the `v_*` views for ad-hoc inspection, not as the engine's own traversal mechanism. |
+| Cold-start time | Load = read `HEAD.json`, the ref, the manifest and its shards; see AR-11 for the end-to-end budget. |
+| Traversal performance | Traversal is not done in storage (AR-5). The store is a fact store; the walk is Rust over an in-memory `GraphView`. |
+| Concurrent CLI access | Write-once objects plus an atomically advanced ref: multiple readers, single writer, plus advisory file locking (IX-7). |
+| Pure Rust | Not entirely. The cache database is SQLite, which is C, vendored and compiled through `rusqlite`'s `bundled` feature. This is the one FFI dependency in the workspace. |
+| Query expressiveness | No SQL surface is exposed; `--sql` is not implemented. |
 
 **Option B (not selected): LMDB or redb as primary**
 
@@ -596,15 +628,18 @@ which is what makes it testable without a live pipe.
 - **`tools/call`** — runs one tool and returns a `structuredContent` body plus a
   `content` text mirror.
 
-Twelve tools are registered (`crates/cgx-mcp/src/tools.rs`, `tool_list()`):
+Thirteen tools are registered (`crates/cgx-mcp/src/tools.rs`, `tool_list()`):
 `callers`, `callees`, `reaches`, `paths`, `unused`, `explain`, `search`,
-`symbols`, `flows_to`, `flows_from`, `graph_query`, `coupling`. Ten are thin
-envelopes over the matching `cgx-query` function; `graph_query` routes to
-`cgx_cql::run` — the same engine `cgx query` drives; `coupling` routes to
-`cgx-diff` and reads git history only.
+`symbols`, `flows_to`, `flows_from`, `graph_query`, `coupling`,
+`impacted_tests`. Ten are thin envelopes over the matching `cgx-query`
+function; `graph_query` routes to `cgx_cql::run` — the same engine `cgx query`
+drives; `coupling` routes to `cgx-diff` and reads git history only;
+`impacted_tests` routes to `cgx_diff::impacted::run`, the entry point
+`cgx impacted-tests` uses.
 
 The MCP surface is a **subset** of the CLI, not a mirror of it: `index`,
-`doctor`, and `diff` have no MCP equivalent. `dispatch` is a pure function over
+`doctor`, `diff`, `dump`, `pack`, `push`, `pull` and `configure-remote` have no
+MCP equivalent. `dispatch` is a pure function over
 a `Request`, and `serve_io` drives the loop over any `BufRead`/`Write`, so both
 are exercised directly in tests.
 
@@ -720,7 +755,7 @@ last index. The budget covers:
 | Binary startup (single static binary) | <5ms |
 | gix: open repo + read HEAD tree OID | <5ms |
 | Staleness check (stored vs current tree OID) | <10ms |
-| Index open (SQLite WAL) | <5ms |
+| Index open (read `HEAD.json`, ref and manifest) | <5ms |
 | Graph load + query execution (simple reachability) | <50ms |
 | Contract + freshness envelope (AR-13) | <5ms |
 | Output serialization + write to stdout | <5ms |

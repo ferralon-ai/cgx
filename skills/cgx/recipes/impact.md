@@ -85,25 +85,34 @@ for `--depth` defaults.
 
 ### Same function, which tests cover it?
 
-**Status:** runnable today (partial)   **Since:** v0.1
+**Status:** runnable today (Rust, Go, Java, Python)   **Since:** v0.3
 
-The `entrypoint_class:"test"` node property is deferred past v0.3 (plan error,
-exit 2 in v0.3.0). Use the subcommand approach and cross-reference separately:
+Use `cgx impacted-tests` — it answers "which test entrypoints reach this change" directly, so there
+is no need to walk `callers` and filter by test-path convention:
 
 ```bash
-# Step 1 — get all callers of the target function
-cgx callers OrderService::submit --depth 5 --format json > callers.json
-
-# Step 2 — identify test modules from the caller list by file path convention
-# (e.g. grep for paths containing /tests/, _test.rs, test_, etc.)
+cgx impacted-tests --uncommitted          # your working-tree edit vs HEAD
+cgx impacted-tests main HEAD              # everything this branch adds (merge-base by default)
+cgx impacted-tests main HEAD --format json
 ```
 
-A first-class "callers scoped to test entrypoints only" query requires
-`entrypoint_class` node properties, which are deferred past v0.3.
+Verified on a copy of `fixtures/python-app` after a body edit to `build_record`:
 
-**Reading the result:** Callers whose file paths match your test naming
-convention are likely test coverage. Callers without any test-path ancestor
-represent uncovered production code — regression risk if the signature changes.
+```
+app::build_record  app.py:11
+└─ test_app::test_build_record  test_app.py:10  [probable]
+```
+
+**Reading the result:** each root is a changed symbol, each child a test that reaches it, with the
+confidence of the weakest edge on the way. The changed set includes every symbol in a changed file,
+so a body-only edit is caught; the contract says so (`impacted-changed-set-file-granular`).
+`(no results)` at exit 0 on a supported language means no recognised test reaches the change.
+
+**Languages:** a changed set in TypeScript/JavaScript, C or C++ only exits **4** with
+`impacted-language-unsupported` — the empty list is vacuous, not a clean bill of health. For those,
+fall back to `cgx callers <changed symbol> --depth 5 --format json` and filter by your test-path
+convention. Python misses unittest camelCase `testFoo` methods and non-default pytest discovery
+config (`impacted-test-recognition-incomplete-python` on the contract).
 
 ---
 
@@ -199,18 +208,21 @@ emits SARIF 2.1.0 suitable for IDE annotation or CI reporting.
 
 **Status:** runnable today (partial)   **Since:** v0.1
 
+Ask **before** renaming, against the name that still resolves:
+
 ```bash
-# All callers, then filter by test file path convention
 cgx callers OrderService::submit --depth 5 --format json
 ```
 
-The CQL form using `entrypoint_class:"test"` node property is deferred past
-v0.3 (plan error, exit 2). Use the file-path filter approach above.
+then filter the callers by your test-path convention. **Do not use `cgx impacted-tests` on the
+rename itself:** after the rename, the tests' calls to the old name resolve to nothing, so no test
+reaches the new symbol and the answer is `(no results)` at exit 0 — only the contract's
+unresolved-calls reason hints at it. (Verified on `fixtures/python-app`: renaming `build_record`
+yields no results, where a body edit to it yields `test_app::test_build_record`.)
 
-**Reading the result:** From the caller list, tests that directly call the
-function (depth 1) will fail to compile on rename. Tests that reach it through
-helper chains (higher depth) may fail at runtime. Sort by depth to prioritize
-immediate breakage.
+**Reading the result:** tests that call the function directly (depth 1) fail to compile — or, in
+Python, fail at call time — on rename. Tests that reach it through helpers break only if a helper
+is left unrenamed. Sort by depth to prioritise.
 
 ---
 

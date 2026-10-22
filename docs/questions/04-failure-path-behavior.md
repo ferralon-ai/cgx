@@ -6,7 +6,7 @@ When a program takes an error path — a `catch` block, a Rust `Err(e) =>` arm, 
 
 ### Q37 — Which functions are ONLY reachable through exception/error handlers — never from the happy path?
 
-**Personas:** PSE · **Status:** deferred (v0.3) — `collect(distinct ...)` inside a `WITH` clause causes a parse error (exit 2) in v0.3.0; the `distinct` modifier inside aggregate functions is not yet supported. When `collect(distinct ...)` ships, this query becomes fully answerable. For now, use `collect()` without deduplication and accept duplicate names in the intermediate set (false negatives are possible but rare).
+**Personas:** PSE · **Status:** answerable-today — the query below runs as written in v0.3.0 (exit 0). It uses plain `collect()`, because `collect(distinct ...)` is still a parse error (exit 2); duplicate names in the happy-path list do not change the `NOT ... IN` test.
 
 Functions that are exclusively reachable via error handlers are often less scrutinized for security properties. An attacker who can trigger error conditions can reach code that developers implicitly treat as "never called in production." This question finds functions where every path from every entrypoint passes through at least one `exception` or `panic` edge before reaching them.
 
@@ -35,7 +35,7 @@ ORDER BY exc_target.file, exc_target.line
 | `NONE(r IN relationships(path) WHERE r.condition IN ["exception","panic"])` | Used in the second part to collect all targets reachable without any exception-class edge — the happy-path reachable set. |
 | `NOT exc_target.name IN happy_path_targets` | The target must not appear in the happy-path set, meaning it is exclusively reachable via error handling. |
 
-**Reading the result** — Each returned function is only callable via error paths. These are candidates for security review: do they have authorization checks? Do they assume invariants that may be violated in error conditions? Dead-code analysis (Theme 5) is a complement: if one of these functions is also unreachable from most error paths, it may effectively be dead code that can be reactivated.
+**Reading the result** — Each returned function is only callable via error paths. The `{kind:"entrypoint"}` anchors match only nodes whose kind is `entrypoint`; if they return nothing on your index, anchor both starts on a named root instead (for example `(ep {name:"handle_request"})` and `(ep2 {name:"handle_request"})`). On the `fixtures/rust-sample` corpus, anchoring both on `handle_with_match` returns `errors::AppError::from` and `errors::log_error`, the two callees reached only through `exception` edges; `parse_int`, which it reaches both ways, is correctly excluded. These are candidates for security review: do they have authorization checks? Do they assume invariants that may be violated in error conditions? Dead-code analysis (Theme 5) is a complement: if one of these functions is also unreachable from most error paths, it may effectively be dead code that can be reactivated.
 
 ---
 

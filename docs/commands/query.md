@@ -75,6 +75,7 @@ Edge-condition and confidence tags are a property of the *forest and path* rende
 | `--depth <DEPTH>` | integer | — | **Accepted and ignored.** Traversal depth comes from the pattern's `*n..m` range, not from this flag. |
 | `--tree <TREE>` | `full\|spanning` | `full` | **Accepted and ignored.** `query` renders tables and paths, never a forest. |
 | `--confidence <CONFIDENCE>` | `possible\|probable\|certain` | — | **Accepted and ignored.** Filter confidence with a `WHERE` clause instead. |
+| `--max-candidates <N>` | integer | — | **Accepted and ignored.** `query` does not run the shared traversal walker this flag configures, and reports no `dropped-max-candidates` reason. |
 | `--assert-empty` | boolean flag | — | CI assertion mode: exit 1 if any rows are returned; exit 4 only if the graph itself was empty (see "Vacuity works differently here"). |
 | `--allow-vacuous` | boolean flag | — | Suppress the ADR-08 vacuity guard: converts exit 4 to exit 0 when `--assert-empty` passes vacuously. |
 | `--no-auto-index` | boolean flag | — | Require an explicit prior `cgx index`; if no `.cgx/` store is present, exit 3 instead of auto-indexing. |

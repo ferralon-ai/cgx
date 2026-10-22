@@ -2344,7 +2344,7 @@ fn callers_of_a_method_narrowing_excluded_reports_the_narrowed_sites() {
     let (out, code) = run_cgx(&legacy, &query);
     assert_eq!(code, 0, "callers: {out}");
     assert!(
-        out.contains("pkg::base::Base::save"),
+        out.contains("pkg.base.Base.save"),
         "legacy keeps the same-name caller: {out}"
     );
     assert!(

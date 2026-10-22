@@ -516,7 +516,10 @@ fn expand_var_length(
         // `RETURN path` see a concrete node/edge sequence. The walk is now
         // budget-bounded; a `Some` truncation from any goal is propagated out.
         for &goal in &goals {
-            let enumer = walker.enumerate_paths(view, anchor, goal, plan.direction);
+            // Trail semantics (no repeated relationship, repeated nodes allowed)
+            // so a path binding sees cycles / self-recursion, not just acyclic
+            // witnesses. Edge-uniqueness keeps each enumerated path bounded.
+            let enumer = walker.enumerate_trails(view, anchor, goal, plan.direction);
             // Accumulate truncation: once set, a later PathCap does not overwrite
             // StepBudget (step-budget is the stronger signal).
             if let Some(reason) = enumer.truncation {
@@ -553,11 +556,14 @@ fn expand_var_length(
         // rows is O(anchors × reachable) and unbounded by the depth cap alone.
         // Cap the total rows accumulated in `out` at DEFAULT_VAR_LENGTH_ROWS and
         // surface PathCap when the cap stops us early (honesty marker, not error).
-        for d in walker.bfs(view, anchor, plan.direction) {
-            if d.depth < min {
-                continue;
-            }
-            if !goals.contains(&d.node) {
+        // `reachable_within` (not `bfs`) so a node that reaches itself — self-
+        // recursion, or a cycle back to the anchor — is admitted. `bfs` marks the
+        // anchor visited up front and reports each node once at its shortest
+        // depth, which makes cycles invisible; the depth-layered walk re-reaches a
+        // node at successive depths and so finds them. The `min` floor is applied
+        // inside the walk; the hop ceiling is the walker's `max_depth`.
+        for node in walker.reachable_within(view, anchor, plan.direction, min) {
+            if !goals.contains(&node) {
                 continue;
             }
             if out.len() >= DEFAULT_VAR_LENGTH_ROWS {
@@ -566,7 +572,7 @@ fn expand_var_length(
             }
             let mut b = base.clone();
             bind_node(&mut b, &plan.anchor_var, anchor);
-            bind_node(&mut b, &plan.peer_var, d.node);
+            bind_node(&mut b, &plan.peer_var, node);
             out.push(b);
         }
     }

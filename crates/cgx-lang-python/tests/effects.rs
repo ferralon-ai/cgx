@@ -200,3 +200,17 @@ fn await_propagates_callee_effects() {
     // `asyncio.sleep` is a blocking yield point per the effect table.
     assert!(effects_of(&facts, "::f").contains(Effect::Blocking));
 }
+
+#[test]
+fn chained_call_keeps_inner_receiver_effect() {
+    // `urlopen(u).read()` — the io.net effect of the inner `urlopen(u)` call
+    // must survive even though it is the receiver of a chained `.read()`.
+    let facts = extract(
+        "m.py",
+        "import urllib.request\ndef f(u):\n    return urllib.request.urlopen(u).read()\n",
+    );
+    assert!(
+        effects_of(&facts, "::f").contains(Effect::IoNet),
+        "inner urlopen effect must be kept in a chained call"
+    );
+}

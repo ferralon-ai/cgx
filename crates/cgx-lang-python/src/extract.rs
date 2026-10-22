@@ -693,17 +693,39 @@ impl<'a> Builder<'a> {
                 }
                 *stmt_index += 1;
             }
-            // The callee operand may itself nest a call (`getattr(o, "m")()`,
-            // `factory().run()`); descend unless it is a plain name/attribute
-            // already accounted for above.
-            if !matches!(func.kind(), "identifier" | "attribute") {
-                self.walk(func, ctx, stmt_index);
+            // The callee operand may itself nest a call. A plain name
+            // (`g()`) is fully accounted for by the ref above. An `attribute`
+            // callee (`recv.method`) is too, EXCEPT when its receiver is itself
+            // a call (`urlopen(u).read()`, `factory().run()`): that inner call is
+            // not otherwise walked, so descend into it to keep its ref and
+            // effects. `super(...)` is modeled as an anon-receiver root, not a
+            // real callee, so it is left alone. Any other callee shape
+            // (`getattr(o, "m")()`) is walked whole.
+            match func.kind() {
+                "identifier" => {}
+                "attribute" => {
+                    if let Some(obj) = func.child_by_field_name("object") {
+                        if obj.kind() == "call" && !self.is_super_call(obj) {
+                            self.walk(obj, ctx, stmt_index);
+                        }
+                    }
+                }
+                _ => self.walk(func, ctx, stmt_index),
             }
         }
         // Walk the argument list for nested calls (`f(g())`).
         if let Some(args) = node.child_by_field_name("arguments") {
             self.walk(args, ctx, stmt_index);
         }
+    }
+
+    /// Whether a `call` node is a `super(...)` call (its function is the bare
+    /// `super` name). `super()` is modeled as an anon-receiver root, not a
+    /// callee, so it is not descended into as a chained-call receiver.
+    fn is_super_call(&self, call: Node<'_>) -> bool {
+        call.child_by_field_name("function")
+            .map(|f| f.kind() == "identifier" && self.text(f) == "super")
+            .unwrap_or(false)
     }
 
     /// An `await <expr>` suspension point (LS-7.2). When the awaited operand is a

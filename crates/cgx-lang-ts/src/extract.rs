@@ -1557,6 +1557,19 @@ impl<'a> Builder<'a> {
         let args_node = node.child_by_field_name("arguments");
         let arity = args_node.map(|a| self.count_args(a));
 
+        // A chained call (`f(x).g()`, `f(x)[k]()`): the callee's receiver object
+        // is itself a call whose edges and effects would otherwise be lost, since
+        // the callee subtree is not walked elsewhere in this method. Descend only
+        // when the receiver is a call; a plain identifier/member receiver is not
+        // walked at all (it emits no ref either way).
+        if matches!(callee.kind(), "member_expression" | "subscript_expression") {
+            if let Some(obj) = callee.child_by_field_name("object") {
+                if obj.kind() == "call_expression" {
+                    self.walk_expr(obj, scope);
+                }
+            }
+        }
+
         // Detect dynamic import: call_expression where function = "import"
         // tree-sitter may parse `import(...)` as a call with `import` keyword
         let callee_text = self.text(callee);

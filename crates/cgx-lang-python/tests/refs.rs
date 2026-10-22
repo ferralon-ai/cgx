@@ -211,3 +211,21 @@ fn second_elif_branch_is_extracted() {
         facts.refs
     );
 }
+
+#[test]
+fn chained_call_extracts_inner_receiver_call() {
+    // `inner(u).read()` — the inner call `inner(u)` is the receiver of the
+    // `.read()` method call and must not be dropped.
+    let facts = extract(FILE, "def f(u):\n    return inner(u).read()\n");
+    assert!(
+        has_ref(&facts, "inner", RefKind::Call, EdgeCondition::Always),
+        "inner receiver call must be extracted: {:?}",
+        facts.refs
+    );
+    assert!(has_ref(
+        &facts,
+        "read",
+        RefKind::CallVirtualReceiver,
+        EdgeCondition::Always
+    ));
+}

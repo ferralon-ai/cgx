@@ -11,8 +11,9 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::confine::confine_root;
 use crate::error::ServeError;
 use crate::protocol::{Request, Response, RpcError};
 use crate::tools;
@@ -20,15 +21,44 @@ use crate::tools;
 /// The MCP protocol version this server implements (docs/07 IF-9).
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Server configuration: the default repository root and the advertised name.
+/// Server configuration: the confinement root (if any) and the advertised name.
 ///
-/// `root` is the fallback repository path when a tool call omits `root`; tools
-/// that take an explicit `root` use theirs. The CLI (`cgx mcp --root <path>`)
-/// constructs this and calls [`serve`].
+/// `root`, when set, is both the fallback repository path for calls that omit
+/// `root` **and** a confinement boundary: every call's effective root must
+/// resolve to this path or a descendant of it (see [`crate::confine`]). It is
+/// canonicalized once, at construction, so the per-call descendant check runs
+/// against a stable, symlink-resolved path. `None` means no `--root` was given:
+/// there is no boundary and no default, and calls behave as they did before
+/// confinement existed (an explicit `root` is used as-is).
+///
+/// The CLI (`cgx mcp --root <path>`) builds this with [`ServerConfig::new`] and
+/// calls [`serve`].
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
-    /// Default repository root (used when a tool omits `root`).
+    /// The canonical confinement root / default repository root, or `None` when
+    /// the server was started without `--root`.
     pub root: Option<PathBuf>,
+}
+
+impl ServerConfig {
+    /// Build a configuration, canonicalizing the confinement root **once**.
+    ///
+    /// A configured root that cannot be canonicalized (it does not exist or is
+    /// inaccessible) is a [`ServeError::Startup`]: we refuse to start rather
+    /// than confine calls to a boundary we cannot resolve. `None` is returned
+    /// unchanged — no boundary, no default.
+    pub fn new(root: Option<PathBuf>) -> Result<Self, ServeError> {
+        let root = match root {
+            Some(raw) => Some(raw.canonicalize().map_err(|e| {
+                ServeError::Startup(format!(
+                    "configured --root `{}` cannot be resolved: {e}",
+                    raw.display()
+                ))
+            })?),
+            None => None,
+        };
+        Ok(Self { root })
+    }
 }
 
 /// Dispatch one JSON-RPC request to its handler.
@@ -85,6 +115,13 @@ fn tools_call(config: &ServerConfig, params: &Value) -> Result<Value, RpcError> 
         .unwrap_or_else(|| json!({}));
     apply_default_root(config, &mut args);
 
+    // When a confinement root is configured, every call's effective root — the
+    // caller's or the one just defaulted in — must stay within it. Rewrite the
+    // argument to the canonical, confined path before it reaches the indexer.
+    if let Some(boundary) = &config.root {
+        confine_args_root(boundary, &mut args)?;
+    }
+
     match tools::call(name, &args) {
         Ok(structured) => Ok(wrap_tool_result(structured)),
         Err(e) => Err(e.to_rpc()),
@@ -105,6 +142,22 @@ fn apply_default_root(config: &ServerConfig, args: &mut Value) {
             }
         }
     }
+}
+
+/// Enforce the confinement boundary on a call's `root` argument, rewriting it to
+/// its canonical, confined form. A call that carries no `root` (a tool that takes
+/// none) has nothing to confine and cannot escape the boundary, so it passes.
+fn confine_args_root(boundary: &Path, args: &mut Value) -> Result<(), RpcError> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(requested) = obj.get("root").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let canonical = confine_root(boundary, Path::new(requested))
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    obj.insert("root".into(), json!(canonical.to_string_lossy()));
+    Ok(())
 }
 
 /// Wrap a tool's structured body in the 2025-06-18 result envelope: the canonical

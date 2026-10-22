@@ -477,7 +477,9 @@ enum Command {
     },
     /// Start the MCP STDIO server (docs/07 IF-9).
     Mcp {
-        /// Default repository root injected into tool calls that omit it.
+        /// Confinement root: the default repository root for calls that omit it,
+        /// and a boundary every call's root must stay within. Without it the
+        /// server imposes no boundary.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -916,7 +918,8 @@ fn run(command: Command) -> Result<(), CliError> {
             format,
         }),
         Command::Mcp { root } => {
-            cgx_mcp::serve(ServerConfig { root }).map_err(|e| CliError::graph(e.to_string()))
+            let config = ServerConfig::new(root).map_err(|e| CliError::graph(e.to_string()))?;
+            cgx_mcp::serve(config).map_err(|e| CliError::graph(e.to_string()))
         }
         Command::ImpactedTests {
             base,

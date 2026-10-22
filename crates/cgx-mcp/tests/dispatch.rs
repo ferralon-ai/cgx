@@ -1981,3 +1981,127 @@ fn impacted_tests_paginates_like_every_other_list_tool() {
         "{out}"
     );
 }
+
+// --- confinement (--root boundary) ------------------------------------------
+
+/// Build a request for `name`/`args`, inserting an explicit `root`.
+fn confined_request(root: &Path, name: &str, mut args: Value) -> Request {
+    args.as_object_mut()
+        .unwrap()
+        .insert("root".into(), json!(root.to_string_lossy()));
+    req(1, "tools/call", json!({ "name": name, "arguments": args }))
+}
+
+/// A server configured with `boundary` as its confinement root.
+fn confined_config(boundary: &Path) -> ServerConfig {
+    ServerConfig::new(Some(boundary.to_path_buf())).expect("boundary canonicalizes")
+}
+
+#[test]
+fn confinement_accepts_root_equal_to_the_boundary() {
+    let (_t, repo) = init_repo();
+    let config = confined_config(&repo);
+    let request = confined_request(&repo, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    assert!(resp.error.is_none(), "boundary itself is inside: {:?}", resp.error);
+}
+
+#[test]
+fn confinement_accepts_a_descendant_of_the_boundary() {
+    let (_t, repo) = init_repo();
+    let config = confined_config(&repo);
+    // `src/` is a descendant; discovery walks up to the enclosing repo, so the
+    // call still answers.
+    let request = confined_request(&repo.join("src"), "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    assert!(resp.error.is_none(), "descendant is inside: {:?}", resp.error);
+}
+
+#[test]
+fn confinement_rejects_an_absolute_root_outside_the_boundary() {
+    let (_t, repo) = init_repo();
+    let (_t2, other) = init_repo();
+    let config = confined_config(&repo);
+    let request = confined_request(&other, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    let err = resp.error.expect("outside the boundary is rejected");
+    assert_eq!(err.code, -32602, "invalid-params: {err:?}");
+    assert!(
+        err.message.contains("outside the configured --root boundary"),
+        "message explains the escape: {err:?}"
+    );
+}
+
+#[test]
+fn confinement_rejects_a_dotdot_traversal_escaping_the_boundary() {
+    // boundary = <tmp>/repo; the sibling <tmp>/other is a real repo reached via `..`.
+    let (_t, repo) = init_repo();
+    let sibling = repo.parent().unwrap().join("other");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let config = confined_config(&repo);
+    let escaping = repo.join("..").join("other");
+    let request = confined_request(&escaping, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    let err = resp.error.expect("`..` escape is rejected");
+    assert_eq!(err.code, -32602, "{err:?}");
+}
+
+#[test]
+fn confinement_rejects_a_sibling_sharing_a_name_prefix() {
+    // `<tmp>/repo-evil` must not be considered inside the `<tmp>/repo` boundary.
+    let (_t, repo) = init_repo();
+    let evil = repo.parent().unwrap().join("repo-evil");
+    std::fs::create_dir_all(&evil).unwrap();
+    let config = confined_config(&repo);
+    let request = confined_request(&evil, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    let err = resp.error.expect("name-prefix sibling is rejected");
+    assert_eq!(err.code, -32602, "{err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn confinement_rejects_a_symlink_inside_the_boundary_pointing_outside() {
+    let (_t, repo) = init_repo();
+    let (_t2, outside) = init_repo();
+    let link = repo.join("escape");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let config = confined_config(&repo);
+    let request = confined_request(&link, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&config, &request).expect("response");
+    let err = resp.error.expect("symlink out of the boundary is rejected");
+    assert_eq!(err.code, -32602, "{err:?}");
+}
+
+#[test]
+fn confinement_preserves_default_injection_ergonomics() {
+    // A call that omits `root` still gets the configured root, and confinement
+    // admits it: the boundary is its own default.
+    let (_t, repo) = init_repo();
+    let config = confined_config(&repo);
+    let request = req(
+        1,
+        "tools/call",
+        json!({ "name": "callers", "arguments": { "symbol": "leaf" } }),
+    );
+    let resp = dispatch(&config, &request).expect("response");
+    assert!(resp.error.is_none(), "defaulted root is accepted: {:?}", resp.error);
+    let names = result_names(
+        resp.result.unwrap().get("structuredContent").unwrap(),
+        "results",
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("helper")),
+        "the defaulted-root call really ran: {names:?}"
+    );
+}
+
+#[test]
+fn without_a_configured_root_there_is_no_boundary() {
+    // No `--root`: today's behavior is preserved — an explicit, arbitrary root
+    // is honored (confinement is active only when `--root` is set).
+    let (_t, repo) = init_repo();
+    let request = confined_request(&repo, "callers", json!({ "symbol": "leaf" }));
+    let resp = dispatch(&ServerConfig::default(), &request).expect("response");
+    assert!(resp.error.is_none(), "no boundary configured: {:?}", resp.error);
+}

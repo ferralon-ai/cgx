@@ -57,16 +57,22 @@ impl std::fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
-/// A fatal error of the STDIO serve loop (I/O on stdin/stdout).
+/// A fatal error of the STDIO serve loop (I/O on stdin/stdout) or of server
+/// startup (e.g. an unresolvable confinement root).
 #[derive(Debug)]
 pub enum ServeError {
     Io(std::io::Error),
+    /// The server could not be configured — the confinement root could not be
+    /// canonicalized at startup. We refuse to run rather than confine calls to a
+    /// boundary we cannot resolve.
+    Startup(String),
 }
 
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServeError::Io(e) => write!(f, "stdio error: {e}"),
+            ServeError::Startup(m) => write!(f, "startup error: {m}"),
         }
     }
 }

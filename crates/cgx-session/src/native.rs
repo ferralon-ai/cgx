@@ -10,9 +10,15 @@
 //!
 //! - `{"id":n,"op":"open"}` — warm-open the persisted index for the current
 //!   `HEAD` (as `cgx_session_open`).
-//! - `{"id":n,"op":"index","mode":"head"|"worktree","dataflow":bool|null,"scip":path|null,"force":bool}`
+//! - `{"id":n,"op":"index","mode":"head"|"worktree","dataflow":bool|null,"scip":path|null,"compdb":path|null,"compdb_dir":path|null,"compdb_complete":bool|null,"source_root":path|null,"force":bool}`
 //!   — index and hold. `head` without `force` returns `up_to_date` when the
-//!   persisted graph is already `HEAD`'s.
+//!   persisted graph is already `HEAD`'s. `scip` overlays a SCIP index;
+//!   `compdb`, `compdb_dir` and `compdb_complete` are `cgx index`'s `--compdb`
+//!   and `--compdb-complete` for a scip-clang index, `compdb_dir` being the base
+//!   for entries without `directory` (default: the compdb's own directory).
+//!   `source_root` is the directory the compdb's paths are anchored against
+//!   (default: the session root). The files are read whole and bounded as
+//!   [`ScipInput`] is.
 //! - `{"id":n,"op":"call","tool":"…","args":{…}}` — an MCP tool or a session op
 //!   on the resident graph.
 //! - `{"id":n,"op":"close"}` — answer, then exit.
@@ -21,9 +27,9 @@
 //! `{"id":n,"ok":false,"error":{"kind":…,"message":…}}`, with `id` echoed.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use cgx_index::{extract_and_link, workdir_key, IndexOpts, Repo, ScipOverlay};
+use cgx_index::{extract_and_link, workdir_key, IndexOpts, Repo};
 use cgx_mcp::session::overlay_difference;
 use cgx_store::FactStore;
 use serde::Deserialize;
@@ -31,7 +37,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Result, SessionError};
 use crate::session::{
-    IndexReport, Mode, OpenRequest, OpenResponse, OpenState, ScipRun, Session, Target,
+    IndexReport, Mode, OpenRequest, OpenResponse, OpenState, ScipInput, ScipRun, Session, Target,
+    MAX_COMPDB_BYTES, MAX_SCIP_BYTES,
 };
 use crate::store_loc::dataflow_default;
 use crate::{schema_hash, ABI_VERSION, PROTOCOL_VERSION};
@@ -70,7 +77,7 @@ impl<S: FactStore> Session<S> {
         &mut self,
         mode: Mode,
         dataflow: Option<bool>,
-        scip: Option<&Path>,
+        scip: Option<ScipInput<'_>>,
         force: bool,
     ) -> Result<IndexReport> {
         self.discard();
@@ -99,12 +106,9 @@ impl<S: FactStore> Session<S> {
         }
         let dataflow = dataflow.unwrap_or_else(|| dataflow_default(toml.as_deref()));
 
-        let scip = match scip {
-            Some(path) => Some(std::fs::read(path).map_err(|e| {
-                SessionError::index(format!("reading SCIP index {path:?}: {e}"))
-            })?),
-            None => None,
-        };
+        if let Some(input) = &scip {
+            input.check()?;
+        }
         let (mut sources, target) = match mode {
             Mode::Head => (
                 repo.enumerate_tree().map_err(git_err)?,
@@ -147,12 +151,8 @@ impl<S: FactStore> Session<S> {
         for source in &mut sources {
             source.content = Vec::new();
         }
-        let scip = scip.as_deref().map(|bytes| ScipRun {
-            overlay: ScipOverlay {
-                scip: bytes,
-                compdb: None,
-                compdb_complete: false,
-            },
+        let scip = scip.map(|input| ScipRun {
+            input,
             sources: &sources,
         });
         self.complete(&mut store, graph, stats, scip, target)
@@ -172,6 +172,14 @@ struct Request {
     dataflow: Option<bool>,
     #[serde(default)]
     scip: Option<String>,
+    #[serde(default)]
+    compdb: Option<String>,
+    #[serde(default)]
+    compdb_dir: Option<String>,
+    #[serde(default)]
+    compdb_complete: Option<bool>,
+    #[serde(default)]
+    source_root: Option<String>,
     #[serde(default)]
     force: Option<bool>,
 }
@@ -234,6 +242,69 @@ pub fn serve<S: FactStore>(
     Ok(())
 }
 
+/// The SCIP overlay files an `index` request names, read whole.
+struct ScipFiles {
+    scip: Vec<u8>,
+    compdb: Option<Vec<u8>>,
+    compdb_dir: Option<PathBuf>,
+    compdb_complete: bool,
+    source_root: Option<PathBuf>,
+}
+
+impl ScipFiles {
+    fn read(req: &Request) -> Result<Option<Self>> {
+        let Some(scip) = &req.scip else {
+            if req.compdb.is_some()
+                || req.compdb_dir.is_some()
+                || req.compdb_complete.is_some()
+                || req.source_root.is_some()
+            {
+                return Err(SessionError::invalid_params("SCIP options without `scip`"));
+            }
+            return Ok(None);
+        };
+        let compdb = match &req.compdb {
+            Some(path) => Some(read_bounded(Path::new(path), "compile_commands.json", MAX_COMPDB_BYTES)?),
+            None => None,
+        };
+        let compdb_dir = req.compdb_dir.as_ref().map(PathBuf::from).or_else(|| {
+            req.compdb
+                .as_ref()
+                .map(|p| Path::new(p).parent().unwrap_or_else(|| Path::new("")).to_path_buf())
+        });
+        Ok(Some(ScipFiles {
+            scip: read_bounded(Path::new(scip), "SCIP index", MAX_SCIP_BYTES)?,
+            compdb,
+            compdb_dir,
+            compdb_complete: req.compdb_complete.unwrap_or(false),
+            source_root: req.source_root.as_ref().map(PathBuf::from),
+        }))
+    }
+
+    fn input(&self) -> ScipInput<'_> {
+        ScipInput {
+            scip: &self.scip,
+            compdb: self.compdb.as_deref(),
+            compdb_dir: self.compdb_dir.as_deref(),
+            compdb_complete: self.compdb_complete,
+            source_root: self.source_root.as_deref(),
+        }
+    }
+}
+
+/// Read `path` whole, refusing a file over `limit` bytes before reading it.
+fn read_bounded(path: &Path, what: &str, limit: usize) -> Result<Vec<u8>> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| SessionError::index(format!("reading {what} {path:?}: {e}")))?
+        .len();
+    if len > limit as u64 {
+        return Err(SessionError::invalid_params(format!(
+            "{what} {path:?} is {len} bytes; the limit is {limit}"
+        )));
+    }
+    std::fs::read(path).map_err(|e| SessionError::index(format!("reading {what} {path:?}: {e}")))
+}
+
 fn to_value<T: serde::Serialize>(v: &T) -> Value {
     serde_json::to_value(v).expect("session response serializes")
 }
@@ -243,10 +314,11 @@ fn handle<S: FactStore>(session: &mut Session<S>, req: Request) -> Result<Value>
         "open" => Ok(to_value(&session.open_native(req.dataflow)?)),
         "index" => {
             let mode = req.mode.unwrap_or(Mode::Head);
+            let files = ScipFiles::read(&req)?;
             let report = session.index_native(
                 mode,
                 req.dataflow,
-                req.scip.as_deref().map(Path::new),
+                files.as_ref().map(ScipFiles::input),
                 req.force.unwrap_or(false),
             )?;
             Ok(to_value(&report))

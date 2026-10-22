@@ -81,6 +81,7 @@ impl Lattice {
         } else {
             out.open = self.rootless[c] && self.rules[c].implicit_root_methods.contains(&method);
             for b in &self.bases[c] {
+                cgx_core::yield_hook::tick();
                 self.visit(b, mid, method, None, &mut out);
             }
         }
@@ -122,6 +123,7 @@ impl Lattice {
             Base::Unknown => out.unknown = true,
             Base::Classes(cs) => {
                 for &s in cs.iter().filter(|s| exclude.is_none_or(|x| !x.contains(s))) {
+                    cgx_core::yield_hook::tick();
                     out.merge(&self.lookup_id(s, mid, method));
                 }
             }
@@ -136,6 +138,7 @@ impl Lattice {
         let mut seen = BTreeSet::new();
         let mut stack = vec![class];
         while let Some(c) = stack.pop() {
+            cgx_core::yield_hook::tick();
             if seen.insert(c) {
                 stack.extend(self.subclasses[c as usize].iter().copied());
             }
@@ -152,6 +155,7 @@ impl Lattice {
         let mut out = Lookup::default();
         let skip = |c: &u32| exclude.is_some_and(|x| x.contains(c));
         for &f in self.floating.iter().filter(|f| !skip(f)) {
+            cgx_core::yield_hook::tick();
             let c = f as usize;
             if exclude.is_none() {
                 if self.attrs[c].contains(method) {
@@ -164,8 +168,10 @@ impl Lattice {
                 }
             }
             for b in &self.bases[c] {
+                cgx_core::yield_hook::tick();
                 let Base::Classes(cs) = b else { continue };
                 for &s in cs.iter().filter(|s| !skip(s)) {
+                    cgx_core::yield_hook::tick();
                     if !self.floating.contains(&s) {
                         let r = self.lookup_id(s, mid, method);
                         out.targets.extend(r.targets.iter().copied());
@@ -194,6 +200,7 @@ impl Lattice {
         let mut seen = BTreeSet::new();
         let mut stack = vec![class];
         while let Some(c) = stack.pop() {
+            cgx_core::yield_hook::tick();
             if !seen.insert(c) {
                 continue;
             }
@@ -202,6 +209,7 @@ impl Lattice {
                 return true;
             }
             for b in &self.bases[i] {
+                cgx_core::yield_hook::tick();
                 match b {
                     Base::Classes(cs) => stack.extend(cs.iter().copied()),
                     Base::Unknown => return true,
@@ -226,6 +234,7 @@ impl Lattice {
             ..Lookup::default()
         };
         for &c in &self.ext_any {
+            cgx_core::yield_hook::tick();
             let r = self.cone_lookup(c, method);
             out.targets.extend(r.targets.iter().copied());
             out.unknown |= r.unknown;
@@ -247,6 +256,7 @@ impl Lattice {
         }
         let mut out = Lookup::default();
         for &s in self.cone(class).iter() {
+            cgx_core::yield_hook::tick();
             let r = self.lookup_id(s, mid, method);
             out.open |= r.targets.is_empty() && r.open;
             out.unknown |= r.unknown;
@@ -276,9 +286,11 @@ impl Lattice {
         let cone = self.cone(class);
         let mut out = Lookup::default();
         for &s in cone.iter() {
+            cgx_core::yield_hook::tick();
             let c = s as usize;
             out.open |= self.rootless[c] && self.rules[c].implicit_root_methods.contains(&method);
             for b in &self.bases[c] {
+                cgx_core::yield_hook::tick();
                 self.visit(b, mid, method, Some(&cone), &mut out);
             }
         }

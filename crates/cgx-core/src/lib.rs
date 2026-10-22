@@ -24,6 +24,8 @@
 //! - Patterns ([`pattern`]): [`SymbolPattern`] resolution.
 //! - Sort rules ([`sort`]): the canonical orders that keep output deterministic.
 //! - Codec ([`codec`]): the canonical `postcard` encode/decode seam.
+//! - Yield points ([`yield_hook`]): cooperative yields for the wasm host; no-ops
+//!   natively.
 //!
 //! ## Determinism
 //!
@@ -48,6 +50,7 @@ pub mod provenance;
 pub mod signature;
 pub mod sort;
 pub mod transform;
+pub mod yield_hook;
 
 // --- Curated flat re-exports for downstream ergonomics ---
 

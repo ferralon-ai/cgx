@@ -49,6 +49,7 @@ pub(super) fn file_scope(f: &FileInput<'_>) -> FileScope {
     };
     let is_package = f.path.ends_with("/__init__.py") || f.path == "__init__.py";
     for imp in f.facts.imports.iter().filter(|i| i.scope.index() == 0) {
+        cgx_core::yield_hook::tick();
         match f.lang.as_str() {
             "python" => python_import(&mut fs, imp, is_package),
             "go" => {

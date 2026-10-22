@@ -385,6 +385,12 @@ fn walk_dir(
             path: path.display().to_string(),
             source,
         })?;
+        // `file_type()` is lstat semantics: a symlink is neither a dir nor a
+        // file here, so it is skipped rather than followed. Keep it that way —
+        // MCP `--root` confinement validates only the root argument, so in-tree
+        // content staying inside the boundary relies on this walk not
+        // dereferencing a symlink out of the tree (see the
+        // workdir_symlink_confinement test).
         if file_type.is_dir() {
             walk_dir(root, &path, hash_kind, out)?;
         } else if file_type.is_file() {

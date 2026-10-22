@@ -46,6 +46,7 @@
 //! was established, and `unknown` when something was never looked at. A `null`
 //! must not render as the reassuring word.
 
+use schemars::JsonSchema;
 use serde::Serialize;
 
 /// How far the indexed state is from the working state (no wall-clock: this is
@@ -54,7 +55,7 @@ use serde::Serialize;
 /// Construct with [`FreshnessEnvelope::new`] — [`stale`](Self::stale) and
 /// [`matches_head`](Self::matches_head) are *derived* there and are never sourced
 /// independently, so the one-glance boolean cannot drift from the facts under it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FreshnessEnvelope {
     /// The Layer-2 key of the graph this answer was computed over: a git tree OID
     /// for an indexed committed tree, or a synthetic `workdir:<digest>` key when

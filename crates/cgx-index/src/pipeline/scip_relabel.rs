@@ -165,12 +165,16 @@ impl<'g, 's> ScipRelabel<'g, 's> {
             .map(|n| (n.node.fqn.clone(), n.node.id))
             .collect();
 
-        // (file, 1-based line) → node, for span-precise overload redirect. On a
-        // span collision (two nodes starting on one line) the last wins; the
-        // redirect only consults this for a SCIP-confirmed unique def site.
+        // (file, 1-based line) → function or method node, for span-precise
+        // overload redirect. Only call targets are indexed: a parameter or
+        // local starts on its function's definition line and would otherwise
+        // shadow it. On a remaining collision (two callables starting on one
+        // line) the last wins; the redirect only consults this for a
+        // SCIP-confirmed unique def site.
         let node_by_loc: BTreeMap<(String, u32), NodeId> = graph
             .nodes
             .iter()
+            .filter(|n| matches!(n.node.kind, SymbolKind::Function | SymbolKind::Method))
             .map(|n| ((n.node.file.clone(), n.node.line_start), n.node.id))
             .collect();
 
@@ -506,6 +510,13 @@ impl<'g, 's> ScipRelabel<'g, 's> {
 
     fn finish(self) -> ScipStats {
         if self.dirty {
+            // A collapsed group's rows describe a call SCIP resolved; once no
+            // edge carries the group they are orphans, which a store rejects.
+            let carried: std::collections::BTreeSet<u32> =
+                self.graph.edges.iter().filter_map(|e| e.edge.candidate_group).collect();
+            self.graph
+                .candidates
+                .retain(|c| carried.contains(&c.candidate_group));
             cgx_resolve::canonicalize(self.graph);
         }
         self.stats

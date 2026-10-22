@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "cgx Layer-1 query engine: a GraphView over a linked graph plus the callers/callees/reachability/paths subcommands as direct, deterministic graph algorithms with per-walk path-relative transience (GM-4)."
 
 [dependencies]
+schemars.workspace = true
 cgx-core.workspace = true
 cgx-select = { path = "../cgx-select" }
 regex = { workspace = true }

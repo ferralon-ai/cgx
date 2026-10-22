@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use cgx_core::{Confidence, EdgeCondition, EdgeKind, SymbolKind, Tier};
+#[cfg(not(target_family = "wasm"))]
 use cgx_diff::CouplingReport;
 use cgx_query::{ApproximationContract, FreshnessEnvelope, TruncationReason};
 use schemars::generate::{SchemaGenerator, SchemaSettings};
@@ -480,9 +481,21 @@ const TOOL_OUTPUTS: &[(&str, SubschemaFn)] = &[
     ("flows_to", sub::<NeighborOutput>),
     ("flows_from", sub::<NeighborOutput>),
     ("graph_query", sub::<GraphQueryOutput>),
-    ("coupling", sub::<CouplingReport>),
+    ("coupling", coupling_output),
     ("impacted_tests", sub::<ImpactedTestsOutput>),
 ];
+
+#[cfg(not(target_family = "wasm"))]
+fn coupling_output(g: &mut SchemaGenerator) -> Schema {
+    g.subschema_for::<CouplingReport>()
+}
+
+/// `coupling` is not served by the wasm build (it reads git history), so there it
+/// has no output: the `false` schema, which nothing validates against.
+#[cfg(target_family = "wasm")]
+fn coupling_output(_: &mut SchemaGenerator) -> Schema {
+    Schema::from(false)
+}
 
 /// The JSON Schema dialect every emitted schema declares.
 pub const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";

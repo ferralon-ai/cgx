@@ -30,7 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use super::scip_relabel::CompdbCompleteness;
-use crate::git::SourceFile;
+use crate::source::SourceFile;
 
 /// C++ translation-unit extensions (NOT headers). The TU subset of the extensions
 /// `cgx_lang_cpp::CppFrontend::handles` claims (`cpp/cc/cxx` are compiled units;
@@ -111,14 +111,13 @@ fn clean_abs(base: &Path, path: &Path) -> PathBuf {
     out
 }
 
-/// Parse `compile_commands.json` into the set of absolute, cleaned TU paths it
-/// covers. A relative `file` is resolved against the entry's `directory` (compdb
-/// semantics) — falling back to the compdb's own parent directory when the entry
-/// omits one. Returns `None` on any read/parse failure (⇒ fail-closed `Partial`).
-fn parse_compdb(compdb_path: &Path) -> Option<BTreeSet<PathBuf>> {
-    let bytes = std::fs::read(compdb_path).ok()?;
-    let entries: Vec<CompdbEntry> = serde_json::from_slice(&bytes).ok()?;
-    let compdb_dir = compdb_path.parent().unwrap_or_else(|| Path::new(""));
+/// Parse `compile_commands.json` bytes into the set of absolute, cleaned TU
+/// paths it covers. A relative `file` is resolved against the entry's
+/// `directory` (compdb semantics) — falling back to `compdb_dir`, the compdb's own
+/// parent directory, when the entry omits one. Returns `None` on any parse
+/// failure (⇒ fail-closed `Partial`).
+fn parse_compdb(bytes: &[u8], compdb_dir: &Path) -> Option<BTreeSet<PathBuf>> {
+    let entries: Vec<CompdbEntry> = serde_json::from_slice(bytes).ok()?;
     let mut covered = BTreeSet::new();
     for e in entries {
         let base = match &e.directory {
@@ -138,13 +137,37 @@ fn parse_compdb(compdb_path: &Path) -> Option<BTreeSet<PathBuf>> {
 /// absolute paths. `compdb` is the `--compdb` path (`None` ⇒ no compdb known).
 /// `assert_complete` is the `--compdb-complete` CI override.
 ///
-/// FAIL-CLOSED: `Complete` is returned only when `assert_complete` is set, or a
-/// parsed compdb covers every discovered C++ TU. Everything else — absent,
-/// unreadable, malformed, or missing even one TU — yields `Partial`.
+/// A thin wrapper over [`completeness_bytes`]: an unreadable compdb is treated
+/// as an absent one. The file is not read under `assert_complete`.
 pub(crate) fn completeness(
     sources: &[SourceFile],
     source_root: &Path,
     compdb: Option<&Path>,
+    assert_complete: bool,
+) -> CompdbReport {
+    let read = match compdb {
+        Some(path) if !assert_complete => std::fs::read(path).ok().map(|bytes| (bytes, path)),
+        _ => None,
+    };
+    let compdb = read.as_ref().map(|(bytes, path)| {
+        (
+            bytes.as_slice(),
+            path.parent().unwrap_or_else(|| Path::new("")),
+        )
+    });
+    completeness_bytes(sources, source_root, compdb, assert_complete)
+}
+
+/// [`completeness`] over the compdb's bytes. `compdb` is the file's bytes and the
+/// directory it lives in (the base for an entry that omits `directory`).
+///
+/// FAIL-CLOSED: `Complete` is returned only when `assert_complete` is set, or a
+/// parsed compdb covers every discovered C++ TU. Everything else — absent,
+/// malformed, or missing even one TU — yields `Partial`.
+pub(crate) fn completeness_bytes(
+    sources: &[SourceFile],
+    source_root: &Path,
+    compdb: Option<(&[u8], &Path)>,
     assert_complete: bool,
 ) -> CompdbReport {
     let discovered: Vec<&str> = sources
@@ -167,10 +190,10 @@ pub(crate) fn completeness(
 
     // No compdb, or one we cannot read/parse → fail-closed Partial. Every
     // discovered TU is "missing" (none verified covered).
-    let Some(compdb) = compdb else {
+    let Some((bytes, compdb_dir)) = compdb else {
         return partial_all_missing(&discovered);
     };
-    let Some(covered) = parse_compdb(compdb) else {
+    let Some(covered) = parse_compdb(bytes, compdb_dir) else {
         return partial_all_missing(&discovered);
     };
 

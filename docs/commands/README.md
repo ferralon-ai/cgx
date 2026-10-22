@@ -1,6 +1,6 @@
 # cgx CLI — Command Reference
 
-cgx provides 22 subcommands organised into nine groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
+cgx provides 23 subcommands organised into nine groups. Most read from a `.cgx/` index built by `cgx index`; `cgx coupling` reads committed git history only and needs no index, and `diff` and `impacted-tests` index the refs they compare themselves.
 
 ## Commands
 
@@ -70,6 +70,7 @@ cgx provides 22 subcommands organised into nine groups. Most read from a `.cgx/`
 | Command | Purpose | Reference |
 |---------|---------|-----------|
 | `cgx mcp` | Start the MCP STDIO server and expose graph tools to AI agents and IDE extensions | [mcp.md](mcp.md) |
+| `cgx session` | Serve a resident session (NDJSON): index or open once, answer tool calls from the graph in memory | [session.md](session.md) |
 
 ---
 

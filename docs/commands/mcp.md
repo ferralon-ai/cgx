@@ -32,7 +32,7 @@ The server conforms to the 2025-06-18 MCP specification and responds to `tools/l
 
 Tool names use underscores where the CLI uses hyphens (`flows_to`, not `flows-to`). The registry in `tools/list` is the authoritative list; the schemas below cover the tools this page documents in detail, and [docs/mcp-tools/](../mcp-tools/README.md) is the full per-tool reference.
 
-Each tool call returns a JSON result envelope containing session metadata alongside the tool-specific result payload. The server does not maintain state between tool calls: every call indexes the repository afresh into an in-memory store and answers from that. The on-disk `.cgx/` index is never read, so options that exist only on `cgx index` — SCIP enrichment, a C/C++ compilation database, receiver narrowing — do not apply to MCP answers.
+Each tool call returns a JSON result envelope containing session metadata alongside the tool-specific result payload. The server does not maintain state between tool calls; every call brings the on-disk `.cgx/` index current (building it when missing, rebuilding it when HEAD has moved, as the CLI's auto-index does) and loads from it.
 
 **MCP vs CLI differences:**
 
@@ -40,7 +40,7 @@ Each tool call returns a JSON result envelope containing session metadata alongs
 - The `paths` tool uses the property name `max_depth` (CLI flag is `--depth`), and its default is **10** (CLI default is 6).
 - **`max_depth: 0` means zero hops over MCP.** The CLI's `paths --depth 0` means *unlimited*; the MCP `paths` tool with `max_depth: 0` searches nothing and returns an empty `paths` array with an `under-approximate … depth-limit` contract. The two surfaces genuinely differ here — do not carry a CLI habit across.
 - `max_results` caps results per page (default 20 for most tools; 10 for `paths`). The hard ceiling is 200; values above 200 are clamped.
-- `include_dirty` defaults to `true` — the server analyses uncommitted working-tree changes via a per-call content-addressed overlay. This overlay is never persisted to the index.
+- `include_dirty` defaults to `true` — when the working tree differs from `HEAD`, the server analyses it via a per-call in-memory overlay over `.cgx/` (unchanged files are cache hits; edited files are re-extracted; the whole program is re-linked). This overlay is never persisted to the index. A working tree content-identical to `HEAD` is served from the stored committed graph.
 - No `at` parameter exists in any MCP tool (git-ref pinning is CLI-only in v0.3).
 
 ## Arguments
@@ -171,7 +171,7 @@ Every successful tool call includes these session metadata fields alongside the 
 
 `explain`, `search`, and `symbols` carry `freshness` but **no** `approximation`, by design: none of them walks a frontier, so there is nothing to over- or under-approximate. `explain` returns one symbol's recorded incident edges, and `search`/`symbols` are table scans.
 
-**`matches_head: null` is the normal case over MCP, not an edge case.** With the default `include_dirty: true` the server analyses the working tree, and `indexed_tree` comes back as `workdir:<hash>` rather than a git tree OID — so it cannot be compared against `head_tree`, and `matches_head` is `null` (verdict `unknown`). Treat the field as three-valued (`true` / `false` / `null`); a client that tests it as a boolean reads the common case as "does not match HEAD".
+**`matches_head` is three-valued (`true` / `false` / `null`).** With the default `include_dirty: true`, a git-clean working tree is served from the committed graph and reports `true`. When a gitignored or untracked source file is on disk, the server analyses the working tree through the overlay, `indexed_tree` comes back as `workdir:<hash>`, and git's dirty count (ignore rules applied) sees nothing to explain the difference — so `matches_head` is `null` (verdict `unknown`). A client that tests the field as a boolean reads that case as "does not match HEAD".
 
 **Errors carry neither field.** A failed `tools/call` comes back as a JSON-RPC error object, not as a result envelope:
 
@@ -223,7 +223,7 @@ Tool calls may then omit the `root` property entirely:
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"callers","arguments":{"symbol":"rust_sample::conditions::dispatch","depth":1}}}
 ```
 
-> Note: `dirty_files_analyzed`, `indexed_tree`, and the dirty suffix in `graph_version` are per-invocation values that vary with working-tree state.
+> Note: `dirty_files_analyzed`, `indexed_tree`, and the dirty suffix in `graph_version` are per-invocation values that vary with working-tree state. The examples below were captured with an earlier server whose overlay also enumerated the `.cgx/` store `cgx index` writes, so a clean tree shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/`; on a clean, indexed tree it reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`.
 
 The response's `content[0].text` is a JSON string. Decoded, it reads:
 
@@ -302,7 +302,7 @@ The response's `content[0].text` is a JSON string. Decoded, it reads:
 
 An agent driving this tool should read `approximation` before `results`. Three callers came back, all `possible`, and the contract says why in machine-matchable form: an over-approximated candidate set produced them (`over-approx-candidate-set`), six call sites on the frontier could not be followed (`unresolved-call`), and the walk stopped at depth 1 (`depth-limit`). `reasons[].code` is a stable token; `detail` is prose and may be reworded.
 
-`matches_head` is `null` here — the default `include_dirty: true` made the server analyse the working tree, so `indexed_tree` is a `workdir:` hash with no git tree to compare against.
+`matches_head` is `null` here because of the capture context noted above: the overlay counted `.cgx/` as working-tree content, so `indexed_tree` is a `workdir:` hash that git's dirty count could not account for.
 
 ### Call the paths tool
 

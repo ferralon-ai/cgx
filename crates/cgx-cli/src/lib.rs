@@ -16,7 +16,6 @@ pub mod freshness;
 pub mod output;
 pub mod pack;
 pub mod pattern;
-pub mod store_loc;
 
 use exit::ExitCode;
 
@@ -56,3 +55,11 @@ impl std::fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+/// Every failure of the shared index layer (missing or corrupt index, a failed
+/// build or prune) is a graph error, exit 3; the message is carried verbatim.
+impl From<cgx_index::IndexError> for CliError {
+    fn from(e: cgx_index::IndexError) -> Self {
+        CliError::graph(e.to_string())
+    }
+}

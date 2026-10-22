@@ -12,7 +12,7 @@ A symbol is unused when no walk from any indexed entrypoint reaches it. If a pro
 
 | Parameter | Type | Required | Default | Meaning |
 |-----------|------|----------|---------|---------|
-| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required** — each call indexes in memory. See [shared parameters](README.md#shared-parameters). |
+| `root` | string | yes | — | Path to the repository root. Must be inside a git repository; **no `.cgx/` store is required in advance** — the server builds and maintains it as the CLI does. See [shared parameters](README.md#shared-parameters). |
 | `kind` | string | no | `"all"` | Restrict results to one symbol kind. Enum: `"function"`, `"method"`, `"field"`, `"all"`. `"all"` returns every kind. |
 | `entrypoint` | string | no | — | FQN or unambiguous short name of a single symbol to use as the sole reachability root, overriding the graph's indexed entrypoints. |
 | `max_results` | integer | no | `20` | Maximum results per page. Clamped to `[1, 200]`; values above 200 are silently reduced to 200. |
@@ -66,7 +66,7 @@ The worked example below shows `scope` on a populated result — three entries o
 
 ## Interpreting `freshness` on a dead-code gate
 
-If you drive a CI gate off `unused`, read `freshness` before acting on the list. `stale: true` means a divergence was established between the graph and the working tree; `matches_head: null` — the ordinary value over MCP for an indexed repository — means the surface declined to decide. Neither invalidates the answer, but both mean the answer describes a tree that may not be the one under review. See [README](README.md#matches_head-is-three-valued-and-null-is-the-default-over-mcp).
+If you drive a CI gate off `unused`, read `freshness` before acting on the list. `stale: true` means a divergence was established between the graph and the working tree; `matches_head: null` — an ignored or untracked source file is in the graph — means the surface declined to decide. Neither invalidates the answer, but both mean the answer describes a tree that may not be the one under review. See [README](README.md#matches_head-is-three-valued).
 
 ## Example
 
@@ -145,6 +145,8 @@ Captured against the two-fixture tree described in [README — Reproducing the e
 To fetch the next page, repeat the call with `"cursor": "3"`.
 
 The `under` reason is the one to read before acting: 40 call sites in the searched region resolved to no in-repo target, so any symbol reached *only* from one of those sites is on this list wrongly. 199 unused functions out of a two-fixture sample tree is itself the signal — this fixture has almost no entrypoints, which is the case `cgx doctor` exists to catch.
+
+The response above was captured with an earlier server whose overlay also enumerated the `.cgx/` store that `cgx index` writes, which is why a `git status`-clean fixture shows `+dirty`, `dirty_files_analyzed: 3` and `matches_head: null`. The current server skips the root `.cgx/` and serves the stored committed graph for a working tree content-identical to `HEAD`, so the same clean, indexed tree now reports `dirty: false`, `dirty_files_analyzed: 0`, `matches_head: true` and the committed `graph_version`.
 
 ## Notes
 

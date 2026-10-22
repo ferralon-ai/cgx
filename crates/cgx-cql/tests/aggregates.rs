@@ -2,8 +2,9 @@
 //! determinism.
 //!
 //! - A reachability-matrix `count(*)` over a `CALLS*` walk that includes a
-//!   mutually-recursive pair, proving BFS simple-path semantics count each
-//!   distinct reachable node once (never infinitely).
+//!   mutually-recursive pair, proving the depth-bounded walk counts each distinct
+//!   reachable node once (never infinitely) — including the start node itself when
+//!   it sits on a cycle, which a var-length reachability pattern must find.
 //! - Determinism: a canonical query run twice is byte-identical, and a
 //!   shuffled-edge-input fixture produces an identical result (no hash-order
 //!   leak — the store canonicalises edge order, the walker sorts neighbours,
@@ -18,9 +19,10 @@ use common::GraphBuilder;
 
 /// Reachability fixture with a mutual recursion `f <-> g` plus a sink `h`:
 ///   f -> g,  g -> f,  f -> h
-/// Distinct nodes reachable from `f` over `CALLS*` are exactly {g, h} (each
-/// visited once; the f<->g cycle does not loop forever). `count(*)` over the
-/// reachable peer set is therefore 2.
+/// Distinct nodes reachable from `f` over `CALLS*` are exactly {f, g, h}: `f`
+/// reaches `g` and `h` directly, and reaches *itself* through the `f <-> g`
+/// cycle (`f -> g -> f`). Each is counted once and the walk is finite (the hop
+/// bound stops the cycle), so `count(*)` over the reachable peer set is 3.
 fn recursion_fixture() -> cgx_query::GraphView {
     GraphBuilder::new()
         .sym("f", Function, "src/a.rs", 1)
@@ -39,7 +41,7 @@ fn reachability_matrix_count_is_distinct_and_finite() {
     let q = r#"MATCH (f{name:"f"})-[:CALLS*]->(m) RETURN count(*) AS reached"#;
     let table = run(&view, q).unwrap_or_else(|e| panic!("{}", e.render(q)));
     assert_eq!(table.columns, vec!["reached"]);
-    assert_eq!(table.rows, vec![vec![Value::Int(2)]]);
+    assert_eq!(table.rows, vec![vec![Value::Int(3)]]);
 }
 
 #[test]

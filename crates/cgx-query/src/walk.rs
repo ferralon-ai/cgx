@@ -19,7 +19,7 @@
 //! a bounded breadth-first frontier walk (`callers`/`callees`) and a bounded
 //! depth-first path enumeration (`paths`/`reaches`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use cgx_core::{Confidence, EdgeCondition, EdgeId, EdgeRecord, NodeId};
 
@@ -228,6 +228,76 @@ impl PathWalker {
         out
     }
 
+    /// The CQL variable-length *peer set*: every node reachable from `start` in
+    /// `dir` by a walk whose hop count lies in `[min, max_depth]`, each returned
+    /// once, in ascending id order.
+    ///
+    /// This is the set-membership companion to [`bfs`](Self::bfs) for the
+    /// `(a)-[:CALLS*min..max]->(b)` pattern's no-path-binding branch. [`bfs`]
+    /// cannot serve it: `bfs` marks `start` visited up front and admits every
+    /// other node exactly once at its *shortest* depth, so a node that reaches
+    /// itself — self-recursion, or any node on a cycle back to `start` — is never
+    /// reported. Here the traversal is **depth-layered**: a node may be re-entered
+    /// at successive depths, so `start` (and every cycle member) is reported the
+    /// moment it is re-reached at a depth within range. Repeated nodes are allowed
+    /// (Cypher `*`); since no concrete path is materialized, relationship-
+    /// uniqueness is not observable in this branch and membership is bounded
+    /// reachability by hop count.
+    ///
+    /// Termination is guaranteed by the hard `max_depth` bound (an explicit
+    /// `*min..max` upper bound, or the caller's default depth): the walk runs at
+    /// most `max_depth` layers, each a single pass over admitted edges with the
+    /// next layer deduplicated, and stops early only when a layer reaches no node
+    /// (an acyclic frontier draining). A cyclic frontier never drains — which is
+    /// exactly why the depth bound, not frontier exhaustion, is the thing that
+    /// must stop it. The bound is never relaxed on account of a cycle.
+    pub fn reachable_within(
+        &self,
+        view: &GraphView,
+        start: NodeId,
+        dir: Direction,
+        min: u32,
+    ) -> Vec<NodeId> {
+        let n = view.node_count();
+        let max = self.max_depth.unwrap_or(u32::MAX);
+
+        let mut admitted: BTreeSet<NodeId> = BTreeSet::new();
+        let mut frontier: Vec<NodeId> = vec![start];
+        let mut depth: u32 = 0;
+        // A node may recur across layers (so cycles are found); within one layer it
+        // is counted once, keeping per-layer work at O(admitted edges). Depths are
+        // counted exactly, so range membership (including parity in a bipartite
+        // cycle) is correct — no early-out that could skip a node's in-range depth.
+        while depth < max && !frontier.is_empty() {
+            let mut in_next = vec![false; n];
+            let mut next: Vec<NodeId> = Vec::new();
+            for &node in &frontier {
+                let mut nbrs: Vec<NodeId> = view
+                    .neighbors(node, dir, &self.filter)
+                    .map(|er| er.peer)
+                    .collect();
+                nbrs.sort_by_key(|p| p.0);
+                for peer in nbrs {
+                    if let Some(pi) = checked_index(peer, n) {
+                        if !in_next[pi] {
+                            in_next[pi] = true;
+                            next.push(peer);
+                        }
+                    }
+                }
+            }
+            depth += 1;
+            if depth >= min {
+                admitted.extend(next.iter().copied());
+            }
+            frontier = next;
+        }
+
+        let mut out: Vec<NodeId> = admitted.into_iter().collect();
+        out.sort_by_key(|id| id.0);
+        out
+    }
+
     /// The bounded directional neighborhood of `anchor`: every node reached by a
     /// depth-bounded walk in `dir` (the anchor plus its [`bfs`](Self::bfs)
     /// frontier), together with the **induced** admitted call-edge set among those
@@ -381,12 +451,45 @@ impl PathWalker {
         goal: NodeId,
         dir: Direction,
     ) -> PathEnumeration {
+        self.enumerate_dfs(view, start, goal, dir, CycleRule::SimplePath)
+    }
+
+    /// Enumerate *trail* paths from `start` to `goal` in `dir`: walks that never
+    /// reuse the same relationship, but *may* revisit a node. This is the Cypher
+    /// variable-length (`[:CALLS*a..b]`) path semantics — repeated nodes allowed,
+    /// repeated relationships forbidden — and, unlike [`enumerate_paths`], it
+    /// therefore finds cycles and self-recursion (a path that returns to a node it
+    /// already visited, including `start`). Bounded identically: by `max_depth`
+    /// (hard hop bound), the path cap, and the work budget; edge-uniqueness alone
+    /// bounds any single path to the graph's edge count, so termination holds.
+    ///
+    /// [`enumerate_paths`]: Self::enumerate_paths
+    pub fn enumerate_trails(
+        &self,
+        view: &GraphView,
+        start: NodeId,
+        goal: NodeId,
+        dir: Direction,
+    ) -> PathEnumeration {
+        self.enumerate_dfs(view, start, goal, dir, CycleRule::Trail)
+    }
+
+    fn enumerate_dfs(
+        &self,
+        view: &GraphView,
+        start: NodeId,
+        goal: NodeId,
+        dir: Direction,
+        rule: CycleRule,
+    ) -> PathEnumeration {
         let mut walk = DfsState {
             paths: Vec::new(),
             cap: self.path_cap(),
             steps: 0,
             budget: self.step_budget(),
             truncation: None,
+            rule,
+            used_edges: Vec::new(),
         };
         let mut stack: Vec<WalkStep> = vec![WalkStep {
             node: start,
@@ -453,10 +556,26 @@ impl PathWalker {
                 Some(pi) => pi,
                 None => continue,
             };
-            if on_path[pi] {
-                continue; // simple paths only — no cycles
+            match walk.rule {
+                // Simple-path semantics: never revisit a node on the current path.
+                CycleRule::SimplePath => {
+                    if on_path[pi] {
+                        continue;
+                    }
+                }
+                // Trail semantics (Cypher `*`): never reuse a relationship on the
+                // current path, but a node may recur — so cycles / self-recursion
+                // are found. Edge-uniqueness still bounds each path's length.
+                CycleRule::Trail => {
+                    if walk.used_edges.contains(&edge.id) {
+                        continue;
+                    }
+                }
             }
-            on_path[pi] = true;
+            match walk.rule {
+                CycleRule::SimplePath => on_path[pi] = true,
+                CycleRule::Trail => walk.used_edges.push(edge.id),
+            }
             stack.push(WalkStep {
                 node: peer,
                 via: Some(edge),
@@ -464,7 +583,12 @@ impl PathWalker {
             });
             self.dfs(view, peer, goal, dir, stack, on_path, walk);
             stack.pop();
-            on_path[pi] = false;
+            match walk.rule {
+                CycleRule::SimplePath => on_path[pi] = false,
+                CycleRule::Trail => {
+                    walk.used_edges.pop();
+                }
+            }
             if walk.truncation == Some(TruncationReason::StepBudget)
                 || walk.paths.len() >= walk.cap
             {
@@ -472,6 +596,17 @@ impl PathWalker {
             }
         }
     }
+}
+
+/// How a path-enumeration DFS prevents a path from looping forever: either no
+/// repeated node (classic simple paths) or no repeated relationship (Cypher `*`
+/// trail semantics, which permits repeated nodes and so finds cycles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleRule {
+    /// No node may appear twice on a path — acyclic witnesses.
+    SimplePath,
+    /// No relationship may appear twice on a path — nodes may recur.
+    Trail,
 }
 
 /// Mutable per-walk DFS bookkeeping, threaded through the recursion so the
@@ -482,6 +617,11 @@ struct DfsState {
     steps: u64,
     budget: u64,
     truncation: Option<TruncationReason>,
+    /// Which anti-looping rule this enumeration enforces.
+    rule: CycleRule,
+    /// Relationships used on the current path (trail mode only); a stack kept in
+    /// sync with the DFS recursion so backtracking frees an edge for reuse.
+    used_edges: Vec<EdgeId>,
 }
 
 /// One node on an enumerated walk, with the edge taken to enter it and the

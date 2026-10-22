@@ -172,3 +172,42 @@ fn ref_scope_is_enclosing_function_scope() {
         .expect("g ref");
     assert_ne!(r.scope, cgx_frontend::ScopeId::ROOT);
 }
+
+#[test]
+fn else_after_elif_branch_is_extracted() {
+    // An `if`/`elif`/`else` chain: the `else` body is the 2nd `alternative`
+    // child and must not be dropped. All three branch calls are conditional.
+    let facts = extract(
+        FILE,
+        "def route(x):\n    if x == 1:\n        a()\n    elif x == 2:\n        c()\n    else:\n        b()\n",
+    );
+    assert!(
+        has_ref(&facts, "a", RefKind::Call, EdgeCondition::Conditional),
+        "{:?}",
+        facts.refs
+    );
+    assert!(
+        has_ref(&facts, "c", RefKind::Call, EdgeCondition::Conditional),
+        "{:?}",
+        facts.refs
+    );
+    assert!(
+        has_ref(&facts, "b", RefKind::Call, EdgeCondition::Conditional),
+        "else-after-elif call must be extracted: {:?}",
+        facts.refs
+    );
+}
+
+#[test]
+fn second_elif_branch_is_extracted() {
+    // `if`/`elif`/`elif`: the 2nd `elif` body must be extracted too.
+    let facts = extract(
+        FILE,
+        "def route(x):\n    if x == 1:\n        a()\n    elif x == 2:\n        c()\n    elif x == 3:\n        d()\n",
+    );
+    assert!(
+        has_ref(&facts, "d", RefKind::Call, EdgeCondition::Conditional),
+        "second elif-branch call must be extracted: {:?}",
+        facts.refs
+    );
+}

@@ -1189,10 +1189,94 @@ impl<'a> Builder<'a> {
                 }
                 // Also record the call itself
                 self.walk_expr(child, scope);
+            } else if child.kind() == "assignment_expression"
+                && self.try_commonjs_export(child, scope)
+            {
+                // Handled as a CommonJS `exports.x = function(){}` /
+                // `module.exports.x = () => {}` function definition.
             } else {
                 self.walk_expr(child, scope);
             }
         }
+    }
+
+    /// Recognise a CommonJS export of a function value —
+    /// `exports.name = function(){…}` or `module.exports.name = () => {…}` —
+    /// and register it as a named definition so the exported function becomes a
+    /// node in the graph (otherwise the RHS is walked as an anonymous lambda and
+    /// the export name is lost). Returns `true` when the assignment matched and
+    /// was handled.
+    fn try_commonjs_export(&mut self, node: Node<'_>, scope: ScopeId) -> bool {
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return false;
+        };
+        if left.kind() != "member_expression" {
+            return false;
+        }
+        // The RHS must be a function value for this to name a callable def.
+        if !matches!(right.kind(), "arrow_function" | "function_expression") {
+            return false;
+        }
+        // The LHS object must be the `exports` identifier or the
+        // `module.exports` member expression; the property is the export name.
+        let Some(obj) = left.child_by_field_name("object") else {
+            return false;
+        };
+        let rooted_at_exports = match obj.kind() {
+            "identifier" => self.text(obj) == "exports",
+            "member_expression" => self.text(obj) == "module.exports",
+            _ => false,
+        };
+        if !rooted_at_exports {
+            return false;
+        }
+        let Some(prop) = left.child_by_field_name("property") else {
+            return false;
+        };
+        let name = self.text(prop).to_string();
+        if name.is_empty() {
+            return false;
+        }
+
+        let parent_fqn = self.scope_owner_fqn(scope);
+        let fqn = self.fqn(parent_fqn.as_deref(), &name);
+        let signature = self.extract_function_signature(right, None);
+        let new_scope = self.facts.scopes.push(scope, Some(fqn.clone()));
+
+        self.lambda_names.insert(name.clone());
+
+        self.facts.defs.push(SymbolDef {
+            fqn: fqn.clone(),
+            kind: SymbolKind::Lambda,
+            visibility: Visibility::Public,
+            scope,
+            span: self.span(node),
+            line_end: self.end_line(node),
+            is_abstract: false,
+            signature: Some(signature),
+        });
+        self.facts.exports.push(ExportFact {
+            name,
+            alias: None,
+            from: None,
+            span: self.span(node),
+        });
+
+        if let Some(body) = right.child_by_field_name("body") {
+            match body.kind() {
+                "statement_block" => {
+                    self.walk_body(body, new_scope);
+                    self.walk_function_ssa(body, new_scope, &fqn);
+                }
+                // Expression-body arrow (`exports.f = x => g(x)`): walk the
+                // single expression for nested calls.
+                _ => self.walk_expr(body, new_scope),
+            }
+        }
+        true
     }
 
     // -----------------------------------------------------------------------

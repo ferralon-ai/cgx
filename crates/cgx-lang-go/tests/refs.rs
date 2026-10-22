@@ -91,3 +91,32 @@ fn call_in_switch_case_is_conditional() {
         EdgeCondition::Conditional
     ));
 }
+
+#[test]
+fn if_initializer_call_is_extracted() {
+    // `if ok := check(); ok {}` — the init statement runs unconditionally before
+    // the branch, so its call is an `Always` edge, not dropped.
+    let facts = extract(
+        FILE,
+        "package svc\nfunc f(){ if ok := check(); ok {} }\nfunc check() bool { return true }\n",
+    );
+    assert!(
+        has_ref(&facts, "check", RefKind::Call, EdgeCondition::Always),
+        "if-initializer call must be extracted: {:?}",
+        facts.refs
+    );
+}
+
+#[test]
+fn switch_initializer_call_is_extracted() {
+    // `switch v := pick(); v {}` — the switch init call must be present too.
+    let facts = extract(
+        FILE,
+        "package svc\nfunc f(){ switch v := pick(); v { case 1: } }\nfunc pick() int { return 1 }\n",
+    );
+    assert!(
+        has_ref(&facts, "pick", RefKind::Call, EdgeCondition::Always),
+        "switch-initializer call must be extracted: {:?}",
+        facts.refs
+    );
+}

@@ -784,6 +784,11 @@ impl<'a> Builder<'a> {
     // --- conditions ---
 
     fn walk_if(&mut self, node: Node<'_>, ctx: &Ctx, stmt_index: &mut u32) {
+        // The optional init statement (`if x := f(); cond {}`) runs unconditionally
+        // before the branch is taken, so it carries the enclosing condition.
+        if let Some(init) = node.child_by_field_name("initializer") {
+            self.walk(init, ctx, stmt_index);
+        }
         if let Some(c) = node.child_by_field_name("condition") {
             self.walk(c, ctx, stmt_index);
         }
@@ -920,6 +925,11 @@ impl<'a> Builder<'a> {
             // Control flow lowers an edge condition exactly like the call walk, so a
             // flow inside an `if`/case/loop body carries the matching condition.
             "if_statement" => {
+                // The init statement (`if x := f(); cond {}`) binds before the
+                // branch, so its dataflow is unconditional.
+                if let Some(init) = node.child_by_field_name("initializer") {
+                    self.ssa_walk(init, ctx, fn_fqn, versions);
+                }
                 if let Some(c) = node.child_by_field_name("condition") {
                     self.ssa_walk(c, ctx, fn_fqn, versions);
                 }

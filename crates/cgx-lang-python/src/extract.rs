@@ -912,10 +912,16 @@ impl<'a> Builder<'a> {
         if let Some(c) = node.child_by_field_name("consequence") {
             self.walk(c, &inner, stmt_index);
         }
-        // `alternative` is an `elif_clause` (own condition/consequence) or an
-        // `else_clause`; both are conditional branches.
-        if let Some(a) = node.child_by_field_name("alternative") {
-            self.walk(a, &inner, stmt_index);
+        // An `if`/`elif`/`else` chain attaches every `elif_clause` and the final
+        // `else_clause` as a separate `alternative` child. `child_by_field_name`
+        // returns only the first, so iterate all of them — otherwise the 2nd and
+        // later branches (e.g. the `else` after an `elif`) are dropped. Both an
+        // `elif` and an `else` are conditional branches.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if matches!(child.kind(), "elif_clause" | "else_clause") {
+                self.walk(child, &inner, stmt_index);
+            }
         }
     }
 

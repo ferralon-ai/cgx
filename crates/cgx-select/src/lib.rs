@@ -56,6 +56,7 @@ pub mod engine;
 pub mod family;
 pub mod grammar;
 pub mod nfa;
+pub mod render;
 pub mod tokenizer;
 
 #[cfg(test)]
@@ -64,4 +65,5 @@ mod tests;
 pub use diagnostics::{Diagnostic, NodeMatch, SelectorError};
 pub use engine::{compile, MatchOptions, Selector, DEFAULT_ACTIVE_STATE_CAP};
 pub use family::Family;
+pub use render::{render_fqn, render_node_fqn};
 pub use tokenizer::{Tokenizer, TokenizerRegistration};

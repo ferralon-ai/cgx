@@ -6,6 +6,17 @@ use crate::provenance::{Provenance, Span};
 use crate::signature::Signature;
 use serde::{Deserialize, Serialize};
 
+/// The internal delimiter joining the abstract segments of a [`NodeRecord::fqn`]
+/// in its stored string encoding.
+///
+/// This is an opaque implementation detail of the storage format, **not** a
+/// user-facing separator. It must never be emitted to a user and must never be
+/// reasoned about as any particular language's separator — a language whose
+/// native separator happens to share this spelling is a coincidence, not a
+/// dependency. Split a stored fqn on this constant to recover its abstract
+/// segments; join segments with a language-native separator to render one.
+pub const FQN_SEGMENT_DELIM: &str = "::";
+
 /// Symbol kinds (GM-1.1). Every named program entity is a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,7 +114,12 @@ pub enum EntrypointKind {
 pub struct NodeRecord {
     pub id: NodeId,
     pub kind: SymbolKind,
-    /// Fully-qualified name, `::`-separated (GM-1.2).
+    /// Fully-qualified name: an abstract sequence of path segments joined by the
+    /// internal segment delimiter [`FQN_SEGMENT_DELIM`] (GM-1.2). The delimiter is
+    /// an opaque implementation detail of the stored encoding — it is **not** any
+    /// one language's surface separator and must never reach a user. Code that
+    /// needs the segments splits on [`FQN_SEGMENT_DELIM`]; code that shows an fqn
+    /// renders the segments into the node's language-native syntax.
     pub fqn: String,
     /// Repo-relative source path.
     pub file: String,

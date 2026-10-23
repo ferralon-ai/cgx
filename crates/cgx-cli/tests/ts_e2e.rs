@@ -19,10 +19,16 @@ use std::process::Command;
 
 use assert_cmd::cargo::cargo_bin;
 
-const A: &str = "ts_sample::dataflow::transform::a#0";
-const B: &str = "ts_sample::dataflow::transform::b#1";
-const C: &str = "ts_sample::dataflow::transform::c#1";
-const RETURN: &str = "ts_sample::dataflow::transform::return#1";
+// Input anchors use the internal `::` separator to prove query-side back-compat;
+// expected *output* fqns are the TypeScript-native `.`-rendered form. (These SSA
+// value nodes carry an empty lang tag, so their native rendering is recovered from
+// the `.ts` file extension.)
+const A_IN: &str = "ts_sample::dataflow::transform::a#0";
+const RETURN_IN: &str = "ts_sample::dataflow::transform::return#1";
+const A: &str = "ts_sample.dataflow.transform.a#0";
+const B: &str = "ts_sample.dataflow.transform.b#1";
+const C: &str = "ts_sample.dataflow.transform.c#1";
+const RETURN: &str = "ts_sample.dataflow.transform.return#1";
 
 /// Absolute path to the workspace `fixtures/ts` source tree.
 fn fixture_src() -> PathBuf {
@@ -129,7 +135,7 @@ fn flows_to_resolves_transform_chain() {
     // `flows-to a` walks the DerivesFrom forward slice a -> b -> c -> return.
     let (_tmp, repo) = fixture_repo();
     index(&repo);
-    let fqns = result_fqns(&repo, &["flows-to", A, "--depth", "8", "--format", "json"]);
+    let fqns = result_fqns(&repo, &["flows-to", A_IN, "--depth", "8", "--format", "json"]);
     for expected in [B, C, RETURN] {
         assert!(
             fqns.iter().any(|f| f == expected),
@@ -145,7 +151,7 @@ fn flows_from_return_walks_pedigree_to_param() {
     index(&repo);
     let fqns = result_fqns(
         &repo,
-        &["flows-from", RETURN, "--depth", "8", "--format", "json"],
+        &["flows-from", RETURN_IN, "--depth", "8", "--format", "json"],
     );
     assert!(
         fqns.iter().any(|f| f == A),

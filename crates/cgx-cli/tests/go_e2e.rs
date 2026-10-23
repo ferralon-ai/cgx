@@ -19,10 +19,13 @@ use std::process::Command;
 
 use assert_cmd::cargo::cargo_bin;
 
-const A: &str = "go_sample::Transform::a#0";
-const B: &str = "go_sample::Transform::b#1";
-const C: &str = "go_sample::Transform::c#1";
-const RETURN: &str = "go_sample::Transform::return#1";
+// Input anchors use the internal `::` separator to prove query-side back-compat:
+// an agnostic cross-language interpretation still resolves a Go symbol named with
+// `::`. Expected *output* fqns are the Go-native `/`-rendered form.
+const A_IN: &str = "go_sample::Transform::a#0";
+const B: &str = "go_sample/Transform/b#1";
+const C: &str = "go_sample/Transform/c#1";
+const RETURN: &str = "go_sample/Transform/return#1";
 
 /// Absolute path to the workspace `fixtures/go` source tree.
 fn fixture_src() -> PathBuf {
@@ -134,8 +137,8 @@ fn structural_callers_resolves_go_spawn_edge() {
     index(&repo);
     let callers = result_fqns(&repo, &["callers", "go_sample::worker", "--format", "json"]);
     assert!(
-        callers.iter().any(|f| f == "go_sample::Spawn"),
-        "callers of worker must include Spawn, got {callers:?}"
+        callers.iter().any(|f| f == "go_sample/Spawn"),
+        "callers of worker must include Spawn (Go-native rendering), got {callers:?}"
     );
 }
 
@@ -144,7 +147,7 @@ fn flows_to_resolves_transform_chain() {
     // `flows-to a` walks the DerivesFrom slice a → b → c → return in `Transform`.
     let (_tmp, repo) = fixture_repo();
     index(&repo);
-    let fqns = result_fqns(&repo, &["flows-to", A, "--depth", "8", "--format", "json"]);
+    let fqns = result_fqns(&repo, &["flows-to", A_IN, "--depth", "8", "--format", "json"]);
     for expected in [B, C, RETURN] {
         assert!(
             fqns.iter().any(|f| f == expected),

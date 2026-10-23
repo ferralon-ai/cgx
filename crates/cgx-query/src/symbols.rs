@@ -98,6 +98,9 @@ pub struct SymbolRank {
     pub file: String,
     pub line: u32,
     pub kind: SymbolKind,
+    /// Source language tag of the symbol, carried so the caller can render the fqn
+    /// in that language's native syntax without re-reading the store.
+    pub lang: String,
     /// Inbound degree across the ranking families (callers + DerivesFrom
     /// consumers) — "how depended-upon".
     pub in_degree: usize,
@@ -178,6 +181,7 @@ pub fn rank_symbols(
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,
+            lang: node.lang.clone(),
             in_degree: inbound[i].total,
             out_degree: outbound[i].total,
             inbound: std::mem::take(&mut inbound[i]),

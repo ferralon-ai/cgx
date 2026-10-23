@@ -17,6 +17,8 @@ use cgx_query::{
 };
 use serde_json::{json, Value};
 
+use cgx_select::render_node_fqn;
+
 use crate::forest::{self, ForestData};
 
 /// The output format selected by `--format` (IF-3 subset for Phase-1 CLI).
@@ -130,7 +132,9 @@ impl<'a> Finding<'a> {
     fn human_line(&self) -> String {
         let mut s = format!(
             "{}  ({}:{})",
-            self.subject.fqn, self.subject.file, self.subject.line_start
+            render_node_fqn(&self.subject.fqn, &self.subject.lang, &self.subject.file),
+            self.subject.file,
+            self.subject.line_start
         );
         if let Some(d) = self.depth {
             s.push_str(&format!("  depth={d}"));
@@ -152,7 +156,7 @@ impl<'a> Finding<'a> {
 
     fn json(&self) -> Value {
         let mut obj = json!({
-            "fqn": self.subject.fqn,
+            "fqn": render_node_fqn(&self.subject.fqn, &self.subject.lang, &self.subject.file),
             "file": self.subject.file,
             "line": self.subject.line_start,
             "kind": self.subject.kind,
@@ -199,14 +203,14 @@ impl<'a> Finding<'a> {
         json!({
             "ruleId": rule_id,
             "level": "note",
-            "message": { "text": format!("{} ({})", self.subject.fqn, sarif_kind(self.subject)) },
+            "message": { "text": format!("{} ({})", render_node_fqn(&self.subject.fqn, &self.subject.lang, &self.subject.file), sarif_kind(self.subject)) },
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": self.subject.file },
                     "region": { "startLine": self.subject.line_start.max(1) }
                 },
                 "logicalLocations": [{
-                    "fullyQualifiedName": self.subject.fqn,
+                    "fullyQualifiedName": render_node_fqn(&self.subject.fqn, &self.subject.lang, &self.subject.file),
                     "kind": "function"
                 }]
             }],
@@ -306,7 +310,7 @@ impl Cell {
             V::List(items) => Cell::List(items.iter().map(|i| Cell::resolve(view, i)).collect()),
             V::Node(id) => match view.try_node(*id) {
                 Some(n) => Cell::Node {
-                    fqn: n.fqn.clone(),
+                    fqn: render_node_fqn(&n.fqn, &n.lang, &n.file),
                     file: n.file.clone(),
                     line: n.line_start,
                     kind: node_kind_str(n),
@@ -325,7 +329,7 @@ impl Cell {
                 p.nodes
                     .iter()
                     .map(|n| match view.try_node(*n) {
-                        Some(rec) => rec.fqn.clone(),
+                        Some(rec) => render_node_fqn(&rec.fqn, &rec.lang, &rec.file),
                         None => String::new(),
                     })
                     .collect(),
@@ -463,12 +467,14 @@ pub fn render(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    agnostic_cross_language: bool,
     freshness: &FreshnessEnvelope,
 ) -> String {
     match format {
         // The approximation contract (A3/A4) and the index-freshness envelope ride
         // on every human answer as two compact trailing lines; the graph emitters
-        // (dot/mermaid/d2) are raw graph source and carry no prose.
+        // (dot/mermaid/d2) are raw graph source and carry no prose. The cross-
+        // language honesty note is emitted on stderr by the caller, not here.
         Format::Human => {
             let mut body = render_human(results);
             if !body.ends_with('\n') {
@@ -480,7 +486,14 @@ pub fn render(
             body.push('\n');
             body
         }
-        Format::Json => render_json(subcommand, results, vacuous, contract, freshness),
+        Format::Json => render_json(
+            subcommand,
+            results,
+            vacuous,
+            contract,
+            agnostic_cross_language,
+            freshness,
+        ),
         Format::Sarif => {
             sarif_document(subcommand, results, vacuous, contract, freshness).to_string()
         }
@@ -549,7 +562,7 @@ fn graph_data(results: &ResultSet) -> GraphData {
     if let ResultSet::Paths(set) = results {
         for p in &set.paths {
             for step in &p.steps {
-                g.push_node(&step.node.fqn);
+                g.push_node(&render_node_fqn(&step.node.fqn, &step.node.lang, &step.node.file));
             }
             for pair in p.steps.windows(2) {
                 let label = pair[1]
@@ -557,7 +570,11 @@ fn graph_data(results: &ResultSet) -> GraphData {
                     .as_ref()
                     .map(|e| condition_str(e.condition).to_string())
                     .unwrap_or_default();
-                g.push_edge(&pair[0].node.fqn, &pair[1].node.fqn, &label);
+                g.push_edge(
+                    &render_node_fqn(&pair[0].node.fqn, &pair[0].node.lang, &pair[0].node.file),
+                    &render_node_fqn(&pair[1].node.fqn, &pair[1].node.lang, &pair[1].node.file),
+                    &label,
+                );
             }
         }
     }
@@ -1028,7 +1045,11 @@ fn render_human(results: &ResultSet) -> String {
                         .unwrap_or_default();
                     lines.push(format!(
                         "{}{}  ({}:{}){}",
-                        arrow, step.node.fqn, step.node.file, step.node.line_start, cond
+                        arrow,
+                        render_node_fqn(&step.node.fqn, &step.node.lang, &step.node.file),
+                        step.node.file,
+                        step.node.line_start,
+                        cond
                     ));
                 }
             }
@@ -1100,6 +1121,7 @@ fn render_json(
     results: &ResultSet,
     vacuous: bool,
     contract: &ApproximationContract,
+    agnostic_cross_language: bool,
     freshness: &FreshnessEnvelope,
 ) -> String {
     if let ResultSet::Table(t) = results {
@@ -1121,6 +1143,10 @@ fn render_json(
         // A3/A4 answer-honesty contract: the direction this answer can be wrong,
         // machine-readable reasons, and (for a negative) the searched scope.
         "approximation": approximation_json(contract),
+        // Whether the query anchor matched only via an agnostic cross-language
+        // interpretation (the family gate was dropped). A sibling of `freshness`,
+        // never interleaved with the result rows.
+        "agnostic_cross_language": agnostic_cross_language,
         // How far the indexed state this answer describes is from the working tree.
         "freshness": freshness_json(freshness),
     });
@@ -1194,7 +1220,7 @@ fn path_json(p: &PathResult) -> Value {
         .iter()
         .map(|s| {
             let mut obj = json!({
-                "fqn": s.node.fqn,
+                "fqn": render_node_fqn(&s.node.fqn, &s.node.lang, &s.node.file),
                 "file": s.node.file,
                 "line": s.node.line_start,
             });
@@ -1409,7 +1435,7 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
                     "artifactLocation": { "uri": n.file },
                     "region": { "startLine": n.line_start.max(1) }
                 },
-                "logicalLocations": [{ "fullyQualifiedName": n.fqn, "kind": "function" }]
+                "logicalLocations": [{ "fullyQualifiedName": render_node_fqn(&n.fqn, &n.lang, &n.file), "kind": "function" }]
             }])
         })
         .unwrap_or_else(|| json!([]));
@@ -1424,7 +1450,7 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
                         "artifactLocation": { "uri": s.node.file },
                         "region": { "startLine": s.node.line_start.max(1) }
                     },
-                    "logicalLocations": [{ "fullyQualifiedName": s.node.fqn }]
+                    "logicalLocations": [{ "fullyQualifiedName": render_node_fqn(&s.node.fqn, &s.node.lang, &s.node.file) }]
                 }
             })
         })
@@ -1433,8 +1459,8 @@ fn sarif_path_result(p: &PathResult, rule_id: &str) -> Value {
     let msg = match (source, sink) {
         (Some(s), Some(d)) => format!(
             "Path from {} to {} ({} hops, {})",
-            s.fqn,
-            d.fqn,
+            render_node_fqn(&s.fqn, &s.lang, &s.file),
+            render_node_fqn(&d.fqn, &d.lang, &d.file),
             p.hops(),
             confidence_str(p.min_confidence)
         ),
@@ -1477,6 +1503,7 @@ pub fn render_search(
     format: Format,
     hits: &[cgx_query::SymbolHit],
     limit: usize,
+    agnostic_cross_language: bool,
     freshness: &FreshnessEnvelope,
 ) -> String {
     let shown = if limit == 0 {
@@ -1487,13 +1514,21 @@ pub fn render_search(
     let visible = &hits[..shown];
     let hidden = hits.len() - shown;
 
+    // Render every fqn into its source language's native syntax up front, so the
+    // human column alignment and the JSON `fqn` field agree and neither re-renders.
+    let rendered: Vec<String> = visible
+        .iter()
+        .map(|h| render_node_fqn(&h.fqn, &h.lang, &h.file))
+        .collect();
+
     match format {
         Format::Json => {
             let items: Vec<Value> = visible
                 .iter()
-                .map(|h| {
+                .zip(&rendered)
+                .map(|(h, fqn)| {
                     json!({
-                        "fqn": h.fqn,
+                        "fqn": fqn,
                         "file": h.file,
                         "line": h.line,
                         "kind": kind_str(h.kind),
@@ -1507,6 +1542,7 @@ pub fn render_search(
             // flag — the wrapped form is the only form.
             let doc = json!({
                 "results": items,
+                "agnostic_cross_language": agnostic_cross_language,
                 "freshness": freshness_json(freshness),
             });
             let mut s = serde_json::to_string_pretty(&doc).expect("search results serialize");
@@ -1521,13 +1557,13 @@ pub fn render_search(
                 return out;
             }
             // Align on the FQN column so `file:line` starts at a fixed offset.
-            let fqn_width = visible.iter().map(|h| h.fqn.chars().count()).max().unwrap_or(0);
+            let fqn_width = rendered.iter().map(|f| f.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
-            for h in visible {
-                let pad = fqn_width.saturating_sub(h.fqn.chars().count());
+            for (h, fqn) in visible.iter().zip(&rendered) {
+                let pad = fqn_width.saturating_sub(fqn.chars().count());
                 out.push_str(&format!(
                     "{}{}  {}:{}  [{}]\n",
-                    h.fqn,
+                    fqn,
                     " ".repeat(pad),
                     h.file,
                     h.line,
@@ -1589,13 +1625,15 @@ pub fn render_symbols(
                 out.push('\n');
                 return out;
             }
-            let fqn_width = visible.iter().map(|r| r.fqn.chars().count()).max().unwrap_or(0);
+            let rendered: Vec<String> =
+                visible.iter().map(|r| render_node_fqn(&r.fqn, &r.lang, &r.file)).collect();
+            let fqn_width = rendered.iter().map(|f| f.chars().count()).max().unwrap_or(0);
             let mut out = String::new();
-            for r in visible {
-                let pad = fqn_width.saturating_sub(r.fqn.chars().count());
+            for (r, fqn) in visible.iter().zip(&rendered) {
+                let pad = fqn_width.saturating_sub(fqn.chars().count());
                 out.push_str(&format!(
                     "{}{}  ({}:{})  [{}]  in={} out={}  in:{}  out:{}\n",
-                    r.fqn,
+                    fqn,
                     " ".repeat(pad),
                     r.file,
                     r.line,
@@ -1640,7 +1678,7 @@ fn breakdown_human(b: &cgx_query::EdgeBreakdown) -> String {
 /// breakdown objects (each with `total` and the family/condition/confidence maps).
 fn symbol_rank_json(r: &cgx_query::SymbolRank) -> Value {
     json!({
-        "fqn": r.fqn,
+        "fqn": render_node_fqn(&r.fqn, &r.lang, &r.file),
         "file": r.file,
         "line": r.line,
         "kind": kind_str(r.kind),
@@ -1757,10 +1795,11 @@ fn coupling_human(r: &CouplingReport) -> String {
 pub fn render_explanation(
     format: Format,
     e: &Explanation,
+    agnostic_cross_language: bool,
     freshness: &FreshnessEnvelope,
 ) -> String {
     match format {
-        Format::Json => explanation_json(e, freshness),
+        Format::Json => explanation_json(e, agnostic_cross_language, freshness),
         _ => {
             let mut out = explanation_human(e);
             out.push_str(&freshness.human_summary());
@@ -1774,7 +1813,7 @@ fn explanation_human(e: &Explanation) -> String {
     let n = &e.node;
     let mut out = format!(
         "{}  ({}:{})\n  kind: {}\n  callers: {}, callees: {}\n",
-        n.fqn,
+        render_node_fqn(&n.fqn, &n.lang, &n.file),
         n.file,
         n.line_start,
         node_kind_str(n),
@@ -1791,7 +1830,7 @@ fn explanation_human(e: &Explanation) -> String {
         out.push_str(&format!(
             "    {} {}  ({}:{})  [{}]  [{}]  tier={}  rule={}",
             arrow,
-            edge.peer.fqn,
+            render_node_fqn(&edge.peer.fqn, &edge.peer.lang, &edge.peer.file),
             edge.peer.file,
             edge.peer.line_start,
             condition_str(edge.condition),
@@ -1810,7 +1849,11 @@ fn explanation_human(e: &Explanation) -> String {
     out
 }
 
-fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
+fn explanation_json(
+    e: &Explanation,
+    agnostic_cross_language: bool,
+    freshness: &FreshnessEnvelope,
+) -> String {
     let n = &e.node;
     let edges: Vec<Value> = e
         .edges
@@ -1818,7 +1861,7 @@ fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
         .map(|edge| {
             json!({
                 "direction": if edge.incoming { "incoming" } else { "outgoing" },
-                "peer": edge.peer.fqn,
+                "peer": render_node_fqn(&edge.peer.fqn, &edge.peer.lang, &edge.peer.file),
                 "peer_file": edge.peer.file,
                 "peer_line": edge.peer.line_start,
                 "condition": condition_str(edge.condition),
@@ -1831,13 +1874,14 @@ fn explanation_json(e: &Explanation, freshness: &FreshnessEnvelope) -> String {
         })
         .collect();
     let doc = json!({
-        "symbol": n.fqn,
+        "symbol": render_node_fqn(&n.fqn, &n.lang, &n.file),
         "file": n.file,
         "line": n.line_start,
         "kind": node_kind_str(n),
         "callers_count": e.callers_count,
         "callees_count": e.callees_count,
         "edges": edges,
+        "agnostic_cross_language": agnostic_cross_language,
         "freshness": freshness_json(freshness),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("explanation doc serializes");

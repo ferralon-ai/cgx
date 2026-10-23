@@ -20,6 +20,9 @@ pub struct SymbolHit {
     pub file: String,
     pub line: u32,
     pub kind: SymbolKind,
+    /// Source language tag of the matched symbol, carried so the caller can render
+    /// the fqn in that language's native syntax without re-reading the store.
+    pub lang: String,
 }
 
 /// A rejected search request — an invalid `--regex` pattern or an empty pattern.
@@ -110,6 +113,7 @@ pub fn search_symbols(
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,
+            lang: node.lang.clone(),
         })
         .collect();
 

@@ -60,7 +60,7 @@ pub use id::{EdgeId, NodeId, NodeSortKey, SiteId, ValueId};
 pub use locality::{locality_tier, LocalityTier};
 pub use node::{
     CallSite, EntrypointKind, NarrowingCounts, NodeFlavor, NodeRecord, NodeWithProvenance,
-    SymbolKind, ValueNode, Visibility,
+    SymbolKind, ValueNode, Visibility, FQN_SEGMENT_DELIM,
 };
 pub use pattern::{PatternKind, SymbolPattern};
 pub use provenance::{Provenance, Span};

@@ -35,7 +35,7 @@ use cgx_cli::output::{
     Format, ResultSet, TableData, IMPACTED_SUBCOMMAND,
 };
 use cgx_cli::pack;
-use cgx_cli::pattern::parse_symbol;
+use cgx_cli::pattern::{has_language_separator, looks_like_selector, parse_symbol};
 use cgx_index::local::{
     cgx_dir, dataflow_default, ensure_cgx_dir, ensure_indexed, index_repo, load_current,
     open_store, read_pointer,
@@ -756,6 +756,12 @@ struct QueryArgs {
     /// unknown-flag error. Passing this flag always exits 2.
     #[arg(long, hide = true)]
     sql: bool,
+    /// Not a CLI flag (`#[arg(skip)]`): an internal channel set by the command
+    /// function once it has resolved the query anchor, carrying whether that anchor
+    /// matched only via an agnostic cross-language interpretation. `emit` reads it
+    /// to put the `agnostic_cross_language` honesty field on the JSON envelope.
+    #[arg(skip)]
+    agnostic_cross_language: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1087,13 +1093,14 @@ enum NeighborDir {
 }
 
 fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), CliError> {
+    let mut args = args;
     let subcommand = match dir {
         NeighborDir::Callers => "callers",
         NeighborDir::Callees => "callees",
     };
     let view = prepare_view(&args)?;
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
-        Some(id) => id,
+        Some(resolved) => resolved,
         // Zero-symbol match under --assert-empty: an empty, vacuous result.
         None => {
             return emit(
@@ -1106,6 +1113,8 @@ fn run_neighbors(symbol: &str, args: QueryArgs, dir: NeighborDir) -> Result<(), 
             )
         }
     };
+    args.agnostic_cross_language = anchor.agnostic_cross_language;
+    let anchor = anchor.id;
 
     let walker = build_forest_walker(&args);
     let walk_dir = match dir {
@@ -1185,13 +1194,14 @@ fn build_flow_walker(args: &QueryArgs) -> PathWalker {
 /// call family to `DerivesFrom`. No second execution path: same `PathWalker`, same
 /// forest rendering, same exit-code contract as the call-graph neighbor commands.
 fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError> {
+    let mut args = args;
     let subcommand = match dir {
         FlowDir::Forward => "flows-to",
         FlowDir::Backward => "flows-from",
     };
     let view = prepare_view(&args)?;
     let anchor = match resolve_anchor_lenient(&view, symbol, args.assert_empty)? {
-        Some(id) => id,
+        Some(resolved) => resolved,
         None => {
             return emit(
                 subcommand,
@@ -1203,6 +1213,8 @@ fn run_flow(symbol: &str, args: QueryArgs, dir: FlowDir) -> Result<(), CliError>
             )
         }
     };
+    args.agnostic_cross_language = anchor.agnostic_cross_language;
+    let anchor = anchor.id;
 
     let walker = build_flow_walker(&args);
     // `flows-from` (pedigree) walks DerivesFrom forward (src→dst) via `callees`;
@@ -1270,9 +1282,10 @@ fn empty_neighbors(args: &QueryArgs) -> ResultSet {
 }
 
 fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliError> {
+    let mut args = args;
     let view = prepare_view(&args)?;
-    let from_id = match resolve_anchor_lenient(&view, from, args.assert_empty)? {
-        Some(id) => id,
+    let from_anchor = match resolve_anchor_lenient(&view, from, args.assert_empty)? {
+        Some(resolved) => resolved,
         None => {
             return emit(
                 "reaches",
@@ -1284,6 +1297,8 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
             )
         }
     };
+    args.agnostic_cross_language = from_anchor.agnostic_cross_language;
+    let from_id = from_anchor.id;
     match to {
         // `from → *`: every reachable symbol (callees machinery), as a forest. Uses
         // the forest walker so the depth-2 default bounds the neighborhood walk.
@@ -1314,8 +1329,8 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
         }
         // `from → to`: a single reachability answer, rendered as its witness path.
         Some(to) => {
-            let to_id = match resolve_anchor_lenient(&view, to, args.assert_empty)? {
-                Some(id) => id,
+            let to_anchor = match resolve_anchor_lenient(&view, to, args.assert_empty)? {
+                Some(resolved) => resolved,
                 None => {
                     return emit(
                         "reaches",
@@ -1327,6 +1342,8 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
                     )
                 }
             };
+            args.agnostic_cross_language |= to_anchor.agnostic_cross_language;
+            let to_id = to_anchor.id;
             let walker = build_walker(&args);
             let result = reaches(&view, from_id, to_id, &walker);
             let approximation = contract::for_reaches(&view, &walker, from_id, &result);
@@ -1349,12 +1366,16 @@ fn run_reaches(from: &str, to: Option<&str>, args: QueryArgs) -> Result<(), CliE
 }
 
 fn run_paths(from: &str, to: &str, args: QueryArgs) -> Result<(), CliError> {
+    let mut args = args;
     let view = prepare_view(&args)?;
     let (from_id, to_id) = match (
         resolve_anchor_lenient(&view, from, args.assert_empty)?,
         resolve_anchor_lenient(&view, to, args.assert_empty)?,
     ) {
-        (Some(f), Some(t)) => (f, t),
+        (Some(f), Some(t)) => {
+            args.agnostic_cross_language = f.agnostic_cross_language | t.agnostic_cross_language;
+            (f.id, t.id)
+        }
         // Either endpoint unresolved under --assert-empty → empty, vacuous.
         _ => {
             return emit(
@@ -1835,15 +1856,23 @@ fn run_explain(
     }
     let view = load_view(&repo_root, !no_auto_index)?;
 
-    let pat: SymbolPattern = parse_symbol(symbol);
-    let anchor = view
-        .resolve_one(&pat)
-        .map_err(|e| CliError::usage(format!("{e}")))?;
-    let explanation = cgx_query::explain(&view, anchor)
+    let anchor = resolve_anchor(&view, symbol).map_err(|e| CliError::usage(e.message(symbol)))?;
+    let explanation = cgx_query::explain(&view, anchor.id)
         .ok_or_else(|| CliError::usage(format!("no symbol matched `{symbol}`")))?;
 
+    if anchor.agnostic_cross_language && !matches!(format, Format::Json) {
+        eprintln!("{}", CROSS_LANGUAGE_ANCHOR_NOTE);
+    }
     let freshness = freshness::envelope(Some(&repo_root), None);
-    print!("{}", render_explanation(format, &explanation, &freshness));
+    print!(
+        "{}",
+        render_explanation(
+            format,
+            &explanation,
+            anchor.agnostic_cross_language,
+            &freshness,
+        )
+    );
     Ok(())
 }
 
@@ -1923,7 +1952,9 @@ fn run_search(
         search_symbols(&view, selector, kind_filter).map_err(|e| CliError::usage(e.to_string()))?;
 
     let freshness = freshness::envelope(Some(&repo_root), None);
-    print!("{}", render_search(format, &hits, limit, &freshness));
+    // The legacy glob/short-name path never drops a family gate, so no match can be
+    // a cross-language one.
+    print!("{}", render_search(format, &hits, limit, false, &freshness));
     Ok(())
 }
 
@@ -2002,6 +2033,7 @@ fn run_search_selector(
             file: node.file.clone(),
             line: node.line_start,
             kind: node.kind,
+            lang: node.lang.clone(),
         })
         .collect();
     // Match `search_symbols`'s FQN-ordered output for a stable, familiar table.
@@ -2013,7 +2045,16 @@ fn run_search_selector(
     });
 
     let freshness = freshness::envelope(Some(&repo_root), None);
-    print!("{}", render_search(format, &hits, limit, &freshness));
+    print!(
+        "{}",
+        render_search(
+            format,
+            &hits,
+            limit,
+            !resolution.agnostic_cross_language.is_empty(),
+            &freshness,
+        )
+    );
     Ok(())
 }
 
@@ -2116,9 +2157,16 @@ fn emit(
             &results,
             outcome.vacuous,
             &contract,
+            args.agnostic_cross_language,
             &freshness,
         )
     );
+
+    // Cross-language honesty signal: a one-line stderr note for human output (the
+    // JSON/SARIF envelopes carry it as a field instead, via `render`).
+    if args.agnostic_cross_language && matches!(args.format, Format::Human) {
+        eprintln!("{}", CROSS_LANGUAGE_ANCHOR_NOTE);
+    }
 
     if let Some(w) = &outcome.warning {
         eprintln!("{w}");
@@ -3025,20 +3073,149 @@ fn load_view(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<GraphView, Cl
     Ok(GraphView::new(graph.nodes, graph.edges, graph.candidates))
 }
 
-/// Resolve an anchor for a query that may carry `--assert-empty`. A zero-symbol
-/// match under `--assert-empty` is **not** a usage error: it is the vacuity-guard
-/// clause (a) (ADR-08), so it returns `Ok(None)` and the caller produces an empty
-/// (vacuous) result. Without `--assert-empty`, a zero-symbol match is a usage
-/// error (exit 2). An ambiguous *FQN* is always a usage error.
+/// The one-line note shown on stderr (human output only) when a query anchor
+/// resolved only because the language-agnostic match dropped the family gate — the
+/// query's surface syntax named one language but the matched symbol's source
+/// language was another. In JSON this is the `agnostic_cross_language` envelope
+/// field instead; the note never interleaves with result rows.
+const CROSS_LANGUAGE_ANCHOR_NOTE: &str =
+    "cgx: note: the anchor matched a symbol whose source language differs from the \
+     query's surface syntax (agnostic mode dropped the family gate)";
+
+/// A resolved single-symbol anchor plus the one honesty signal single-anchor
+/// resolution can raise: whether the match came *only* from agnostic cross-language
+/// interpretation — the query's surface syntax named one language but the matched
+/// symbol's source language was another (the family gate was dropped to find it).
+#[derive(Debug, Clone, Copy)]
+struct ResolvedAnchor {
+    id: NodeId,
+    agnostic_cross_language: bool,
+}
+
+/// Why a single-anchor resolution did not yield exactly one symbol.
+enum AnchorError {
+    /// No symbol matched.
+    NotFound,
+    /// More than one symbol matched. Carries the candidates, each pre-rendered as a
+    /// native-syntax line, so the caller can list them instead of silently picking.
+    Ambiguous(Vec<String>),
+    /// A selector-grammar string the engine could not compile (a usage error).
+    Compile(String),
+}
+
+impl AnchorError {
+    /// The usage message this error renders as.
+    fn message(&self, symbol: &str) -> String {
+        match self {
+            AnchorError::NotFound => format!("no symbol matched `{symbol}`"),
+            AnchorError::Ambiguous(candidates) => format!(
+                "`{symbol}` is ambiguous — it matched {} symbols:\n{}\nnarrow the query to one of them",
+                candidates.len(),
+                candidates.join("\n"),
+            ),
+            AnchorError::Compile(detail) => detail.clone(),
+        }
+    }
+}
+
+/// One native-rendered candidate line (`  <native-fqn>  (file:line)`) per id, in the
+/// canonical id order the resolver returned them.
+fn render_anchor_candidates(view: &GraphView, ids: &[NodeId]) -> Vec<String> {
+    ids.iter()
+        .map(|&id| {
+            let n = view.node(id);
+            format!(
+                "  {}  ({}:{})",
+                cgx_select::render_node_fqn(&n.fqn, &n.lang, &n.file),
+                n.file,
+                n.line_start
+            )
+        })
+        .collect()
+}
+
+/// Resolve `symbol` to a single anchor through the node-selector engine in
+/// language-agnostic mode, enforcing anchor arity: zero matches is not-found, one
+/// proceeds, and more than one is an ambiguity error listing the natively-rendered
+/// candidates (never a silent pick, never a fan-out).
+fn resolve_anchor_via_engine(
+    view: &GraphView,
+    symbol: &str,
+    surface_error: bool,
+) -> Result<ResolvedAnchor, AnchorError> {
+    match cgx_select::compile(symbol) {
+        Ok(selector) => {
+            let resolution = view.resolve_select(&selector, &cgx_select::MatchOptions::agnostic());
+            match resolution.ids.len() {
+                0 => Err(AnchorError::NotFound),
+                1 => {
+                    let id = resolution.ids[0];
+                    Ok(ResolvedAnchor {
+                        id,
+                        agnostic_cross_language: resolution.agnostic_cross_language.contains(&id),
+                    })
+                }
+                _ => Err(AnchorError::Ambiguous(render_anchor_candidates(
+                    view,
+                    &resolution.ids,
+                ))),
+            }
+        }
+        // A selector-grammar string that fails to compile is a usage error the user
+        // should see; a plain native string that no tokenizer accepts (e.g. a
+        // scoped `@acme/utils`) falls back to the legacy exact/short-name heuristic.
+        Err(e) if surface_error => Err(AnchorError::Compile(e.to_string())),
+        Err(_) => resolve_anchor_via_legacy(view, symbol),
+    }
+}
+
+/// Resolve `symbol` through the legacy glob/`::`/short-name heuristic. Preserves the
+/// shipped contract: an exact-FQN match of many is an ambiguity error, while a
+/// glob/short-name that fans out resolves to the first in canonical order.
+fn resolve_anchor_via_legacy(view: &GraphView, symbol: &str) -> Result<ResolvedAnchor, AnchorError> {
+    let pat: SymbolPattern = parse_symbol(symbol);
+    match view.resolve_one(&pat) {
+        Ok(id) => Ok(ResolvedAnchor {
+            id,
+            agnostic_cross_language: false,
+        }),
+        Err(cgx_query::ResolveError::NotFound { .. }) => Err(AnchorError::NotFound),
+        Err(cgx_query::ResolveError::Ambiguous { .. }) => Err(AnchorError::Ambiguous(
+            render_anchor_candidates(view, &view.resolve_symbol(&pat)),
+        )),
+    }
+}
+
+/// Resolve a single query anchor, routing the input to the surface its grammar
+/// requests (the routing ladder):
+///
+/// 1. selector-only grammar (`**`/`(`/`!`) → the engine (a compile error surfaces);
+/// 2. a `*`/`?` glob, or a bare identifier with no language separator → the legacy
+///    heuristic (a glob stays a legacy glob; a single-segment name resolves by
+///    short-name);
+/// 3. everything else (a multi-segment native symbol) → the engine, agnostic, with a
+///    legacy fallback when no tokenizer accepts it.
+fn resolve_anchor(view: &GraphView, symbol: &str) -> Result<ResolvedAnchor, AnchorError> {
+    if looks_like_selector(symbol) {
+        resolve_anchor_via_engine(view, symbol, true)
+    } else if symbol.contains('*') || symbol.contains('?') || !has_language_separator(symbol) {
+        resolve_anchor_via_legacy(view, symbol)
+    } else {
+        resolve_anchor_via_engine(view, symbol, false)
+    }
+}
+
+/// Resolve a query anchor, softening a genuine zero-match to `Ok(None)` under
+/// `--assert-empty` (a vacuous result the caller renders as empty). An ambiguity or
+/// a selector compile error stays a hard usage error even under `--assert-empty`.
 fn resolve_anchor_lenient(
     view: &GraphView,
     symbol: &str,
     assert_empty: bool,
-) -> Result<Option<NodeId>, CliError> {
-    let pat: SymbolPattern = parse_symbol(symbol);
-    match view.resolve_one(&pat) {
-        Ok(id) => Ok(Some(id)),
-        Err(cgx_query::ResolveError::NotFound { .. }) if assert_empty => Ok(None),
-        Err(e) => Err(CliError::usage(format!("{e}"))),
+) -> Result<Option<ResolvedAnchor>, CliError> {
+    match resolve_anchor(view, symbol) {
+        Ok(anchor) => Ok(Some(anchor)),
+        Err(AnchorError::NotFound) if assert_empty => Ok(None),
+        Err(e) => Err(CliError::usage(e.message(symbol))),
     }
 }

@@ -12,13 +12,12 @@
 //!
 //! A newer, richer surface — the language-agnostic **node selector** engine
 //! ([`cgx_select`]) — coexists with the legacy glob/`::`/short-name heuristic. The
-//! two share one matcher core (a per-node predicate over the loaded view); only
-//! the feeder differs. [`route_symbol`] is the single chokepoint that decides
-//! which surface an input string wants: a string carrying selector-only grammar
-//! (`**`, `(`, or `!`) is a [`SymbolQuery::Selector`] compiled by the engine; every
-//! other string falls through to [`parse_symbol`]'s heuristic **unchanged**. A
-//! single `*` alone is *not* a routing trigger — it stays a legacy glob, so the
-//! common `auth::*` case is untouched.
+//! two share one matcher core (a per-node predicate over the loaded view); only the
+//! feeder differs. The anchor-resolution path in `main` is the chokepoint that
+//! decides which surface an input wants, using the two predicates here:
+//! [`looks_like_selector`] (selector-only grammar) and [`has_language_separator`]
+//! (a native separator in any supported language). A single `*`/`?` glob without
+//! selector grammar stays a legacy glob, so the common `auth::*` case is untouched.
 
 use cgx_core::SymbolPattern;
 
@@ -33,18 +32,6 @@ pub fn parse_symbol(text: &str) -> SymbolPattern {
     }
 }
 
-/// The two symbol-resolution surfaces a CLI string can route to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SymbolQuery {
-    /// The legacy glob/`::`/short-name heuristic ([`parse_symbol`]).
-    Legacy(SymbolPattern),
-    /// The node-selector engine ([`cgx_select`]). Carries the raw selector source;
-    /// the caller compiles it (so a compile error can be surfaced as a labeled
-    /// usage error, never a silent empty result) and evaluates it via
-    /// `GraphView::resolve_select`.
-    Selector(String),
-}
-
 /// Does this input use selector-only grammar (globstar `**`, an alternation `(`,
 /// or an affix negation `!`)? These three never occur in a legacy glob/fqn/short-
 /// name string, so their presence unambiguously requests the selector engine. A
@@ -53,14 +40,15 @@ pub fn looks_like_selector(text: &str) -> bool {
     text.contains("**") || text.contains('(') || text.contains('!')
 }
 
-/// Route a CLI symbol string to the surface its grammar requests: the selector
-/// engine for selector-only grammar, else the legacy [`parse_symbol`] heuristic.
-pub fn route_symbol(text: &str) -> SymbolQuery {
-    if looks_like_selector(text) {
-        SymbolQuery::Selector(text.to_string())
-    } else {
-        SymbolQuery::Legacy(parse_symbol(text))
-    }
+/// Does this input carry a native separator in any supported language — Rust/C++
+/// `::`, Go/scoped `/`, or the dotted families' `.`? A string with none is a bare
+/// single identifier (a short-name). This is the signal that a non-glob input is a
+/// multi-segment native symbol the selector engine should interpret, rather than a
+/// short-name lookup; `.` is included (unlike [`cgx_core::pattern::
+/// contains_segment_separator`]) precisely so native dotted symbols route to the
+/// engine instead of falling through to a short-name that can never match.
+pub fn has_language_separator(text: &str) -> bool {
+    text.contains("::") || text.contains('/') || text.contains('.')
 }
 
 #[cfg(test)]
@@ -99,63 +87,30 @@ mod tests {
         assert_eq!(parse_symbol("**::sink").kind, PatternKind::Glob);
     }
 
-    /// The router sends selector-grammar strings to the engine and everything else
-    /// to the legacy heuristic. `parse_symbol` itself is left untouched (the two
-    /// `double_star_is_glob`/`star_is_glob` cases above still hold for it).
+    /// `looks_like_selector` fires only on selector-only grammar (`**`, `(`, `!`),
+    /// never on a lone `*`/`?` glob or a plain `::`/short-name string.
     #[test]
-    fn route_symbol_classification() {
-        struct Case {
-            input: &'static str,
-            selector: bool,
-        }
-        let cases = [
-            // Selector-only grammar → engine.
-            Case {
-                input: "com::foo::**::*Service",
-                selector: true,
-            },
-            Case {
-                input: "(foo|bar)::Svc",
-                selector: true,
-            },
-            Case {
-                input: "com::foo::!Mock*Service",
-                selector: true,
-            },
-            Case {
-                input: "**::sink",
-                selector: true,
-            },
-            // Legacy heuristic → unchanged.
-            Case {
-                input: "auth::validate",
-                selector: false,
-            },
-            Case {
-                input: "auth::*",
-                selector: false,
-            },
-            Case {
-                input: "validate",
-                selector: false,
-            },
-            Case {
-                input: "Parser*",
-                selector: false,
-            },
-        ];
-        for c in cases {
-            let routed = route_symbol(c.input);
-            let is_selector = matches!(routed, SymbolQuery::Selector(_));
-            assert_eq!(
-                is_selector, c.selector,
-                "route_symbol({:?}) selector-routed = {is_selector}, want {}",
-                c.input, c.selector
-            );
-            // Legacy routes carry the same pattern parse_symbol would have produced.
-            if let SymbolQuery::Legacy(p) = routed {
-                assert_eq!(p, parse_symbol(c.input));
-            }
-        }
+    fn looks_like_selector_classification() {
+        assert!(looks_like_selector("com::foo::**::*Service"));
+        assert!(looks_like_selector("(foo|bar)::Svc"));
+        assert!(looks_like_selector("com::foo::!Mock*Service"));
+        assert!(looks_like_selector("**::sink"));
+        assert!(!looks_like_selector("auth::validate"));
+        assert!(!looks_like_selector("auth::*"));
+        assert!(!looks_like_selector("validate"));
+        assert!(!looks_like_selector("Parser*"));
+    }
+
+    /// `has_language_separator` distinguishes a multi-segment native symbol (which
+    /// the engine should interpret) from a bare short-name. `.` counts — that is
+    /// the fix that lets native dotted symbols reach the engine.
+    #[test]
+    fn has_language_separator_classification() {
+        assert!(has_language_separator("auth::validate")); // Rust / C++
+        assert!(has_language_separator("example.com/app/store")); // Go
+        assert!(has_language_separator("com.example.Service")); // Java / Python / TS
+        assert!(has_language_separator("@acme/utils")); // scoped
+        assert!(!has_language_separator("validate")); // bare short-name
+        assert!(!has_language_separator("Parser")); // bare short-name
     }
 }

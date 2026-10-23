@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use cgx_core::{Confidence, EdgeCondition, NodeId, NodeRecord};
 use cgx_query::{EdgeRec, GraphView, Subgraph};
+use cgx_select::render_node_fqn;
 
 /// Which forest shape `--tree` selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -218,7 +219,10 @@ impl<'a> Forest<'a> {
             let child = self.node(edge.dst);
 
             if ancestors.contains(&edge.dst) {
-                w.out.push_str(&format!("{prefix}↺ {} (cycle)\n", child.fqn));
+                w.out.push_str(&format!(
+                    "{prefix}↺ {} (cycle)\n",
+                    render_node_fqn(&child.fqn, &child.lang, &child.file)
+                ));
                 continue;
             }
 
@@ -370,9 +374,11 @@ fn tree_prefix(parents_is_last: &[bool], is_last: bool) -> String {
     s
 }
 
-/// The bare `fqn  file:line` line (root nodes; no edge context).
+/// The bare `fqn  file:line` line (root nodes; no edge context). The fqn is
+/// rendered in the node's native language syntax; the deterministic child ordering
+/// (`node_sort_key`) stays keyed on the stored fqn, so rendering never perturbs it.
 fn base_line(n: &NodeRecord) -> String {
-    format!("{}  {}:{}", n.fqn, n.file, n.line_start)
+    format!("{}  {}:{}", render_node_fqn(&n.fqn, &n.lang, &n.file), n.file, n.line_start)
 }
 
 /// A child line: `fqn  file:line` plus the non-default condition/confidence tags.

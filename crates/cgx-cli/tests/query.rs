@@ -526,10 +526,10 @@ fn conditional_edge_repo() -> (tempfile::TempDir, PathBuf) {
 fn paths_mermaid_emits_a_labeled_edge() {
     let (_tmp, repo) = conditional_edge_repo();
     index(&repo);
-    for (to, condition) in [("**sys::run", "conditional"), ("**sys::boom", "loop")] {
+    for (to, condition) in [("**::sys::run", "conditional"), ("**::sys::boom", "loop")] {
         let (out, code) = run_cgx(
             &repo,
-            &["paths", "**handler::process", to, "--format", "mermaid"],
+            &["paths", "**::handler::process", to, "--format", "mermaid"],
         );
         assert_eq!(code, 0, "paths --format mermaid exits 0: {out}");
         let edge = out

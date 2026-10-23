@@ -124,7 +124,7 @@ impl Selector {
 
     /// Evaluate one node, returning the match plus provenance and honesty signals.
     pub fn evaluate(&self, node: &NodeRecord, opts: &MatchOptions) -> NodeMatch {
-        let segments: Vec<&str> = node.fqn.split("::").collect();
+        let segments: Vec<&str> = node.fqn.split(cgx_core::FQN_SEGMENT_DELIM).collect();
         let node_lang = node.lang.as_str();
 
         let mut native_families: Vec<Family> = Vec::new();

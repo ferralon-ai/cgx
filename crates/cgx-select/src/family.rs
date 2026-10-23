@@ -33,6 +33,57 @@ impl Family {
         }
     }
 
+    /// The family that owns a [`NodeRecord.lang`](cgx_core::node::NodeRecord) tag,
+    /// or `None` for a tag no family claims (e.g. `c`, `cpp`). The inverse of
+    /// [`lang_tags`](Self::lang_tags); the tag domain is disjoint across families,
+    /// so the first match is unambiguous.
+    pub fn from_lang_tag(tag: &str) -> Option<Family> {
+        [
+            Family::Rust,
+            Family::Go,
+            Family::TypeScript,
+            Family::Java,
+            Family::Python,
+        ]
+        .into_iter()
+        .find(|fam| fam.lang_tags().contains(&tag))
+    }
+
+    /// The family that owns a source file, inferred from its extension, or `None`
+    /// for an extension no family claims. This is the fallback language signal for
+    /// rendering a node whose [`NodeRecord.lang`](cgx_core::node::NodeRecord) tag is
+    /// empty — dataflow value nodes are synthesized without a lang tag, yet their
+    /// fqn must still render in the owning language's native syntax rather than
+    /// leaking the internal segment delimiter. Extensions mirror the adapters'
+    /// `Frontend::extensions` (`crates/cgx-lang-*`); C/C++ are deliberately absent
+    /// (no family), so their nodes keep the stored encoding.
+    pub fn from_path(path: &str) -> Option<Family> {
+        let ext = path.rsplit('.').next().filter(|e| *e != path)?;
+        match ext {
+            "rs" => Some(Family::Rust),
+            "go" => Some(Family::Go),
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(Family::TypeScript),
+            "java" => Some(Family::Java),
+            "py" => Some(Family::Python),
+            _ => None,
+        }
+    }
+
+    /// The surface separator this family joins fqn segments with when rendering a
+    /// symbol in its native syntax. This is the family's own separator — kept in
+    /// lockstep with the family's tokenizer (`tokenizer::SeparatorTokenizer`): Rust
+    /// `::`, Go `/`, and `.` for the dotted families (TypeScript/Java/Python). It
+    /// is deliberately distinct from the opaque internal
+    /// [`FQN_SEGMENT_DELIM`](cgx_core::FQN_SEGMENT_DELIM) that a stored fqn is split
+    /// on — that Rust's native separator coincides with it is not relied upon here.
+    pub fn native_separator(self) -> &'static str {
+        match self {
+            Family::Rust => "::",
+            Family::Go => "/",
+            Family::TypeScript | Family::Java | Family::Python => ".",
+        }
+    }
+
     /// Stable human-readable name (matches the surface syntax family, not a tag).
     pub fn name(self) -> &'static str {
         match self {

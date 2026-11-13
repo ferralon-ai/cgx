@@ -204,46 +204,58 @@ pub(crate) fn extract_and_link<S: FactStore>(
         }
     }
 
-    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the (content, context) purity that makes Layer-1
-    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
-    // step 3).
-    let extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = misses
-        .into_par_iter()
-        .map(|(src, ctx, key)| {
-            let rel = RelPath::new(src.rel_path.clone());
-            let facts = registry.extract(&src.content, &ctx)?;
-            let bytes = encode(&facts)?;
-            let version = registry.frontend_for(&rel).fragment_version();
-            Ok((
-                PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                },
-                key,
-                version,
-                bytes,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    stats.blobs_extracted = extracted.len();
-
-    // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .map(|(p, key, version, bytes)| FragmentInput {
-                key,
-                lang: &p.lang,
-                frontend_version: *version,
-                bytes,
+    // Pass 2 (parallel, rayon): extract every miss in bounded chunks.
+    //
+    // Chunking keeps peak RSS proportional to EXTRACT_CHUNK_SIZE rather than to
+    // the full miss set.  On a large corpus (e.g. 468 K files / 10 GB) collecting
+    // all misses at once held gigabytes of FileFacts in memory alongside the full
+    // `sources` Vec before the first SQLite write; each chunk is written and
+    // freed before the next one starts.
+    //
+    // Within each chunk the work is still embarrassingly parallel (IX-2 step 3):
+    // the per-file extract is a pure function of (content, context) with zero
+    // store/git access.
+    const EXTRACT_CHUNK_SIZE: usize = 2_000;
+    let mut total_extracted = 0usize;
+    for chunk in misses.chunks(EXTRACT_CHUNK_SIZE) {
+        let chunk_extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = chunk
+            .into_par_iter()
+            .map(|(src, ctx, key)| {
+                let rel = RelPath::new(src.rel_path.clone());
+                let facts = registry.extract(&src.content, &ctx)?;
+                let bytes = encode(&facts)?;
+                let version = registry.frontend_for(&rel).fragment_version();
+                Ok((
+                    PreparedFile {
+                        blob_oid: src.blob_oid.clone(),
+                        rel_path: src.rel_path.clone(),
+                        lang: registry.lang_for(&rel).tag().to_string(),
+                        facts,
+                    },
+                    key.clone(),
+                    version,
+                    bytes,
+                ))
             })
-            .collect();
-        store.put_fragments(&batch)?;
+            .collect::<Result<Vec<_>>>()?;
+        total_extracted += chunk_extracted.len();
+
+        // Write this chunk's fragments and free their bytes before the next chunk.
+        if !chunk_extracted.is_empty() {
+            let batch: Vec<FragmentInput<'_>> = chunk_extracted
+                .iter()
+                .map(|(p, key, version, bytes)| FragmentInput {
+                    key,
+                    lang: &p.lang,
+                    frontend_version: *version,
+                    bytes,
+                })
+                .collect();
+            store.put_fragments(&batch)?;
+        }
+        prepared.extend(chunk_extracted.into_iter().map(|(p, ..)| p));
     }
-    prepared.extend(extracted.into_iter().map(|(p, ..)| p));
+    stats.blobs_extracted = total_extracted;
 
     // Restore deterministic order (cache hits + parallel misses interleave):
     // sort by path so the link input set is order-stable.

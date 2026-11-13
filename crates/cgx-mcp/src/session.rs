@@ -151,7 +151,7 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .tree_blob_oids(&head_tree_oid)
         .map_err(|e| ToolError::index(e.to_string()))?;
     let working = repo
-        .enumerate_workdir(&workdir)
+        .enumerate_workdir(&workdir, None)
         .map_err(|e| ToolError::index(e.to_string()))?;
     let overlay = overlay_difference(&committed, &working);
 

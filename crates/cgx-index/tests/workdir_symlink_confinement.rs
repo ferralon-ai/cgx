@@ -39,7 +39,7 @@ fn enumerate_workdir_does_not_follow_symlinks_out_of_the_tree() {
     std::os::unix::fs::symlink(outside.path(), repo.join("src/linkdir")).expect("dir symlink");
 
     let r = Repo::discover(&repo).expect("discover");
-    let sources = r.enumerate_workdir(&repo).expect("enumerate workdir");
+    let sources = r.enumerate_workdir(&repo, None).expect("enumerate workdir");
 
     // The real file is enumerated.
     assert!(

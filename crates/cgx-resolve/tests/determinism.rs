@@ -5,7 +5,7 @@ mod common;
 
 use cgx_core::node::{SymbolKind, Visibility};
 use cgx_frontend::facts::{FileFacts, ScopeId};
-use cgx_resolve::{link, FileInput, LinkOpts};
+use cgx_resolve::{build_global_index, link, FileInput, FileSummary, LinkOpts, LinkSession};
 use proptest::prelude::*;
 
 use common::FileBuilder;
@@ -133,6 +133,62 @@ proptest! {
         let shuffled = link(&inputs(&files, &perm), &LinkOpts::default());
         prop_assert_eq!(reference, shuffled);
     }
+}
+
+/// The streaming path ([`build_global_index`] + [`LinkSession`]) must produce
+/// a graph byte-identical to the single-call `link` for the same file set and
+/// order — this is the correctness bar for routing cgx-index's extraction
+/// pipeline through the streaming path instead of materializing every file's
+/// full facts at once.
+#[test]
+fn streaming_link_matches_single_call_link() {
+    let files = program();
+    let order = [0, 1, 2];
+    let file_inputs = inputs(&files, &order);
+    let reference = link(&file_inputs, &LinkOpts::default());
+
+    let summaries: Vec<FileSummary> = file_inputs
+        .iter()
+        .map(|f| FileSummary::from_facts(f.blob_oid.clone(), f.path.clone(), f.lang.clone(), f.facts))
+        .collect();
+    let (nodes, def_to_node, table) = build_global_index(&summaries);
+    let mut session = LinkSession::new(&table, &def_to_node, LinkOpts::default());
+    for (file_idx, file) in file_inputs.iter().enumerate() {
+        session.resolve_file(file, file_idx);
+    }
+    let streamed = session.finish(nodes);
+
+    assert_eq!(
+        reference, streamed,
+        "streaming link must be byte-identical to the single-call link"
+    );
+}
+
+/// Same equivalence check, but files are summarized/resolved in reverse order —
+/// the streaming path's per-file resolve order must not affect the result
+/// (same convergence guarantee `link` itself has).
+#[test]
+fn streaming_link_is_independent_of_resolve_order() {
+    let files = program();
+    let order = [0, 1, 2];
+    let file_inputs = inputs(&files, &order);
+    let reference = link(&file_inputs, &LinkOpts::default());
+
+    let summaries: Vec<FileSummary> = file_inputs
+        .iter()
+        .map(|f| FileSummary::from_facts(f.blob_oid.clone(), f.path.clone(), f.lang.clone(), f.facts))
+        .collect();
+    let (nodes, def_to_node, table) = build_global_index(&summaries);
+    let mut session = LinkSession::new(&table, &def_to_node, LinkOpts::default());
+    for (file_idx, file) in file_inputs.iter().enumerate().rev() {
+        session.resolve_file(file, file_idx);
+    }
+    let streamed = session.finish(nodes);
+
+    assert_eq!(
+        reference, streamed,
+        "streaming resolve order must not affect the result"
+    );
 }
 
 #[test]

@@ -79,6 +79,7 @@ use cgx_core::confidence::{Confidence, Tier};
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
+use cgx_core::locality::{locality_tier, LocalityTier};
 use cgx_core::node::SymbolKind;
 use cgx_core::provenance::Provenance;
 
@@ -107,7 +108,19 @@ pub struct SigStats {
 /// Run the signature-keyed indirect-call resolution post-pass on `graph` in place,
 /// returning counters. Re-canonicalizes the graph if any placeholder was replaced
 /// (candidate-group membership changed).
-pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
+///
+/// `max_candidates` (opt-in, `None` = uncapped, matching every prior release):
+/// index-time analogue of the name-arity fallback's own cap. A signature-
+/// compatible set over [`CHA_SUPERNODE_CAP`] is *flagged* (`supernode_sites`,
+/// cut-marked) either way; when `max_candidates` is `Some(n)`, it is
+/// additionally truncated to the `n` nearest-by-locality targets — the same
+/// rule `--max-candidates` and the name-arity cap already use — rather than
+/// emitting an edge for every same-arity free function/closure in the corpus.
+/// A common 0-/1-arg callback signature (ubiquitous in both C fn-pointer
+/// callback tables and async JS/TS `(err, data) => {}`-shaped handlers) is
+/// exactly the shape this caps: candidate count scales with corpus size, not
+/// with how many functions could plausibly flow to the call site.
+pub fn run_sig(graph: &mut ResolvedGraph, max_candidates: Option<u32>) -> SigStats {
     let mut stats = SigStats::default();
 
     let sites = collect_indirect_sites(graph);
@@ -125,6 +138,14 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
         .nodes
         .iter()
         .map(|n| (n.node.id, n.node.lang.as_str()))
+        .collect();
+    // (file, fqn) per node, for the cap's nearest-first locality ranking only —
+    // built unconditionally since it is cheap relative to `lang_by_id` above and
+    // every site needs the caller's file/fqn, not just over-cap ones.
+    let file_fqn_by_id: BTreeMap<NodeId, (&str, &str)> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.node.id, (n.node.file.as_str(), n.node.fqn.as_str())))
         .collect();
 
     let mut next_group: u32 = graph
@@ -169,6 +190,21 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
             stats.supernode_sites += 1;
         }
         stats.sites_resolved += 1;
+
+        if let Some(max) = max_candidates {
+            if dsts.len() > max as usize {
+                let (caller_file, caller_fqn) =
+                    file_fqn_by_id.get(&src).copied().unwrap_or(("", ""));
+                dsts.sort_by_key(|dst| {
+                    let tier = file_fqn_by_id
+                        .get(dst)
+                        .map(|&(f, q)| locality_tier(caller_file, caller_fqn, f, q))
+                        .unwrap_or(LocalityTier::Global);
+                    (tier, *dst)
+                });
+                dsts.truncate(max as usize);
+            }
+        }
 
         // A group is allocated only for a multi-candidate set; a single-candidate
         // `possible` set carries no group (matches the link/CHA convention).

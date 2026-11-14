@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgx_core::id::NodeId;
 use cgx_core::node::{NodeRecord, SymbolKind};
-use cgx_frontend::facts::{FileFacts, ImportFact, ScopeId};
+use cgx_frontend::facts::{ExportFact, ImportFact, ScopeId};
 
 /// A definition's address in the linked graph plus the bits the link pass needs.
 #[derive(Debug, Clone)]
@@ -72,14 +72,20 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
-    /// Build the table from the assigned nodes and the per-file facts. `nodes`
-    /// must already carry their final dense [`NodeId`]s (assigned by the caller
-    /// via the canonical sort). `files` supplies the re-export facts; each entry
-    /// is `(module-last-segment, &FileFacts)`.
-    pub fn build(nodes: &[NodeRecord], files: &[(String, &FileFacts)]) -> Self {
+    /// Build the table from the assigned nodes and the per-file re-export facts.
+    /// `nodes` must already carry their final dense [`NodeId`]s (assigned by the
+    /// caller via the canonical sort). `files` supplies the re-export facts; each
+    /// entry is `(module-last-segment, imports, exports)` — only `ImportFact`s
+    /// with `re_export` set and `ExportFact`s with a `from` matter here, so a
+    /// streaming caller only needs these two slices per file, never the full
+    /// `FileFacts` (in particular, never `refs`/`scopes`).
+    pub fn build(
+        nodes: &[NodeRecord],
+        files: &[(String, &[ImportFact], &[ExportFact])],
+    ) -> Self {
         let mut t = SymbolTable::default();
-        for (module_seg, facts) in files {
-            t.record_reexports(module_seg, facts);
+        for (module_seg, imports, exports) in files {
+            t.record_reexports(module_seg, imports, exports);
         }
         for n in nodes {
             let entry = DefEntry {
@@ -120,8 +126,8 @@ impl SymbolTable {
 
     /// Record the re-export edges a file declares (`pub use … from`, `export …
     /// from`). `module_seg` is the file's module last segment (the suffix key).
-    fn record_reexports(&mut self, module_seg: &str, facts: &FileFacts) {
-        for imp in &facts.imports {
+    fn record_reexports(&mut self, module_seg: &str, imports: &[ImportFact], exports: &[ExportFact]) {
+        for imp in imports {
             if !imp.re_export {
                 continue;
             }
@@ -135,7 +141,7 @@ impl SymbolTable {
                 );
             }
         }
-        for exp in &facts.exports {
+        for exp in exports {
             if let Some(from) = &exp.from {
                 let local = exp.alias.clone().unwrap_or_else(|| exp.name.clone());
                 self.reexports.insert(

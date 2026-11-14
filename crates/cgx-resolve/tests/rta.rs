@@ -118,7 +118,7 @@ enum TriangleCtor {
 
 fn run_pipeline(facts: &FileFacts) -> ResolvedGraph {
     let mut g = link_facts(facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     run_rta(&mut g);
     g
 }
@@ -129,7 +129,7 @@ fn rta_prunes_the_never_instantiated_impl_and_upgrades_survivors_to_probable() {
     // drop Triangle and upgrade the surviving {Circle, Square} group to probable.
     let facts = shape_fixture(TriangleCtor::None);
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     let stats = run_rta(&mut g);
 
     assert_eq!(stats.sites_pruned, 1, "the one vcall site is RTA-pruned");
@@ -172,7 +172,7 @@ fn cut_marker_guard_keeps_the_full_cha_set_when_a_construction_is_under_a_cut() 
     // 3-candidate CHA set stays `possible`.
     let facts = shape_fixture(TriangleCtor::UnderMacroCut);
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     let stats = run_rta(&mut g);
 
     assert_eq!(stats.sites_pruned, 0, "the cut guard prevents any prune");
@@ -228,7 +228,7 @@ fn rta_pruned_to_a_single_survivor_is_still_probable_not_certain() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     let stats = run_rta(&mut g);
 
     assert_eq!(stats.sites_pruned, 1);
@@ -255,7 +255,7 @@ fn rta_leaves_a_fully_instantiated_set_as_cha_possible() {
     // an un-narrowed set is not "upgraded" because nothing was pruned.
     let facts = shape_fixture(TriangleCtor::Plain);
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     let stats = run_rta(&mut g);
 
     assert_eq!(stats.sites_pruned, 0, "every candidate type is instantiated ⇒ no prune");
@@ -299,7 +299,7 @@ fn rta_does_not_prune_when_no_type_is_instantiated() {
     };
 
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     let stats = run_rta(&mut g);
 
     assert_eq!(stats.sites_pruned, 0, "no instantiation evidence ⇒ no prune");

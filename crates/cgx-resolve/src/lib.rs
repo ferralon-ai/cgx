@@ -87,8 +87,9 @@ pub use graph::{
     UnresolvedRef,
 };
 pub use ifds::{IfdsStats, DEFAULT_MAX_SUMMARY_EDGES};
-pub use input::{FileInput, LinkOpts};
-pub use link::{canonicalize, link};
+pub use input::{FileInput, FileSummary, LinkOpts};
+pub use link::{build_global_index, canonicalize, link, LinkSession};
+pub use symtab::SymbolTable;
 pub use receiver::{CatStats, PrecisionStats};
 pub use rta::{run_rta, RtaStats};
 pub use sig::{run_sig, SigStats};
@@ -97,6 +98,6 @@ pub use summary::{FormalOut, SummaryFact};
 // Re-export the core types a caller needs to read the result without importing
 // cgx-core directly.
 pub use cgx_core::{
-    Candidate, Confidence, EdgeRecord, EdgeWithProvenance, NarrowingCounts, NodeRecord,
+    Candidate, Confidence, EdgeRecord, EdgeWithProvenance, NarrowingCounts, NodeId, NodeRecord,
     NodeWithProvenance, Tier,
 };

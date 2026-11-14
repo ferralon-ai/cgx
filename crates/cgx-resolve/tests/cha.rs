@@ -81,7 +81,7 @@ fn e3_cha_possible_set_equals_the_implements_trait_impl_set() {
     // must equal exactly the set of `Implements(_, Shape)` types' `area` methods.
     let facts = three_impls_with_vcall();
     let mut g = link_facts(&facts);
-    let stats = run_cha(&mut g);
+    let stats = run_cha(&mut g, None);
 
     assert_eq!(stats.sites_rescoped, 1, "the one vcall site is trait-scoped");
 
@@ -108,11 +108,44 @@ fn e3_cha_possible_set_equals_the_implements_trait_impl_set() {
 }
 
 #[test]
+fn max_candidates_none_keeps_every_implementor_unchanged() {
+    // Regression guard: `None` (the default) must reproduce the uncapped E3
+    // behavior byte-for-byte — confirms the cap parameter is a true no-op when
+    // unset, not just "off by default" in name.
+    let facts = three_impls_with_vcall();
+    let mut uncapped = link_facts(&facts);
+    run_cha(&mut uncapped, None);
+    let mut explicit_none = link_facts(&facts);
+    run_cha(&mut explicit_none, None);
+    assert_eq!(uncapped, explicit_none);
+    assert_eq!(cha_candidate_dsts(&uncapped).len(), 3);
+}
+
+#[test]
+fn max_candidates_caps_the_trait_scoped_set() {
+    // Three implementors of Shape::area, capped to 2: only 2 of the 3 survive,
+    // instead of every implementor getting a full CallsVirtual edge. This is
+    // the index-time analogue of `--max-candidates` for CHA's own fan-out —
+    // same rationale as the SIG cap, for a trait implemented by many types
+    // (e.g. a blanket `impl<T> Trait for T`) instead of a handful.
+    let facts = three_impls_with_vcall();
+    let mut g = link_facts(&facts);
+    let stats = run_cha(&mut g, Some(2));
+
+    assert_eq!(stats.sites_rescoped, 1);
+    assert_eq!(
+        cha_candidate_dsts(&g).len(),
+        2,
+        "capped to 2 of the 3 implementors"
+    );
+}
+
+#[test]
 fn no_name_method_edge_survives_after_cha_rescopes_the_site() {
     // The name-scoped resolution is replaced, not added alongside.
     let facts = three_impls_with_vcall();
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
     assert_eq!(
         g.edge_records()
             .filter(|e| e.rule == "name-method")
@@ -142,7 +175,7 @@ fn single_impl_trait_yields_a_probable_candidate() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    let stats = run_cha(&mut g);
+    let stats = run_cha(&mut g, None);
     assert_eq!(stats.sites_rescoped, 1);
 
     let cha: Vec<_> = g
@@ -183,7 +216,7 @@ fn supertrait_call_reaches_super_method_impls_via_inherits() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
 
     let expected: BTreeSet<NodeId> = ["m::Widget::base", "m::Gadget::base"]
         .iter()
@@ -221,7 +254,7 @@ fn unoverridden_default_method_points_at_the_trait_default_body() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    run_cha(&mut g);
+    run_cha(&mut g, None);
 
     let expected: BTreeSet<NodeId> = ["m::Circle::name", "m::Shape::name"]
         .iter()
@@ -257,7 +290,7 @@ fn blanket_impl_over_the_cap_keeps_the_group_and_cut_marks_it() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    let stats = run_cha(&mut g);
+    let stats = run_cha(&mut g, None);
 
     assert_eq!(stats.supernode_sites, 1, "the over-cap site is counted as a supernode");
 
@@ -289,7 +322,7 @@ fn pure_inherent_method_call_is_left_name_scoped() {
     let facts = b.build();
 
     let mut g = link_facts(&facts);
-    let stats = run_cha(&mut g);
+    let stats = run_cha(&mut g, None);
     assert_eq!(stats.sites_rescoped, 0, "no trait declares compute() → untouched");
     assert_eq!(
         g.edge_records().filter(|e| e.rule == "cha-trait-set").count(),
@@ -307,8 +340,8 @@ fn cha_reindex_is_byte_identical() {
     let facts = three_impls_with_vcall();
     let mut g1 = link_facts(&facts);
     let mut g2 = link_facts(&facts);
-    run_cha(&mut g1);
-    run_cha(&mut g2);
+    run_cha(&mut g1, None);
+    run_cha(&mut g2, None);
     let (n1, e1, c1) = g1.into_linked();
     let (n2, e2, c2) = g2.into_linked();
     let b1 = cgx_core::codec::encode(&(&n1, &e1, &c1)).unwrap();

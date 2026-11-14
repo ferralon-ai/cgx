@@ -57,6 +57,7 @@ use cgx_core::confidence::{Confidence, Tier};
 use cgx_core::cut::CutMarker;
 use cgx_core::edge::{Candidate, EdgeKind, EdgeRecord, EdgeWithProvenance};
 use cgx_core::id::{EdgeId, NodeId, SiteId};
+use cgx_core::locality::{locality_tier, LocalityTier};
 use cgx_core::node::SymbolKind;
 use cgx_core::provenance::Provenance;
 
@@ -89,7 +90,15 @@ pub struct ChaStats {
 /// Run the CHA trait-scoping post-pass on `graph` in place, returning counters.
 /// Re-canonicalizes the graph if any site was rescoped (candidate-group
 /// membership changed).
-pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
+///
+/// `max_candidates` (opt-in, `None` = uncapped, matching every prior release):
+/// index-time analogue of the name-arity fallback's own cap. A trait-scoped set
+/// over [`CHA_SUPERNODE_CAP`] is *flagged* (`supernode_sites`, cut-marked) either
+/// way; when `max_candidates` is `Some(n)`, it is additionally truncated to the
+/// `n` nearest-by-locality targets, same rule `--max-candidates` and the
+/// name-arity cap already use — rather than emitting every one of a hierarchy
+/// with hundreds of implementors (e.g. a blanket `impl<T> Trait for T`).
+pub fn run_cha(graph: &mut ResolvedGraph, max_candidates: Option<u32>) -> ChaStats {
     let lattice = Lattice::build(graph);
     let mut stats = ChaStats::default();
 
@@ -139,6 +148,30 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
             stats.supernode_sites += 1;
         }
         stats.sites_rescoped += 1;
+
+        if let Some(max) = max_candidates {
+            if dsts.len() > max as usize {
+                let (caller_file, caller_fqn) = node_index
+                    .get(&template.edge.src)
+                    .map(|&i| (graph.nodes[i].node.file.as_str(), graph.nodes[i].node.fqn.as_str()))
+                    .unwrap_or(("", ""));
+                dsts.sort_by_key(|dst| {
+                    let tier = node_index
+                        .get(dst)
+                        .map(|&i| {
+                            locality_tier(
+                                caller_file,
+                                caller_fqn,
+                                &graph.nodes[i].node.file,
+                                &graph.nodes[i].node.fqn,
+                            )
+                        })
+                        .unwrap_or(LocalityTier::Global);
+                    (tier, *dst)
+                });
+                dsts.truncate(max as usize);
+            }
+        }
 
         // The new group: only when the rescoped set has >1 candidate.
         let group = if dsts.len() > 1 {

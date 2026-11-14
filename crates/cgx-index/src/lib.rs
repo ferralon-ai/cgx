@@ -127,9 +127,9 @@ pub fn index_path(
     let blobs_loaded = stats.blobs_indexed + stats.blobs_unsupported;
     stats.blobs_unsupported += total_blob_count.saturating_sub(blobs_loaded);
     pipeline::apply_scip(&mut graph, &mut stats, &sources, &source_root, opts)?;
-    pipeline::apply_cha(&mut graph, &mut stats);
+    pipeline::apply_cha(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_rta(&mut graph, &mut stats);
-    pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_effects(&mut graph, &mut stats);
     pipeline::store_graph(store, &tree_oid, None, graph)?;
     Ok(IndexOutcome {
@@ -165,9 +165,9 @@ pub fn index_workdir(
     let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
     // Workdir rel-paths are relative to the walked directory; anchor there.
     pipeline::apply_scip(&mut graph, &mut stats, &sources, dir, opts)?;
-    pipeline::apply_cha(&mut graph, &mut stats);
+    pipeline::apply_cha(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_rta(&mut graph, &mut stats);
-    pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_effects(&mut graph, &mut stats);
     pipeline::store_graph(store, &key, None, graph)?;
     Ok(IndexOutcome {
@@ -211,6 +211,15 @@ pub fn manifest_digest(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard (user requirement): both index-time candidate caps
+    /// must default to uncapped, matching every prior release's behavior.
+    #[test]
+    fn index_opts_default_never_caps_candidate_fan_out() {
+        let opts = IndexOpts::default();
+        assert_eq!(opts.max_name_arity_candidates, None);
+        assert_eq!(opts.max_supernode_candidates, None);
+    }
 
     fn source(blob_oid: &str, rel_path: &str) -> SourceFile {
         SourceFile {

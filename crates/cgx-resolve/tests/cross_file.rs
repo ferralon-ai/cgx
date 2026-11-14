@@ -551,6 +551,123 @@ fn name_arity_candidates_ranked_by_locality_none_dropped() {
 }
 
 #[test]
+fn link_opts_default_never_caps_the_name_arity_fallback() {
+    // Explicit regression guard (user requirement): the index-time fan-out cap
+    // must never be the default — it is a recall trade a caller opts into for
+    // a corpus with heavy same-short-name collisions (e.g. WS2003's MFC/ATL
+    // dialogs), not a behavior change for every existing cgx user.
+    assert_eq!(
+        LinkOpts::default().max_name_arity_candidates,
+        None,
+        "max_name_arity_candidates must default to uncapped"
+    );
+}
+
+#[test]
+fn name_arity_cap_keeps_only_the_nearest_candidates_and_drops_the_rest() {
+    // Same three-locality fixture as
+    // `name_arity_candidates_ranked_by_locality_none_dropped` (same-module,
+    // same-crate, global), but with `max_name_arity_candidates: Some(2)`: only
+    // the two *nearest* candidates survive — same-module and same-crate — and
+    // the farthest (global) is dropped entirely, never reaching `edges` or
+    // `candidates`. This is the index-time analogue of `--max-candidates`,
+    // applied before the edge is ever built rather than filtered at query time.
+    let mut m = FileBuilder::new();
+    m.def(
+        "crate::b::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let m = m.build();
+
+    let mut x = FileBuilder::new();
+    x.def(
+        "crate::x::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let x = x.build();
+
+    let mut o = FileBuilder::new();
+    o.def(
+        "other::helper",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(1),
+    );
+    let o = o.build();
+
+    let mut caller_file = FileBuilder::new();
+    let run = caller_file.scope(ScopeId::ROOT, Some("crate::b::run"));
+    caller_file.def(
+        "crate::b::run",
+        SymbolKind::Function,
+        ScopeId::ROOT,
+        1,
+        PUB,
+        false,
+        Some(0),
+    );
+    caller_file.raw_ref(
+        &["helper"],
+        run,
+        2,
+        RefKind::Call,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let b = caller_file.build();
+
+    let inputs = vec![
+        input("src/m.rs", "rust", &m),
+        input("src/x.rs", "rust", &x),
+        input("src/o.rs", "rust", &o),
+        input("src/b.rs", "rust", &b),
+    ];
+    let opts = LinkOpts {
+        max_name_arity_candidates: Some(2),
+        ..LinkOpts::default()
+    };
+    let g = link(&inputs, &opts);
+
+    let fqn_of: std::collections::BTreeMap<_, _> =
+        g.node_records().map(|n| (n.id, n.fqn.clone())).collect();
+    let fallback: Vec<_> = g
+        .edge_records()
+        .filter(|e| e.rule.starts_with("name-arity"))
+        .collect();
+    assert_eq!(fallback.len(), 2, "capped to the 2 nearest candidates");
+
+    let kept: std::collections::BTreeSet<&str> = fallback
+        .iter()
+        .map(|e| fqn_of.get(&e.dst).map(String::as_str).unwrap())
+        .collect();
+    assert!(
+        kept.contains("crate::b::helper"),
+        "nearest (same-module) candidate must survive the cap"
+    );
+    assert!(
+        kept.contains("crate::x::helper"),
+        "second-nearest (same-crate) candidate must survive the cap"
+    );
+    assert!(
+        !kept.contains("other::helper"),
+        "farthest (global) candidate must be the one dropped by the cap"
+    );
+}
+
+#[test]
 fn re_export_chain_resolves_to_original_definition() {
     // direct.rs defines add; imports.rs does `pub use crate::direct::add`;
     // consumer.rs imports add *from crate::imports* and calls it. Resolution must

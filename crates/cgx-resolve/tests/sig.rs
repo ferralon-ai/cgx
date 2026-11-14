@@ -92,7 +92,7 @@ fn indirect_call_resolves_to_the_arity_compatible_function_values_only() {
     assert_eq!(placeholders.len(), 1, "one indirect placeholder edge");
     assert_eq!(placeholders[0].rule, "indirect:1", "arity encoded in the rule");
 
-    let stats = run_sig(&mut g);
+    let stats = run_sig(&mut g, None);
     assert_eq!(stats.sites_resolved, 1, "the one indirect site is resolved");
     assert_eq!(stats.sites_unmatched, 0);
 
@@ -118,7 +118,7 @@ fn the_signature_compatible_set_is_all_possible_chararta_callscallback() {
     // rule `sig-compat`, and carries a candidate group (a multi-candidate set).
     let facts = callback_with_arity_one_and_two();
     let mut g = link_facts(&facts);
-    run_sig(&mut g);
+    run_sig(&mut g, None);
 
     let edges: Vec<_> = g.edge_records().filter(|e| e.rule == "sig-compat").collect();
     assert_eq!(edges.len(), 3, "three compatible candidates");
@@ -154,7 +154,7 @@ fn no_compatible_target_leaves_the_call_honestly_dangling() {
     let facts = b.build();
     let mut g = link_facts(&facts);
 
-    let stats = run_sig(&mut g);
+    let stats = run_sig(&mut g, None);
     assert_eq!(stats.sites_resolved, 0);
     assert_eq!(stats.sites_unmatched, 1, "no arity-3 candidate → unmatched");
     assert_eq!(sig_candidate_dsts(&g).len(), 0, "no sig-compat edge emitted");
@@ -190,7 +190,7 @@ fn unknown_call_site_arity_admits_every_function_value() {
         "arity-less placeholder encodes `indirect:?`"
     );
 
-    let stats = run_sig(&mut g);
+    let stats = run_sig(&mut g, None);
     assert_eq!(stats.sites_resolved, 1);
     // run, a, b, and the closure are all function values (run is the caller but
     // also a free fn value); all admitted under unknown arity.
@@ -223,7 +223,7 @@ fn methods_are_excluded_only_free_functions_and_closures_are_candidates() {
     );
     let facts = b.build();
     let mut g = link_facts(&facts);
-    run_sig(&mut g);
+    run_sig(&mut g, None);
 
     let dsts = sig_candidate_dsts(&g);
     assert!(dsts.contains(&node_id(&g, "m::free")), "free fn is a candidate");
@@ -263,7 +263,7 @@ fn supernode_cap_keeps_the_full_set_with_a_cut_marker() {
     );
     let facts = b.build();
     let mut g = link_facts(&facts);
-    let stats = run_sig(&mut g);
+    let stats = run_sig(&mut g, None);
 
     assert_eq!(stats.sites_resolved, 1);
     assert_eq!(stats.supernode_sites, 1, "the over-cap site is counted");
@@ -310,7 +310,7 @@ fn candidates_are_partitioned_by_source_language() {
     ];
     let mut g = link(&inputs, &LinkOpts::default());
 
-    let stats = run_sig(&mut g);
+    let stats = run_sig(&mut g, None);
     assert_eq!(stats.sites_resolved, 1);
 
     let dsts = sig_candidate_dsts(&g);
@@ -325,14 +325,114 @@ fn candidates_are_partitioned_by_source_language() {
 }
 
 #[test]
+fn max_candidates_none_is_uncapped_by_default() {
+    // Regression guard (user requirement): the index-time supernode cap must
+    // never be the default — `None` must reproduce the exact uncapped
+    // candidate set, same as calling `run_sig` had no cap parameter at all.
+    let n = CHA_SUPERNODE_CAP + 5;
+    let mut b = FileBuilder::new();
+    b.def("m::run", SymbolKind::Function, ROOT, 1, PUB, false, Some(0));
+    for i in 0..n {
+        b.def(
+            &format!("m::f{i:03}"),
+            SymbolKind::Function,
+            ROOT,
+            (i + 2) as u32,
+            PUB,
+            false,
+            Some(1),
+        );
+    }
+    let run_scope = b.scope(ROOT, Some("m::run"));
+    b.raw_ref(
+        &["cb"],
+        run_scope,
+        500,
+        RefKind::CallCallback,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let facts = b.build();
+    let mut g = link_facts(&facts);
+    run_sig(&mut g, None);
+    assert_eq!(
+        sig_candidate_dsts(&g).len(),
+        n,
+        "None must keep every candidate, identical to the uncapped path"
+    );
+}
+
+#[test]
+fn max_candidates_caps_the_signature_compatible_set_to_the_nearest() {
+    // Three same-arity free functions at three localities relative to the
+    // caller `crate::b::run` (file `src/b.rs`) — same fixture shape as
+    // `cross_file.rs`'s `name_arity_candidates_ranked_by_locality_none_dropped`:
+    //   crate::b::helper  (shares crate::b) -> same-module (nearest)
+    //   crate::x::helper  (shares crate)    -> same-crate
+    //   other::helper     (shares nothing)  -> global (farthest)
+    // Capped to 2: only the two nearest survive; the farthest (global) is
+    // dropped — the index-time analogue of `--max-candidates`, applied before
+    // the edge is built rather than filtered at query time.
+    let mut m = FileBuilder::new();
+    m.def("crate::b::helper", SymbolKind::Function, ROOT, 1, PUB, false, Some(1));
+    let m_facts = m.build();
+
+    let mut x = FileBuilder::new();
+    x.def("crate::x::helper", SymbolKind::Function, ROOT, 1, PUB, false, Some(1));
+    let x_facts = x.build();
+
+    let mut o = FileBuilder::new();
+    o.def("other::helper", SymbolKind::Function, ROOT, 1, PUB, false, Some(1));
+    let o_facts = o.build();
+
+    let mut b = FileBuilder::new();
+    let run_scope = b.scope(ROOT, Some("crate::b::run"));
+    b.def("crate::b::run", SymbolKind::Function, ROOT, 1, PUB, false, Some(0));
+    b.raw_ref(
+        &["cb"],
+        run_scope,
+        2,
+        RefKind::CallCallback,
+        EdgeCondition::Always,
+        Some(1),
+    );
+    let b_facts = b.build();
+
+    let inputs = vec![
+        FileInput::new("blob-m".to_string(), "src/m.rs", "rust", &m_facts),
+        FileInput::new("blob-x".to_string(), "src/x.rs", "rust", &x_facts),
+        FileInput::new("blob-o".to_string(), "src/o.rs", "rust", &o_facts),
+        FileInput::new("blob-b".to_string(), "src/b.rs", "rust", &b_facts),
+    ];
+    let mut g = link(&inputs, &LinkOpts::default());
+    let stats = run_sig(&mut g, Some(2));
+
+    assert_eq!(stats.sites_resolved, 1);
+    let kept = sig_candidate_dsts(&g);
+    assert_eq!(kept.len(), 2, "capped to the 2 nearest candidates");
+    assert!(
+        kept.contains(&node_id(&g, "crate::b::helper")),
+        "nearest (same-module) candidate must survive the cap"
+    );
+    assert!(
+        kept.contains(&node_id(&g, "crate::x::helper")),
+        "second-nearest (same-crate) candidate must survive the cap"
+    );
+    assert!(
+        !kept.contains(&node_id(&g, "other::helper")),
+        "farthest (global) candidate must be the one dropped by the cap"
+    );
+}
+
+#[test]
 fn re_running_the_signature_pass_is_byte_identical() {
     // Determinism (§7): link + run_sig twice → identical graphs.
     let facts = callback_with_arity_one_and_two();
 
     let mut g1 = link_facts(&facts);
-    run_sig(&mut g1);
+    run_sig(&mut g1, None);
     let mut g2 = link_facts(&facts);
-    run_sig(&mut g2);
+    run_sig(&mut g2, None);
 
     assert_eq!(g1.edges, g2.edges, "edges are byte-identical across runs");
     assert_eq!(

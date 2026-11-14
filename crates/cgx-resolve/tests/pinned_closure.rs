@@ -40,7 +40,7 @@ fn link_ts(facts: &FileFacts) -> ResolvedGraph {
         facts,
     )];
     let mut g = link(&inputs, &LinkOpts::default());
-    run_sig(&mut g);
+    run_sig(&mut g, None);
     g
 }
 

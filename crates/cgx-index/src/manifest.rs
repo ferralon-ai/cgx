@@ -160,6 +160,22 @@ fn is_named(path: &str, name: &str) -> bool {
     path == name || path.ends_with(&format!("/{name}"))
 }
 
+/// Whether `path` is a build-system manifest the pipeline's `PackageMap` or
+/// `ManifestMap` may need to read for package-identity resolution. Used by the
+/// enumeration pre-filter so manifest files are included in `sources` even when
+/// no language adapter handles them.
+pub(crate) fn is_pipeline_manifest(path: &str) -> bool {
+    // Cargo manifest (any depth)
+    is_named(path, "Cargo.toml") ||
+    // Go module root
+    is_named(path, "go.mod") ||
+    // Node/NPM package
+    is_named(path, "package.json") ||
+    // Python packaging
+    is_named(path, "pyproject.toml") ||
+    is_named(path, "setup.py")
+}
+
 /// The src-aware Python import root: the pyproject/setup.py dir plus `/src` when
 /// a `src/` subdir exists in the source set (src-layout anchor), else the dir
 /// itself. This is the accepted v1 heuristic (`[tool.setuptools] package-dir` is

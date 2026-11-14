@@ -384,7 +384,7 @@ fn acquire(store: &mut impl FactStore, root: &Path, sides: &Sides) -> Result<(Si
         }
         Sides::Workdir => {
             let repo = Repo::discover(root)?;
-            let committed = repo.enumerate_tree()?;
+            let committed = repo.enumerate_tree(None)?;
             let outcome = index_path(root, &default_registry(), store, &IndexOpts::default())?;
             let base_side = Side {
                 graph_key: outcome.graph_key,
@@ -404,7 +404,7 @@ fn index_working_dir(store: &mut impl FactStore, root: &Path) -> Result<Side> {
         .workdir()
         .ok_or_else(|| DiffError::Git("repository has no working directory (bare)".to_string()))?
         .to_path_buf();
-    let working = repo.enumerate_workdir(&workdir)?;
+    let working = repo.enumerate_workdir(&workdir, None)?;
     let manifest = manifest_of(working);
     let outcome = index_workdir(
         root,
@@ -453,7 +453,7 @@ fn index_ref(store: &mut impl FactStore, repo_root: &Path, commit_hex: &str) -> 
     }
 
     let acquired = (|| -> Result<(cgx_index::IndexOutcome, Vec<cgx_index::SourceFile>)> {
-        let sources = Repo::discover(&worktree_path)?.enumerate_tree()?;
+        let sources = Repo::discover(&worktree_path)?.enumerate_tree(None)?;
         let outcome = index_path(
             &worktree_path,
             &default_registry(),

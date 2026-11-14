@@ -70,7 +70,7 @@ pub use cgx_resolve::{ChaStats, DataflowStats, RtaStats, SigStats};
 pub use pipeline::{CompdbReport, IndexOpts, IndexStats, ScipStats};
 pub use registry::default_registry;
 
-use cgx_frontend::FrontendRegistry;
+use cgx_frontend::{FrontendRegistry, RelPath};
 use cgx_store::FactStore;
 use std::path::Path;
 
@@ -99,7 +99,21 @@ pub fn index_path(
 ) -> Result<IndexOutcome> {
     let repo = Repo::discover(&repo_path)?;
     let tree_oid = repo.head_tree_oid()?;
-    let sources = repo.enumerate_tree()?;
+    // Count all blobs in the tree cheaply (no content load) so we can report the
+    // true total and unsupported-file counts even though the filter below skips
+    // loading content for files no adapter or manifest reader can use.
+    let total_blob_count = repo
+        .tree_blob_oids(&tree_oid)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    // Pre-filter by path before loading blob content: skips files no adapter can
+    // process, avoiding materialising their bytes in memory (peak-RSS fix).
+    // Manifest files (Cargo.toml, go.mod, …) are always included so PackageMap
+    // and ManifestMap can resolve package identities from the sources slice.
+    let sources = repo.enumerate_tree(Some(&|path: &str| {
+        registry.has_adapter_for(&RelPath::new(path.to_string()))
+            || manifest::is_pipeline_manifest(path)
+    }))?;
     // Discovered C++ TU paths are relative to the repo root; anchor compdb
     // coverage comparison there.
     let source_root = repo
@@ -107,10 +121,15 @@ pub fn index_path(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo_path.as_ref().to_path_buf());
     let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
+    // Back-fill the unsupported count with blobs the filter skipped entirely.
+    // `blobs_indexed + blobs_unsupported` = blobs we loaded; anything beyond
+    // that total was filtered before content load and should count as unsupported.
+    let blobs_loaded = stats.blobs_indexed + stats.blobs_unsupported;
+    stats.blobs_unsupported += total_blob_count.saturating_sub(blobs_loaded);
     pipeline::apply_scip(&mut graph, &mut stats, &sources, &source_root, opts)?;
-    pipeline::apply_cha(&mut graph, &mut stats);
+    pipeline::apply_cha(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_rta(&mut graph, &mut stats);
-    pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_effects(&mut graph, &mut stats);
     pipeline::store_graph(store, &tree_oid, None, graph)?;
     Ok(IndexOutcome {
@@ -137,14 +156,18 @@ pub fn index_workdir(
 ) -> Result<IndexOutcome> {
     let repo = Repo::discover(repo_path)?;
     let dir = dir.as_ref();
-    let sources = repo.enumerate_workdir(dir)?;
+    // Pre-filter by path before reading file content (peak-RSS fix, mirrors index_path).
+    let sources = repo.enumerate_workdir(dir, Some(&|path: &str| {
+        registry.has_adapter_for(&RelPath::new(path.to_string()))
+            || manifest::is_pipeline_manifest(path)
+    }))?;
     let key = workdir_key(&sources);
     let (mut graph, mut stats) = pipeline::extract_and_link(&sources, registry, store, opts)?;
     // Workdir rel-paths are relative to the walked directory; anchor there.
     pipeline::apply_scip(&mut graph, &mut stats, &sources, dir, opts)?;
-    pipeline::apply_cha(&mut graph, &mut stats);
+    pipeline::apply_cha(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_rta(&mut graph, &mut stats);
-    pipeline::apply_sig(&mut graph, &mut stats);
+    pipeline::apply_sig(&mut graph, &mut stats, opts.max_supernode_candidates);
     pipeline::apply_effects(&mut graph, &mut stats);
     pipeline::store_graph(store, &key, None, graph)?;
     Ok(IndexOutcome {
@@ -188,6 +211,15 @@ pub fn manifest_digest(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard (user requirement): both index-time candidate caps
+    /// must default to uncapped, matching every prior release's behavior.
+    #[test]
+    fn index_opts_default_never_caps_candidate_fan_out() {
+        let opts = IndexOpts::default();
+        assert_eq!(opts.max_name_arity_candidates, None);
+        assert_eq!(opts.max_supernode_candidates, None);
+    }
 
     fn source(blob_oid: &str, rel_path: &str) -> SourceFile {
         SourceFile {

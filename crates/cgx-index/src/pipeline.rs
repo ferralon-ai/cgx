@@ -33,8 +33,9 @@ use crate::git::SourceFile;
 use cgx_core::codec::{decode, encode};
 use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
 use cgx_resolve::{
-    link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
-    EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
+    build_global_index, link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig,
+    ChaStats, DataflowStats, EffectStats, FileInput, FileSummary, IfdsDataflowStats, LinkOpts,
+    LinkSession, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
 use cgx_store::{FactStore, FragmentInput, FragmentKey, LinkedGraph, TreeOid};
@@ -70,6 +71,21 @@ pub struct IndexOpts {
     /// Print one stderr line per narrowed virtual site. Ignored unless
     /// `receiver_narrowing` is on.
     pub narrowing_trace: bool,
+    /// Cap the Tier-0 global name(+arity) fallback's candidate-set size at
+    /// index time (`cgx index --max-name-arity-candidates N`). `None` (the
+    /// default) is uncapped — see `cgx_resolve::LinkOpts::max_name_arity_candidates`
+    /// for why this must stay opt-in rather than become a default.
+    pub max_name_arity_candidates: Option<u32>,
+    /// Cap CHA's trait-scoped and SIG's signature-compatible candidate-set
+    /// size at index time (`cgx index --max-supernode-candidates N`). Both
+    /// passes already flag an over-[`cgx_resolve::CHA_SUPERNODE_CAP`] (64)
+    /// group as a cut-marked "supernode" — but that flag never limited the
+    /// edge count; every candidate still got a full edge. `None` (the
+    /// default) keeps that uncapped behavior, matching every prior release;
+    /// `Some(n)` truncates each over-cap group to its `n` nearest-by-locality
+    /// targets. See `cgx_resolve::run_cha`/`run_sig` for why this must stay
+    /// opt-in rather than become a default.
+    pub max_supernode_candidates: Option<u32>,
 }
 
 /// Counters describing what an index run did. The incremental win is observable
@@ -145,8 +161,6 @@ pub(crate) fn extract_and_link<S: FactStore>(
     store: &mut S,
     opts: &IndexOpts,
 ) -> Result<(ResolvedGraph, IndexStats)> {
-    use rayon::prelude::*;
-
     let mut stats = IndexStats::default();
 
     // Resolve each file's owning package from the Cargo manifests in the source
@@ -161,106 +175,6 @@ pub(crate) fn extract_and_link<S: FactStore>(
     // reads `FileCtx::manifest` yet.
     let manifest_map = ManifestMap::from_sources(sources);
 
-    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
-    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
-    // this stays single-threaded; only the CPU-bound extraction is parallelized.
-    let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
-    for src in sources {
-        let rel = RelPath::new(src.rel_path.clone());
-        if !registry.has_adapter_for(&rel) {
-            stats.blobs_unsupported += 1;
-            continue;
-        }
-        // The key is derived from the exact context `extract` will see, so an
-        // identical blob at another path (or under another package/manifest)
-        // never reuses this file's path-derived FQNs.
-        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
-        let manifest = manifest_map.manifest_for(&src.rel_path);
-        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
-            .with_package(package)
-            .with_manifest(manifest);
-        let key = FragmentKey::derive(&ctx.cache_identity());
-        let want = registry.frontend_for(&rel).fragment_version();
-        match store.fragment(&key)? {
-            Some(cached) if cached.frontend_version == want => {
-                let facts: FileFacts = decode(&cached.fragment)?;
-                stats.blobs_cached += 1;
-                prepared.push(PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                });
-            }
-            // A fragment from another frontend version may not even decode under
-            // the current `FileFacts` schema, so it is never read: re-extract it
-            // and let the store overwrite it.
-            Some(_) => {
-                stats.blobs_stale += 1;
-                misses.push((src, ctx, key));
-            }
-            None => misses.push((src, ctx, key)),
-        }
-    }
-
-    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the (content, context) purity that makes Layer-1
-    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
-    // step 3).
-    let extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = misses
-        .into_par_iter()
-        .map(|(src, ctx, key)| {
-            let rel = RelPath::new(src.rel_path.clone());
-            let facts = registry.extract(&src.content, &ctx)?;
-            let bytes = encode(&facts)?;
-            let version = registry.frontend_for(&rel).fragment_version();
-            Ok((
-                PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                },
-                key,
-                version,
-                bytes,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    stats.blobs_extracted = extracted.len();
-
-    // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .map(|(p, key, version, bytes)| FragmentInput {
-                key,
-                lang: &p.lang,
-                frontend_version: *version,
-                bytes,
-            })
-            .collect();
-        store.put_fragments(&batch)?;
-    }
-    prepared.extend(extracted.into_iter().map(|(p, ..)| p));
-
-    // Restore deterministic order (cache hits + parallel misses interleave):
-    // sort by path so the link input set is order-stable.
-    prepared.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    stats.blobs_indexed = prepared.len();
-
-    let inputs: Vec<FileInput<'_>> = prepared
-        .iter()
-        .map(|p| {
-            FileInput::new(
-                p.blob_oid.clone(),
-                p.rel_path.clone(),
-                p.lang.clone(),
-                &p.facts,
-            )
-        })
-        .collect();
     // v0.3 SC3 pre-pass: load the per-function intraproc cache so the link can
     // classify each function as recomputed (hash changed / absent) or reused
     // (hash unchanged). Empty/absent for a non-dataflow run (the cache is only
@@ -276,9 +190,22 @@ pub(crate) fn extract_and_link<S: FactStore>(
         prior_fn_cache,
         receiver_narrowing: opts.receiver_narrowing,
         narrowing_trace: opts.narrowing_trace,
+        max_name_arity_candidates: opts.max_name_arity_candidates,
         ..LinkOpts::default()
     };
-    let graph = link(&inputs, &link_opts);
+
+    // The streaming path (peak-RSS fix) never holds every file's full
+    // `FileFacts` in memory at once; it needs `--dataflow` and
+    // `--receiver-narrowing` off, since both need every file's full facts
+    // available simultaneously (summary dataflow closures / receiver-kind
+    // narrowing across the whole corpus). Those two flags are off by default
+    // and unused by the WS2003 corpus; the in-memory path below is their
+    // (unchanged) fallback.
+    let graph = if link_opts.dataflow || link_opts.receiver_narrowing {
+        extract_and_link_in_memory(sources, registry, store, &pkg_map, &manifest_map, &link_opts, &mut stats)?
+    } else {
+        extract_and_link_streaming(sources, registry, store, &pkg_map, &manifest_map, &link_opts, &mut stats)?
+    };
     stats.precision = graph.precision;
     stats.nodes = graph.nodes.len();
     stats.edges = graph.edges.len();
@@ -306,6 +233,267 @@ pub(crate) fn extract_and_link<S: FactStore>(
     }
 
     Ok((graph, stats))
+}
+
+/// The original extract → cache → link path: every file's `FileFacts` (cache
+/// hits and freshly extracted misses alike) are materialized into `prepared`
+/// and handed to `cgx_resolve::link` in one call. Used only when
+/// `link_opts.dataflow` or `link_opts.receiver_narrowing` is set — both need
+/// every file's full facts available at once, so there is nothing to stream.
+/// On a large corpus with many declarations per file (e.g. WS2003's 131K
+/// C/C++ files) this holds tens of GB of `FileFacts` simultaneously; avoid it
+/// for the default (non-dataflow, non-narrowing) case — see
+/// `extract_and_link_streaming`.
+fn extract_and_link_in_memory<S: FactStore>(
+    sources: &[SourceFile],
+    registry: &FrontendRegistry,
+    store: &mut S,
+    pkg_map: &PackageMap,
+    manifest_map: &ManifestMap,
+    link_opts: &LinkOpts,
+    stats: &mut IndexStats,
+) -> Result<ResolvedGraph> {
+    use rayon::prelude::*;
+
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
+    for src in sources {
+        let rel = RelPath::new(src.rel_path.clone());
+        if !registry.has_adapter_for(&rel) {
+            stats.blobs_unsupported += 1;
+            continue;
+        }
+        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+        let manifest = manifest_map.manifest_for(&src.rel_path);
+        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+            .with_package(package)
+            .with_manifest(manifest);
+        let key = FragmentKey::derive(&ctx.cache_identity());
+        let want = registry.frontend_for(&rel).fragment_version();
+        match store.fragment(&key)? {
+            Some(cached) if cached.frontend_version == want => {
+                let facts: FileFacts = decode(&cached.fragment)?;
+                stats.blobs_cached += 1;
+                prepared.push(PreparedFile {
+                    blob_oid: src.blob_oid.clone(),
+                    rel_path: src.rel_path.clone(),
+                    lang: registry.lang_for(&rel).tag().to_string(),
+                    facts,
+                });
+            }
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push((src, ctx, key));
+            }
+            None => misses.push((src, ctx, key)),
+        }
+    }
+
+    const EXTRACT_CHUNK_SIZE: usize = 2_000;
+    let mut total_extracted = 0usize;
+    for chunk in misses.chunks(EXTRACT_CHUNK_SIZE) {
+        let chunk_extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = chunk
+            .into_par_iter()
+            .map(|(src, ctx, key)| {
+                let rel = RelPath::new(src.rel_path.clone());
+                let facts = registry.extract(&src.content, &ctx)?;
+                let bytes = encode(&facts)?;
+                let version = registry.frontend_for(&rel).fragment_version();
+                Ok((
+                    PreparedFile {
+                        blob_oid: src.blob_oid.clone(),
+                        rel_path: src.rel_path.clone(),
+                        lang: registry.lang_for(&rel).tag().to_string(),
+                        facts,
+                    },
+                    key.clone(),
+                    version,
+                    bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        total_extracted += chunk_extracted.len();
+
+        if !chunk_extracted.is_empty() {
+            let batch: Vec<FragmentInput<'_>> = chunk_extracted
+                .iter()
+                .map(|(p, key, version, bytes)| FragmentInput {
+                    key,
+                    lang: &p.lang,
+                    frontend_version: *version,
+                    bytes,
+                })
+                .collect();
+            store.put_fragments(&batch)?;
+        }
+        prepared.extend(chunk_extracted.into_iter().map(|(p, ..)| p));
+    }
+    stats.blobs_extracted = total_extracted;
+
+    prepared.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    stats.blobs_indexed = prepared.len();
+
+    let inputs: Vec<FileInput<'_>> = prepared
+        .iter()
+        .map(|p| {
+            FileInput::new(
+                p.blob_oid.clone(),
+                p.rel_path.clone(),
+                p.lang.clone(),
+                &p.facts,
+            )
+        })
+        .collect();
+    Ok(link(&inputs, link_opts))
+}
+
+/// The streaming extract → cache → link path (peak-RSS fix): Pass 0 builds the
+/// global symbol table from a [`FileSummary`] per file — declaration-level
+/// facts only (`defs`/`effects`/`entrypoint_hints`/`imports`/`exports`/
+/// `impl_relations`), never the much larger `refs`/`scopes` a full `FileFacts`
+/// also carries. Pass A/B then re-reads each file's full `FileFacts` from the
+/// Layer-1 fragment store **one file at a time**, resolves it against the
+/// already-built table, and drops it before the next file. Peak memory holds
+/// the summaries for every file (small) plus one file's full facts (tiny) at
+/// once, instead of every file's full facts simultaneously.
+///
+/// Requires `link_opts.dataflow` and `link_opts.receiver_narrowing` both off —
+/// callers must route through `extract_and_link_in_memory` otherwise (see
+/// `LinkSession::new`, which asserts this).
+fn extract_and_link_streaming<S: FactStore>(
+    sources: &[SourceFile],
+    registry: &FrontendRegistry,
+    store: &mut S,
+    pkg_map: &PackageMap,
+    manifest_map: &ManifestMap,
+    link_opts: &LinkOpts,
+    stats: &mut IndexStats,
+) -> Result<ResolvedGraph> {
+    use rayon::prelude::*;
+
+    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits
+    // (summarize now, dropping the decoded full facts immediately) and misses
+    // (extract in parallel below).
+    let mut summaries: Vec<FileSummary> = Vec::new();
+    let mut keys: Vec<FragmentKey> = Vec::new();
+    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
+    for src in sources {
+        let rel = RelPath::new(src.rel_path.clone());
+        if !registry.has_adapter_for(&rel) {
+            stats.blobs_unsupported += 1;
+            continue;
+        }
+        let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
+        let manifest = manifest_map.manifest_for(&src.rel_path);
+        let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
+            .with_package(package)
+            .with_manifest(manifest);
+        let key = FragmentKey::derive(&ctx.cache_identity());
+        let want = registry.frontend_for(&rel).fragment_version();
+        match store.fragment(&key)? {
+            Some(cached) if cached.frontend_version == want => {
+                let facts: FileFacts = decode(&cached.fragment)?;
+                stats.blobs_cached += 1;
+                let lang = registry.lang_for(&rel).tag().to_string();
+                summaries.push(FileSummary::from_facts(
+                    src.blob_oid.clone(),
+                    src.rel_path.clone(),
+                    lang,
+                    &facts,
+                ));
+                keys.push(key);
+                // `facts` drops here — only the summary survives.
+            }
+            Some(_) => {
+                stats.blobs_stale += 1;
+                misses.push((src, ctx, key));
+            }
+            None => misses.push((src, ctx, key)),
+        }
+    }
+
+    // Pass 2 (parallel, rayon): extract every miss in bounded chunks, same
+    // chunking rationale as the in-memory path — write and free each chunk's
+    // encoded bytes before the next starts. The full `FileFacts` this produces
+    // is summarized and dropped within the chunk too, so it never joins a
+    // corpus-wide accumulator.
+    const EXTRACT_CHUNK_SIZE: usize = 2_000;
+    let mut total_extracted = 0usize;
+    for chunk in misses.chunks(EXTRACT_CHUNK_SIZE) {
+        let chunk_extracted: Vec<(FileSummary, FragmentKey, u32, Vec<u8>, String)> = chunk
+            .into_par_iter()
+            .map(|(src, ctx, key)| {
+                let rel = RelPath::new(src.rel_path.clone());
+                let facts = registry.extract(&src.content, &ctx)?;
+                let bytes = encode(&facts)?;
+                let version = registry.frontend_for(&rel).fragment_version();
+                let lang = registry.lang_for(&rel).tag().to_string();
+                let summary = FileSummary::from_facts(
+                    src.blob_oid.clone(),
+                    src.rel_path.clone(),
+                    lang.clone(),
+                    &facts,
+                );
+                // `facts` drops here (end of closure scope) — only `summary`
+                // and the already-encoded `bytes` survive past this map.
+                Ok((summary, key.clone(), version, bytes, lang))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        total_extracted += chunk_extracted.len();
+
+        if !chunk_extracted.is_empty() {
+            let batch: Vec<FragmentInput<'_>> = chunk_extracted
+                .iter()
+                .map(|(_, key, version, bytes, lang)| FragmentInput {
+                    key,
+                    lang,
+                    frontend_version: *version,
+                    bytes,
+                })
+                .collect();
+            store.put_fragments(&batch)?;
+        }
+        for (summary, key, ..) in chunk_extracted {
+            summaries.push(summary);
+            keys.push(key);
+        }
+    }
+    stats.blobs_extracted = total_extracted;
+
+    // Restore deterministic order (cache hits + parallel misses interleave):
+    // sort by path, keeping each summary paired with its fragment key.
+    let mut paired: Vec<(FileSummary, FragmentKey)> =
+        summaries.into_iter().zip(keys).collect();
+    paired.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    stats.blobs_indexed = paired.len();
+    let (summaries, keys): (Vec<FileSummary>, Vec<FragmentKey>) = paired.into_iter().unzip();
+
+    // Pass 0: the global node set + symbol table, from summaries alone.
+    let (nodes, def_to_node, table) = build_global_index(&summaries);
+
+    // Pass A/B: resolve one file's full facts at a time, re-read from the
+    // Layer-1 store by the fragment key Pass 1/2 just wrote or read — the same
+    // row, so this is a cache hit with no re-extraction.
+    let mut session = LinkSession::new(&table, &def_to_node, link_opts.clone());
+    for (file_idx, (summary, key)) in summaries.iter().zip(keys.iter()).enumerate() {
+        let cached = store.fragment(key)?.ok_or_else(|| {
+            IndexError::Local(format!(
+                "streaming link: fragment missing for {} (written or read earlier this same run)",
+                summary.path
+            ))
+        })?;
+        let facts: FileFacts = decode(&cached.fragment)?;
+        let file = FileInput::new(
+            summary.blob_oid.clone(),
+            summary.path.clone(),
+            summary.lang.clone(),
+            &facts,
+        );
+        session.resolve_file(&file, file_idx);
+        // `facts` drops at the end of this iteration — never more than one
+        // file's full facts alive at once.
+    }
+    Ok(session.finish(nodes))
 }
 
 /// Apply the SCIP upgrade-only re-label pass (design §3.5) to `graph` in place
@@ -367,8 +555,12 @@ fn read_scip(path: &Path) -> Result<Vec<u8>> {
 /// input, so it always runs — per the precedence ladder (§5) it runs **after**
 /// [`apply_scip`] so SCIP-settled sites are left alone. Updates the edge count
 /// and the `cha` counters.
-pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
-    stats.cha = run_cha(graph);
+pub(crate) fn apply_cha(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    max_supernode_candidates: Option<u32>,
+) {
+    stats.cha = run_cha(graph, max_supernode_candidates);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
 }
@@ -393,8 +585,12 @@ pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// a disjoint set of edge kinds (`CallsClosure`/`CallsCallback`/`CallsIndirect`)
 /// from CHA/RTA's `CallsVirtual`, so ordering relative to them is immaterial; it
 /// runs last. Updates the edge count and the `sig` counters.
-pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
-    stats.sig = run_sig(graph);
+pub(crate) fn apply_sig(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    max_supernode_candidates: Option<u32>,
+) {
+    stats.sig = run_sig(graph, max_supernode_candidates);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
 }

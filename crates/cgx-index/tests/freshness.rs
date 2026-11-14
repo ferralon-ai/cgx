@@ -25,7 +25,7 @@ fn tree_blob_oids_matches_the_content_addressed_enumeration() {
     let (r, map) = head_map(&repo);
 
     let enumerated: BTreeMap<String, String> = r
-        .enumerate_tree()
+        .enumerate_tree(None)
         .unwrap()
         .into_iter()
         .map(|s| (s.rel_path, s.blob_oid))

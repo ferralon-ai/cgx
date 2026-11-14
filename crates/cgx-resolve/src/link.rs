@@ -17,7 +17,7 @@ use cgx_frontend::facts::{
 
 use crate::chunked::ChunkedVec;
 use crate::graph::{DataflowOutput, ResolvedGraph, UnresolvedRef};
-use crate::input::{FileInput, LinkOpts};
+use crate::input::{FileInput, FileSummary, LinkOpts};
 use crate::receiver::{Ledger, Narrowed, ReceiverIndex, Site};
 use crate::symtab::{
     collect_import_bindings, short_name, DefEntry, ImportBinding, ResolveOutcome, SymbolTable,
@@ -32,10 +32,11 @@ use crate::symtab::{
 pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // --- Pass 0: materialize nodes and assign dense ids by canonical sort. ---
     let (mut nodes, def_to_node) = build_nodes(inputs);
-    let files: Vec<(String, &cgx_frontend::facts::FileFacts)> = inputs
-        .iter()
-        .map(|f| (module_segment(f), f.facts))
-        .collect();
+    let files: Vec<(String, &[cgx_frontend::facts::ImportFact], &[cgx_frontend::facts::ExportFact])> =
+        inputs
+            .iter()
+            .map(|f| (module_segment(f), f.facts.imports.as_slice(), f.facts.exports.as_slice()))
+            .collect();
     let table = SymbolTable::build(&node_records(&nodes), &files);
 
     // --- Pass A/B: resolve every reference. ---
@@ -205,6 +206,287 @@ fn build_nodes(
         });
     }
     (nodes, map)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming link (peak-RSS fix): build the global index from declaration-level
+// `FileSummary`s only, then resolve one file's full `FileFacts` at a time via
+// `LinkSession`, instead of holding every file's full facts for the whole
+// corpus simultaneously (as the single-call `link` above does). Produces the
+// same graph as `link` would for the files it processes, provided
+// `opts.dataflow` and `opts.receiver_narrowing` are both off — both need
+// random access across every file's full facts at once (data-flow summaries,
+// receiver-kind narrowing) and are not supported in the streaming path.
+// ---------------------------------------------------------------------------
+
+fn entrypoint_kinds_from_summary(s: &FileSummary) -> Vec<(String, EntrypointKind)> {
+    s.entrypoint_hints
+        .iter()
+        .map(|h| (h.fqn.clone(), h.kind))
+        .collect()
+}
+
+/// [`build_nodes`]'s logic, sourced from [`FileSummary`] instead of a full
+/// [`FileInput`] slice — identical output given the same `defs`/`effects`/
+/// `entrypoint_hints`/`path`/`lang`/`blob_oid`, since those are exactly the
+/// fields `build_nodes` reads.
+fn build_nodes_from_summaries(
+    summaries: &[FileSummary],
+) -> (
+    Vec<NodeWithProvenance>,
+    std::collections::BTreeMap<String, NodeId>,
+) {
+    let mut staged: Vec<(NodeRecord, Provenance)> = Vec::new();
+    for file in summaries {
+        let entry_kinds = entrypoint_kinds_from_summary(file);
+        for def in &file.defs {
+            let signature = def.signature.clone();
+            let entrypoint_kind = entry_kinds
+                .iter()
+                .find(|(fqn, _)| *fqn == def.fqn)
+                .map(|(_, k)| *k);
+            let own_effects = file
+                .effects
+                .iter()
+                .find(|e| e.fqn == def.fqn)
+                .map(|e| e.effects)
+                .unwrap_or_default();
+            let record = NodeRecord {
+                id: NodeId(0), // assigned after sort
+                kind: def.kind,
+                fqn: def.fqn.clone(),
+                file: file.path.clone(),
+                line_start: def.span.line,
+                line_end: def.line_end,
+                lang: file.lang.clone(),
+                visibility: def.visibility,
+                is_abstract: def.is_abstract,
+                entrypoint_kind,
+                signature,
+                own_effects,
+                transitive_effects: cgx_core::EffectSet::new(),
+                unresolved_calls: 0,
+                external_calls: 0,
+                narrowing: Default::default(),
+            };
+            let prov = Provenance::new(
+                def.span.clone(),
+                "def",
+                Tier::ScopeGraph,
+                file.blob_oid.clone(),
+            );
+            staged.push((record, prov));
+        }
+    }
+
+    staged.sort_by(|a, b| {
+        (a.0.file.as_str(), a.0.line_start, a.0.fqn.as_str()).cmp(&(
+            b.0.file.as_str(),
+            b.0.line_start,
+            b.0.fqn.as_str(),
+        ))
+    });
+
+    let mut map = std::collections::BTreeMap::new();
+    let mut nodes = Vec::with_capacity(staged.len());
+    for (i, (mut record, prov)) in staged.into_iter().enumerate() {
+        record.id = NodeId(i as u32);
+        map.insert(record.fqn.clone(), record.id);
+        nodes.push(NodeWithProvenance {
+            node: record,
+            provenance: prov,
+        });
+    }
+    (nodes, map)
+}
+
+fn module_segment_from_summary(file: &FileSummary) -> String {
+    if let Some(def) = file.defs.iter().find(|d| d.fqn.contains("::")) {
+        if let Some(idx) = def.fqn.rfind("::") {
+            let module = &def.fqn[..idx];
+            return module.rsplit("::").next().unwrap_or(module).to_owned();
+        }
+    }
+    let name = file.path.rsplit(['/', '\\']).next().unwrap_or(&file.path);
+    name.split('.').next().unwrap_or(name).to_owned()
+}
+
+/// Pass 0 of the streaming link: the global node set, `fqn → NodeId` map, and
+/// symbol table, built from declaration-level summaries alone. Peak memory here
+/// scales with total declarations across the corpus, not with the much larger
+/// `refs`/`scopes` every full `FileFacts` also carries.
+pub fn build_global_index(
+    summaries: &[FileSummary],
+) -> (
+    Vec<NodeWithProvenance>,
+    std::collections::BTreeMap<String, NodeId>,
+    SymbolTable,
+) {
+    let (nodes, def_to_node) = build_nodes_from_summaries(summaries);
+    let files: Vec<(String, &[cgx_frontend::facts::ImportFact], &[cgx_frontend::facts::ExportFact])> =
+        summaries
+            .iter()
+            .map(|f| (module_segment_from_summary(f), f.imports.as_slice(), f.exports.as_slice()))
+            .collect();
+    let table = SymbolTable::build(&node_records(&nodes), &files);
+    (nodes, def_to_node, table)
+}
+
+/// Pass A/B of the streaming link for one file: resolve its refs and impl
+/// relations against the already-built global `table`, appending to the shared
+/// accumulators. Mirrors the per-file body of `link`'s main loop plus its
+/// impl_relations pass. `receivers` is always `None` in the streaming path
+/// (receiver narrowing needs every file's full facts at once — unsupported
+/// here; see [`LinkSession`]).
+#[allow(clippy::too_many_arguments)]
+fn resolve_file_into(
+    file: &FileInput<'_>,
+    file_idx: usize,
+    table: &SymbolTable,
+    def_to_node: &std::collections::BTreeMap<String, NodeId>,
+    opts: &LinkOpts,
+    edges: &mut ChunkedVec<EdgeWithProvenance>,
+    candidates: &mut Vec<Candidate>,
+    unresolved: &mut Vec<UnresolvedRef>,
+    next_group: &mut u32,
+    ledger: &mut Ledger,
+) {
+    let facts = file.facts;
+    let bindings = collect_import_bindings(&facts.imports);
+    for raw in &facts.refs {
+        let caller = match enclosing_def(&facts.scopes, &facts.defs, raw.scope) {
+            Some(d) => d,
+            None => continue,
+        };
+        let caller_id = match def_to_node.get(caller.fqn.as_str()) {
+            Some(id) => *id,
+            None => continue,
+        };
+        resolve_ref(
+            file,
+            file_idx,
+            raw,
+            caller,
+            caller_id,
+            &facts.scopes,
+            &facts.defs,
+            &bindings,
+            table,
+            opts,
+            edges,
+            candidates,
+            unresolved,
+            next_group,
+            None,
+            ledger,
+        );
+    }
+    for rel in &facts.impl_relations {
+        resolve_impl_relation(file, rel, def_to_node, table, edges);
+    }
+}
+
+/// The tail of the streaming link: canonical sort, ledger finalize, and graph
+/// assembly — mirrors the end of `link` after its main loop. The streaming path
+/// never builds the v0.3 DATA_FLOW layer, so `graph.dataflow` is always default.
+fn finish_link(
+    mut nodes: Vec<NodeWithProvenance>,
+    mut edges: ChunkedVec<EdgeWithProvenance>,
+    mut candidates: Vec<Candidate>,
+    unresolved: Vec<UnresolvedRef>,
+    ledger: Ledger,
+    table: &SymbolTable,
+) -> ResolvedGraph {
+    let remap = sort_nodes_canonical(&mut nodes, &mut edges, &mut candidates);
+    let (precision, mut narrowing) = ledger.finish(table);
+    if let Some(remap) = remap {
+        narrowing = narrowing
+            .into_iter()
+            .map(|(id, counts)| (remap[id.index()], counts))
+            .collect();
+    }
+    let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
+    graph.dataflow = DataflowOutput::default();
+    graph.precision = precision;
+    graph
+}
+
+/// Drives Pass A/B of the streaming link one file at a time against a
+/// `table`/`def_to_node` already built by [`build_global_index`]. Construct
+/// with [`LinkSession::new`], call [`LinkSession::resolve_file`] once per file
+/// in the same order the caller will later hand to [`LinkSession::finish`]
+/// (any consistent order — the result is order-independent, same as `link`),
+/// then call [`LinkSession::finish`] with the node set `build_global_index`
+/// returned.
+///
+/// Panics if `opts.dataflow` or `opts.receiver_narrowing` is set — both need
+/// every file's full facts available at once, which defeats the point of
+/// streaming; a caller wanting those must use [`crate::link`] instead.
+#[allow(missing_debug_implementations)]
+pub struct LinkSession<'t> {
+    table: &'t SymbolTable,
+    def_to_node: &'t std::collections::BTreeMap<String, NodeId>,
+    opts: LinkOpts,
+    edges: ChunkedVec<EdgeWithProvenance>,
+    candidates: Vec<Candidate>,
+    unresolved: Vec<UnresolvedRef>,
+    next_group: u32,
+    ledger: Ledger,
+}
+
+impl<'t> LinkSession<'t> {
+    pub fn new(
+        table: &'t SymbolTable,
+        def_to_node: &'t std::collections::BTreeMap<String, NodeId>,
+        opts: LinkOpts,
+    ) -> Self {
+        assert!(
+            !opts.dataflow && !opts.receiver_narrowing,
+            "LinkSession (streaming link) does not support dataflow or receiver_narrowing; use link() instead"
+        );
+        let ledger = Ledger::new(opts.narrowing_trace);
+        LinkSession {
+            table,
+            def_to_node,
+            opts,
+            edges: ChunkedVec::new(),
+            candidates: Vec::new(),
+            unresolved: Vec::new(),
+            next_group: 0,
+            ledger,
+        }
+    }
+
+    /// Resolve one file's refs and impl relations. `file` must carry that
+    /// file's full `FileFacts`; drop it after this call returns — nothing here
+    /// retains a reference past the call.
+    pub fn resolve_file(&mut self, file: &FileInput<'_>, file_idx: usize) {
+        resolve_file_into(
+            file,
+            file_idx,
+            self.table,
+            self.def_to_node,
+            &self.opts,
+            &mut self.edges,
+            &mut self.candidates,
+            &mut self.unresolved,
+            &mut self.next_group,
+            &mut self.ledger,
+        );
+    }
+
+    /// Finish the link, consuming the session. `nodes` is the node set
+    /// [`build_global_index`] returned for the same `table`.
+    pub fn finish(self, nodes: Vec<NodeWithProvenance>) -> ResolvedGraph {
+        finish_link(
+            nodes,
+            self.edges,
+            self.candidates,
+            self.unresolved,
+            self.ledger,
+            self.table,
+        )
+    }
 }
 
 /// Put every node, symbol and SSA value alike, into the canonical
@@ -461,6 +743,7 @@ fn resolve_ref(
                     rule,
                     &caller.fqn,
                     &span,
+                    None,
                 );
                 return;
             }
@@ -512,6 +795,7 @@ fn resolve_ref(
                     "import-ref",
                     &caller.fqn,
                     &span,
+                    None,
                 );
                 return;
             }
@@ -537,6 +821,7 @@ fn resolve_ref(
                 "name-method",
                 &caller.fqn,
                 &span,
+                None,
             );
             return;
         }
@@ -582,6 +867,7 @@ fn resolve_ref(
                 "name-arity",
                 &caller.fqn,
                 &span,
+                opts.max_name_arity_candidates,
             );
             return;
         }
@@ -1609,6 +1895,7 @@ pub(crate) fn canonicalize_candidate_dsts(dsts: &mut Vec<NodeId>) -> Confidence 
 /// Emit one edge per candidate, all sharing a candidate group, at `possible`
 /// (multiple) or `probable` (single). Records the candidate table rows.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_candidate_set(
     edges: &mut ChunkedVec<EdgeWithProvenance>,
     candidates: &mut Vec<Candidate>,
@@ -1620,6 +1907,7 @@ fn emit_candidate_set(
     rule: &'static str,
     caller_fqn: &str,
     span: &Span,
+    max_candidates: Option<u32>,
 ) {
     // Canonicalize the dst set through the shared helper so ordering/dedup/band
     // match the CHA post-pass exactly.
@@ -1657,6 +1945,16 @@ fn emit_candidate_set(
                 dst.0,
             )
         });
+        // Index-time fan-out cap (opt-in, `LinkOpts::max_name_arity_candidates`):
+        // same nearest-first order and "cut from the far end" semantics as
+        // `cgx-query`'s query-time `--max-candidates`, but applied here so a
+        // name collision in the thousands (MFC/ATL virtual-override names
+        // colliding across hundreds of unrelated classes) never reaches
+        // `edges`/`candidates` at all, instead of being built and then
+        // filtered back out at query time.
+        if let Some(max) = max_candidates {
+            dsts.truncate(max as usize);
+        }
     }
 
     let group = if dsts.len() > 1 {

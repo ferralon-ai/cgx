@@ -149,6 +149,33 @@ enum Command {
         /// line per narrowed site.
         #[arg(long = "receiver-narrowing")]
         receiver_narrowing: bool,
+        /// Cap the Tier-0 global name(+arity) fallback's candidate-set size at
+        /// index time: a bare-name match with more than N same-named defs
+        /// keeps only the N nearest by locality and drops the rest, instead of
+        /// emitting an edge (and a candidate row) for every one. For a corpus
+        /// with heavy same-short-name collisions (large C/C++ codebases with
+        /// no namespacing — MFC/ATL virtual-override names like
+        /// `OnInitDialog` colliding across hundreds of unrelated classes),
+        /// this is the index-time fix the query-time `--max-candidates` on
+        /// `callers`/`callees`/`impacted` cannot provide: that flag only
+        /// trims the search frontier after the full (already memory-costly)
+        /// edge set has been built and stored. Unset (the default) is
+        /// uncapped — this is a recall trade, so it is never on by default;
+        /// opt in only for a corpus that needs it.
+        #[arg(long = "max-name-arity-candidates", value_name = "N")]
+        max_name_arity_candidates: Option<u32>,
+        /// Cap CHA's trait-scoped and SIG's signature-compatible candidate-set
+        /// size at index time. Both passes already flag an over-64 group as a
+        /// cut-marked "supernode"; that flag never limited the edge count —
+        /// every candidate still got a full edge either way. Set this to keep
+        /// only the N nearest-by-locality targets of each over-cap group
+        /// instead (e.g. a trait implemented by hundreds of types, or an
+        /// indirect-call arity that matches hundreds of same-arity
+        /// functions/closures). Unset (the default) is uncapped — a recall
+        /// trade, so never on by default; opt in only for a corpus that needs
+        /// it.
+        #[arg(long = "max-supernode-candidates", value_name = "N")]
+        max_supernode_candidates: Option<u32>,
     },
     /// Symbols that (transitively) call `symbol`.
     Callers {
@@ -813,6 +840,8 @@ fn run(command: Command) -> Result<(), CliError> {
             compdb_complete,
             no_dataflow,
             receiver_narrowing,
+            max_name_arity_candidates,
+            max_supernode_candidates,
         } => run_index(
             path,
             scip,
@@ -820,6 +849,8 @@ fn run(command: Command) -> Result<(), CliError> {
             compdb_complete,
             no_dataflow,
             receiver_narrowing,
+            max_name_arity_candidates,
+            max_supernode_candidates,
         ),
         Command::Callers { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callers),
         Command::Callees { symbol, query } => run_neighbors(&symbol, query, NeighborDir::Callees),
@@ -964,6 +995,8 @@ fn run_index(
     compdb_complete: bool,
     no_dataflow: bool,
     receiver_narrowing: bool,
+    max_name_arity_candidates: Option<u32>,
+    max_supernode_candidates: Option<u32>,
 ) -> Result<(), CliError> {
     let repo_root = resolve_repo(path)?;
     // v0.3 SC6: dataflow is ON by default. The CLI flag `--no-dataflow` and the
@@ -982,6 +1015,8 @@ fn run_index(
             compdb_complete,
             receiver_narrowing,
             narrowing_trace: env_on("CGX_PRECISION_TRACE"),
+            max_name_arity_candidates,
+            max_supernode_candidates,
         },
     )?;
 

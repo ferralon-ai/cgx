@@ -62,7 +62,16 @@ impl Repo {
     }
 
     /// Enumerate every blob in `HEAD`'s tree as a [`SourceFile`], sorted by path.
-    pub fn enumerate_tree(&self) -> Result<Vec<SourceFile>> {
+    ///
+    /// `path_filter`: when `Some`, blob content is **not loaded** for paths where
+    /// the predicate returns `false`. Those paths are skipped entirely and do not
+    /// appear in the output. Use this to avoid materialising the bytes of files
+    /// no registered adapter can process — on a large corpus (e.g. 468 K files /
+    /// 10 GB) this is the dominant source of peak RSS.
+    pub fn enumerate_tree(
+        &self,
+        path_filter: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Vec<SourceFile>> {
         let commit = self
             .inner
             .head_commit()
@@ -80,6 +89,11 @@ impl Repo {
                 continue;
             }
             let rel_path = entry.filepath.to_str_lossy().into_owned();
+            if let Some(filter) = path_filter {
+                if !filter(&rel_path) {
+                    continue;
+                }
+            }
             let obj = self
                 .inner
                 .find_object(entry.oid)
@@ -98,11 +112,19 @@ impl Repo {
     /// worktree), computing each file's git blob OID from its current content
     /// (IX-6 worktree awareness, IX-3 dirty handling). `.git` is skipped, and so is
     /// cgx's own `.cgx/` index at `root`. Results are sorted by repo-relative path.
-    pub fn enumerate_workdir(&self, root: impl AsRef<Path>) -> Result<Vec<SourceFile>> {
+    ///
+    /// `path_filter`: when `Some`, file content is **not read** for paths where the
+    /// predicate returns `false`. Those paths are skipped entirely and do not appear
+    /// in the output. Use this to avoid reading files no registered adapter handles.
+    pub fn enumerate_workdir(
+        &self,
+        root: impl AsRef<Path>,
+        path_filter: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Vec<SourceFile>> {
         let root = root.as_ref();
         let hash_kind = self.inner.object_hash();
         let mut out = Vec::new();
-        walk_dir(root, root, hash_kind, &mut out)?;
+        walk_dir(root, root, hash_kind, path_filter, &mut out)?;
         out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         Ok(out)
     }
@@ -365,6 +387,7 @@ fn walk_dir(
     root: &Path,
     dir: &Path,
     hash_kind: gix::hash::Kind,
+    path_filter: Option<&dyn Fn(&str) -> bool>,
     out: &mut Vec<SourceFile>,
 ) -> Result<()> {
     let read = std::fs::read_dir(dir).map_err(|source| IndexError::Io {
@@ -394,12 +417,8 @@ fn walk_dir(
         // dereferencing a symlink out of the tree (see the
         // workdir_symlink_confinement test).
         if file_type.is_dir() {
-            walk_dir(root, &path, hash_kind, out)?;
+            walk_dir(root, &path, hash_kind, path_filter, out)?;
         } else if file_type.is_file() {
-            let content = std::fs::read(&path).map_err(|source| IndexError::Io {
-                path: path.display().to_string(),
-                source,
-            })?;
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -407,6 +426,15 @@ fn walk_dir(
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
+            if let Some(filter) = path_filter {
+                if !filter(&rel) {
+                    continue;
+                }
+            }
+            let content = std::fs::read(&path).map_err(|source| IndexError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
             let blob_oid = gix::objs::compute_hash(hash_kind, gix::object::Kind::Blob, &content)
                 .map_err(|e| IndexError::Git(e.to_string()))?
                 .to_string();
@@ -442,7 +470,7 @@ mod tests {
 
         let repo = Repo::discover(root).unwrap();
         let paths: Vec<String> = repo
-            .enumerate_workdir(root)
+            .enumerate_workdir(root, None)
             .unwrap()
             .into_iter()
             .map(|f| f.rel_path)

@@ -17,14 +17,25 @@
 //! write the same objects. The pointer is replaced by an atomic rename. A graph
 //! that a concurrent run pruned or tore reads as missing or corrupt, and
 //! [`load_current`] answers that by re-indexing rather than by serving it.
+//!
+//! ## Targets
+//!
+//! The layout, the pointer and the `cgx.toml` rule build everywhere, so a wasm
+//! embedding writes `.cgx/` through the same code as the CLI and MCP server. The
+//! git-driven entry points ([`index_repo`], [`ensure_indexed`], [`load_current`])
+//! are native-only, as the git layer is.
 
 use std::path::{Path, PathBuf};
 
-use cgx_store::{FactStore, LinkedGraph, ObjectStore, StoreError, TreeOid};
+use cgx_store::ObjectStore;
+#[cfg(not(target_family = "wasm"))]
+use cgx_store::{FactStore, LinkedGraph, StoreError, TreeOid};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IndexError, Result};
-use crate::{default_registry, index_path, IndexOpts, IndexOutcome, Repo};
+use crate::IndexOpts;
+#[cfg(not(target_family = "wasm"))]
+use crate::{default_registry, index_path, IndexOutcome, Repo};
 
 /// The repo-local index directory name.
 pub const CGX_DIR: &str = ".cgx";
@@ -49,7 +60,7 @@ const GITIGNORE_BODY: &str = "*\n";
 
 /// The pointer written by an index run and read by every query: which stored
 /// Layer-2 graph is "current", and what tree/workdir key it came from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexPointer {
     /// The Layer-2 key the graph was stored under (tree OID or `workdir:<digest>`).
     /// This is the read key: `FactStore::read_graph` is keyed by it directly.
@@ -64,6 +75,16 @@ pub struct IndexPointer {
     /// `IndexStats`. See `total_files` for the `#[serde(default)]` rationale.
     #[serde(default)]
     pub unsupported_files: Option<usize>,
+}
+
+impl IndexPointer {
+    /// Whether this pointer names the current graph for a repository whose `HEAD`
+    /// tree is `head_tree` (the auto-index staleness rule, audit row #23): fresh
+    /// iff the pointer's key is that tree. With no tree OID (not a git repository,
+    /// unborn `HEAD`) no staleness check is possible and the pointer is trusted.
+    pub fn is_fresh(&self, head_tree: Option<&str>) -> bool {
+        head_tree.is_none_or(|tree| tree == self.graph_key)
+    }
 }
 
 /// The `.cgx/` directory for a repository rooted at `repo_root`.
@@ -145,6 +166,7 @@ pub fn open_store(repo_root: &Path) -> Result<ObjectStore> {
 /// current-index pointer — the shared core of `cgx index` and the auto-index
 /// trigger ([`ensure_indexed`]). Deterministic and idempotent: a re-index of an
 /// unchanged tree extracts 0 blobs (IX-1) and rewrites an identical pointer.
+#[cfg(not(target_family = "wasm"))]
 pub fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<IndexOutcome> {
     let registry = default_registry();
     let mut store = open_store(repo_root)?;
@@ -178,6 +200,7 @@ pub fn index_repo(repo_root: &Path, opts: &IndexOpts) -> Result<IndexOutcome> {
 /// Idempotent: the underlying pipeline performs zero extraction on an unchanged
 /// tree (IX-1), so a re-index over the same committed state re-links cached facts
 /// without re-parsing.
+#[cfg(not(target_family = "wasm"))]
 pub fn ensure_indexed(repo_root: &Path) -> Result<()> {
     // Not a git repo / no HEAD → `None`: we then fall back to "index iff the
     // pointer is missing" (no staleness check is possible without a tree OID).
@@ -187,14 +210,10 @@ pub fn ensure_indexed(repo_root: &Path) -> Result<()> {
 
     let opts = auto_index_opts(repo_root);
     match read_pointer(repo_root) {
-        Ok(ptr) => match &current_tree {
-            // Pointer's tree OID differs from the live HEAD tree: stale, re-index.
-            Some(tree) if *tree != ptr.graph_key => index_repo(repo_root, &opts).map(|_| ()),
-            // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
-            _ => Ok(()),
-        },
-        // No index yet: build one.
-        Err(_) => index_repo(repo_root, &opts).map(|_| ()),
+        // Fresh, or HEAD tree undeterminable (non-git): trust the pointer.
+        Ok(ptr) if ptr.is_fresh(current_tree.as_deref()) => Ok(()),
+        // Stale (the pointer names another tree), or no index yet: build one.
+        _ => index_repo(repo_root, &opts).map(|_| ()),
     }
 }
 
@@ -205,6 +224,7 @@ pub fn ensure_indexed(repo_root: &Path) -> Result<()> {
 /// another tree leaves behind once it prunes — is treated as not indexed: it is
 /// re-indexed once and read again. Without it, either case is an error; an empty
 /// graph is never served in place of a missing one.
+#[cfg(not(target_family = "wasm"))]
 pub fn load_current(repo_root: &Path, rebuild_if_corrupt: bool) -> Result<(String, LinkedGraph)> {
     let ptr = read_pointer(repo_root)?;
     let store = open_store(repo_root)?;
@@ -246,10 +266,14 @@ pub fn auto_index_opts(repo_root: &Path) -> IndexOpts {
 /// `[index] data_flow = false` key in a `cgx.toml` at the repo root. Any other
 /// value (or a missing key/file) leaves dataflow enabled.
 pub fn dataflow_default(repo_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(repo_root.join("cgx.toml")) else {
-        return true;
-    };
-    !cgx_toml_data_flow_is_false(&text)
+    let text = std::fs::read_to_string(repo_root.join("cgx.toml")).ok();
+    dataflow_default_from(text.as_deref())
+}
+
+/// [`dataflow_default`] given the text of a repository's `cgx.toml` (`None` when
+/// there is none), for a caller that holds the file's content rather than a path.
+pub fn dataflow_default_from(cgx_toml: Option<&str>) -> bool {
+    !cgx_toml.is_some_and(cgx_toml_data_flow_is_false)
 }
 
 /// Whether a `cgx.toml`'s `[index]` table sets `data_flow = false`. A minimal
@@ -344,6 +368,30 @@ mod tests {
         assert!(dir.join("cache.db").exists(), "dataflow cache is kept");
         // Idempotent when nothing is left to remove.
         remove_retired_files(root).unwrap();
+    }
+
+    #[test]
+    fn freshness_is_key_equality_and_trusts_the_pointer_without_a_tree() {
+        let ptr = IndexPointer {
+            graph_key: "t1".into(),
+            total_files: None,
+            unsupported_files: None,
+        };
+        assert!(ptr.is_fresh(Some("t1")));
+        assert!(!ptr.is_fresh(Some("t2")));
+        assert!(ptr.is_fresh(None));
+    }
+
+    #[test]
+    fn dataflow_is_on_unless_the_index_table_turns_it_off() {
+        assert!(dataflow_default_from(None));
+        assert!(dataflow_default_from(Some("")));
+        assert!(!dataflow_default_from(Some("[index]\ndata_flow = false\n")));
+        assert!(dataflow_default_from(Some("[index]\ndata_flow = true\n")));
+        assert!(dataflow_default_from(Some("[other]\ndata_flow = false\n")));
+        assert!(!dataflow_default_from(Some(
+            "[index] \n data_flow = false # off\n"
+        )));
     }
 
     #[test]

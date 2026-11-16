@@ -220,6 +220,7 @@ dependencies = [
  "cgx-mcp",
  "cgx-query",
  "cgx-select",
+ "cgx-session",
  "cgx-store",
  "cgx-transport",
  "clap",

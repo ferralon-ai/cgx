@@ -202,6 +202,7 @@ pub fn run_sig(graph: &mut ResolvedGraph) -> SigStats {
     crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
     for r in &replacements {
         for dst in &r.dsts {
+            cgx_core::yield_hook::tick();
             graph.edges.push(build_sig_edge(
                 &r.proto,
                 *dst,

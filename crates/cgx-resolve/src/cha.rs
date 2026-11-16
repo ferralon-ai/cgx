@@ -183,6 +183,7 @@ pub fn run_cha(graph: &mut ResolvedGraph) -> ChaStats {
     crate::link::remove_edges_at(&mut graph.edges, &drop_edge_idx);
     for r in &replacements {
         for dst in &r.dsts {
+            cgx_core::yield_hook::tick();
             graph.edges.push(build_cha_edge(
                 &r.proto,
                 *dst,

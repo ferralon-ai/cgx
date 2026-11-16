@@ -179,7 +179,8 @@ impl ResolvedGraph {
         nodes.shrink_to_fit();
         // Allocated once at the exact length; each source chunk is freed as soon
         // as it has been drained.
-        let edges: Vec<EdgeRecord> = self.edges.into_iter().map(|e| e.edge).collect();
+        let edges: Vec<EdgeRecord> =
+            cgx_core::yield_hook::ticking(self.edges).map(|e| e.edge).collect();
         (nodes, edges, self.candidates)
     }
 

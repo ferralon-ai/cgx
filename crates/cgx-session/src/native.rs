@@ -23,9 +23,9 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use cgx_index::{extract_and_link, workdir_key, IndexOpts, Repo, ScipOverlay};
+use cgx_index::{extract_and_link, workdir_key, IndexOpts, Repo, ScipOverlay, SourceFile};
 use cgx_mcp::session::overlay_difference;
-use cgx_store::FactStore;
+use cgx_store::{FactStore, OverlayStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -122,8 +122,6 @@ impl<S: FactStore> Session<S> {
                     .ok_or_else(|| SessionError::index("repository has no working directory"))?
                     .to_path_buf();
                 let committed = repo.tree_blob_oids(&head).map_err(git_err)?;
-                // Walk before the store opens so the walk sees the same `.cgx/` a
-                // host-driven worktree index sees.
                 let working = repo.enumerate_workdir(&workdir).map_err(git_err)?;
                 let target = Target {
                     mode,
@@ -141,22 +139,38 @@ impl<S: FactStore> Session<S> {
             dataflow,
             ..IndexOpts::default()
         };
-        let (graph, stats) = extract_and_link(&sources, self.registry(), &mut store, &opts)?;
-        // Only paths are read from here on (the SCIP compdb check): free the
-        // contents before the post-link passes.
-        for source in &mut sources {
-            source.content = Vec::new();
+        // A working-tree index persists nothing (ADR-06): it writes to an overlay
+        // dropped at the end of this call and reads the store through it.
+        if mode == Mode::Worktree {
+            let mut overlay = OverlayStore::new(&store);
+            let (graph, stats) = extract_and_link(&sources, self.registry(), &mut overlay, &opts)?;
+            let scip = scip_run(scip.as_deref(), free_contents(&mut sources));
+            return self.complete(&mut overlay, graph, stats, scip, target);
         }
-        let scip = scip.as_deref().map(|bytes| ScipRun {
-            overlay: ScipOverlay {
-                scip: bytes,
-                compdb: None,
-                compdb_complete: false,
-            },
-            sources: &sources,
-        });
+        let (graph, stats) = extract_and_link(&sources, self.registry(), &mut store, &opts)?;
+        let scip = scip_run(scip.as_deref(), free_contents(&mut sources));
         self.complete(&mut store, graph, stats, scip, target)
     }
+}
+
+/// Only paths are read after linking (the SCIP compdb check): free the contents
+/// before the post-link passes.
+fn free_contents(sources: &mut [SourceFile]) -> &[SourceFile] {
+    for source in sources.iter_mut() {
+        source.content = Vec::new();
+    }
+    sources
+}
+
+fn scip_run<'a>(scip: Option<&'a [u8]>, sources: &'a [SourceFile]) -> Option<ScipRun<'a>> {
+    scip.map(|bytes| ScipRun {
+        overlay: ScipOverlay {
+            scip: bytes,
+            compdb: None,
+            compdb_complete: false,
+        },
+        sources,
+    })
 }
 
 #[derive(Debug, Deserialize)]

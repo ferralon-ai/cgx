@@ -31,7 +31,7 @@ use cgx_mcp::tools::{SessionProvider, SessionRef};
 use cgx_mcp::{GraphSession, ToolError};
 use cgx_query::GraphView;
 use cgx_resolve::ResolvedGraph;
-use cgx_store::{FactStore, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, LinkedGraph, OverlayStore, TreeOid};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -43,8 +43,8 @@ use crate::store_loc::{dataflow_default, read_pointer, write_pointer, IndexPoint
 pub type StoreOpener<S> = Box<dyn Fn(&Path) -> cgx_store::Result<S>>;
 
 /// What an index builds: the committed `HEAD` tree (stored, pointer advanced) or
-/// the working directory (held only; its fragments are cached, its graph never
-/// persisted).
+/// the working directory (held only; nothing it computes is persisted — it reads
+/// the store's fragment cache through an overlay, ADR-06).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -614,14 +614,10 @@ impl<S: FactStore> Session<S> {
         }
         let target = pending.target;
         planned.stats.blobs_extracted = planned.extracted.len();
-        put_extracted(&mut planned.store, &planned.extracted)?;
-        let mut prepared = planned.prepared;
-        prepared.extend(planned.extracted.into_iter().map(|e| e.prepared));
         let opts = IndexOpts {
             dataflow: target.dataflow,
             ..IndexOpts::default()
         };
-        let graph = link_prepared(prepared, &mut planned.store, &opts, &mut planned.stats)?;
         let scip = scip.map(|bytes| ScipRun {
             overlay: ScipOverlay {
                 scip: bytes,
@@ -630,14 +626,34 @@ impl<S: FactStore> Session<S> {
             },
             sources: &pending.sources,
         });
-        self.complete(&mut planned.store, graph, planned.stats, scip, target)
+        let Planned {
+            mut store,
+            mut stats,
+            prepared,
+            extracted,
+            ..
+        } = planned;
+        match target.mode {
+            Mode::Head => {
+                let graph = link_extracted(&mut store, prepared, extracted, &opts, &mut stats)?;
+                self.complete(&mut store, graph, stats, scip, target)
+            }
+            // A working-tree index persists nothing (ADR-06): its fragments and
+            // dataflow caches go to an overlay dropped at the end of this call;
+            // the store is only read through, for Layer-1 cache hits.
+            Mode::Worktree => {
+                let mut overlay = OverlayStore::new(&store);
+                let graph = link_extracted(&mut overlay, prepared, extracted, &opts, &mut stats)?;
+                self.complete(&mut overlay, graph, stats, scip, target)
+            }
+        }
     }
 
     /// The tail every index shares once linked: post-link passes, persistence
     /// for `head` mode, and the resident graph.
-    pub(crate) fn complete(
+    pub(crate) fn complete<T: FactStore>(
         &mut self,
-        store: &mut S,
+        store: &mut T,
         mut graph: ResolvedGraph,
         mut stats: IndexStats,
         scip: Option<ScipRun<'_>>,
@@ -762,3 +778,16 @@ pub fn extract(registry: &FrontendRegistry, ctx: &[u8], content: &[u8]) -> Resul
     ))
 }
 
+
+/// Store the submitted fragments in `store`, then link them with the cache hits.
+fn link_extracted<T: FactStore>(
+    store: &mut T,
+    mut prepared: Vec<PreparedFile>,
+    extracted: Vec<ExtractedFile>,
+    opts: &IndexOpts,
+    stats: &mut IndexStats,
+) -> Result<ResolvedGraph> {
+    put_extracted(store, &extracted)?;
+    prepared.extend(extracted.into_iter().map(|e| e.prepared));
+    Ok(link_prepared(prepared, store, opts, stats)?)
+}

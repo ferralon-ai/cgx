@@ -203,14 +203,34 @@ fn resolve_answers_a_batch_of_selectors() {
     assert_eq!(s.call("resolve", &json!({})).unwrap_err().kind, ErrorKind::InvalidParams);
 }
 
-/// Worktree mode holds the working tree's graph, never advances the pointer, and
-/// reports the overlay in its session metadata.
+/// Every file under `dir`, by path relative to it, with its bytes.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(path.strip_prefix(dir).unwrap().to_path_buf(), bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Worktree mode holds the working tree's graph, persists nothing (no fragment,
+/// graph, cache or pointer write reaches `.cgx/`), and reports the overlay in its
+/// session metadata.
 #[test]
 fn worktree_index_is_held_not_persisted() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = fixture_repo(tmp.path(), "go");
     let mut s = indexed(&repo);
     let pointer = std::fs::read(repo.join(".cgx/HEAD.json")).unwrap();
+    let before = snapshot(&repo.join(".cgx"));
 
     std::fs::write(repo.join("extra.go"), "package main\n\nfunc extraForWorktree() {}\n").unwrap();
     let report = s.index_native(Mode::Worktree, None, None, false).unwrap();
@@ -220,6 +240,7 @@ fn worktree_index_is_held_not_persisted() {
     assert!(found["graph_version"].as_str().unwrap().contains("+dirty."));
     assert_eq!(found["results"].as_array().unwrap().len(), 1);
     assert_eq!(std::fs::read(repo.join(".cgx/HEAD.json")).unwrap(), pointer);
+    assert!(before == snapshot(&repo.join(".cgx")), "a worktree index wrote to .cgx/");
 }
 
 /// cgx's own `.cgx/` is not part of the working set: a worktree index after a

@@ -62,10 +62,15 @@ pub fn run(args: WasmArgs) -> Result<()> {
         root.display(),
         registry.display()
     );
-    // With the rust-src component installed, std code monomorphized into our
-    // crates carries the toolchain's absolute source path; remap it too.
-    if let Some(sysroot) = rustc_sysroot(&root) {
-        rustflags.push_str(&format!(" --remap-path-prefix={sysroot}=/build/rust"));
+    // Without the rust-src component, std code monomorphized into our crates
+    // carries rustc's own `/rustc/<commit-hash>` prefix. With rust-src
+    // installed, rustc maps that back to the local source path, so map the
+    // local path to the same prefix: the module must not depend on whether
+    // rust-src is installed.
+    if let (Some(sysroot), Some(commit)) = (rustc_sysroot(&root), rustc_commit_hash(&root)) {
+        rustflags.push_str(&format!(
+            " --remap-path-prefix={sysroot}/lib/rustlib/src/rust=/rustc/{commit}"
+        ));
     }
     let cflags = format!(
         "--sysroot={} -ffile-prefix-map={}=/build/cgx -ffile-prefix-map={}=/build/cargo-registry",
@@ -128,6 +133,25 @@ fn rustc_sysroot(root: &Path) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The `commit-hash` line of `rustc -vV`: the prefix rustc's own std sources
+/// carry in a toolchain without rust-src.
+fn rustc_commit_hash(root: &Path) -> Option<String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = Command::new(rustc)
+        .current_dir(root)
+        .arg("-vV")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("commit-hash: "))
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty() && h != "unknown")
 }
 
 /// HEAD's author date, matching reproducible-build.sh. `None` outside a git

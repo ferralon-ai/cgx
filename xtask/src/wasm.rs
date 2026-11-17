@@ -12,6 +12,14 @@
 // overridden for this build only (fat LTO, one codegen unit), so the native
 // release profile is untouched.
 //
+// The module is reproducible per build host, not across hosts. Cargo folds
+// rustc's verbose version, whose `host:` line names the build host, into the
+// `-C metadata` hash of every crate, and that hash reaches symbol names and
+// code layout. A macOS arm64 build therefore reproduces itself but differs from
+// an x86_64 Linux build of the same commit. The reference host is
+// x86_64-unknown-linux-gnu: to cross-check a published module, build it in a
+// linux/amd64 environment with the x86_64-linux wasi-sdk.
+//
 // Usage:
 //   WASI_SDK_PATH=/path/to/wasi-sdk-34.0 cargo run -p xtask -- wasm
 //   cargo run -p xtask -- wasm --wasi-sdk /path/to/wasi-sdk-34.0 --out cgx.wasm

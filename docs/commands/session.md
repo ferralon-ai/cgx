@@ -10,7 +10,7 @@ cgx session [--repo <path>]
 
 ## Description
 
-`cgx session` is the embedding protocol behind the Go SDK's native transport, and the native twin of the `cgx.wasm` module's exports. Unlike [`cgx mcp`](mcp.md), which indexes the repository for every tool call, a session indexes (or warm-opens the persisted `.cgx/` index) once and keeps the graph resident, so each later call costs only the query.
+`cgx session` is the embedding protocol behind the Go SDK's native transport, and the native twin of the `cgx.wasm` module's exports. Unlike [`cgx mcp`](mcp.md), which loads the graph from the persistent `.cgx/` index on every tool call (bringing it current when `HEAD` has moved, and re-linking a working-tree overlay that is never persisted when the tree is dirty), a session indexes (or warm-opens the persisted `.cgx/` index) once and keeps the graph resident, so each later call costs only the query.
 
 The protocol is newline-delimited JSON. The server's first line is a handshake:
 
@@ -40,7 +40,7 @@ Node and edge ids in these answers are valid for one `graph_version` only.
 
 ### Freshness is as of `open` / `index`
 
-A session establishes `graph_version`, `dirty` and the freshness envelope when a graph becomes resident and does not re-check them per call (unlike `cgx mcp`, which re-indexes per call). If `HEAD` moves while a session holds a graph, answers keep describing the graph as it was; send `open` (or `index`) to pick up the change. In worktree mode `freshness.dirty_files` is `null`: the session does not run git's ignore-aware dirty count.
+A session establishes `graph_version`, `dirty` and the freshness envelope when a graph becomes resident and does not re-check them per call (unlike `cgx mcp`, which re-checks the persistent `.cgx/` index against `HEAD` and rebuilds its never-persisted dirty overlay on every call). If `HEAD` moves while a session holds a graph, answers keep describing the graph as it was; send `open` (or `index`) to pick up the change. In worktree mode `freshness.dirty_files` is `null`: the session does not run git's ignore-aware dirty count.
 
 ### Concurrency
 

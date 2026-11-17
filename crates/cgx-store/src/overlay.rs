@@ -13,7 +13,7 @@
 
 use crate::error::Result;
 use crate::object_store::check_canonical;
-use crate::store::{FactStore, FnSummaryRow, FragmentInput};
+use crate::fact_store::{FactStore, FnSummaryRow, FragmentInput};
 use crate::types::{CachedFragment, FragmentKey, FragmentKeySet, LinkedGraph, PruneStats, TreeOid};
 use std::collections::BTreeMap;
 

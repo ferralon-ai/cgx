@@ -43,3 +43,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- determinism
+
+  wasm:
+    name: wasm32 module
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The C toolchain for tree-sitter and SQLite on wasm32-wasip1; xtask wasm
+      # refuses any other version. sha256 of the release asset.
+      WASI_SDK_VERSION: "34.0"
+      WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasi-sdk
+        run: |
+          archive="$RUNNER_TEMP/wasi-sdk.tar.gz"
+          curl -sSfL -o "$archive" \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION%%.*}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          echo "${WASI_SDK_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          sdk="$RUNNER_TEMP/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux"
+          {
+            echo "WASI_SDK_PATH=$sdk"
+            echo "CC_wasm32_wasip1=$sdk/bin/clang"
+            echo "AR_wasm32_wasip1=$sdk/bin/llvm-ar"
+            echo "CFLAGS_wasm32_wasip1=--sysroot=$sdk/share/wasi-sysroot"
+          } >> "$GITHUB_ENV"
+      - run: cargo clippy --target wasm32-wasip1 -p cgx-wasm -- -D warnings
+      - run: cargo run -p xtask -- wasm

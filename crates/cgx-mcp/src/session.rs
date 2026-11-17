@@ -52,13 +52,20 @@
 //! while `index_workdir` had genuinely built a smaller graph: same cache key,
 //! different answer.
 
-use cgx_index::local::{auto_index_opts, ensure_indexed, load_current, open_store};
-use cgx_index::{default_registry, index_workdir, manifest_digest, IndexError, Repo, SourceFile};
+use cgx_index::{manifest_digest, SourceFile};
 use cgx_query::{FreshnessEnvelope, GraphView};
-use cgx_store::{LinkedGraph, OverlayStore, TreeOid};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(not(target_family = "wasm"))]
+use cgx_index::local::{auto_index_opts, ensure_indexed, load_current, open_store};
+#[cfg(not(target_family = "wasm"))]
+use cgx_index::{default_registry, index_workdir, IndexError, Repo};
+#[cfg(not(target_family = "wasm"))]
+use cgx_store::{LinkedGraph, OverlayStore, TreeOid};
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::error::ToolError;
 
 /// A graph ready to query plus the per-call honesty metadata (ADR-06).
@@ -106,12 +113,118 @@ pub struct GraphSession {
     pub freshness: FreshnessEnvelope,
 }
 
+impl GraphSession {
+    /// The session over a graph of the committed tree `graph_key`, with `head_tree`
+    /// the `HEAD` tree as established independently of the graph (`None` when it
+    /// could not be). The working tree was not inspected, so `dirty_files` is
+    /// unknown rather than `0`.
+    pub fn committed(view: GraphView, graph_key: String, head_tree: Option<String>) -> Self {
+        GraphSession {
+            view,
+            graph_version: short_oid(&graph_key),
+            dirty: false,
+            dirty_files_analyzed: 0,
+            freshness: FreshnessEnvelope::new(Some(graph_key), head_tree, None),
+        }
+    }
+
+    /// The session over a graph of the working directory, stored or held under
+    /// `graph_key` (`workdir:<digest>`). `overlay` is [`overlay_difference`] of the
+    /// committed tree `head_tree_oid` and the working sources the graph was built
+    /// from; `dirty` is `HEAD`'s tree and git's count of divergent paths from it,
+    /// `None` where that count was not established.
+    pub fn worktree(
+        view: GraphView,
+        head_tree_oid: String,
+        overlay: &[String],
+        dirty: Option<(String, usize)>,
+        graph_key: String,
+    ) -> Self {
+        let dirty_files = dirty.as_ref().map(|(_, n)| *n);
+
+        // Whether the graph is HEAD's tree is **three-valued**, because neither view of
+        // the working tree is authoritative alone:
+        //
+        // - `overlay` is built from `enumerate_workdir`, which applies no ignore rules.
+        //   It is exactly what fed the indexer, so an empty overlay is the strongest
+        //   fact available: nothing on disk differs from the committed tree at all, and
+        //   the graph *is* HEAD's tree however git would describe the checkout.
+        // - `dirty_file_count` applies git's ignore rules, so it answers a narrower
+        //   question and can report `0` for a tree the indexer read extra files from.
+        //
+        // A non-empty overlay beside `dirty_files == 0` is those two views disagreeing:
+        // an ignored `.rs` file is in the graph and not in HEAD's tree (`matches_head:
+        // true` would be a false clean bill on an answer containing a symbol HEAD does
+        // not have), yet git's own account of the checkout is that it matches HEAD
+        // (`false` would assert a divergence nobody established). `None` is the honest
+        // third answer, and the envelope's verdict word renders it `unknown`.
+        //
+        // This is a bridge, not a permanent shrug: once `enumerate_workdir` becomes
+        // ignore-aware (backlog B-17), a git-clean repo has an empty overlay and this
+        // returns to `Some(true)` on its own.
+        let matches_head = if overlay.is_empty() {
+            Some(true)
+        } else if dirty_files.is_some_and(|n| n > 0) {
+            Some(false)
+        } else {
+            None
+        };
+
+        // What the answer was computed over is the working tree, so that is what
+        // `indexed_tree` must name — unless the working tree is established to be
+        // content-identical to HEAD's tree, in which case naming HEAD's tree is the
+        // honest description of the same graph.
+        let indexed_tree = if matches_head == Some(true) {
+            head_tree_oid.clone()
+        } else {
+            graph_key
+        };
+        let freshness = match matches_head {
+            // The `workdir:` key is never HEAD's tree OID, so `new` derives exactly the
+            // `matches_head` computed above for both `Some` arms.
+            Some(_) => {
+                FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty)
+            }
+            None => FreshnessEnvelope::indeterminate_head(
+                Some(indexed_tree),
+                Some(head_tree_oid.clone()),
+                dirty,
+            ),
+        };
+        debug_assert_eq!(freshness.matches_head, matches_head);
+
+        if overlay.is_empty() {
+            // Clean tree: the overlay changed nothing, so report the committed base.
+            GraphSession {
+                view,
+                graph_version: short_oid(&head_tree_oid),
+                dirty: false,
+                dirty_files_analyzed: 0,
+                freshness,
+            }
+        } else {
+            GraphSession {
+                view,
+                graph_version: format!(
+                    "{}+dirty.{}",
+                    short_oid(&head_tree_oid),
+                    overlay_digest(overlay)
+                ),
+                dirty: true,
+                dirty_files_analyzed: overlay.len(),
+                freshness,
+            }
+        }
+    }
+}
+
 /// Acquire a graph for one tool call.
 ///
 /// `root` is the repository root the tool named. `include_dirty` selects the
 /// committed tree (false) or the working-directory overlay (true). The persistent
 /// `.cgx/` index is brought current first, exactly as a CLI query does; the
 /// overlay itself is never persisted (ADR-06 invariant).
+#[cfg(not(target_family = "wasm"))]
 pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolError> {
     if !include_dirty {
         ensure_indexed(root).map_err(|e| index_error("indexing committed tree", e))?;
@@ -123,13 +236,11 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         let head_tree = Repo::discover(root)
             .ok()
             .and_then(|r| r.head_tree_oid().ok());
-        return Ok(GraphSession {
-            view: into_view(graph),
-            graph_version: short_oid(&graph_key),
-            dirty: false,
-            dirty_files_analyzed: 0,
-            freshness: FreshnessEnvelope::new(Some(graph_key), head_tree, None),
-        });
+        return Ok(GraphSession::committed(
+            into_view(graph),
+            graph_key,
+            head_tree,
+        ));
     }
 
     // include_dirty: the working directory (committed + uncommitted).
@@ -180,84 +291,23 @@ pub fn acquire(root: &Path, include_dirty: bool) -> Result<GraphSession, ToolErr
         .dirty_file_count(&committed)
         .ok()
         .map(|n| (head_tree_oid.clone(), n));
-    let dirty_files = dirty.as_ref().map(|(_, n)| *n);
-
-    // Whether the graph is HEAD's tree is **three-valued**, because neither view of
-    // the working tree is authoritative alone:
-    //
-    // - `overlay` is built from `enumerate_workdir`, which applies no ignore rules.
-    //   It is exactly what fed the indexer, so an empty overlay is the strongest
-    //   fact available: nothing on disk differs from the committed tree at all, and
-    //   the graph *is* HEAD's tree however git would describe the checkout.
-    // - `dirty_file_count` applies git's ignore rules, so it answers a narrower
-    //   question and can report `0` for a tree the indexer read extra files from.
-    //
-    // A non-empty overlay beside `dirty_files == 0` is those two views disagreeing:
-    // an ignored `.rs` file is in the graph and not in HEAD's tree (`matches_head:
-    // true` would be a false clean bill on an answer containing a symbol HEAD does
-    // not have), yet git's own account of the checkout is that it matches HEAD
-    // (`false` would assert a divergence nobody established). `None` is the honest
-    // third answer, and the envelope's verdict word renders it `unknown`.
-    //
-    // This is a bridge, not a permanent shrug: once `enumerate_workdir` becomes
-    // ignore-aware (backlog B-17), a git-clean repo has an empty overlay and this
-    // returns to `Some(true)` on its own.
-    let matches_head = if overlay.is_empty() {
-        Some(true)
-    } else if dirty_files.is_some_and(|n| n > 0) {
-        Some(false)
-    } else {
-        None
-    };
-
-    // What the answer was computed over is the working tree, so that is what
-    // `indexed_tree` must name — unless the working tree is established to be
-    // content-identical to HEAD's tree, in which case naming HEAD's tree is the
-    // honest description of the same graph.
-    let indexed_tree = match workdir_key {
-        Some(key) if matches_head != Some(true) => key,
-        _ => head_tree_oid.clone(),
-    };
-    let freshness = match matches_head {
-        // The `workdir:` key is never HEAD's tree OID, so `new` derives exactly the
-        // `matches_head` computed above for both `Some` arms.
-        Some(_) => FreshnessEnvelope::new(Some(indexed_tree), Some(head_tree_oid.clone()), dirty),
-        None => FreshnessEnvelope::indeterminate_head(
-            Some(indexed_tree),
-            Some(head_tree_oid.clone()),
-            dirty,
-        ),
-    };
-    debug_assert_eq!(freshness.matches_head, matches_head);
-
-    if overlay.is_empty() {
-        // Clean tree: the overlay changed nothing, so report the committed base.
-        Ok(GraphSession {
-            view,
-            graph_version: short_oid(&head_tree_oid),
-            dirty: false,
-            dirty_files_analyzed: 0,
-            freshness,
-        })
-    } else {
-        Ok(GraphSession {
-            view,
-            graph_version: format!(
-                "{}+dirty.{}",
-                short_oid(&head_tree_oid),
-                overlay_digest(&overlay)
-            ),
-            dirty: true,
-            dirty_files_analyzed: overlay.len(),
-            freshness,
-        })
-    }
+    // A clean overlay served the stored committed graph, which has no `workdir:`
+    // key; `worktree` names HEAD's tree for it either way.
+    let graph_key = workdir_key.unwrap_or_else(|| head_tree_oid.clone());
+    Ok(GraphSession::worktree(
+        view,
+        head_tree_oid,
+        &overlay,
+        dirty,
+        graph_key,
+    ))
 }
 
 /// Index the working directory through an [`OverlayStore`] over the persistent
 /// `.cgx/` store and return its graph with the `workdir:` key it was built under.
 /// Unchanged files are Layer-1 cache hits against `.cgx/`; every fragment and
 /// graph this run produces stays in the overlay and is dropped with it (ADR-06).
+#[cfg(not(target_family = "wasm"))]
 fn index_overlay(root: &Path, workdir: &Path) -> Result<(GraphView, Option<String>), ToolError> {
     let base = open_store(root).map_err(|e| ToolError::index(e.to_string()))?;
     let mut overlay = OverlayStore::new(&base);
@@ -277,10 +327,12 @@ fn index_overlay(root: &Path, workdir: &Path) -> Result<(GraphView, Option<Strin
 
 /// The stored graph of the committed tree the `.cgx/` pointer names, with its
 /// key. A missing or corrupt graph is rebuilt once, as the CLI does.
+#[cfg(not(target_family = "wasm"))]
 fn load_committed(root: &Path) -> Result<(String, LinkedGraph), ToolError> {
     load_current(root, true).map_err(|e| index_error("indexing committed tree", e))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn into_view(graph: LinkedGraph) -> GraphView {
     GraphView::new(graph.nodes, graph.edges, graph.candidates)
 }
@@ -288,6 +340,7 @@ fn into_view(graph: LinkedGraph) -> GraphView {
 /// Map a local-index failure to a tool error. A failed index run reads
 /// `"<what>: <pipeline error>"`; anything else (the store, the pointer) carries
 /// its own message, which names the operation and path.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn index_error(what: &str, e: IndexError) -> ToolError {
     match e {
         IndexError::Build(inner) => ToolError::index(format!("{what}: {inner}")),
@@ -319,7 +372,10 @@ pub(crate) fn index_error(what: &str, e: IndexError) -> ToolError {
 /// entirely (a deletion-only tree hashed to the empty difference and collided with
 /// the clean-`HEAD` version) and deduped two distinct paths sharing a blob into
 /// one, so a pure rename was invisible to a cache keyed on `graph_version`.
-fn overlay_difference(committed: &BTreeMap<String, String>, working: &[SourceFile]) -> Vec<String> {
+pub fn overlay_difference(
+    committed: &BTreeMap<String, String>,
+    working: &[SourceFile],
+) -> Vec<String> {
     let mut out: Vec<String> = working
         .iter()
         .filter(|w| committed.get(&w.rel_path) != Some(&w.blob_oid))

@@ -29,15 +29,15 @@ use std::path::{Path, PathBuf};
 use crate::cargo_pkg::PackageMap;
 use crate::error::{IndexError, Result};
 use crate::manifest::ManifestMap;
-use crate::git::SourceFile;
-use cgx_core::codec::{decode, encode};
-use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, RelPath};
+use crate::source::SourceFile;
+use cgx_core::codec::encode;
+use cgx_frontend::{FileCtx, FileFacts, FrontendRegistry, ManifestKind, RelPath};
 use cgx_resolve::{
     link, propagate_dirty, run_cha, run_effect_closure, run_rta, run_sig, ChaStats, DataflowStats,
     EffectStats, FileInput, IfdsDataflowStats, LinkOpts, ResolvedGraph, RtaStats, SigStats,
 };
 use cgx_scip::ScipResolver;
-use cgx_store::{FactStore, FragmentInput, FragmentKey, LinkedGraph, TreeOid};
+use cgx_store::{FactStore, FragmentKey, LinkedGraph, TreeOid};
 
 pub use compdb::CompdbReport;
 pub use scip_relabel::ScipStats;
@@ -128,27 +128,66 @@ pub struct IndexStats {
 
 /// One file's resolved contribution, carrying owned facts so the link step can
 /// borrow them uniformly whether they came from cache or fresh extraction.
-struct PreparedFile {
-    blob_oid: String,
-    rel_path: String,
-    lang: String,
-    facts: FileFacts,
+#[derive(Debug, Clone)]
+pub struct PreparedFile {
+    /// Git blob OID (hex) of the file's content.
+    pub blob_oid: String,
+    /// Repo-relative, `/`-separated path.
+    pub rel_path: String,
+    /// The language tag of the adapter that claims the file.
+    pub lang: String,
+    /// The file's extracted facts — fresh from [`extract_one`], or decoded from a
+    /// cached Layer-1 fragment.
+    pub facts: FileFacts,
 }
 
-/// Run the extract → cache → link stages over `sources`, writing newly extracted
-/// fragments to the store and returning the resolved graph plus stats. Does *not*
-/// store the graph — the caller decides the Layer-2 key (a real tree OID, or a
-/// synthetic key for a dirty overlay).
-pub(crate) fn extract_and_link<S: FactStore>(
-    sources: &[SourceFile],
-    registry: &FrontendRegistry,
-    store: &mut S,
-    opts: &IndexOpts,
-) -> Result<(ResolvedGraph, IndexStats)> {
-    use rayon::prelude::*;
+/// One source an adapter claims, with the context its extraction runs under.
+#[derive(Debug, Clone)]
+pub struct PlannedFile {
+    /// Index of the file in the `sources` slice given to [`plan`].
+    pub source: usize,
+    /// The extraction context: path, blob OID, owning package and manifest.
+    pub ctx: FileCtx,
+    /// The Layer-1 fragment-cache key, derived from the whole `ctx`
+    /// ([`FileCtx::cache_identity`]).
+    pub key: FragmentKey,
+    /// The language tag of the claiming adapter.
+    pub lang: String,
+}
 
-    let mut stats = IndexStats::default();
+/// The output of [`plan`]: the claimed files in source order, and how many
+/// sources no adapter claims.
+#[derive(Debug, Clone, Default)]
+pub struct Plan {
+    /// Files a registered adapter claims, in `sources` order.
+    pub files: Vec<PlannedFile>,
+    /// Sources skipped because no registered adapter claims them.
+    pub unsupported: usize,
+}
 
+/// A freshly extracted file: its prepared facts plus the Layer-1 fragment to
+/// cache under its key.
+#[derive(Debug, Clone)]
+pub struct ExtractedFile {
+    /// The file's identity and extracted facts.
+    pub prepared: PreparedFile,
+    /// The Layer-1 fragment-cache key of the context the file was extracted under.
+    pub key: FragmentKey,
+    /// The claiming frontend's `fragment_version()`; a cached fragment is valid
+    /// only for the version that wrote it.
+    pub fragment_version: u32,
+    /// The canonical postcard encoding of `prepared.facts`
+    /// (`cgx_core::codec::encode`) — the bytes stored as the Layer-1 fragment.
+    pub fragment: Vec<u8>,
+}
+
+/// Stage 1 of [`extract_and_link`]: decide which sources are extracted and under
+/// what [`FileCtx`].
+///
+/// Resolves each file's owning package and build manifest from the manifests in
+/// `sources` and drops files no registered adapter claims. Pure: no store, no
+/// git. Only manifest contents are read; other files' `content` is not consulted.
+pub fn plan(sources: &[SourceFile], registry: &FrontendRegistry) -> Plan {
     // Resolve each file's owning package from the Cargo manifests in the source
     // set (workspace-aware), so FQNs root at the real crate name even for the
     // `src/`-at-root / no-`src` layouts the path alone can't disambiguate. This
@@ -157,39 +196,98 @@ pub(crate) fn extract_and_link<S: FactStore>(
 
     // Resolve the non-Cargo build manifests (go.mod / package.json / pyproject)
     // the same way, so the Go/Python/TS adapters can receive manifest-declared
-    // identity their per-file extract cannot read. Behaviour-neutral: no adapter
-    // reads `FileCtx::manifest` yet.
+    // identity their per-file extract cannot read.
     let manifest_map = ManifestMap::from_sources(sources);
 
-    // Pass 1 (sequential, cheap SQLite reads): partition into cache hits (decode
-    // now) and misses (extract in parallel below). The store needs `&mut`/`&` so
-    // this stays single-threaded; only the CPU-bound extraction is parallelized.
-    let mut prepared: Vec<PreparedFile> = Vec::new();
-    let mut misses: Vec<(&SourceFile, FileCtx, FragmentKey)> = Vec::new();
-    for src in sources {
+    let mut out = Plan::default();
+    for (i, src) in sources.iter().enumerate() {
         let rel = RelPath::new(src.rel_path.clone());
         if !registry.has_adapter_for(&rel) {
-            stats.blobs_unsupported += 1;
+            out.unsupported += 1;
             continue;
         }
-        // The key is derived from the exact context `extract` will see, so an
-        // identical blob at another path (or under another package/manifest)
-        // never reuses this file's path-derived FQNs.
         let package = pkg_map.package_for(&src.rel_path).map(str::to_string);
         let manifest = manifest_map.manifest_for(&src.rel_path);
         let ctx = FileCtx::new(src.rel_path.clone(), src.blob_oid.clone())
             .with_package(package)
             .with_manifest(manifest);
+        // The key is derived from the exact context `extract` will see, so an
+        // identical blob at another path (or under another package/manifest)
+        // never reuses this file's path-derived FQNs.
         let key = FragmentKey::derive(&ctx.cache_identity());
-        let want = registry.frontend_for(&rel).fragment_version();
-        match store.fragment(&key)? {
+        out.files.push(PlannedFile {
+            source: i,
+            ctx,
+            key,
+            lang: registry.lang_for(&rel).tag().to_string(),
+        });
+    }
+    out
+}
+
+/// The manifest table: each manifest file name (matched against a path's final
+/// segment, at any depth) and the kind of manifest it is, which selects the
+/// resolver that reads it. Extend this table — and only this table — when
+/// planning starts reading another manifest kind.
+const MANIFEST_FILES: &[(&str, ManifestKind)] = &[
+    ("Cargo.toml", ManifestKind::Cargo),
+    ("go.mod", ManifestKind::GoMod),
+    ("package.json", ManifestKind::PackageJson),
+    ("pyproject.toml", ManifestKind::PyProject),
+    ("setup.py", ManifestKind::PyProject),
+];
+
+/// The kind of manifest `path` is (see [`is_manifest_path`]), or `None`.
+pub(crate) fn manifest_kind(path: &str) -> Option<ManifestKind> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    MANIFEST_FILES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .map(|(_, kind)| kind.clone())
+}
+
+/// Whether `path` is a manifest: **the single manifest-filename predicate in
+/// cgx-index.** Every manifest resolver (the Cargo package map and the
+/// go.mod / package.json / Python manifest map) selects its files through it,
+/// dispatching on the matched kind, and [`plan`] reads the
+/// content of these sources and of no others, so a host that supplies sources
+/// itself sends content only for these paths and may leave the rest empty. A
+/// resolver that reads a file this predicate rejects would see empty content on
+/// such a host and silently diverge; `tests/manifest_predicate.rs` guards that
+/// over the fixtures.
+pub fn is_manifest_path(path: &str) -> bool {
+    manifest_kind(path).is_some()
+}
+
+/// Pass 1 of [`extract_and_link`]: probe the store's Layer-1 fragment cache for
+/// every planned file. Hits from the current frontend version are decoded into
+/// prepared facts and counted in `stats.blobs_cached`; fragments from another
+/// frontend version are counted in `stats.blobs_stale` and returned with the
+/// misses for extraction.
+///
+/// This is the single implementation of the cache probe: every driver of the
+/// pipeline stages (the native composition and a host-driven one) calls it, so a
+/// change to what counts as a usable hit applies to all of them.
+pub fn probe_fragments<'p, S: FactStore>(
+    plan: &'p Plan,
+    registry: &FrontendRegistry,
+    store: &S,
+    stats: &mut IndexStats,
+) -> Result<(Vec<PreparedFile>, Vec<&'p PlannedFile>)> {
+    use cgx_core::codec::decode;
+
+    let mut prepared: Vec<PreparedFile> = Vec::new();
+    let mut misses: Vec<&PlannedFile> = Vec::new();
+    for file in &plan.files {
+        let want = registry.frontend_for(&file.ctx.path).fragment_version();
+        match store.fragment(&file.key)? {
             Some(cached) if cached.frontend_version == want => {
                 let facts: FileFacts = decode(&cached.fragment)?;
                 stats.blobs_cached += 1;
                 prepared.push(PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
+                    blob_oid: file.ctx.blob_oid.clone(),
+                    rel_path: file.ctx.path.as_str().to_string(),
+                    lang: file.lang.clone(),
                     facts,
                 });
             }
@@ -198,53 +296,75 @@ pub(crate) fn extract_and_link<S: FactStore>(
             // and let the store overwrite it.
             Some(_) => {
                 stats.blobs_stale += 1;
-                misses.push((src, ctx, key));
+                misses.push(file);
             }
-            None => misses.push((src, ctx, key)),
+            None => misses.push(file),
         }
     }
+    Ok((prepared, misses))
+}
 
-    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
-    // store/git access — the (content, context) purity that makes Layer-1
-    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
-    // step 3).
-    let extracted: Vec<(PreparedFile, FragmentKey, u32, Vec<u8>)> = misses
-        .into_par_iter()
-        .map(|(src, ctx, key)| {
-            let rel = RelPath::new(src.rel_path.clone());
-            let facts = registry.extract(&src.content, &ctx)?;
-            let bytes = encode(&facts)?;
-            let version = registry.frontend_for(&rel).fragment_version();
-            Ok((
-                PreparedFile {
-                    blob_oid: src.blob_oid.clone(),
-                    rel_path: src.rel_path.clone(),
-                    lang: registry.lang_for(&rel).tag().to_string(),
-                    facts,
-                },
-                key,
-                version,
-                bytes,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    stats.blobs_extracted = extracted.len();
+/// Write freshly extracted fragments to the store's Layer-1 cache in one batch.
+/// A no-op for an empty slice.
+pub fn put_extracted<S: FactStore>(store: &mut S, extracted: &[ExtractedFile]) -> Result<()> {
+    use cgx_store::FragmentInput;
 
-    // Batch-write the freshly extracted fragments in one transaction.
-    if !extracted.is_empty() {
-        let batch: Vec<FragmentInput<'_>> = extracted
-            .iter()
-            .map(|(p, key, version, bytes)| FragmentInput {
-                key,
-                lang: &p.lang,
-                frontend_version: *version,
-                bytes,
-            })
-            .collect();
-        store.put_fragments(&batch)?;
+    if extracted.is_empty() {
+        return Ok(());
     }
-    prepared.extend(extracted.into_iter().map(|(p, ..)| p));
+    let batch: Vec<FragmentInput<'_>> = extracted
+        .iter()
+        .map(|e| FragmentInput {
+            key: &e.key,
+            lang: &e.prepared.lang,
+            frontend_version: e.fragment_version,
+            bytes: &e.fragment,
+        })
+        .collect();
+    store.put_fragments(&batch)?;
+    Ok(())
+}
 
+/// Stage 2 of [`extract_and_link`]: extract one file's facts and encode its
+/// Layer-1 fragment. Pure per-file work with no store or git access, so callers
+/// may run it in parallel or on another host.
+pub fn extract_one(
+    registry: &FrontendRegistry,
+    ctx: &FileCtx,
+    content: &[u8],
+) -> Result<ExtractedFile> {
+    let rel = &ctx.path;
+    let facts = registry.extract(content, ctx)?;
+    let bytes = encode(&facts)?;
+    let version = registry.frontend_for(rel).fragment_version();
+    Ok(ExtractedFile {
+        prepared: PreparedFile {
+            blob_oid: ctx.blob_oid.clone(),
+            rel_path: rel.as_str().to_string(),
+            lang: registry.lang_for(rel).tag().to_string(),
+            facts,
+        },
+        key: FragmentKey::derive(&ctx.cache_identity()),
+        fragment_version: version,
+        fragment: bytes,
+    })
+}
+
+/// Stage 3 of [`extract_and_link`]: link the prepared files into a
+/// [`ResolvedGraph`].
+///
+/// Sorts `prepared` by path (link input must be order-stable), builds the
+/// [`LinkOpts`] from `opts`, and runs [`link`]. Under `opts.dataflow` it also
+/// loads the per-function intraproc cache from `store` beforehand and persists
+/// the new cache, `summary_deps`, and IFDS summaries afterwards. Fills the
+/// `blobs_indexed`, `nodes`, `edges`, `unresolved`, `dataflow` and `ifds`
+/// counters in `stats`.
+pub fn link_prepared<S: FactStore>(
+    mut prepared: Vec<PreparedFile>,
+    store: &mut S,
+    opts: &IndexOpts,
+    stats: &mut IndexStats,
+) -> Result<ResolvedGraph> {
     // Restore deterministic order (cache hits + parallel misses interleave):
     // sort by path so the link input set is order-stable.
     prepared.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -305,6 +425,50 @@ pub(crate) fn extract_and_link<S: FactStore>(
         stats.ifds = df.ifds_stats;
     }
 
+    Ok(graph)
+}
+
+/// Run the extract → cache → link stages over `sources`, writing newly extracted
+/// fragments to the store and returning the resolved graph plus stats. Does *not*
+/// store the graph — the caller decides the Layer-2 key (a real tree OID, or a
+/// synthetic key for a dirty overlay).
+///
+/// The composition of [`plan`], [`extract_one`] and [`link_prepared`] around the
+/// store's Layer-1 fragment cache.
+#[cfg(not(target_family = "wasm"))]
+pub fn extract_and_link<S: FactStore>(
+    sources: &[SourceFile],
+    registry: &FrontendRegistry,
+    store: &mut S,
+    opts: &IndexOpts,
+) -> Result<(ResolvedGraph, IndexStats)> {
+    use rayon::prelude::*;
+
+    let mut stats = IndexStats::default();
+
+    let plan = plan(sources, registry);
+    stats.blobs_unsupported = plan.unsupported;
+
+    // Pass 1 (sequential, cheap store reads): partition into cache hits (decoded
+    // now) and misses (extracted in parallel below). The store needs `&mut`/`&` so
+    // this stays single-threaded; only the CPU-bound extraction is parallelized.
+    let (mut prepared, misses) = probe_fragments(&plan, registry, store, &mut stats)?;
+
+    // Pass 2 (parallel, rayon): extract every miss. Pure per-file work with zero
+    // store/git access — the (content, context) purity that makes Layer-1
+    // cacheable (IX-1) is exactly what makes it embarrassingly parallel (IX-2
+    // step 3).
+    let extracted: Vec<ExtractedFile> = misses
+        .par_iter()
+        .map(|file| extract_one(registry, &file.ctx, &sources[file.source].content))
+        .collect::<Result<Vec<_>>>()?;
+    stats.blobs_extracted = extracted.len();
+
+    // Batch-write the freshly extracted fragments in one transaction.
+    put_extracted(store, &extracted)?;
+    prepared.extend(extracted.into_iter().map(|e| e.prepared));
+
+    let graph = link_prepared(prepared, store, opts, &mut stats)?;
     Ok((graph, stats))
 }
 
@@ -312,7 +476,7 @@ pub(crate) fn extract_and_link<S: FactStore>(
 /// when `opts.scip` is set, updating `stats` with the SCIP counters and any edge
 /// count change (dependency edges). A `None` `opts.scip` is a no-op — the graph
 /// and stats are byte-identical to the Phase-1 path.
-pub(crate) fn apply_scip(
+pub fn apply_scip(
     graph: &mut ResolvedGraph,
     stats: &mut IndexStats,
     sources: &[SourceFile],
@@ -322,9 +486,72 @@ pub(crate) fn apply_scip(
     let Some(scip_path) = opts.scip.as_ref() else {
         return Ok(());
     };
-    let bytes = read_scip(scip_path)?;
-    let resolver = ScipResolver::from_bytes(&bytes)
-        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))?;
+    let scip = read_scip(scip_path)?;
+    let compdb = || {
+        compdb::completeness(sources, source_root, opts.compdb.as_deref(), opts.compdb_complete)
+    };
+    relabel_scip(graph, stats, &scip, compdb)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index {scip_path:?}: {e}")))
+}
+
+/// A SCIP overlay supplied as bytes rather than paths: the input to
+/// [`apply_scip_bytes`], for a caller with no filesystem access to the files (a
+/// wasm guest whose host read them).
+#[derive(Debug, Clone, Copy)]
+pub struct ScipOverlay<'a> {
+    /// The `.scip` index bytes.
+    pub scip: &'a [u8],
+    /// The `compile_commands.json` behind a scip-clang index, if known. Consulted
+    /// only for a scip-clang index and only when `compdb_complete` is unset.
+    pub compdb: Option<CompdbInput<'a>>,
+    /// The `--compdb-complete` assertion: trust the compdb as covering every
+    /// translation unit without checking.
+    pub compdb_complete: bool,
+}
+
+/// A `compile_commands.json` supplied as bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct CompdbInput<'a> {
+    /// The file's bytes.
+    pub bytes: &'a [u8],
+    /// The directory the file lives in: the base for an entry that omits
+    /// `directory`, as it would be when the compdb is read from disk.
+    pub dir: &'a Path,
+}
+
+/// [`apply_scip`] over bytes. `sources` and `source_root` are as for
+/// [`apply_scip`]: the indexed source set and the absolute directory its paths are
+/// relative to, which anchors the scip-clang compdb-completeness check. The path
+/// form is a thin wrapper that reads the files and calls the same code.
+pub fn apply_scip_bytes(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    sources: &[SourceFile],
+    source_root: &Path,
+    overlay: &ScipOverlay<'_>,
+) -> Result<()> {
+    let compdb = || {
+        compdb::completeness_bytes(
+            sources,
+            source_root,
+            overlay.compdb.map(|c| (c.bytes, c.dir)),
+            overlay.compdb_complete,
+        )
+    };
+    relabel_scip(graph, stats, overlay.scip, compdb)
+        .map_err(|e| IndexError::Scip(format!("parsing SCIP index: {e}")))
+}
+
+/// The SCIP pass shared by [`apply_scip`] and [`apply_scip_bytes`]. `compdb`
+/// computes the compdb-completeness report and is called only for a scip-clang
+/// index. The error is the SCIP parse failure, which each caller labels.
+fn relabel_scip(
+    graph: &mut ResolvedGraph,
+    stats: &mut IndexStats,
+    scip: &[u8],
+    compdb: impl FnOnce() -> compdb::CompdbReport,
+) -> std::result::Result<(), String> {
+    let resolver = ScipResolver::from_bytes(scip).map_err(|e| e.to_string())?;
     // FAIL-CLOSED compdb policy (ADR B2 Decision 3 / Phase F2): rust-analyzer
     // indices have no compile_commands.json, so the gate does not apply. A
     // scip-clang index's completeness is verified against the discovered C++ TU
@@ -334,12 +561,7 @@ pub(crate) fn apply_scip(
     let compdb = match resolver.scheme() {
         cgx_scip::SymbolScheme::RustAnalyzer => scip_relabel::CompdbCompleteness::NotApplicable,
         cgx_scip::SymbolScheme::ScipClang => {
-            let report = compdb::completeness(
-                sources,
-                source_root,
-                opts.compdb.as_deref(),
-                opts.compdb_complete,
-            );
+            let report = compdb();
             let completeness = report.completeness;
             stats.compdb = Some(report);
             completeness
@@ -367,7 +589,7 @@ fn read_scip(path: &Path) -> Result<Vec<u8>> {
 /// input, so it always runs — per the precedence ladder (§5) it runs **after**
 /// [`apply_scip`] so SCIP-settled sites are left alone. Updates the edge count
 /// and the `cha` counters.
-pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.cha = run_cha(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -380,7 +602,7 @@ pub(crate) fn apply_cha(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// ladder (§5) it runs **after** [`apply_cha`] (RTA narrows CHA's set). The
 /// cut-marker guard (design §4.3 step 3) prevents pruning a site whose
 /// construction view is incomplete. Updates the edge count and the `rta` counters.
-pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.rta = run_rta(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -393,7 +615,7 @@ pub(crate) fn apply_rta(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// a disjoint set of edge kinds (`CallsClosure`/`CallsCallback`/`CallsIndirect`)
 /// from CHA/RTA's `CallsVirtual`, so ordering relative to them is immaterial; it
 /// runs last. Updates the edge count and the `sig` counters.
-pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.sig = run_sig(graph);
     stats.edges = graph.edges.len();
     stats.nodes = graph.nodes.len();
@@ -406,12 +628,12 @@ pub(crate) fn apply_sig(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
 /// rides the improved edge precision. It mutates only node effect attributes (not
 /// edges or candidate groups), so no re-canonicalization is required. Updates the
 /// `effects` counters.
-pub(crate) fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
+pub fn apply_effects(graph: &mut ResolvedGraph, stats: &mut IndexStats) {
     stats.effects = run_effect_closure(graph);
 }
 
 /// Materialize `graph` into the store under `tree_oid`.
-pub(crate) fn store_graph<S: FactStore>(
+pub fn store_graph<S: FactStore>(
     store: &mut S,
     tree_oid: &str,
     created_rev: Option<&str>,

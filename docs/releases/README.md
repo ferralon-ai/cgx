@@ -82,6 +82,16 @@ cleave commit contains `sdk/go/go.mod`, the workflow additionally:
 Consumers depend on it as usual: `go get github.com/ferralon-ai/cgx/sdk/go@vX.Y.Z`.
 The module zip carries the stamp commit's dated `LICENSE`.
 
+**The published `cgx.wasm` hash is the Release asset's.** The module is
+reproducible per build host, not across hosts: cargo folds rustc's host triple
+into every crate's metadata hash, so a macOS build of the cleave commit
+reproduces itself but does not match the release. The reference build host is
+x86_64-unknown-linux-gnu, the release workflow's runner. To cross-check a
+release, build the cleave commit (the stamp commit's parent) in a linux/amd64
+environment with the x86_64-linux wasi-sdk 34.0, run `cargo run --locked -p
+xtask -- wasm --check-reproducible --out cgx.wasm`, and compare its sha256 with
+the `cgx-vX.Y.Z-wasm32-wasip1.wasm.sha256` asset.
+
 **The Go tag is created once and never moved.** The Go checksum database
 records the first content it sees for a module version, so a moved tag would
 break every consumer's build. If `sdk/go/vX.Y.Z` already exists at another

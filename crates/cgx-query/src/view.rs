@@ -77,6 +77,7 @@ impl GraphView {
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut in_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
         for (idx, e) in edges.iter().enumerate() {
+            cgx_core::yield_hook::tick();
             let idx = idx as u32;
             let s = e.src.index();
             let d = e.dst.index();
@@ -89,6 +90,7 @@ impl GraphView {
         }
         let mut group_sizes: BTreeMap<u32, u32> = BTreeMap::new();
         for c in &candidates {
+            cgx_core::yield_hook::tick();
             *group_sizes.entry(c.candidate_group).or_default() += 1;
         }
         GraphView {

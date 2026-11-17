@@ -157,6 +157,7 @@ pub(crate) fn classify(ix: &ReceiverIndex<'_>, site: &Site<'_>) -> Classified {
     if let Resolved::Class(ids) = resolved {
         let mut lookup = Lookup::default();
         for c in ids {
+            cgx_core::yield_hook::tick();
             lookup.merge(&lattice.lookup(c, m));
         }
         return Classified::Lookup {
@@ -246,6 +247,7 @@ pub(crate) fn constructed(
             // An in-repo `__new__` can return an instance of any class.
             let mut ts = TypeSet::default();
             for c in ids {
+                cgx_core::yield_hook::tick();
                 if ix.lattice.mro_may_define(c, "__new__") {
                     return TypeSet::top();
                 }

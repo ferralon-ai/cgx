@@ -152,6 +152,7 @@ impl<T> ChunkedVec<T> {
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let mut write = 0usize;
         for read in 0..self.len {
+            cgx_core::yield_hook::tick();
             if keep(&self[read]) {
                 if read != write {
                     self.swap(read, write);
@@ -183,13 +184,25 @@ impl<T> ChunkedVec<T> {
         from: impl Fn(I) -> usize,
     ) {
         let mut indices: Vec<(K, I)> = Vec::with_capacity(self.len);
-        indices.extend(self.iter().map(f).enumerate().map(|(i, k)| (k, to(i))));
+        indices.extend(
+            self.iter()
+                .map(f)
+                .enumerate()
+                .map(|(i, k)| (k, to(i)))
+                .inspect(|_| cgx_core::yield_hook::tick()),
+        );
         // (key, index) pairs are unique, so an unstable sort is deterministic and
-        // equals a stable sort by key.
-        indices.sort_unstable();
+        // equals a stable sort by key. Each pass here (keys, comparisons,
+        // placements) is a long allocation-free loop, so each step ticks.
+        indices.sort_unstable_by(|a, b| {
+            cgx_core::yield_hook::tick();
+            a.cmp(b)
+        });
         for i in 0..self.len {
+            cgx_core::yield_hook::tick();
             let mut index = indices[i].1;
             while from(index) < i {
+                cgx_core::yield_hook::tick();
                 index = indices[from(index)].1;
             }
             indices[i].1 = index;

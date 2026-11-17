@@ -52,6 +52,7 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
         let facts = file.facts;
         let bindings = collect_import_bindings(&facts.imports);
         for raw in &facts.refs {
+            cgx_core::yield_hook::tick();
             let caller = match enclosing_def(&facts.scopes, &facts.defs, raw.scope) {
                 Some(d) => d,
                 None => continue, // a ref with no enclosing symbol has no edge source.
@@ -116,10 +117,14 @@ pub fn link(inputs: &[FileInput<'_>], opts: &LinkOpts) -> ResolvedGraph {
     // The ledger is keyed by symbol-table ids, which the sort may just have moved.
     let (precision, mut narrowing) = ledger.finish(&table);
     if let Some(remap) = remap {
-        narrowing = narrowing
-            .into_iter()
-            .map(|(id, counts)| (remap[id.index()], counts))
-            .collect();
+        // Inserts, not `collect`: collecting sorts the remapped keys in one
+        // run with no yield point.
+        let mut remapped = std::collections::BTreeMap::new();
+        for (id, counts) in narrowing {
+            cgx_core::yield_hook::tick();
+            remapped.insert(remap[id.index()], counts);
+        }
+        narrowing = remapped;
     }
     let mut graph = finalize(nodes, edges, candidates, unresolved, &narrowing);
     graph.dataflow = dataflow;
@@ -186,7 +191,10 @@ fn build_nodes(
     }
 
     // Canonical node order: (file, line_start, fqn). Assign dense ids by position.
+    // Whole-graph sorts tick per comparison: they neither allocate nor call out,
+    // so on wasm they would otherwise run without a yield point.
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.0.file.as_str(), a.0.line_start, a.0.fqn.as_str()).cmp(&(
             b.0.file.as_str(),
             b.0.line_start,
@@ -225,20 +233,29 @@ fn sort_nodes_canonical(
     fn key(n: &NodeWithProvenance) -> (&str, u32, &str) {
         cgx_core::sort::node_sort_key(&n.node)
     }
-    if nodes.is_sorted_by(|a, b| key(a) <= key(b)) {
+    if nodes.is_sorted_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        key(a) <= key(b)
+    }) {
         return None;
     }
-    nodes.sort_by(|a, b| key(a).cmp(&key(b)));
+    nodes.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        key(a).cmp(&key(b))
+    });
     let mut remap = vec![NodeId(0); nodes.len()];
     for (i, n) in nodes.iter_mut().enumerate() {
+        cgx_core::yield_hook::tick();
         remap[n.node.id.index()] = NodeId(i as u32);
         n.node.id = NodeId(i as u32);
     }
     for e in edges.iter_mut() {
+        cgx_core::yield_hook::tick();
         e.edge.src = remap[e.edge.src.index()];
         e.edge.dst = remap[e.edge.dst.index()];
     }
     for c in candidates.iter_mut() {
+        cgx_core::yield_hook::tick();
         c.dst = remap[c.dst.index()];
     }
     Some(remap)
@@ -287,7 +304,11 @@ fn enclosing_def<'a>(
             .get(sid.index())
             .and_then(|s| s.owner_fqn.as_ref())
         {
-            if let Some(def) = defs.iter().find(|d| &d.fqn == owner) {
+            // Linear in the file's defs, per ref: tick (see `resolve_local`).
+            if let Some(def) = defs.iter().find(|d| {
+                cgx_core::yield_hook::tick();
+                &d.fqn == owner
+            }) {
                 return Some(def);
             }
         }
@@ -329,10 +350,10 @@ fn resolve_ref(
     // owner's FQN), fall through to the indirect placeholder rather than guess.
     if raw.kind == RefKind::CallPinnedClosure && raw.name_path.len() == 1 {
         if let Some(local) = resolve_pinned_closure(scopes, defs, raw.scope, last) {
-            let mut same_fqn = table
-                .defs_by_short(last)
-                .iter()
-                .filter(|d| d.fqn == local.fqn);
+            let mut same_fqn = table.defs_by_short(last).iter().filter(|d| {
+                cgx_core::yield_hook::tick();
+                d.fqn == local.fqn
+            });
             if let (Some(target), None) = (same_fqn.next(), same_fqn.next()) {
                 let id = target.node_id;
                 push_edge(
@@ -555,7 +576,10 @@ fn resolve_ref(
         let mut hits: Vec<&DefEntry> = table
             .defs_by_short(last)
             .iter()
-            .filter(|d| d.lang == file.lang)
+            .filter(|d| {
+                cgx_core::yield_hook::tick();
+                d.lang == file.lang
+            })
             .filter(|d| d.kind.is_callable() || matches!(d.kind, SymbolKind::Type))
             .collect();
         if opts.arity_filter {
@@ -563,7 +587,10 @@ fn resolve_ref(
                 let filtered: Vec<&DefEntry> = hits
                     .iter()
                     .copied()
-                    .filter(|d| d.arity.is_none_or(|a| a == arity))
+                    .filter(|d| {
+                        cgx_core::yield_hook::tick();
+                        d.arity.is_none_or(|a| a == arity)
+                    })
                     .collect();
                 if !filtered.is_empty() {
                     hits = filtered;
@@ -726,11 +753,13 @@ fn resolve_data_flows(
 
         let mut ordered: Vec<&DataFlowFact> = facts.data_flows.iter().collect();
         ordered.sort_by(|a, b| {
+            cgx_core::yield_hook::tick();
             (&a.span, &a.derived, a.derived_version)
                 .cmp(&(&b.span, &b.derived, b.derived_version))
         });
 
         for df in ordered {
+            cgx_core::yield_hook::tick();
             let Some(caller) = enclosing_def(&facts.scopes, &facts.defs, df.scope) else {
                 continue;
             };
@@ -858,6 +887,7 @@ fn resolve_data_flows(
     // in canonical (file, line, fqn) order. Symbol node ids are unchanged.
     let mut staged: Vec<ValueNodeStage> = value_nodes.into_values().collect();
     staged.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
         (a.file.as_str(), a.line, a.fqn.as_str()).cmp(&(b.file.as_str(), b.line, b.fqn.as_str()))
     });
     let mut value_fqn_to_node: std::collections::BTreeMap<String, NodeId> =
@@ -904,7 +934,10 @@ fn resolve_data_flows(
         let bytes = cgx_core::codec::encode(facts).unwrap_or_default();
         output.fn_summaries.push(((blob, fn_fqn.clone()), bytes));
     }
-    output.fn_summaries.sort();
+    output.fn_summaries.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
     output.ifds_stats = crate::graph::IfdsDataflowStats {
         summaries_computed: ifds.stats.summaries_computed,
         summary_edges_materialized: ifds.stats.summary_edges_materialized,
@@ -958,6 +991,7 @@ fn summary_site_callees<'a>(
     for (file_idx, file) in inputs.iter().enumerate() {
         let facts = file.facts;
         for df in &facts.data_flows {
+            cgx_core::yield_hook::tick();
             if !df.cut_markers.contains(&CutMarker::OpaqueCall) {
                 continue;
             }
@@ -985,6 +1019,7 @@ fn summary_site_callees<'a>(
     for (file_idx, file) in inputs.iter().enumerate() {
         let facts = file.facts;
         for raw in &facts.refs {
+            cgx_core::yield_hook::tick();
             if matches!(raw.kind, RefKind::Reference | RefKind::Instantiate)
                 || !wanted_lines.contains(&(file_idx, raw.span.line))
             {
@@ -1011,6 +1046,7 @@ fn summary_site_callees<'a>(
 
     // Fold each site's pass-1 call edges into its outcome.
     for e in edges {
+        cgx_core::yield_hook::tick();
         if !e.edge.kind.is_call() {
             continue;
         }
@@ -1037,6 +1073,7 @@ fn summary_site_callees<'a>(
     // Several calls under one key (same callee path on one line) must agree.
     let mut by_key: HashMap<(NodeId, u32, &'a str), Outcome> = HashMap::new();
     for ((caller, line, _), (callee, outcome)) in sites {
+        cgx_core::yield_hook::tick();
         by_key
             .entry((caller, line, callee))
             .and_modify(|acc| *acc = join(*acc, outcome))
@@ -1423,9 +1460,15 @@ fn resolve_local<'a>(
     name: &str,
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
+        // A scan of every def in the file, per ref and ancestor scope: a file
+        // with tens of thousands of defs makes this seconds of allocation-free
+        // work, so it ticks per def visited.
         if let Some(def) = defs
             .iter()
-            .filter(|d| d.scope == sid && short_name(&d.fqn) == name)
+            .filter(|d| {
+                cgx_core::yield_hook::tick();
+                d.scope == sid && short_name(&d.fqn) == name
+            })
             .min_by(|a, b| a.fqn.cmp(&b.fqn))
         {
             return Some(def);
@@ -1448,6 +1491,7 @@ fn resolve_pinned_closure<'a>(
 ) -> Option<&'a SymbolDef> {
     for sid in scopes.ancestors(scope) {
         let mut hits = defs.iter().filter(|d| {
+            cgx_core::yield_hook::tick();
             d.scope == sid && d.kind == SymbolKind::Lambda && short_name(&d.fqn) == name
         });
         if let Some(first) = hits.next() {
@@ -1468,11 +1512,15 @@ fn lookup_binding<'a>(
     let visible: Vec<ScopeId> = scopes.ancestors(scope).collect();
     bindings
         .iter()
-        .find(|b| !b.glob && b.local == head && visible.contains(&b.scope))
+        .find(|b| {
+            cgx_core::yield_hook::tick();
+            !b.glob && b.local == head && visible.contains(&b.scope)
+        })
         .or_else(|| {
-            bindings
-                .iter()
-                .find(|b| b.glob && visible.contains(&b.scope))
+            bindings.iter().find(|b| {
+                cgx_core::yield_hook::tick();
+                b.glob && visible.contains(&b.scope)
+            })
         })
 }
 
@@ -1506,7 +1554,10 @@ fn method_candidates(table: &SymbolTable, name: &str, lang: &str) -> Vec<DefEntr
     table
         .defs_by_short(name)
         .iter()
-        .filter(|d| matches!(d.kind, SymbolKind::Method | SymbolKind::Function))
+        .filter(|d| {
+            cgx_core::yield_hook::tick();
+            matches!(d.kind, SymbolKind::Method | SymbolKind::Function)
+        })
         .filter(|d| d.lang == lang)
         .cloned()
         .collect()
@@ -1597,7 +1648,10 @@ fn push_edge(edges: &mut ChunkedVec<EdgeWithProvenance>, b: EdgeBuild<'_>) {
 /// (deduped) set: one target ⇒ [`Confidence::Probable`], several ⇒
 /// [`Confidence::Possible`].
 pub(crate) fn canonicalize_candidate_dsts(dsts: &mut Vec<NodeId>) -> Confidence {
-    dsts.sort_by_key(|id| id.0);
+    dsts.sort_by_key(|id| {
+        cgx_core::yield_hook::tick();
+        id.0
+    });
     dsts.dedup();
     if dsts.len() == 1 {
         Confidence::Probable
@@ -1641,6 +1695,7 @@ fn emit_candidate_set(
     let locality: std::collections::BTreeMap<NodeId, LocalityTier> = if rule == "name-arity" {
         hits.iter()
             .map(|d| {
+                cgx_core::yield_hook::tick();
                 (
                     d.node_id,
                     locality_tier(&span.file, caller_fqn, &d.file, &d.fqn),
@@ -1651,11 +1706,15 @@ fn emit_candidate_set(
         std::collections::BTreeMap::new()
     };
     if rule == "name-arity" {
-        dsts.sort_by_key(|dst| {
-            (
-                locality.get(dst).copied().unwrap_or(LocalityTier::Global),
-                dst.0,
-            )
+        dsts.sort_by(|a, b| {
+            cgx_core::yield_hook::tick();
+            let key = |dst: &NodeId| {
+                (
+                    locality.get(dst).copied().unwrap_or(LocalityTier::Global),
+                    dst.0,
+                )
+            };
+            key(a).cmp(&key(b))
         });
     }
 
@@ -1685,6 +1744,7 @@ fn emit_candidate_set(
     };
 
     for (rank, dst) in dsts.iter().enumerate() {
+        cgx_core::yield_hook::tick();
         if let Some(g) = group {
             candidates.push(Candidate {
                 candidate_group: g,
@@ -1739,7 +1799,10 @@ fn finalize(
     mut unresolved: Vec<UnresolvedRef>,
     narrowing: &std::collections::BTreeMap<NodeId, NarrowingCounts>,
 ) -> ResolvedGraph {
-    unresolved.sort();
+    unresolved.sort_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
 
     // Stamp each caller's dangling-ref counts onto its node record, one field per
     // marker. Dangling refs leave *no edge*, so these counts are the only trace
@@ -1757,6 +1820,7 @@ fn finalize(
     let mut dangling: std::collections::BTreeMap<NodeId, Dangling> =
         std::collections::BTreeMap::new();
     for r in &unresolved {
+        cgx_core::yield_hook::tick();
         let d = dangling.entry(r.caller).or_default();
         match r.marker {
             CutMarker::External => d.external += 1,
@@ -1768,6 +1832,7 @@ fn finalize(
     }
     if !dangling.is_empty() || !narrowing.is_empty() {
         for n in &mut nodes {
+            cgx_core::yield_hook::tick();
             let d = dangling.get(&n.node.id);
             if let Some(d) = d {
                 n.node.unresolved_calls = d.unresolved;
@@ -1802,6 +1867,7 @@ pub(crate) fn remove_edges_at(
     let mut drop = drop.iter().copied().peekable();
     let mut i = 0usize;
     edges.retain(|_| {
+        cgx_core::yield_hook::tick();
         let keep = drop.next_if_eq(&i).is_none();
         i += 1;
         keep
@@ -1853,6 +1919,7 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     let mut renumber: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut identity = true;
     for e in &mut graph.edges {
+        cgx_core::yield_hook::tick();
         if let Some(g) = e.edge.candidate_group.as_mut() {
             let next = renumber.len() as u32;
             let new = *renumber.entry(*g).or_insert(next);
@@ -1866,9 +1933,15 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
         .candidates
         .iter()
         .map(|c| c.candidate_group)
-        .filter(|g| !renumber.contains_key(g))
+        .filter(|g| {
+            cgx_core::yield_hook::tick();
+            !renumber.contains_key(g)
+        })
         .collect();
-    edgeless.sort_unstable();
+    edgeless.sort_unstable_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        a.cmp(b)
+    });
     edgeless.dedup();
     for g in edgeless {
         let next = renumber.len() as u32;
@@ -1877,25 +1950,29 @@ pub fn canonicalize(graph: &mut ResolvedGraph) {
     }
     if !identity {
         for c in &mut graph.candidates {
+            cgx_core::yield_hook::tick();
             c.candidate_group = renumber[&c.candidate_group];
         }
         sort(&mut graph.edges);
     }
     for (i, e) in graph.edges.iter_mut().enumerate() {
+        cgx_core::yield_hook::tick();
         e.edge.id = EdgeId(i as u32);
     }
 
     // The key covers every field of a candidate, so equal keys are equal rows and
     // an unstable (allocation-free) sort yields the same sequence.
-    graph
-        .candidates
-        .sort_unstable_by_key(|c| (c.candidate_group, c.rank, c.dst.0));
+    graph.candidates.sort_unstable_by(|a, b| {
+        cgx_core::yield_hook::tick();
+        (a.candidate_group, a.rank, a.dst.0).cmp(&(b.candidate_group, b.rank, b.dst.0))
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
 
     fn node(id: u32, fqn: &str, file: &str) -> NodeWithProvenance {
         NodeWithProvenance {

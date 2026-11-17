@@ -111,8 +111,9 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
 
     // The type FQN that declares each candidate dst (the dst is a `T::m` callable;
     // its declaring type is the FQN parent).
-    let fqn_by_id: BTreeMap<NodeId, &str> =
-        graph.nodes.iter().map(|n| (n.node.id, n.node.fqn.as_str())).collect();
+    let fqn_by_id: BTreeMap<NodeId, &str> = cgx_core::yield_hook::ticking(&graph.nodes)
+        .map(|n| (n.node.id, n.node.fqn.as_str()))
+        .collect();
 
     let mut drop_edge_idx: BTreeSet<usize> = BTreeSet::new();
     let mut upgrade_edge_idx: BTreeSet<usize> = BTreeSet::new();
@@ -120,6 +121,7 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
     let mut touched_groups: BTreeSet<u32> = BTreeSet::new();
 
     for site in &sites {
+        cgx_core::yield_hook::tick();
         // CUT-MARKER GUARD (load-bearing): never prune a site whose call edge is
         // cut-marked, or when any reachable construction is behind a cut.
         let call_site_cut = site
@@ -207,6 +209,7 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
 
     // Remove the dropped candidate rows.
     graph.candidates.retain(|c| {
+        cgx_core::yield_hook::tick();
         dropped_dsts_by_group
             .get(&c.candidate_group)
             .map(|dsts| !dsts.contains(&c.dst))
@@ -218,6 +221,7 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
     // dropped. Recompute survivors per touched group from the post-drop edge set.
     let mut survivors_by_group: BTreeMap<u32, Vec<NodeId>> = BTreeMap::new();
     for e in &graph.edges {
+        cgx_core::yield_hook::tick();
         if e.edge.rule == RTA_RULE {
             if let Some(g) = e.edge.candidate_group {
                 survivors_by_group.entry(g).or_default().push(e.edge.dst);
@@ -234,15 +238,17 @@ pub fn run_rta(graph: &mut ResolvedGraph) -> RtaStats {
     }
     if !singleton_groups.is_empty() {
         for e in &mut graph.edges {
+            cgx_core::yield_hook::tick();
             if let Some(g) = e.edge.candidate_group {
                 if singleton_groups.contains(&g) {
                     e.edge.candidate_group = None;
                 }
             }
         }
-        graph
-            .candidates
-            .retain(|c| !singleton_groups.contains(&c.candidate_group));
+        graph.candidates.retain(|c| {
+            cgx_core::yield_hook::tick();
+            !singleton_groups.contains(&c.candidate_group)
+        });
     }
 
     crate::canonicalize(graph);
@@ -259,7 +265,7 @@ struct ChaSite {
 /// by `(src, site_id)`, in a deterministic order.
 fn collect_cha_sites(graph: &ResolvedGraph) -> Vec<ChaSite> {
     let mut by_site: BTreeMap<(NodeId, SiteId), Vec<usize>> = BTreeMap::new();
-    for (i, e) in graph.edges.iter().enumerate() {
+    for (i, e) in cgx_core::yield_hook::ticking(&graph.edges).enumerate() {
         if e.edge.kind == EdgeKind::CallsVirtual && e.edge.rule == CHA_RULE {
             if let Some(site_id) = e.edge.site_id {
                 by_site.entry((e.edge.src, site_id)).or_default().push(i);
@@ -278,22 +284,19 @@ fn reachable_callers(graph: &ResolvedGraph) -> BTreeSet<NodeId> {
     // Forward adjacency over call-family edges only.
     let mut adj: BTreeMap<NodeId, BTreeSet<NodeId>> = BTreeMap::new();
     for e in &graph.edges {
+        cgx_core::yield_hook::tick();
         if e.edge.kind.is_call() {
             adj.entry(e.edge.src).or_default().insert(e.edge.dst);
         }
     }
 
     let roots: Vec<NodeId> = {
-        let tagged: Vec<NodeId> = graph
-            .nodes
-            .iter()
+        let tagged: Vec<NodeId> = cgx_core::yield_hook::ticking(&graph.nodes)
             .filter(|n| n.node.entrypoint_kind.is_some())
             .map(|n| n.node.id)
             .collect();
         if tagged.is_empty() {
-            graph
-                .nodes
-                .iter()
+            cgx_core::yield_hook::ticking(&graph.nodes)
                 .filter(|n| matches!(n.node.kind, SymbolKind::Function | SymbolKind::Method))
                 .map(|n| n.node.id)
                 .collect()
@@ -312,6 +315,7 @@ fn reachable_callers(graph: &ResolvedGraph) -> BTreeSet<NodeId> {
     while let Some(n) = queue.pop_front() {
         if let Some(succ) = adj.get(&n) {
             for &s in succ {
+                cgx_core::yield_hook::tick();
                 if reachable.insert(s) {
                     queue.push_back(s);
                 }
@@ -328,10 +332,12 @@ fn instantiated_types<'g>(
     graph: &'g ResolvedGraph,
     reachable: &BTreeSet<NodeId>,
 ) -> BTreeSet<&'g str> {
-    let fqn_by_id: BTreeMap<NodeId, &str> =
-        graph.nodes.iter().map(|n| (n.node.id, n.node.fqn.as_str())).collect();
+    let fqn_by_id: BTreeMap<NodeId, &str> = cgx_core::yield_hook::ticking(&graph.nodes)
+        .map(|n| (n.node.id, n.node.fqn.as_str()))
+        .collect();
     let mut out: BTreeSet<&str> = BTreeSet::new();
     for e in &graph.edges {
+        cgx_core::yield_hook::tick();
         if e.edge.kind == EdgeKind::Instantiates && reachable.contains(&e.edge.src) {
             if let Some(ty) = fqn_by_id.get(&e.edge.dst) {
                 out.insert(ty);
@@ -348,7 +354,7 @@ fn instantiated_types<'g>(
 /// [`ResolvedGraph::unresolved`] are call/construction names cgx could not bind;
 /// they are conservatively treated as potential off-graph constructions.
 fn construction_under_cut(graph: &ResolvedGraph, reachable: &BTreeSet<NodeId>) -> bool {
-    let instantiate_under_cut = graph.edges.iter().any(|e| {
+    let instantiate_under_cut = cgx_core::yield_hook::ticking(&graph.edges).any(|e| {
         e.edge.kind == EdgeKind::Instantiates
             && reachable.contains(&e.edge.src)
             && !e.edge.cut_markers.is_empty()
@@ -359,7 +365,7 @@ fn construction_under_cut(graph: &ResolvedGraph, reachable: &BTreeSet<NodeId>) -
     // A reachable caller that carries an `UnexpandedMacro`/`ViaFfi`/`Reflective`/
     // `Dynamic`/`ViaDi` cut on *any* of its outgoing edges may construct a type we
     // cannot see. Treat that as an incomplete instantiation view.
-    graph.edges.iter().any(|e| {
+    cgx_core::yield_hook::ticking(&graph.edges).any(|e| {
         reachable.contains(&e.edge.src)
             && e.edge.cut_markers.iter().any(|m| {
                 matches!(

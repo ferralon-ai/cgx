@@ -580,6 +580,7 @@ fn scan_frontier(
     }
     for &r in roots {
         for d in walker.bfs(view, r, dir) {
+            cgx_core::yield_hook::tick();
             if let Some(i) = idx(d.node, n) {
                 if !reached[i] {
                     reached[i] = true;
@@ -628,6 +629,7 @@ fn scan_frontier(
 
     let mut facts = FrontierFacts::default();
     for &node in &touched {
+        cgx_core::yield_hook::tick();
         let node_ix = node.index();
         let record = view.node(node);
         // A narrowed site on a node at the depth horizon could only lose a
@@ -650,6 +652,7 @@ fn scan_frontier(
             facts.visible_away_in += u64::from(record.narrowing.visible_away_in);
         }
         for er in view.neighbors(node, dir, &scan_filter) {
+            cgx_core::yield_hook::tick();
             for marker in er.edge.cut_markers.iter() {
                 *facts.cut_counts.entry(marker).or_default() += 1;
             }

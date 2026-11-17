@@ -12,6 +12,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+cgx-core = { path = "../cgx-core" }
 cgx-mcp = { path = "../cgx-mcp" }
 cgx-session = { path = "../cgx-session" }
 cgx-store = { path = "../cgx-store" }

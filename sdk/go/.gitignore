@@ -1,0 +1,3 @@
+# The engine module is built by `cargo xtask wasm` and committed only into the
+# release stamp commit; see internal/embedded/module/README.md.
+/internal/embedded/module/cgx.wasm

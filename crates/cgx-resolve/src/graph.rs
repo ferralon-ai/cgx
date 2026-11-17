@@ -128,6 +128,7 @@ pub fn propagate_dirty(seed: &[String], summary_deps: &[(String, String)]) -> Ve
     // Functions whose dep set includes the wildcard: dirty if anything changed.
     let mut wildcard_dependents: Vec<&str> = Vec::new();
     for (dependent, callee) in summary_deps {
+        cgx_core::yield_hook::tick();
         if callee == "*" {
             wildcard_dependents.push(dependent.as_str());
         } else {
@@ -138,7 +139,7 @@ pub fn propagate_dirty(seed: &[String], summary_deps: &[(String, String)]) -> Ve
         }
     }
 
-    let mut dirty: BTreeSet<String> = seed.iter().cloned().collect();
+    let mut dirty: BTreeSet<String> = cgx_core::yield_hook::collect_set(seed.iter().cloned());
     let mut queue: VecDeque<String> = seed.iter().cloned().collect();
 
     // Any real change activates every wildcard dependent up front; they then
@@ -154,6 +155,7 @@ pub fn propagate_dirty(seed: &[String], summary_deps: &[(String, String)]) -> Ve
     while let Some(node) = queue.pop_front() {
         if let Some(deps) = dependents_of.get(node.as_str()) {
             for dep in deps {
+                cgx_core::yield_hook::tick();
                 if dirty.insert(dep.to_string()) {
                     queue.push_back(dep.to_string());
                 }
@@ -177,7 +179,8 @@ impl ResolvedGraph {
         nodes.shrink_to_fit();
         // Allocated once at the exact length; each source chunk is freed as soon
         // as it has been drained.
-        let edges: Vec<EdgeRecord> = self.edges.into_iter().map(|e| e.edge).collect();
+        let edges: Vec<EdgeRecord> =
+            cgx_core::yield_hook::ticking(self.edges).map(|e| e.edge).collect();
         (nodes, edges, self.candidates)
     }
 

@@ -342,3 +342,90 @@ fn missing_header_does_not_make_compdb_partial() {
     assert_eq!(c.discovered_tus, 2, "the .hpp header is excluded from the TU set");
     assert_eq!(c.missing_tus, 0);
 }
+
+/// `apply_scip_bytes` and the path form `apply_scip` are one pass: on the same
+/// linked graph and the same file contents they produce the same graph and the
+/// same SCIP and compdb counters, for every compdb case — complete, partial,
+/// asserted, absent, and a compdb path that cannot be read (absent, in both).
+#[test]
+fn bytes_and_path_forms_agree() {
+    let (_tmp, aux, repo, scip_path) = fixture();
+    let wd = repo_workdir(&repo);
+    let complete = aux.path().join("complete.json");
+    write_compdb(&complete, &repo, &["src/over.cpp", "src/main.cpp"]);
+    let partial = aux.path().join("partial.json");
+    write_compdb(&partial, &repo, &["src/main.cpp"]);
+    let unreadable = aux.path().join("missing.json");
+
+    let repo_handle = cgx_index::Repo::discover(&repo).unwrap();
+    let sources = repo_handle.enumerate_tree().unwrap();
+    let registry = cgx_index::default_registry();
+    let mut store = mem_store();
+    let base_opts = IndexOpts {
+        dataflow: false,
+        ..IndexOpts::default()
+    };
+    let (linked, base_stats) =
+        cgx_index::extract_and_link(&sources, &registry, &mut store, &base_opts).unwrap();
+    let scip = std::fs::read(&scip_path).unwrap();
+
+    let cases: [(&str, Option<&std::path::Path>, bool); 5] = [
+        ("complete", Some(&complete), false),
+        ("partial", Some(&partial), false),
+        ("asserted", None, true),
+        ("absent", None, false),
+        ("unreadable", Some(&unreadable), false),
+    ];
+    for (name, compdb, compdb_complete) in cases {
+        let opts = IndexOpts {
+            scip: Some(scip_path.clone()),
+            dataflow: false,
+            compdb: compdb.map(std::path::Path::to_path_buf),
+            compdb_complete,
+            ..IndexOpts::default()
+        };
+        let (mut by_path, mut path_stats) = (linked.clone(), base_stats.clone());
+        cgx_index::apply_scip(&mut by_path, &mut path_stats, &sources, &wd, &opts).unwrap();
+
+        let compdb_bytes = compdb.and_then(|p| std::fs::read(p).ok());
+        let overlay = cgx_index::ScipOverlay {
+            scip: &scip,
+            compdb: compdb_bytes.as_deref().map(|bytes| cgx_index::CompdbInput {
+                bytes,
+                dir: compdb.unwrap().parent().unwrap(),
+            }),
+            compdb_complete,
+        };
+        let (mut by_bytes, mut bytes_stats) = (linked.clone(), base_stats.clone());
+        cgx_index::apply_scip_bytes(&mut by_bytes, &mut bytes_stats, &sources, &wd, &overlay).unwrap();
+
+        assert_eq!(by_path, by_bytes, "{name}: graphs differ");
+        assert_eq!(path_stats.scip, bytes_stats.scip, "{name}: SCIP counters differ");
+        assert_eq!(path_stats.compdb, bytes_stats.compdb, "{name}: compdb reports differ");
+        assert!(path_stats.scip.is_some(), "{name}: the pass ran");
+    }
+}
+
+/// `fixtures/scip-clang` is this test's scenario committed for out-of-process
+/// consumers (the Go SDK's conformance suite): the sources and the encoded
+/// scip-clang index. `CGX_REGEN_FIXTURES=1` rewrites it.
+#[test]
+fn committed_scip_clang_fixture_matches_the_encoder() {
+    let dir = fixtures_root().join("scip-clang");
+    let want: [(&str, &[u8]); 4] = [
+        ("src/over.cpp", OVER_SRC.as_bytes()),
+        ("src/main.cpp", MAIN_SRC.as_bytes()),
+        ("src/pick.hpp", HEADER_SRC.as_bytes()),
+        ("index.scip", &scip_bytes()),
+    ];
+    let regen = std::env::var_os("CGX_REGEN_FIXTURES").is_some();
+    for (rel, bytes) in want {
+        let path = dir.join(rel);
+        if regen {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let got = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e} (CGX_REGEN_FIXTURES=1 writes it)"));
+        assert!(got == bytes, "{path:?} is stale; rerun with CGX_REGEN_FIXTURES=1");
+    }
+}

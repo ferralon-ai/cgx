@@ -46,10 +46,28 @@
 # and the GitHub Release body. A missing or empty file fails the run. See
 # docs/releases/README.md.
 #
+# Go module (sdk/go): when the cleave tree contains `sdk/go/go.mod`, the
+# workflow also builds `cgx.wasm` from C (twice, from two checkout paths; the
+# run fails unless the builds are byte-identical) and commits it into S at
+# `sdk/go/internal/embedded/module/cgx.wasm`, the path the module's go:embed
+# reads. S then changes exactly LICENSE and that file. The module is verified
+# at S (go vet, go test with the embedded engine) before any tag is pushed, and
+# an annotated `sdk/go/vX.Y.Z` tag is created at S. That tag is created ONCE
+# and never moved: the Go checksum database records the first content it sees
+# for a version, so a moved module tag would break every consumer. If it
+# already exists at another commit the run fails. No `sdk/go/vX.Y` alias ever
+# exists (Go resolves `@v0.3` to the newest patch by itself), and the floating
+# minor alias step below never touches `sdk/go/` tags. Cleave points without
+# `sdk/go/go.mod` (old backfills) take the LICENSE-only path unchanged. The
+# release also carries `cgx-vX.Y.Z-wasm32-wasip1.wasm` (the bytes committed in
+# S) and its `.sha256`.
+#
 # Re-entrancy / idempotency: the stamp SHA is deterministic (fixed tree, parent,
-# author/committer dates, identities, and message), so re-running converges on
-# the same commit. The guard below additionally short-circuits to a plain
-# rebuild when the tag already points at a correctly-stamped commit.
+# author/committer dates, identities, and message — and, with the Go SDK, a
+# byte-reproducible wasm), so re-running converges on the same commit. The
+# guard below additionally short-circuits to a plain rebuild when the tag
+# already points at a correctly-stamped commit; the Go tag step then only
+# confirms (or, after an interrupted run, creates) `sdk/go/vX.Y.Z` at it.
 
 name: release
 
@@ -80,6 +98,11 @@ permissions:
 env:
   TARGET: x86_64-unknown-linux-gnu
   BIN_NAME: cgx
+  # Go SDK: where the engine module sits in S, and the C toolchain that builds
+  # it (xtask wasm refuses any other wasi-sdk version; sha256 of the asset).
+  WASM_PATH: sdk/go/internal/embedded/module/cgx.wasm
+  WASI_SDK_VERSION: "34.0"
+  WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
 
 jobs:
   stamp-and-build:
@@ -190,20 +213,86 @@ jobs:
         id: guard
         env:
           TAG: ${{ steps.params.outputs.tag }}
+          CLEAVE_SHA: ${{ steps.params.outputs.cleave_sha }}
           CHANGE_DATE: ${{ steps.change_date.outputs.date }}
         run: |
           set -euo pipefail
+          # The Go SDK ships with this release iff the cleave tree has its
+          # module; older cleave points take the LICENSE-only path.
+          sdk=false
+          if git cat-file -e "${CLEAVE_SHA}:sdk/go/go.mod" 2>/dev/null; then
+            sdk=true
+          fi
+
+          # Go tooling must never resolve a moving alias: no two-field
+          # `sdk/go/vX.Y` tag may exist. Checked on the remote, before anything
+          # is pushed.
+          ALIASES="$(git ls-remote --tags --refs origin 'refs/tags/sdk/go/*' \
+            | awk '{print $2}' | grep -E '^refs/tags/sdk/go/v[0-9]+\.[0-9]+$' || true)"
+          if [ -n "${ALIASES}" ]; then
+            echo "::error::moving Go module aliases exist; delete them before releasing: ${ALIASES}" >&2
+            exit 1
+          fi
+
           # Already done iff the tag exists AND its commit's LICENSE already
-          # carries the target Change Date. Covers re-runs on both paths (a
-          # dispatch tag doesn't exist yet on the first run → not stamped).
+          # carries the target Change Date AND, with the SDK, the commit carries
+          # the engine module. Covers re-runs on both paths (a dispatch tag
+          # doesn't exist yet on the first run → not stamped).
           already=false
           if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
             TAG_COMMIT="$(git rev-parse "${TAG}^{commit}")"
             if git show "${TAG_COMMIT}:LICENSE" 2>/dev/null | grep -qE "^Change Date: +${CHANGE_DATE}\$"; then
+              if [ "${sdk}" = "true" ] && ! git cat-file -e "${TAG_COMMIT}:${WASM_PATH}" 2>/dev/null; then
+                # Re-stamping from here would find nothing to change; refuse
+                # rather than publish a Go module without its engine.
+                echo "::error::${TAG} is stamped but its commit has no ${WASM_PATH}" >&2
+                exit 1
+              fi
               already=true
             fi
           fi
-          echo "already_stamped=${already}" >> "$GITHUB_OUTPUT"
+          {
+            echo "already_stamped=${already}"
+            echo "sdk=${sdk}"
+            echo "go_tag=sdk/go/${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the cleave commit for the wasm build
+        if: steps.guard.outputs.sdk == 'true' && steps.guard.outputs.already_stamped == 'false'
+        env:
+          CLEAVE_SHA: ${{ steps.params.outputs.cleave_sha }}
+        run: git checkout --quiet "${CLEAVE_SHA}"
+
+      - name: Install pinned Rust toolchain (wasm32-wasip1)
+        if: steps.guard.outputs.sdk == 'true' && steps.guard.outputs.already_stamped == 'false'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml
+          targets: wasm32-wasip1
+
+      - name: Cache wasi-sdk archive
+        if: steps.guard.outputs.sdk == 'true' && steps.guard.outputs.already_stamped == 'false'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux-${{ env.WASI_SDK_SHA256 }}
+
+      - name: Build cgx.wasm from the cleave commit (twice; must be byte-identical)
+        if: steps.guard.outputs.sdk == 'true' && steps.guard.outputs.already_stamped == 'false'
+        run: |
+          set -euo pipefail
+          # The archive is verified on every run, cached or not.
+          archive="$HOME/.cache/wasi-sdk/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          if [ ! -f "$archive" ]; then
+            mkdir -p "$(dirname "$archive")"
+            curl -sSfL -o "$archive" \
+              "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION%%.*}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          fi
+          echo "${WASI_SDK_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          WASI_SDK_PATH="$RUNNER_TEMP/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux" \
+            cargo run --locked -p xtask -- wasm --check-reproducible --out "$RUNNER_TEMP/cgx.wasm"
+          sha256sum "$RUNNER_TEMP/cgx.wasm"
 
       - name: Create stamp commit (child of cleave, author-dated to it)
         if: steps.guard.outputs.already_stamped == 'false'
@@ -215,11 +304,12 @@ jobs:
           AUTHOR_EMAIL: ${{ steps.params.outputs.author_email }}
           AUTHOR_DATE: ${{ steps.params.outputs.author_date }}
           BODY_FILE: ${{ steps.notes.outputs.body_file }}
+          SDK: ${{ steps.guard.outputs.sdk }}
         run: |
           set -euo pipefail
 
-          # Materialize the cleave tree so we can edit LICENSE without touching
-          # anything else.
+          # Materialize the cleave tree so we can edit LICENSE (and, with the
+          # Go SDK, add the engine module) without touching anything else.
           git checkout --quiet "${CLEAVE_SHA}"
 
           # Edit ONLY the Change Date line; preserve column alignment and every
@@ -230,17 +320,29 @@ jobs:
             exit 1
           fi
           sed -i "s/^Change Date:.*\$/Change Date:          ${CHANGE_DATE}/" LICENSE
+          git add LICENSE
 
-          # Sanity: exactly one FILE changed, and it's LICENSE. Count changed
-          # files via --name-only (--stat emits an extra summary line).
-          CHANGED="$(git diff --name-only -- LICENSE | wc -l | tr -d ' ')"
-          if [ "${CHANGED}" -ne 1 ]; then
-            echo "::error::LICENSE diff touched an unexpected number of files (${CHANGED})" >&2
-            git diff --stat -- LICENSE >&2
+          # The engine module is gitignored on main; force-add the build.
+          if [ "${SDK}" = "true" ]; then
+            mkdir -p "$(dirname "${WASM_PATH}")"
+            cp "${RUNNER_TEMP}/cgx.wasm" "${WASM_PATH}"
+            git add -f "${WASM_PATH}"
+          fi
+
+          # Sanity: the stamp changes exactly the expected paths relative to
+          # the cleave commit — LICENSE modified and, with the SDK, the engine
+          # module added — and nothing else.
+          EXPECTED="$(printf 'M\tLICENSE')"
+          if [ "${SDK}" = "true" ]; then
+            EXPECTED="$(printf '%s\nA\t%s' "${EXPECTED}" "${WASM_PATH}")"
+          fi
+          ACTUAL="$(git diff --cached --no-renames --name-status "${CLEAVE_SHA}")"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::stamp would change an unexpected set of paths" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "${EXPECTED}" "${ACTUAL}" >&2
             exit 1
           fi
 
-          git add LICENSE
           NEW_TREE="$(git write-tree)"
 
           # Author AND committer date pinned to the cleave commit's author date,
@@ -256,27 +358,6 @@ jobs:
               -F "${BODY_FILE}")"
 
           echo "sha=${STAMP_SHA}" >> "$GITHUB_OUTPUT"
-
-      - name: Create annotated tag at the stamp commit
-        if: steps.guard.outputs.already_stamped == 'false'
-        env:
-          TAG: ${{ steps.params.outputs.tag }}
-          STAMP_SHA: ${{ steps.stamp.outputs.sha }}
-          PUB_DAY: ${{ steps.params.outputs.pub_day }}
-          CHANGE_DATE: ${{ steps.change_date.outputs.date }}
-        run: |
-          set -euo pipefail
-          # Annotated tag dated to the publication day (midnight UTC). -f so a
-          # forward tag-push (whose lightweight tag already exists) is converted
-          # to this annotated tag at the stamp. Force-pushing a TAG ref touches
-          # no branch — main is never advanced, checked out, or merged into.
-          GIT_COMMITTER_NAME="cgx-release-bot" \
-          GIT_COMMITTER_EMAIL="release@ferralon.com" \
-          GIT_COMMITTER_DATE="${PUB_DAY}T00:00:00Z" \
-            git tag -f -a "${TAG}" "${STAMP_SHA}" \
-              -m "cgx ${TAG}" \
-              -m "BUSL-1.1 Change Date: ${CHANGE_DATE} (converts to MIT)."
-          git push --force origin "refs/tags/${TAG}"
 
       - name: Resolve build ref (stamp, or already-stamped tag)
         id: build_ref
@@ -301,6 +382,72 @@ jobs:
           # Confirm we build from the dated LICENSE, not TBD.
           grep '^Change Date:' LICENSE
 
+      - name: Set up Go for the module check
+        if: steps.guard.outputs.sdk == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+
+      - name: Verify the Go module at the stamp commit (before any tag push)
+        if: steps.guard.outputs.sdk == 'true'
+        working-directory: sdk/go
+        run: |
+          set -euo pipefail
+          # The tests run against the engine embedded in this commit.
+          test -s "${GITHUB_WORKSPACE}/${WASM_PATH}"
+          go vet ./...
+          CGX_REQUIRE_WASM=1 go test -count=1 ./...
+
+      - name: Tag the Go module at the stamp commit (created once, never moved)
+        if: steps.guard.outputs.sdk == 'true'
+        env:
+          GO_TAG: ${{ steps.guard.outputs.go_tag }}
+          TAG: ${{ steps.params.outputs.tag }}
+          BUILD_SHA: ${{ steps.build_ref.outputs.sha }}
+          PUB_DAY: ${{ steps.params.outputs.pub_day }}
+        run: |
+          set -euo pipefail
+          # Runs before the vX.Y.Z tag moves, so a conflict stops the release
+          # with nothing published. Local tags mirror the remote (fetched with
+          # --force at the start of the job).
+          if git rev-parse -q --verify "refs/tags/${GO_TAG}" >/dev/null; then
+            AT="$(git rev-parse "refs/tags/${GO_TAG}^{commit}")"
+            if [ "${AT}" != "${BUILD_SHA}" ]; then
+              echo "::error::${GO_TAG} already points at ${AT}, not at the stamp ${BUILD_SHA}; a Go module version is immutable once published, so it is never moved — release a new version instead" >&2
+              exit 1
+            fi
+            echo "${GO_TAG} already at ${BUILD_SHA}"
+            exit 0
+          fi
+          GIT_COMMITTER_NAME="cgx-release-bot" \
+          GIT_COMMITTER_EMAIL="release@ferralon.com" \
+          GIT_COMMITTER_DATE="${PUB_DAY}T00:00:00Z" \
+            git tag -a "${GO_TAG}" "${BUILD_SHA}" -m "cgx Go SDK ${TAG}"
+          # No --force: git refuses to replace a tag the remote gained meanwhile.
+          git push origin "refs/tags/${GO_TAG}"
+
+      - name: Create annotated tag at the stamp commit
+        if: steps.guard.outputs.already_stamped == 'false'
+        env:
+          TAG: ${{ steps.params.outputs.tag }}
+          STAMP_SHA: ${{ steps.stamp.outputs.sha }}
+          PUB_DAY: ${{ steps.params.outputs.pub_day }}
+          CHANGE_DATE: ${{ steps.change_date.outputs.date }}
+        run: |
+          set -euo pipefail
+          # Annotated tag dated to the publication day (midnight UTC). -f so a
+          # forward tag-push (whose lightweight tag already exists) is converted
+          # to this annotated tag at the stamp. Force-pushing a TAG ref touches
+          # no branch — main is never advanced, checked out, or merged into.
+          GIT_COMMITTER_NAME="cgx-release-bot" \
+          GIT_COMMITTER_EMAIL="release@ferralon.com" \
+          GIT_COMMITTER_DATE="${PUB_DAY}T00:00:00Z" \
+            git tag -f -a "${TAG}" "${STAMP_SHA}" \
+              -m "cgx ${TAG}" \
+              -m "BUSL-1.1 Change Date: ${CHANGE_DATE} (converts to MIT)."
+          git push --force origin "refs/tags/${TAG}"
+
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -312,10 +459,11 @@ jobs:
           chmod +x ./reproducible-build.sh
           ./reproducible-build.sh "${TARGET}"
 
-      - name: Package tarball (binary + dated LICENSE)
+      - name: Package tarball (binary + dated LICENSE) and the wasm engine
         id: package
         env:
           TAG: ${{ steps.params.outputs.tag }}
+          SDK: ${{ steps.guard.outputs.sdk }}
         run: |
           set -euo pipefail
           STAGE="dist/${BIN_NAME}-${TAG}-${TARGET}"
@@ -339,22 +487,36 @@ jobs:
           echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
 
-      - name: Create/update GitHub Release and attach tarball
+          # The engine module exactly as committed in the stamp (the bytes the
+          # Go module embeds), published beside the binary.
+          if [ "${SDK}" = "true" ]; then
+            WASM_ASSET="${BIN_NAME}-${TAG}-wasm32-wasip1.wasm"
+            git show "HEAD:${WASM_PATH}" > "dist/${WASM_ASSET}"
+            (cd dist && sha256sum "${WASM_ASSET}" > "${WASM_ASSET}.sha256")
+            echo "wasm=dist/${WASM_ASSET}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create/update GitHub Release and attach the assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.params.outputs.tag }}
           TARBALL: ${{ steps.package.outputs.tarball }}
+          WASM: ${{ steps.package.outputs.wasm }}
           BODY_FILE: ${{ steps.notes.outputs.body_file }}
         run: |
           set -euo pipefail
+          ASSETS=("${TARBALL}" "${TARBALL}.sha256")
+          if [ -n "${WASM}" ]; then
+            ASSETS+=("${WASM}" "${WASM}.sha256")
+          fi
           if gh release view "${TAG}" >/dev/null 2>&1; then
             # Re-run against an existing release: refresh assets and body from
             # the same source so a re-run converges rather than leaving stale
             # content behind.
-            gh release upload "${TAG}" "${TARBALL}" "${TARBALL}.sha256" --clobber
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
             gh release edit "${TAG}" --notes-file "${BODY_FILE}"
           else
-            gh release create "${TAG}" "${TARBALL}" "${TARBALL}.sha256" \
+            gh release create "${TAG}" "${ASSETS[@]}" \
               --title "${TAG}" \
               --notes-file "${BODY_FILE}"
           fi
@@ -373,10 +535,16 @@ jobs:
           # drag the alias backward. The highest patch is read from the remote,
           # because a backfill checkout does not carry every tag locally.
           MINOR="${TAG%.*}"                              # v0.3.2 -> v0.3
+          # Only top-level release tags: the alias is never an `sdk/go/` tag,
+          # and Go module tags never count toward the highest patch.
+          if ! printf '%s' "${MINOR}" | grep -qE '^v[0-9]+\.[0-9]+$'; then
+            echo "::error::refusing to float '${MINOR}': not a top-level vMAJOR.MINOR alias" >&2; exit 1
+          fi
           esc="${MINOR//./\\.}"                          # v0\.3 (exact 3-field match below)
           HIGHEST="$(git ls-remote --tags --refs origin "refs/tags/${MINOR}.*" \
-            | awk -F/ '{print $NF}' \
-            | grep -E "^${esc}\.[0-9]+$" \
+            | awk '{print $2}' \
+            | grep -E "^refs/tags/${esc}\.[0-9]+$" \
+            | sed 's|^refs/tags/||' \
             | sort -V | tail -n1)"
           if [ "${HIGHEST}" != "${TAG}" ]; then
             echo "::notice::${TAG} is not the highest patch on ${MINOR} (highest released is ${HIGHEST}); leaving ${MINOR} unmoved."

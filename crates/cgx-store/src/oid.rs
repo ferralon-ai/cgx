@@ -12,6 +12,24 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 
+/// SHA-1 of `bytes`. On wasm it is computed one 64-byte block at a time with a
+/// yield tick per block: hashing a large object is otherwise one long run with
+/// no yield point. Natively it is a plain [`Sha1::digest`].
+#[inline]
+pub(crate) fn sha1(bytes: &[u8]) -> sha1::digest::Output<Sha1> {
+    #[cfg(target_family = "wasm")]
+    {
+        let mut h = Sha1::new();
+        for block in bytes.chunks(64) {
+            h.update(block);
+            cgx_core::yield_hook::tick();
+        }
+        h.finalize()
+    }
+    #[cfg(not(target_family = "wasm"))]
+    Sha1::digest(bytes)
+}
+
 /// The content-addressed identity of a stored object: lowercase-hex SHA-1 of its
 /// canonical-postcard bytes (Decision D1). Ordered so shard lists sort canonically.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -22,8 +40,7 @@ impl ObjectOid {
     /// Hash `bytes` (already canonical postcard) into an object OID. No git-blob
     /// framing — the raw bytes are hashed.
     pub fn of_bytes(bytes: &[u8]) -> ObjectOid {
-        let digest = Sha1::digest(bytes);
-        ObjectOid(hex_lower(&digest))
+        ObjectOid(hex_lower(&sha1(bytes)))
     }
 
     pub fn as_str(&self) -> &str {

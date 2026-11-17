@@ -58,7 +58,7 @@ Reading only `inputSchema` gives the wrong picture here: it says a call with jus
 
 There is **no `approximation` key** on this tool, in any response.
 
-Each record in `results` (`symbol_hit_json`, `crates/cgx-mcp/src/tools.rs:937`):
+Each record in `results` (`SymbolHitRow`, `crates/cgx-mcp/src/output.rs`):
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -148,7 +148,7 @@ callable symbols.
 ### Why there is no `approximation` field
 
 `search`, [symbols](symbols.md) and [explain](explain.md) are the three tools that
-do not pass through `with_contract` (`crates/cgx-mcp/src/tools.rs:549-577`). This
+have no `approximation` field in their output types (`crates/cgx-mcp/src/output.rs`). This
 is by design, not an omission: the approximation contract describes how a
 **traversal** can be wrong — an over-approximated candidate set on a walked edge,
 or a frontier the walk could not follow. `search` performs no traversal. It scans

@@ -40,7 +40,7 @@ A single JSON object. The session-metadata fields (`graph_version`, `dirty`, `di
 
 ### `explain` carries no `approximation`, by design
 
-`explain` is one of three tools — with [`search`](search.md) and [`symbols`](symbols.md) — that skip the approximation contract deliberately (`crates/cgx-mcp/src/tools.rs:566`). It performs no traversal: there is no frontier to under-approximate and no path-level candidate set to over-approximate. What it reports is the incident-edge list as stored, and each edge already carries its own `confidence`, `tier` and `rule`, which is the same honesty at edge granularity.
+`explain` is one of three tools — with [`search`](search.md) and [`symbols`](symbols.md) — that have no `approximation` field in their output types (`crates/cgx-mcp/src/output.rs`), by design. It performs no traversal: there is no frontier to under-approximate and no path-level candidate set to over-approximate. What it reports is the incident-edge list as stored, and each edge already carries its own `confidence`, `tier` and `rule`, which is the same honesty at edge granularity.
 
 Read those per-edge fields the way you would read a contract. An edge at `possible` was resolved through an over-approximated candidate set and may not occur at runtime. An edge with `tier: "scope_graph"` and `rule: "name-method"` is the one to distrust most: it is a global short-name method lookup with no receiver-type corroboration, yet it is banded `probable`. `explain` is the right tool for spotting one, because it shows `tier` and `rule` where the traversal tools show only `confidence`.
 

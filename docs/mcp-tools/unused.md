@@ -23,7 +23,7 @@ A symbol is unused when no walk from any indexed entrypoint reaches it. If a pro
 
 ## Output shape
 
-Every response includes the approximation contract added by `with_contract()` and the session metadata plus freshness envelope added by `with_session_meta()`:
+Every response (`UnusedOutput`, `crates/cgx-mcp/src/output.rs`) includes the approximation contract and the session metadata plus freshness envelope:
 
 | Field | Type | Meaning |
 |-------|------|---------|
